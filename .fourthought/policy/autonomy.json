@@ -1,0 +1,7 @@
+{
+  "schema": "fourthought-autonomy/v1",
+  "owner_escalation": "Escalate to the owner only for material product direction or UX, significant cost, material risk/security/privacy changes, major scope changes, conflicts with explicit owner decisions, or hard-to-reverse commitments. Investigate uncertainty first. Routine technical decisions belong to Product, Project, Lead/Architecture or Assurance.",
+  "normal_interface": "product-manager",
+  "engineering_requires": "ready",
+  "merge": "never automatic"
+}

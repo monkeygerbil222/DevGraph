@@ -1,0 +1,19 @@
+name: Fourthought feature
+description: Product shapes this request before engineering starts.
+title: "[feature] "
+body:
+  - type: textarea
+    id: need
+    attributes:
+      label: Problem or need
+      description: Describe the user outcome or observed failure.
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Context and constraints
+      description: Existing evidence, non-goals and constraints. Product resolves routine uncertainty.
+  - type: markdown
+    attributes:
+      value: "Product Manager converts this request into an Engineering Work Contract. The coordinator owns the structured Fourthought state block; do not edit it by hand."

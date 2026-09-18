@@ -1,0 +1,11 @@
+{
+  "schema": "fourthought-protected-paths/v1",
+  "paths": [
+    ".git/**",
+    ".github/**",
+    ".fourthought/**",
+    ".accountability/**"
+  ],
+  "enforcement": "fourthought_lib.hooks.check_scope",
+  "phase1_override": false
+}

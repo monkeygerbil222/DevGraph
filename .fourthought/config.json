@@ -1,0 +1,31 @@
+{
+  "assurance": {
+    "mode": "detect"
+  },
+  "github": {
+    "actors": {},
+    "coordinator": "github-actions",
+    "enabled": false,
+    "repository": "",
+    "runtime_sessions": false,
+    "state_public_key": ""
+  },
+  "loops": {
+    "review": 2,
+    "verification": 3
+  },
+  "project": {
+    "name": "DevGraph"
+  },
+  "runtime": {
+    "lease_ttl": 900,
+    "push_remote": "origin",
+    "verify_commands": [],
+    "worker_timeout": 900
+  },
+  "schema": "fourthought-config/v1",
+  "skills": {
+    "pins": {},
+    "roles": {}
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "accountability_present": false,
+  "branch_at_attachment": "codex/fedora-council",
+  "ci": [],
+  "head_at_attachment": "757229acd9b4741f170fb34f675ebe26d9cc7f96",
+  "instructions": [
+    "CLAUDE.md"
+  ],
+  "languages": [
+    "python"
+  ],
+  "schema": "fourthought-profile/v1",
+  "test_files": [
+    "tests/test_dependencies.py"
+  ]
+}

@@ -1,0 +1,203 @@
+{
+  "files": {
+    ".fourthought/hooks/post-agent": {
+      "owner": "framework",
+      "sha256": "f1c26050937d610ee17fcb90b80bf2d55bedf0c4b62e6e3977c23d3bf5e6b4f3"
+    },
+    ".fourthought/hooks/post-commit": {
+      "owner": "framework",
+      "sha256": "5c520c0f9d5a79ef654ea93311e7958515a742644d3faf9d504fd977c131fefe"
+    },
+    ".fourthought/hooks/post-transition": {
+      "owner": "framework",
+      "sha256": "1a30fab22772428633b36092bcc4034904fcc7674379d0ffd5d410a0c1d135d7"
+    },
+    ".fourthought/hooks/pre-agent": {
+      "owner": "framework",
+      "sha256": "7b2fccfa1f40a67ef9e84036d7c44a0f070caf31126caa120a7da160f65669fa"
+    },
+    ".fourthought/hooks/pre-claim": {
+      "owner": "framework",
+      "sha256": "f3fa8361cd7486445c170af4428c64241c3bd1e8624a962e60a89d133ca51fac"
+    },
+    ".fourthought/hooks/pre-commit": {
+      "owner": "framework",
+      "sha256": "14d2bc2bda3e31333ba9dc3bfb070987273954259953448a9f784fd6bc115467"
+    },
+    ".fourthought/hooks/pre-merge": {
+      "owner": "framework",
+      "sha256": "60562e0f6b0297adfbd24eb8342815a2618a13a516042f3c531fca42df882bd0"
+    },
+    ".fourthought/hooks/pre-transition": {
+      "owner": "framework",
+      "sha256": "6637535b507d59345b47117a35c1c2c79eaf9a7c910450beca3e72925366432d"
+    },
+    ".fourthought/loops/review-remediate.json": {
+      "owner": "framework",
+      "sha256": "5609f60c48ba876174136c2d60bec58e6783095ba7a105c8d1ee84f73600a418"
+    },
+    ".fourthought/loops/verify-remediate.json": {
+      "owner": "framework",
+      "sha256": "5e21570bb2342d8159ca5fb1060bf9668728aad15350ce3d8c8e612ab56318f3"
+    },
+    ".fourthought/policy/autonomy.json": {
+      "owner": "framework",
+      "sha256": "97dd4050e283db5fbacafeca23e0b3d1922183ca15a696e474cd33a91f10612b"
+    },
+    ".fourthought/policy/protected-paths.json": {
+      "owner": "framework",
+      "sha256": "2b62fe7c6f44a143cc509c5d0502f874ca79b3850fee9379019df7a2cb2c21ea"
+    },
+    ".fourthought/roles/assurance.md": {
+      "owner": "framework",
+      "sha256": "1ea9b6f432da053451b64ec637d996d53d505e03fe58d86f70974759ed193531"
+    },
+    ".fourthought/roles/implementer.md": {
+      "owner": "framework",
+      "sha256": "4def249ccc72249fc940ec791b4c52a840918d7c3d2b5e88cb0f25fa90f76ed5"
+    },
+    ".fourthought/roles/lead.md": {
+      "owner": "framework",
+      "sha256": "c1490a985115d56829b722381e2083db8038e6b5a18ccb8a63e3832bf9debc22"
+    },
+    ".fourthought/roles/planner.md": {
+      "owner": "framework",
+      "sha256": "d25f5daedc50a5b214432d04c326736f3998af47912c615b725af01815409c61"
+    },
+    ".fourthought/roles/product-manager.md": {
+      "owner": "framework",
+      "sha256": "10bc52be258c3a10ac2d7beab19a52ea47ad190415b1288a8f03a9c20a20e478"
+    },
+    ".fourthought/roles/project-manager.md": {
+      "owner": "framework",
+      "sha256": "5c6506fdc825c8a544518e95a00c81444ce214892f7066cb636286ad6458d220"
+    },
+    ".fourthought/roles/reviewer.md": {
+      "owner": "framework",
+      "sha256": "354a96f0edd32dedefe78bd2097d9e86a75e4ec0a3dd602ec2308265fdcc2209"
+    },
+    ".fourthought/roles/triage.md": {
+      "owner": "framework",
+      "sha256": "746c6a8ce7e6567de93352820b9582a3d17366fbe409b316773a524c9847de70"
+    },
+    ".fourthought/roles/verifier.md": {
+      "owner": "framework",
+      "sha256": "21c8f1c8486940183af3451fe5a1dd5935c2ef26dddf0b3dc8513bf15c177548"
+    },
+    ".fourthought/runtime/fourthought_lib/__init__.py": {
+      "owner": "framework",
+      "sha256": "5738590807176609ff7a213c568d4d8e6719457b92a9f7dffad5fc5785aaa949"
+    },
+    ".fourthought/runtime/fourthought_lib/attachment.py": {
+      "owner": "framework",
+      "sha256": "bdde2bb25c360116c91e28a46052e11f304772efcae4d4cfe9f2b0c1c948f9ca"
+    },
+    ".fourthought/runtime/fourthought_lib/cli.py": {
+      "owner": "framework",
+      "sha256": "afdd0a2184398800950c09ec94790236dffe1a5b614580f8733a392d0e512c5c"
+    },
+    ".fourthought/runtime/fourthought_lib/coordination.py": {
+      "owner": "framework",
+      "sha256": "5668aaacc4c4b3bf3226db8531c4653b4724a1a0074df13fc0c44a03a1db42be"
+    },
+    ".fourthought/runtime/fourthought_lib/dispatch.py": {
+      "owner": "framework",
+      "sha256": "0a5559a41316741052f57873ea37139454829b6c6590710734ab1fb93683d88f"
+    },
+    ".fourthought/runtime/fourthought_lib/engine.py": {
+      "owner": "framework",
+      "sha256": "5506dbe066987411d2f44085e13cd6e07ae33be72367efdaf1c514f62706216d"
+    },
+    ".fourthought/runtime/fourthought_lib/github.py": {
+      "owner": "framework",
+      "sha256": "a7bb6d1ae257295e2017421a8d96630e02d09bd55df22451d9a8c77be5b40bad"
+    },
+    ".fourthought/runtime/fourthought_lib/hooks.py": {
+      "owner": "framework",
+      "sha256": "5b0315e5f1d6f7c3994b0f3de250ebb094ff3080d91bd1885ce133389e959a58"
+    },
+    ".fourthought/runtime/fourthought_lib/integrations.py": {
+      "owner": "framework",
+      "sha256": "c371d5239b8ecbb0dcce17260de53a198e86e83088cf89d10aabe30cd01aa2d8"
+    },
+    ".fourthought/runtime/fourthought_lib/policy.py": {
+      "owner": "framework",
+      "sha256": "1abeb17d99efc01b1e76fd1b926e8e517db1b85f3547aeb734f1ef2a1647928b"
+    },
+    ".fourthought/runtime/fourthought_lib/sessions.py": {
+      "owner": "framework",
+      "sha256": "36b6e72ed1945be8c5075480abee26106970066a450e662914ad875c983b1b5c"
+    },
+    ".fourthought/runtime/ruff.toml": {
+      "owner": "framework",
+      "sha256": "891eb4df886880bcde5dee9682c3e9288e357692623f53a811882ed8102d679b"
+    },
+    ".fourthought/schemas/execution-receipt.schema.json": {
+      "owner": "framework",
+      "sha256": "fc1f7f9199135bf4f68ff95936ae9bcd655a9ecd7b289e2f5499300d96931584"
+    },
+    ".fourthought/schemas/work-claim.schema.json": {
+      "owner": "framework",
+      "sha256": "d400acf7fbc787f8f0c5c070982956ffd2e5e8df4627839664d3e4593b418d8c"
+    },
+    ".fourthought/schemas/work-contract.schema.json": {
+      "owner": "framework",
+      "sha256": "73448956c2d8895ab21669d9ef7be48656a69b6a1ef9179970be2fc86316163d"
+    },
+    ".fourthought/version": {
+      "owner": "framework",
+      "sha256": "1f930dd1f133c1f97a94fe3acb8db34372cf4c01ffdb2b3ff4ca72f9494121e9"
+    },
+    ".fourthought/workflows/architecture.json": {
+      "owner": "framework",
+      "sha256": "e138e0e02932348e243fc8fb2b3f136eb021003d931bbc1c649e53fd09a14c3b"
+    },
+    ".fourthought/workflows/bug.json": {
+      "owner": "framework",
+      "sha256": "f50faba46a34dc8ed79a7c8c3d1dd5d60d2f6044f9368e5f72ebb2710d4553ac"
+    },
+    ".fourthought/workflows/feature.json": {
+      "owner": "framework",
+      "sha256": "1957c7f5098fcecd8a8dd69146b176de07de06ab0fb1069f3060e1dcd660bf02"
+    },
+    ".fourthought/workflows/investigation.json": {
+      "owner": "framework",
+      "sha256": "e2a8496c7796ea9eb7b94331c39875daa83d8254339098e7747f7c2196872213"
+    },
+    ".fourthought/workflows/refactor.json": {
+      "owner": "framework",
+      "sha256": "f6e5e84ef2c9197c9b1abc34f68bbf9494924112e93ca5a25ca383f7e67b3a30"
+    },
+    ".github/ISSUE_TEMPLATE/fourthought-bug.yml": {
+      "owner": "framework",
+      "sha256": "49ddb7bb0eb59d3220306c645f313d459720207985638cad2fca5aa836acc87e"
+    },
+    ".github/ISSUE_TEMPLATE/fourthought-feature.yml": {
+      "owner": "framework",
+      "sha256": "7e4a0b586830867dd2809c4864582fb17b0bbe7cf401c81c15bf6b7f4142bee0"
+    },
+    ".github/workflows/fourthought-router.yml": {
+      "owner": "framework",
+      "sha256": "70537e9c3de9e087bb5d8750bb05f67f40f74d9ce3bf60610df3364c2fd15512"
+    },
+    "scripts/fourthought": {
+      "owner": "framework",
+      "sha256": "d40131dee8e0b0715e408d9705a2964e9118ce2e2e778a22f393cb7cd94d0ccc"
+    }
+  },
+  "project_files": [
+    ".fourthought/config.json",
+    ".fourthought/product/architecture-boundaries.md",
+    ".fourthought/product/constraints.md",
+    ".fourthought/product/decision-log.md",
+    ".fourthought/product/glossary.md",
+    ".fourthought/product/non-goals.md",
+    ".fourthought/product/principles.md",
+    ".fourthought/product/roadmap.md",
+    ".fourthought/product/users.md",
+    ".fourthought/product/vision.md",
+    ".fourthought/repo-profile.json"
+  ],
+  "schema": "fourthought-manifest/v1",
+  "version": "0.2.0"
+}

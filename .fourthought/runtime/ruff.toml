@@ -1,0 +1,3 @@
+# Framework-owned vendored code is verified in the Fourthought source repository.
+# Keep target application lint/format rules scoped to target-owned code.
+exclude = ["*"]

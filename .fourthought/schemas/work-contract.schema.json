@@ -1,0 +1,115 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Fourthought work-contract",
+  "type": "object",
+  "properties": {
+    "initiative": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "\\S"
+    },
+    "issue": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "intent": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "\\S"
+    },
+    "outcomes": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "pattern": "\\S"
+      },
+      "uniqueItems": true,
+      "minItems": 1
+    },
+    "non_goals": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "pattern": "\\S"
+      },
+      "uniqueItems": true
+    },
+    "constraints": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "pattern": "\\S"
+      },
+      "uniqueItems": true
+    },
+    "acceptance": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "pattern": "\\S"
+      },
+      "uniqueItems": true,
+      "minItems": 1
+    },
+    "owner_decisions": {
+      "type": "object",
+      "properties": {
+        "status": {
+          "enum": [
+            "resolved",
+            "pending",
+            "not-required"
+          ]
+        }
+      },
+      "required": [
+        "status"
+      ],
+      "additionalProperties": false
+    },
+    "engineering": {
+      "type": "object",
+      "properties": {
+        "status": {
+          "enum": [
+            "draft",
+            "ready",
+            "blocked"
+          ]
+        }
+      },
+      "required": [
+        "status"
+      ],
+      "additionalProperties": false
+    },
+    "assurance": {
+      "type": "object",
+      "properties": {
+        "required": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "required"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "required": [
+    "initiative",
+    "issue",
+    "intent",
+    "outcomes",
+    "non_goals",
+    "constraints",
+    "acceptance",
+    "owner_decisions",
+    "engineering"
+  ],
+  "additionalProperties": false
+}

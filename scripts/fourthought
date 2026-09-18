@@ -1,0 +1,18 @@
+#!/usr/bin/env python3
+"""Source and repository-attached Fourthought entry point."""
+from pathlib import Path
+import sys
+sys.dont_write_bytecode = True
+
+here = Path(__file__).resolve().parent
+installed = here.parent / '.fourthought/runtime'
+if (here.parent / '.fourthought').exists():
+    if not all((installed / 'fourthought_lib' / name).is_file()
+               for name in ('__init__.py', 'cli.py')):
+        print('Fourthought blocked: installed runtime is incomplete; inspect with the source CLI', file=sys.stderr)
+        sys.exit(1)
+    sys.path.insert(0, str(installed))
+from fourthought_lib.cli import main
+
+if __name__ == '__main__':
+    sys.exit(main())

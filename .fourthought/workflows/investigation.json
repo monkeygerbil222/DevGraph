@@ -1,0 +1,21 @@
+{
+  "schema": "fourthought-workflow/v1",
+  "class": "investigation",
+  "entry": "triage",
+  "sequence": [
+    "ready:plan",
+    "planning",
+    "ready:implement",
+    "implementing",
+    "ready:verify",
+    "verifying",
+    "ready:review",
+    "reviewing",
+    "merge-ready"
+  ],
+  "loops": [
+    "verify-remediate",
+    "review-remediate"
+  ],
+  "executor": "fourthought_lib.policy.transition"
+}

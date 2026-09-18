@@ -1,0 +1,17 @@
+{
+  "schema": "fourthought-loop/v1",
+  "stage": "verify",
+  "max_remediations": 3,
+  "failure": "remediate",
+  "after_remediation": "ready:verify",
+  "success": "ready:review",
+  "exhaustion": {
+    "state": "blocked",
+    "route_to": [
+      "lead",
+      "project-manager",
+      "product-manager"
+    ]
+  },
+  "executor": "fourthought_lib.policy.transition"
+}
