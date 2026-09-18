@@ -9,3 +9,13 @@ See [README.md](README.md) for what this project is and [PROJECT_STATUS.md](PROJ
 - Keep README.md, design docs, and status docs current when behavior changes; don't let them drift into fiction.
 - Never commit real names, personal paths, or identifying data — use fictional examples.
 - Never add a `Co-Authored-By: Claude` (or similar self-referencing) trailer to commit messages, and don't mention Claude/the assistant by name in commit messages, PR descriptions, or code comments unless the user explicitly asks for it.
+
+## Agent skills
+
+### Issue tracker
+
+GitHub Issues on `HaydenSchmidtDOC/DevGraph`, via the `gh` CLI. See `docs/agents/issue-tracker.md`.
+
+### Domain docs
+
+Single-context: `CONTEXT.md` + `docs/adr/` at the repo root. See `docs/agents/domain.md`.
