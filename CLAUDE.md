@@ -14,7 +14,10 @@ See [README.md](README.md) for what this project is and [PROJECT_STATUS.md](PROJ
 
 ### Issue tracker
 
-GitHub Issues on `HaydenSchmidtDOC/DevGraph`, via the `gh` CLI. See `docs/agents/issue-tracker.md`.
+Two trackers, split by purpose. Human-facing issues live upstream on
+`HaydenSchmidtDOC/DevGraph`; Fourthought coordination state lives on the fork
+`monkeygerbil222/DevGraph` and is written only by the coordinator. Never create a
+Fourthought record upstream. See `docs/agents/issue-tracker.md`.
 
 ### Domain docs
 

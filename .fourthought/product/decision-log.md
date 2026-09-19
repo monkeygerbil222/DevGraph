@@ -19,7 +19,24 @@ approval for the full schema epic or all open issues. Start by recommending a
 small issue and concrete acceptance criteria.
 
 This branch attaches the Council trial separately from the upstream-facing docs.
-GitHub coordination is disabled. Product may investigate and shape locally;
-engineering dispatch is blocked until protected coordinator state, role actors,
-verification commands and required independent review are configured and tested.
-Do not merge automatically or change upstream settings.
+
+GitHub coordination is enabled. Protected coordinator state, role actors,
+verification commands and the required independent review policy are configured;
+engineering dispatch is permitted. The coordinator signing key and protection
+token live in the `fourthought-coordinator` environment and have not yet been
+exercised by a real dispatch — treat the first run as a live test of sealing and
+signature verification, not as settled evidence.
+
+Issue boundary, split by purpose:
+
+- `monkeygerbil222/DevGraph` (origin, the contributor fork) is canonical for
+  Fourthought coordination. Every work contract, claim, receipt and sealed
+  record the coordinator writes belongs here. `.fourthought/config.json`
+  `github.repository` must always name this repository.
+- `HaydenSchmidtDOC/DevGraph` (upstream) is the human-facing tracker. Read
+  upstream issues for intake evidence and reference them by URL, but never
+  write Fourthought state there and never create a coordination issue there.
+
+When a Fourthought record cites upstream work, link the upstream issue in the
+body and keep the canonical record in the fork. Do not merge automatically or
+change upstream settings.

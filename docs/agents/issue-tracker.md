@@ -2,6 +2,22 @@
 
 Issues and specs for this repo live as GitHub issues. Use the `gh` CLI for all operations.
 
+## Which repository
+
+Two repositories, split by purpose. Pick by what you are writing, not by what you
+have checked out:
+
+| Purpose | Repository | Written by |
+| :--- | :--- | :--- |
+| Human-facing feature requests, bugs, triage | `HaydenSchmidtDOC/DevGraph` (upstream) | people, agents doing triage |
+| Fourthought coordination state: contracts, claims, receipts, sealed records | `monkeygerbil222/DevGraph` (origin, the fork) | the coordinator workflow only |
+
+Every `gh issue`/`gh pr` convention below defaults to **upstream**. Fourthought
+records are never created by hand with `gh`; they are created by
+`scripts/fourthought submit` and sealed by the coordinator in the fork. If you
+find yourself about to run `gh issue create` for a work contract, stop — that is
+a `submit`.
+
 ## Access
 
 Check the authenticated account and repository permissions before publishing:
