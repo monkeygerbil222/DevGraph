@@ -3,12 +3,40 @@
     "mode": "detect"
   },
   "github": {
-    "actors": {},
+    "actors": {
+      "assurance": [
+        "monkeygerbil222"
+      ],
+      "implementer": [
+        "monkeygerbil222"
+      ],
+      "lead": [
+        "monkeygerbil222"
+      ],
+      "planner": [
+        "monkeygerbil222"
+      ],
+      "product-manager": [
+        "monkeygerbil222"
+      ],
+      "project-manager": [
+        "monkeygerbil222"
+      ],
+      "reviewer": [
+        "monkeygerbil222"
+      ],
+      "triage": [
+        "monkeygerbil222"
+      ],
+      "verifier": [
+        "monkeygerbil222"
+      ]
+    },
     "coordinator": "github-actions",
-    "enabled": false,
-    "repository": "",
-    "runtime_sessions": false,
-    "state_public_key": ""
+    "enabled": true,
+    "repository": "monkeygerbil222/DevGraph",
+    "runtime_sessions": true,
+    "state_public_key": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEA5RE9TibANYdql548Nsl7CDuUvxivbEjsyD+mcKO5yDE=\n-----END PUBLIC KEY-----\n"
   },
   "loops": {
     "review": 2,
@@ -20,7 +48,24 @@
   "runtime": {
     "lease_ttl": 900,
     "push_remote": "origin",
-    "verify_commands": [],
+    "verify_commands": [
+      [
+        "uv",
+        "sync",
+        "--python",
+        "3.13",
+        "--locked",
+        "--extra",
+        "dev"
+      ],
+      [
+        "uv",
+        "run",
+        "--locked",
+        "pytest",
+        "-q"
+      ]
+    ],
     "worker_timeout": 900
   },
   "schema": "fourthought-config/v1",

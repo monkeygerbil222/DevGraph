@@ -301,15 +301,15 @@ def coordinate(repo, request, *, api=None, actor=None, now=None, state_key=None)
         runtime_actor(login, role, request['session'])
     elif 'session' in request:
         raise ValueError('Runtime sessions are not enabled')
-    checkpoint = _read_checkpoint(api, github['repository'], public_key)
     if op == 'repair':
+        checkpoint = _read_checkpoint(api, github['repository'], public_key)
         sealed = checkpoint['records'].get(request['issue'])
         if (role != 'lead' or request_id is None or sealed is None
                 or request.get('checkpoint') != checkpoint['head']
                 or request['expected_revision'] != sealed['_revision']):
             raise ValueError('Repair requires Lead and the exact checkpoint head and revision')
         return _repair_publication(api, github['repository'], public_key, checkpoint, request['issue'])
-    snapshot = _canonical_snapshot(api, github['repository'], public_key, checkpoint=checkpoint)
+    checkpoint, snapshot = _read_canonical_state(api, github['repository'], public_key)
     issues = [item[0] for item in snapshot]
     records = [item[1] for item in snapshot]
     for r in records:
@@ -522,6 +522,7 @@ def _canonical_snapshot(api, repository, public_key, *, checkpoint=None):
     prefix = _repository(repository)
     checkpoint = _read_checkpoint(api, repository, public_key) if checkpoint is None else checkpoint
     result = []
+    consistency_error = None
     for issue in read_snapshot(api, repository, include_unattached=True):
         revisions, page, seen = {}, 1, set()
         while True:
@@ -554,24 +555,45 @@ def _canonical_snapshot(api, repository, public_key, *, checkpoint=None):
         if min(revisions) != 1 or len(revisions) != latest:
             raise ValueError('Canonical comment history has missing revisions')
         if mirror != revisions[latest]:
-            raise ValueError('Canonical issue mirror differs from signed history; trusted reconciliation required')
+            consistency_error = 'Canonical issue mirror differs from signed history; trusted reconciliation required'
         if checkpoint['records'].get(issue['number']) != revisions[latest]:
-            raise ValueError('Issue history differs from durable checkpoint; trusted reconciliation required')
+            consistency_error = consistency_error or 'Issue history differs from durable checkpoint; trusted reconciliation required'
         record = verify_record(revisions[latest], public_key, repository)
         from .policy import _record
         _record(record)
         result.append((issue, record))
     if {record['issue'] for issue, record in result} != set(checkpoint['records']):
-        raise ValueError('Durable checkpoint issue history is missing; trusted reconciliation required')
+        consistency_error = consistency_error or 'Durable checkpoint issue history is missing; trusted reconciliation required'
+    # Cross-surface mismatches can reflect a concurrent publication. Validate
+    # signatures and policy first, then distinguish movement from stable damage.
     if _checkpoint_head(api, repository) != checkpoint['head']:
-        raise ValueError('Checkpoint advanced during issue snapshot; restart coordination')
+        raise SnapshotChanged('Checkpoint advanced during issue snapshot; restart coordination')
+    if consistency_error is not None:
+        raise ValueError(consistency_error)
     _checkpoint_protection(api, repository)
     return result
 
 
+class SnapshotChanged(ValueError):
+    """A verified checkpoint moved while assembling a read-only snapshot."""
+
+
+def _read_canonical_state(api, repository, public_key):
+    """Retry complete reads only; integrity failures and all writes fail closed."""
+    for attempt in range(3):
+        try:
+            checkpoint = _read_checkpoint(api, repository, public_key)
+            snapshot = _canonical_snapshot(api, repository, public_key, checkpoint=checkpoint)
+            return checkpoint, snapshot
+        except SnapshotChanged:
+            if attempt == 2:
+                raise
+
+
 def read_canonical_snapshot(api, repository, public_key):
     """Return records after protected checkpoint and full issues/comments checks."""
-    return [record for issue, record in _canonical_snapshot(api, repository, public_key)]
+    checkpoint, snapshot = _read_canonical_state(api, repository, public_key)
+    return [record for issue, record in snapshot]
 
 
 def _persist_revision(api, repository, old, sealed, checkpoint):
@@ -655,7 +677,7 @@ def _read_checkpoint(api, repository, public_key):
         records[record['issue']] = sealed
         history.setdefault(record['issue'], []).append(sealed)
     if _checkpoint_head(api, repository) != head:
-        raise ValueError('Checkpoint advanced during snapshot; restart coordination')
+        raise SnapshotChanged('Checkpoint advanced during snapshot; restart coordination')
     return {'head':head, 'records':records, 'history':history}
 
 

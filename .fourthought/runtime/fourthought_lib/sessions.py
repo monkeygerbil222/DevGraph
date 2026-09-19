@@ -12,6 +12,7 @@ from pathlib import Path
 import shlex
 import subprocess
 import sys
+import time
 import uuid
 from .attachment import atomic, decode, encoded, git, root, safe, sha
 from .integrations import ROLES, skills
@@ -217,6 +218,17 @@ def start(repo, resume=False, background=False, dry_run=False):
             if result.returncode:
                 raise ValueError('Claude launch exited with code ' + str(result.returncode))
             agents = _native()
+            if background:
+                # Native launch returns before discovery necessarily publishes the job.
+                # Retry only absence, never an ambiguous identity or home mismatch.
+                for attempt in range(4):
+                    if resume:
+                        if _bound(state, agents):break
+                    else:
+                        candidates = [a for a in agents if _active(a) and a.get('kind') == 'background' and Path(a.get('cwd', '')).resolve() == home.resolve()]
+                        if candidates:break
+                    time.sleep(.25 * (attempt + 1))
+                    agents = _native()
             if background and not resume:
                 matches = [a for a in agents if _active(a) and a.get('kind') == 'background' and Path(a.get('cwd', '')).resolve() == home.resolve()]
                 state['native_candidates'] = [a.get('sessionId') for a in matches]

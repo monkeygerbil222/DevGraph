@@ -106,11 +106,11 @@
     },
     ".fourthought/runtime/fourthought_lib/engine.py": {
       "owner": "framework",
-      "sha256": "5506dbe066987411d2f44085e13cd6e07ae33be72367efdaf1c514f62706216d"
+      "sha256": "bf00f0a1c907a3b8f4532fa972f87e0f2b26e6af699c1b725e4eba015d25beae"
     },
     ".fourthought/runtime/fourthought_lib/github.py": {
       "owner": "framework",
-      "sha256": "a7bb6d1ae257295e2017421a8d96630e02d09bd55df22451d9a8c77be5b40bad"
+      "sha256": "1e6e2ba95b7623d9f4677f6d42b12bdf57095b9b58079f3062b180f0da1dcd6b"
     },
     ".fourthought/runtime/fourthought_lib/hooks.py": {
       "owner": "framework",
@@ -126,7 +126,7 @@
     },
     ".fourthought/runtime/fourthought_lib/sessions.py": {
       "owner": "framework",
-      "sha256": "36b6e72ed1945be8c5075480abee26106970066a450e662914ad875c983b1b5c"
+      "sha256": "2d4c6cc11423805d396375db75a2a422e3dc1c634f99f03f87b6e3585de417ae"
     },
     ".fourthought/runtime/ruff.toml": {
       "owner": "framework",
