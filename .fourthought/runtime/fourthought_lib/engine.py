@@ -2,6 +2,7 @@
 from contextlib import contextmanager
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import signal
@@ -137,8 +138,21 @@ def execute(argv,cwd,env,heartbeat,timeout,input_text=None):
             except subprocess.TimeoutExpired:
                 first_communication=False
                 continue
-    except BaseException:
+    except BaseException as exc:
         terminate(process)
+        # A detached descendant can inherit these pipes after the supervised
+        # process group is dead. Bound the drain so evidence collection cannot
+        # turn a worker timeout into an unbounded supervisor hang.
+        try:
+            out,err=process.communicate(timeout=1)
+        except subprocess.TimeoutExpired as drain:
+            def text(value):
+                if value is None:return ''
+                return value.decode(errors='replace') if isinstance(value,bytes) else value
+            out,err=text(drain.output),text(drain.stderr)
+            for stream in (process.stdout,process.stderr):
+                if stream is not None and not stream.closed:stream.close()
+        exc.worker_output=(process.returncode,out,err)
         raise
     finally:
         finished.set();guard.join(timeout=6)
@@ -146,21 +160,78 @@ def execute(argv,cwd,env,heartbeat,timeout,input_text=None):
             if stream is not None and not stream.closed:stream.close()
 
 
+def usage_fields(data):
+    """Allowlisted numeric telemetry only; null means unreported, never zero.
+
+    usage is the invocation total; modelUsage is its per-model breakdown.
+    Consumers must not add the two representations together.
+    """
+    def number(value):
+        return value if type(value) in (int,float) and value>=0 and math.isfinite(value) else None
+    def counters(value,names):
+        return {name:number(value.get(name)) for name in names} if isinstance(value,dict) else None
+    usage=counters(data.get('usage'),('input_tokens','output_tokens','cache_read_input_tokens','cache_creation_input_tokens'))
+    if usage is not None:
+        usage['cache_creation']=counters(data['usage'].get('cache_creation'),
+                                        ('ephemeral_5m_input_tokens','ephemeral_1h_input_tokens'))
+        usage['server_tool_use']=counters(data['usage'].get('server_tool_use'),
+                                         ('web_search_requests','web_fetch_requests'))
+    models=data.get('modelUsage')
+    return {'usage':usage,
+            'modelUsage':{name:counters(value,('inputTokens','outputTokens','cacheReadInputTokens',
+                          'cacheCreationInputTokens','webSearchRequests','costUSD','contextWindow','maxOutputTokens'))
+                          for name,value in models.items()} if isinstance(models,dict) else None,
+            **{name:number(data.get(name)) for name in ('duration_ms','duration_api_ms','total_cost_usd','num_turns')}}
+
+
 def model(repo,tree,role,session,prompt,claim,heartbeat,timeout,resume=False):
     from .sessions import worker_command
     command=worker_command(repo,tree,role,session,{'text':prompt,'claim':claim},PLAN_SCHEMA if role=='planner' else OUTPUT_SCHEMA)
     if resume:
         command['argv'][command['argv'].index('--session-id')]='--resume'
-    code,out,err=execute(command['argv'][:-2],command['cwd'],command['env'],heartbeat,timeout,input_text=command['argv'][-1])
-    attachment.atomic(directory(repo)/(session+'-claude.log'),(out+'\n'+err).encode())
-    if code:raise ValueError('Claude worker failed (exit '+str(code)+'); worktree and lease preserved')
+    # One exclusive directory per invocation, including retries of a bound session.
+    usage=attachment.safe(directory(repo),'usage')
+    usage.mkdir(mode=0o700,exist_ok=True)
+    invocation=str(uuid.uuid4());path=usage/invocation
+    path.mkdir(mode=0o700)
+    started=time.time();clock=time.monotonic()
+    code=None;out=err='';data={};state='execution_error'
     try:
-        data=json.loads(out)
-        if data.get('is_error') or data.get('subtype','success')!='success':raise ValueError('Claude returned an error result')
-        result=data['structured_output']
-    except (ValueError,KeyError,TypeError) as exc:
-        raise ValueError('Claude did not return the required structured stage result') from exc
-    return result
+        try:
+            code,out,err=execute(command['argv'][:-2],command['cwd'],command['env'],heartbeat,timeout,input_text=command['argv'][-1])
+        except BaseException as exc:
+            code,out,err=getattr(exc,'worker_output',(None,'',''))
+            raise
+        state='worker_error' if code else 'invalid_output'
+        try:
+            parsed=json.loads(out)
+            if isinstance(parsed,dict):data=parsed
+        except ValueError:pass
+        if code:raise ValueError('Claude worker failed (exit '+str(code)+'); worktree and lease preserved')
+        try:
+            if data.get('is_error') or data.get('subtype','success')!='success':raise ValueError('Claude returned an error result')
+            result=data['structured_output']
+        except (ValueError,KeyError,TypeError) as exc:
+            raise ValueError('Claude did not return the required structured stage result') from exc
+        state='success'
+        return result
+    finally:
+        # Keep raw output private and separate from prompt-free accounting evidence.
+        # An execution error can still leave a complete JSON usage report.
+        if not data:
+            try:
+                parsed=json.loads(out)
+                if isinstance(parsed,dict):data=parsed
+            except ValueError:pass
+        record={'schema':'fourthought-usage/v1','invocation_id':invocation,
+                'session_id':session,'role':role,'resume':resume,'started_at':started,
+                'elapsed_ms':round((time.monotonic()-clock)*1000),'exit_code':code,'status':state,
+                **usage_fields(data)}
+        for name,content in (('stdout.log',out.encode()),('stderr.log',err.encode()),
+                             ('usage.json',attachment.encoded(record))):
+            fd=os.open(path/name,os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600)
+            with os.fdopen(fd,'wb') as stream:
+                stream.write(content);stream.flush();os.fsync(stream.fileno())
 
 
 def output(value, role=None):
