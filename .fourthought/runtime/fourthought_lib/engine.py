@@ -15,6 +15,9 @@ from . import attachment, coordination, hooks, integrations, policy
 
 OUTPUT_SCHEMA = {'type':'object','additionalProperties':False,'required':['result','summary'],
                  'properties':{'result':{'enum':['pass','fail']},'summary':{'type':'string','minLength':1}}}
+PLAN_SCHEMA = dict(OUTPUT_SCHEMA, required=['result','summary','planned_paths'],
+                   properties=dict(OUTPUT_SCHEMA['properties'], planned_paths={
+                       'type':'array','items':{'type':'string','minLength':1},'uniqueItems':True}))
 STAGES = {'ready:plan':('planner','planning','plan','ready:implement'),
           'ready:implement':('implementer','implementing','implement','ready:verify'),
           'remediate':('implementer','remediate','remediate','ready:verify'),
@@ -143,9 +146,11 @@ def execute(argv,cwd,env,heartbeat,timeout,input_text=None):
             if stream is not None and not stream.closed:stream.close()
 
 
-def model(repo,tree,role,session,prompt,claim,heartbeat,timeout):
+def model(repo,tree,role,session,prompt,claim,heartbeat,timeout,resume=False):
     from .sessions import worker_command
-    command=worker_command(repo,tree,role,session,{'text':prompt,'claim':claim},OUTPUT_SCHEMA)
+    command=worker_command(repo,tree,role,session,{'text':prompt,'claim':claim},PLAN_SCHEMA if role=='planner' else OUTPUT_SCHEMA)
+    if resume:
+        command['argv'][command['argv'].index('--session-id')]='--resume'
     code,out,err=execute(command['argv'][:-2],command['cwd'],command['env'],heartbeat,timeout,input_text=command['argv'][-1])
     attachment.atomic(directory(repo)/(session+'-claude.log'),(out+'\n'+err).encode())
     if code:raise ValueError('Claude worker failed (exit '+str(code)+'); worktree and lease preserved')
@@ -158,10 +163,12 @@ def model(repo,tree,role,session,prompt,claim,heartbeat,timeout):
     return result
 
 
-def output(value):
-    if (not isinstance(value,dict) or set(value)!= {'result','summary'} or value['result'] not in ('pass','fail')
+def output(value, role=None):
+    if (not isinstance(value,dict) or set(value)!= ({'result','summary','planned_paths'} if role=='planner' else {'result','summary'}) or value['result'] not in ('pass','fail')
             or not isinstance(value['summary'],str) or not value['summary'].strip()):
         raise ValueError('Invalid structured worker result')
+    if role=='planner' and (not isinstance(value['planned_paths'],list) or any(not isinstance(p,str) or not p for p in value['planned_paths'])):
+        raise ValueError('Invalid planned-path manifest')
     return value
 
 
@@ -253,7 +260,10 @@ def run(repo,issue,*,client=None,worker=None,acceptance_only=False,launch_genera
         def stage_worker(tree):
             prompt=('Work only on this issue and stage. Return result pass/fail and a factual summary. '
                     'Do not commit, push, change framework files or call other agents. The supervisor owns tests, commits and canonical transitions. '
-                    'For planning describe the concrete implementation plan. For implementation/remediation edit only claimed paths. '
+                    'For planning describe a concrete implementation that satisfies the engineering contract entirely within claim.scope.likely_paths. '
+                    'For planning, return planned_paths listing every repository-relative file to create, edit or delete, including tests. '
+                    'Collision domains do not authorize additional paths. If scope prevents satisfying the contract, return fail and explain the required claim revision. '
+                    'For implementation/remediation edit only claimed paths. Bash is unavailable; use file tools. The supervisor runs all verification commands. '
                     'For verification inspect acceptance against actual changes. For review independently inspect the diff, correctness and tests.\n'
                     +json.dumps(record,sort_keys=True))
             if role in ('verifier','reviewer','assurance','product-manager'):
@@ -262,8 +272,21 @@ def run(repo,issue,*,client=None,worker=None,acceptance_only=False,launch_genera
                 diff=command(tree,'diff','--no-ext-diff','--no-textconv',plan['head'],record['head'],'--')
                 if len(diff)>200000:raise ValueError('Review diff exceeds bounded context; split the issue')
                 prompt+='\nSupervisor Git diff '+plan['head']+'..'+record['head']+':\n'+diff
-            result=worker(role,tree,session,prompt,heartbeat) if worker else model(repo,tree,role,session,prompt,record['claim'],heartbeat,cfg['worker_timeout'])
-            heartbeat();return output(result)
+            for attempt in range(2 if role=='planner' else 1):
+                result=worker(role,tree,session,prompt,heartbeat) if worker else model(repo,tree,role,session,prompt,record['claim'],heartbeat,cfg['worker_timeout'],resume=attempt>0)
+                heartbeat();result=output(result,role)
+                if role!='planner':return result
+                clean(tree,record['head'])
+                try:
+                    hooks.check_scope(result['planned_paths'],record['claim'])
+                except ValueError as exc:
+                    diagnostic='Planning scope rejected: '+str(exc)
+                    attachment.atomic(meta/(session+'-plan-scope.json'),attachment.encoded({'result':result,'error':diagnostic}))
+                    if attempt==0:
+                        prompt+='\n'+diagnostic+'\nRefine the plan within the existing approved claim and contract. Do not drop acceptance criteria. If impossible, return fail with the necessary claim revision; do not expand scope. Previous proposal: '+json.dumps(result)
+                        continue
+                    return {'result':'fail','summary':diagnostic}
+                return {'result':result['result'],'summary':result['summary']+'\nPlanned paths: '+json.dumps(result['planned_paths'])}
         try:
             for step in range(40):
                 state=record['state'];save()
