@@ -1,0 +1,39 @@
+# Temporary diagnostic: report which coordinator read fails, by status code only.
+name: Fourthought probe
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+  issues: write
+jobs:
+  probe:
+    environment: fourthought-coordinator
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Probe coordinator reads
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FOURTHOUGHT_PROTECTION_TOKEN: ${{ secrets.FOURTHOUGHT_PROTECTION_TOKEN }}
+          FOURTHOUGHT_STATE_KEY: ${{ secrets.FOURTHOUGHT_STATE_KEY }}
+        run: |
+          set -u
+          R=${{ github.repository }}
+          A=${{ github.actor }}
+          probe() { # name token path
+            code=$(curl -s -o /dev/null -w '%{http_code}' \
+              -H "Authorization: Bearer $2" \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2026-03-10' \
+              "https://api.github.com$3")
+            echo "PROBE $1 -> $code"
+          }
+          echo "state_key_present=$([ -n "${FOURTHOUGHT_STATE_KEY:-}" ] && echo yes || echo no)"
+          echo "state_key_is_private_pem=$(case "${FOURTHOUGHT_STATE_KEY:-}" in *'BEGIN PRIVATE KEY'*) echo yes;; *) echo no;; esac)"
+          echo "protection_token_present=$([ -n "${FOURTHOUGHT_PROTECTION_TOKEN:-}" ] && echo yes || echo no)"
+          probe "repo-metadata(GH_TOKEN)"        "$GH_TOKEN" "/repos/$R"
+          probe "collab-permission(GH_TOKEN)"    "$GH_TOKEN" "/repos/$R/collaborators/$A/permission"
+          probe "state-ref(GH_TOKEN)"            "$GH_TOKEN" "/repos/$R/git/ref/heads/fourthought-state"
+          probe "protection(PROTECTION_TOKEN)"   "$FOURTHOUGHT_PROTECTION_TOKEN" "/repos/$R/branches/fourthought-state/protection"
+          probe "protection(GH_TOKEN)"           "$GH_TOKEN" "/repos/$R/branches/fourthought-state/protection"
+          probe "user(PROTECTION_TOKEN)"         "$FOURTHOUGHT_PROTECTION_TOKEN" "/user"
