@@ -19,3 +19,6 @@ dist/
 .firecrawl/
 .claude/worktrees/
 .serena/
+
+# Product submission scratch: consumed by `fourthought submit`, not repo material
+.fourthought/product/*submission*.json
