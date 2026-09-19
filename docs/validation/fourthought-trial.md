@@ -21,7 +21,7 @@ Verification uses Python 3.13, the committed dependency lock and the complete py
 
 ## Commissioning boundary
 
-The coordinator additionally requires `FOURTHOUGHT_PROTECTION_TOKEN` in the restricted environment. It needs Administration read and Metadata read for this fork so the workflow can verify protected history. The account's broad CLI OAuth credential is deliberately not copied into a hosted workflow. Local attachment checks do not prove that this GitHub credential exists or that a live issue has completed.
+The coordinator requires `FOURTHOUGHT_PROTECTION_TOKEN` in the restricted environment. It needs Administration read and Metadata read for this fork so the workflow can verify protected history. The account's broad CLI OAuth credential is deliberately not copied into a hosted workflow.
 
 Publish only verified outcomes: submission, launch, completed stages and product acceptance are distinct milestones.
 
@@ -30,6 +30,12 @@ Publish only verified outcomes: submission, launch, completed stages and product
 - `uv run --locked pytest -q`: 535 passed; 13 dependency/deprecation warnings.
 - Corrected CLI coverage: 36 passed, including Linux, macOS and Windows paths.
 - Dashboard harness independently challenged with three behavior mutations; each failed as intended.
-- Framework source revision `e2b07d3`: 233-test suite passed; final snapshot retry suite 7 passed; independent runtime review found no remaining important findings.
+- Framework repair revision `3382dbb`: 245-test suite passed; 28 focused session/usage tests passed; independent review found no blocking correctness or security findings.
 - `scripts/fourthought doctor .` passed attachment validation.
-- Existing protection credential returned HTTP 403 for this fork; no claim of successful live delivery is made.
+- Issue 7 completed planning, implementation, full verification, independent review, required Assurance and Product acceptance at `4db70c583b743774cc13e523b04f55c32656cff2`. Verification recorded 481 passed and 1 skipped.
+
+## Token baseline
+
+Issue 7 is the first measured end-to-end delivery baseline. The seven bounded worker calls reported 63,754 output tokens, 191,201 cache-creation input tokens, 1,486,194 cache-read input tokens, 123 turns, 798,520 ms aggregate model duration and $4.249667 reported model cost. Raw input tokens were 142; this small figure excludes cached context and must not be presented as total input consumption.
+
+The baseline excludes interactive Product shaping and the human/agent effort spent commissioning and repairing the workflow. It therefore cannot establish savings against the previous Delivery Council. It does establish that this version is not yet token-efficient for a two-file low-risk fix. Required Assurance currently causes a reviewer pass before and after Assurance; that duplication is the first optimization candidate. Compare future trials by stage and keep framework-repair cost separate from feature-delivery cost.
