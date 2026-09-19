@@ -1,0 +1,18 @@
+schema: accountability-engagement/v1
+project_id: 'devgraph'
+project_name: 'DevGraph'
+framework:
+  name: 'Accountability'
+  version: '0.2.0'
+  commit: 'e2b07d38446a30f0602b564cb3ff8ebd7c7a2afc'
+sessions:
+  lead: 'devgraph-lead'
+  assurance: 'devgraph-assurance'
+  product: 'devgraph-product'
+  auditor: 'devgraph-auditor'
+review_policy:
+  C0: 'independent'
+  C1: 'lead_with_verification'
+  C2: 'assurance_review_then_auditor_adjudication_if_disputed'
+  C3: 'peer_concurrence_and_human_gate'
+state_location: '.accountability'
