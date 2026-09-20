@@ -6,7 +6,6 @@ with two repos to also verify repo_id scoping holds through this second
 entry point into the same engine.
 """
 
-import os
 import tempfile
 from pathlib import Path
 
@@ -243,10 +242,6 @@ def test_query_rate_endpoint_shape(client):
     assert sum(b["count"] for b in buckets) == 1
 
 
-@pytest.mark.skipif(
-    not os.environ.get("DISPLAY"),
-    reason="/api/mcp-tools imports the MCP server, which imports pystray",
-)
 def test_mcp_tools_endpoint_has_real_descriptions(client):
     res = client.get("/api/mcp-tools")
     assert res.status_code == 200
