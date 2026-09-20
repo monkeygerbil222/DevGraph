@@ -82,6 +82,9 @@ def status(repo):
         return {'status': 'absent', 'session_id': None}
     state = decode(path)
     live = _bound(state, _native())
+    # A blocked native binding still prevents duplicate launches, but is not ready.
+    if live and live.get('state', live.get('status')) == 'blocked':
+        return dict(state, status='blocked', native=live)
     return dict(state, status='running' if live else ('stopped' if state.get('status') == 'running' else state.get('status', 'stopped')), native=live)
 
 
