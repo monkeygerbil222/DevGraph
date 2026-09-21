@@ -131,13 +131,20 @@ def record_tool_call(*, tool: str, repo_id: str | None, duration_ms: float, ok: 
     processes: a single O_APPEND write of one line well under PIPE_BUF, which
     the OS will not interleave with another process's. Never raises and never
     blocks on a lock — telemetry must not be able to fail a tool call.
+
+    Everything runs inside the guard, resolving the store's location and
+    building the line included: this is called from the instrumentation
+    wrapper's `finally`, so anything raising here would replace the tool's own
+    result or exception. Settings/path resolution can fail (a missing or
+    unreadable state directory config) as readily as the write itself, so the
+    two are not split across the try.
     """
-    path = telemetry_path()
-    line = json.dumps(
-        {"ts": time.time(), "tool": tool, "repo_id": repo_id, "duration_ms": duration_ms, "ok": ok},
-        separators=(",", ":"),
-    )
     try:
+        path = telemetry_path()
+        line = json.dumps(
+            {"ts": time.time(), "tool": tool, "repo_id": repo_id, "duration_ms": duration_ms, "ok": ok},
+            separators=(",", ":"),
+        )
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
         try:
             os.write(fd, (line + "\n").encode("utf-8"))

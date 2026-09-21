@@ -161,6 +161,42 @@ def test_an_unwritable_store_does_not_change_the_tool_call(settings):
     assert mcp_server.read_tool_telemetry(100) == []
 
 
+def _unresolvable_settings():
+    """Settings that fail, so the store's location can't be resolved at all."""
+    raise RuntimeError("no state dir")
+
+
+def test_an_unresolvable_store_location_does_not_change_the_tool_call(settings, monkeypatch):
+    # The failure the unwritable-store case above cannot reach: the store's
+    # location is resolved from settings, which is itself able to fail before
+    # any write is attempted. Recording runs from the instrumentation
+    # wrapper's `finally`, so raising here would replace the tool's result.
+    # Built first -- build_server reads settings legitimately.
+    server = _build()
+    monkeypatch.setattr(mcp_server, "get_settings", _unresolvable_settings)
+
+    result = asyncio.run(server.call_tool("list_services", {"repo_id": "demo"}))
+
+    assert result.is_error is False
+    assert result.structured_content == {"count": 0, "results": [], "truncated": False}
+
+
+def test_an_unresolvable_store_location_leaves_a_failing_tools_exception_intact(settings, monkeypatch):
+    boom = RuntimeError("neo4j is down")
+
+    def failing_tool(repo_id: str) -> dict:
+        raise boom
+
+    instrumented = mcp_server._instrument(failing_tool)
+    monkeypatch.setattr(mcp_server, "get_settings", _unresolvable_settings)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        instrumented("demo")
+
+    # The tool's own exception, not the telemetry one that fired afterwards.
+    assert excinfo.value is boom
+
+
 def test_a_corrupt_store_does_not_change_the_tool_call(settings):
     mcp_server.telemetry_path().write_text('not json\n{"half": \n', encoding="utf-8")
     server = _build()
