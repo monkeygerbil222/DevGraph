@@ -51,17 +51,10 @@
     "verify_commands": [
       [
         "uv",
-        "sync",
-        "--python",
-        "3.13",
-        "--locked",
-        "--extra",
-        "dev"
-      ],
-      [
-        "uv",
         "run",
-        "--locked",
+        "--no-project",
+        "--with-editable",
+        ".[dev]",
         "pytest",
         "-q"
       ]
