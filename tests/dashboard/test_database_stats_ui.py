@@ -4,8 +4,9 @@ part of the normal suite.
 The logic under test is browser JavaScript, and its failure mode is quiet by
 construction: the card is designed to stay dashed when the reading is
 missing, so a card that can no longer read *anything* looks exactly like one
-whose server has nothing to report. The JS file drives the real
-attemptMemoryMetrics out of index.html against stubbed responses, so both
+whose server has nothing to report -- and a boot that never asks looks like a
+read still in flight. The JS file drives the real attemptMemoryMetrics and
+bootConnect out of index.html against stubbed responses, so all of those
 directions are checked without a browser.
 
 Skipped when node isn't on PATH -- the Python suite is the one that has to

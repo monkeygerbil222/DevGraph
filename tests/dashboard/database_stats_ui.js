@@ -1,7 +1,8 @@
 /* Headless test of the Database & memory card's heap path, lifted verbatim
-   out of index.html. attemptMemoryMetrics only touches fetch and
-   document.getElementById, so a handful of stubs exercises the real function
-   -- no browser, deterministic, re-runnable.
+   out of index.html: attemptMemoryMetrics plus the bootConnect branch that
+   decides whether it runs at all. Both reach only fetch, runCypher and
+   document.getElementById, so a handful of stubs exercises the real
+   functions -- no browser, deterministic, re-runnable.
 
    The failure this exists to catch is exactly the one that shipped: the card
    asked for a shape the server never returns, and every failure mode looked
@@ -23,9 +24,12 @@ const grab = (startRe, endMarker) => {
 };
 const src = [
   grab(/^function setMemNote\(/m, "\n}"),
-  grab(/^function setHeapUnavailable\(\)/m, "\n}"),
+  grab(/^function setHeapUnavailable\(/m, "\n}"),
   grab(/^async function attemptMemoryMetrics\(\)/m, "\n}"),
 ].join("\n");
+/* The boot path decides whether the heap read is even attempted, so it gets
+   the same treatment: the real bootConnect, driven over stubs. */
+const bootSrc = src + "\n" + grab(/^async function bootConnect\(\)/m, "\n}");
 
 // --- stubs ------------------------------------------------------------
 const mkEl = initialClass => {
@@ -48,6 +52,32 @@ const sandboxGlobals = {
 const api = new Function(...Object.keys(sandboxGlobals),
   src + "\nreturn { attemptMemoryMetrics };")(...Object.values(sandboxGlobals));
 
+/* Everything bootConnect reaches for besides the card itself. Nothing here
+   is under test -- the point is to let the real boot function run to either
+   of its two ends. probe is what the Neo4j reachability check does. */
+let probe = async () => ({ results: [{ data: [{ row: [1] }] }] });
+const bootGlobals = {
+  ...sandboxGlobals,
+  runCypher: async q => probe(q),
+  neo4jConnected: false,
+  neo4jStatus: mkEl(""),
+  legendStatus: mkEl(""),
+  populateRealRepos: async () => {},
+  refreshGraph: async () => {},
+  loadGitHistory: () => {},
+  attemptQueryTelemetry: async () => {},
+  attemptCommunityDetection: async () => {},
+  cy: { add: () => {} },
+  buildElements: () => [],
+  forceDirectedSettle: () => {},
+  focusRotation: () => {},
+};
+const boot = new Function(...Object.keys(bootGlobals),
+  bootSrc + "\nreturn { bootConnect };")(...Object.values(bootGlobals));
+// bootConnect fires the three card reads without awaiting them (they run in
+// parallel by design), so give those promises a turn before asserting.
+const flush = () => new Promise(r => setTimeout(r, 0));
+
 // --- helpers ----------------------------------------------------------
 let failures = 0;
 const check = (label, cond, detail) => {
@@ -61,6 +91,7 @@ const reset = () => {
     heapMeter: mkEl(""),
     memPill: mkEl("sample-pill"),
     memNote: mkEl("placeholder-note"),
+    repoSelect: mkEl(""),   // boot path only
   };
   els.heapVal.textContent = "—";
   els.heapMeter.style.width = "0%";
@@ -157,6 +188,46 @@ const labelledUnavailable = () =>
   check("the heap path does not call runCypher", !/runCypher/.test(src), src);
   check("the card no longer ships the pre-wiring 'Not wired' heap pill",
     !/id="memPill"[^>]*>Not wired</.test(html), "the Database & memory pill still says Not wired");
+
+  /* 7. boot path. The heap read only happens on the branch where the Neo4j
+     probe succeeds, so an unreachable server used to leave the card on its
+     served "Checking…" pill -- indistinguishable from a reading still in
+     flight, and never resolved. Both branches have to land somewhere
+     honest. */
+  const checking = () => els.memPill.textContent === "Checking…";
+  for (const [label, failure] of [
+    ["the probe request fails outright", async () => { throw new Error("Failed to fetch"); }],
+    ["the probe comes back with a Neo4j error",
+      async () => ({ errors: [{ message: "ServiceUnavailable" }] })],
+  ]) {
+    reset();
+    probe = failure;
+    // A live reading is on offer; the card must not end up showing one on a
+    // branch where the database itself never answered.
+    respond = serves(LIVE);
+    await boot.bootConnect();
+    await flush();
+    check(`boot leaves the card dashed when ${label}`, dashed(),
+      JSON.stringify({ val: els.heapVal.textContent, meter: els.heapMeter.style.width }));
+    check(`boot labels the card unavailable when ${label}`, labelledUnavailable(),
+      els.memPill.textContent + " | " + els.memNote.textContent);
+    check(`boot never leaves the pill stuck on "Checking…" when ${label}`, !checking(),
+      els.memPill.textContent);
+  }
+  check("the unreachable boot path says why, without raw backend text",
+    /unreachable/i.test(els.memNote.textContent) && !/ServiceUnavailable/.test(els.memNote.textContent + els.memPill.title),
+    els.memNote.textContent + " | " + els.memPill.title);
+
+  // ...and the reachable branch still actually reads the heap.
+  reset();
+  probe = async () => ({ results: [{ data: [{ row: [1] }] }] });
+  respond = serves(LIVE);
+  await boot.bootConnect();
+  await flush();
+  check("boot reads the heap once Neo4j is reachable",
+    els.heapVal.textContent === "537MB / 2147MB" && els.memPill.textContent === "Live" &&
+    fetchCalls.some(c => c.url === "/api/database-stats"),
+    els.heapVal.textContent + " | " + els.memPill.textContent + " | " + JSON.stringify(fetchCalls.map(c => c.url)));
 
   console.log(failures ? "\n" + failures + " FAILED" : "\nall passed");
   process.exit(failures ? 1 : 0);
