@@ -24,8 +24,8 @@ a human copy-pasting a doc into another repo's CLAUDE.md/AGENTS.md:
     it can never drift out of sync with the actual tool surface since it's
     served from the same process that registers the tools.
 
-Every tool call is recorded, metadata only (timestamp, tool name, repo_id,
-duration, success), to a local JSONL store in the DevGraph state directory —
+Every tool call is recorded, metadata only (timestamp, tool name, duration,
+success), to a local JSONL store in the DevGraph state directory —
 see `record_tool_call` below. It exists because this process is short-lived
 and separate from the dashboard's, and the dashboard reads it back over
 `GET /api/mcp-telemetry`. Nothing about it leaves the machine.
@@ -36,7 +36,6 @@ Run directly: `.venv/Scripts/python -m devgraph.mcp.server`
 from __future__ import annotations
 
 import functools
-import inspect
 import json
 import logging
 import os
@@ -64,6 +63,12 @@ _CLIENT_GUIDE_PATH = Path(__file__).resolve().parent.parent.parent / "DEVGRAPH-C
 # that dies with the process would be unreadable by the dashboard running in
 # a different one, and several connected clients record at the same time.
 _TELEMETRY_FILENAME = "mcp_telemetry.jsonl"
+# The whole of a record: metadata about the call, never anything drawn from
+# the call itself. Nothing derived from a tool's arguments belongs here — a
+# repo_id in particular is caller-supplied data, not metadata. Written by
+# record_tool_call and re-applied as an allow-list by read_tool_telemetry, so
+# the guarantee holds at both ends of the store.
+_TELEMETRY_FIELDS = ("ts", "tool", "duration_ms", "ok")
 # Kept in step with QueryLog's own ring-buffer size, so the two telemetry
 # sources the dashboard reads hold a comparable amount of history.
 _TELEMETRY_MAX_ENTRIES = 500
@@ -121,11 +126,12 @@ def telemetry_path() -> Path:
     return get_settings().registry_db_path.parent / _TELEMETRY_FILENAME
 
 
-def record_tool_call(*, tool: str, repo_id: str | None, duration_ms: float, ok: bool) -> None:
+def record_tool_call(*, tool: str, duration_ms: float, ok: bool) -> None:
     """Append one metadata-only record of a tool call.
 
     Records *that* a tool ran, never *what* was asked or answered: no
-    arguments, no Cypher, no results — only the five fields written below.
+    arguments — not even the repo_id every tool takes — no Cypher and no
+    results, only the four `_TELEMETRY_FIELDS` written below.
 
     Append-safe across the concurrently-connected clients' separate server
     processes: a single O_APPEND write of one line well under PIPE_BUF, which
@@ -142,7 +148,7 @@ def record_tool_call(*, tool: str, repo_id: str | None, duration_ms: float, ok: 
     try:
         path = telemetry_path()
         line = json.dumps(
-            {"ts": time.time(), "tool": tool, "repo_id": repo_id, "duration_ms": duration_ms, "ok": ok},
+            {"ts": time.time(), "tool": tool, "duration_ms": duration_ms, "ok": ok},
             separators=(",", ":"),
         )
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
@@ -176,11 +182,21 @@ def read_tool_telemetry(limit: int) -> list[dict[str, Any]]:
 
     Read-only and never raises: a missing store reads as no records, and an
     unparseable line is skipped rather than failing the whole read, so a
-    corrupt file costs the dashboard some history instead of an error.
+    corrupt file costs the dashboard some history instead of an error. The
+    guard spans resolving the store's location too, since settings can fail
+    for reasons a write never reaches (a missing or unreadable state
+    directory config) and the dashboard endpoint behind this must lose
+    history rather than return a 500.
+
+    Each record is rebuilt from `_TELEMETRY_FIELDS` alone rather than passed
+    through as parsed, so a line that is valid JSON but carries extra keys —
+    a store corrupted or hand-edited outside this module — can never relay
+    anything beyond the four allowed fields to the API.
     """
     try:
         raw = telemetry_path().read_text(encoding="utf-8", errors="replace")
-    except OSError:
+    except Exception:
+        logger.debug("failed to read MCP tool telemetry", exc_info=True)
         return []
     entries: list[dict[str, Any]] = []
     for line in raw.splitlines()[-limit:]:
@@ -189,7 +205,7 @@ def read_tool_telemetry(limit: int) -> list[dict[str, Any]]:
         except ValueError:
             continue
         if isinstance(entry, dict):
-            entries.append(entry)
+            entries.append({field: entry[field] for field in _TELEMETRY_FIELDS if field in entry})
     entries.reverse()
     return entries
 
@@ -205,18 +221,14 @@ def _instrument(fn: Callable[..., Any]) -> Callable[..., Any]:
     The result and any exception pass through untouched: the record is
     written from a `finally`, so a failing call is recorded as failed and
     then keeps propagating as the exact exception the tool raised.
+
+    The call's arguments are never inspected: the wrapper passes *args and
+    **kwargs straight through and records only the tool's name, how long it
+    took and whether it succeeded.
     """
-    params = list(inspect.signature(fn).parameters)
-    repo_id_at = params.index("repo_id") if "repo_id" in params else None
 
     @functools.wraps(fn)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
-        if repo_id_at is None:
-            repo_id = None
-        elif len(args) > repo_id_at:
-            repo_id = args[repo_id_at]
-        else:
-            repo_id = kwargs.get("repo_id")
         start = time.monotonic()
         ok = False
         try:
@@ -226,7 +238,6 @@ def _instrument(fn: Callable[..., Any]) -> Callable[..., Any]:
         finally:
             record_tool_call(
                 tool=fn.__name__,
-                repo_id=repo_id if isinstance(repo_id, str) else None,
                 duration_ms=(time.monotonic() - start) * 1000,
                 ok=ok,
             )

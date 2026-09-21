@@ -7,6 +7,7 @@ between the two telemetry sources — `/api/mcp-telemetry` is what MCP clients
 ran, `/api/query-log` and `/api/query-rate` stay the dashboard console's own.
 """
 
+import json
 from pathlib import Path
 
 import pytest
@@ -38,7 +39,7 @@ def client(tmp_path, monkeypatch):
 
 
 def _record(tool: str, ok: bool = True) -> None:
-    mcp_server.record_tool_call(tool=tool, repo_id="demo", duration_ms=12.5, ok=ok)
+    mcp_server.record_tool_call(tool=tool, duration_ms=12.5, ok=ok)
 
 
 def test_endpoint_returns_recorded_mcp_entries_newest_first(client):
@@ -51,12 +52,48 @@ def test_endpoint_returns_recorded_mcp_entries_newest_first(client):
     entries = res.json()["entries"]
     assert [e["tool"] for e in entries] == ["impact_analysis", "search_component"]
     assert entries[0]["ok"] is False
-    assert entries[0]["repo_id"] == "demo"
     assert entries[0]["duration_ms"] == 12.5
+    # The endpoint exposes metadata only -- no repo_id, no other argument.
+    assert entries[0].keys() == {"ts", "tool", "duration_ms", "ok"}
 
 
 def test_endpoint_is_empty_when_nothing_has_been_recorded(client):
     res = client.get("/api/mcp-telemetry")
+    assert res.status_code == 200
+    assert res.json() == {"entries": []}
+
+
+def test_a_store_line_with_extra_fields_is_not_relayed_by_the_endpoint(client):
+    # Defence at the boundary: whatever ends up in the file, the endpoint
+    # only ever serves the four allowed metadata fields.
+    mcp_server.telemetry_path().write_text(
+        json.dumps(
+            {
+                "ts": 1.0,
+                "tool": "search_component",
+                "duration_ms": 2.5,
+                "ok": True,
+                "repo_id": "demo",
+                "query": "zz-not-a-real-component-name-zz",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    entries = client.get("/api/mcp-telemetry").json()["entries"]
+
+    assert entries == [{"ts": 1.0, "tool": "search_component", "duration_ms": 2.5, "ok": True}]
+
+
+def test_an_unresolvable_store_location_returns_no_entries_not_an_error(client, monkeypatch):
+    def _unresolvable_settings():
+        raise RuntimeError("no state dir")
+
+    monkeypatch.setattr(mcp_server, "get_settings", _unresolvable_settings)
+
+    res = client.get("/api/mcp-telemetry")
+
     assert res.status_code == 200
     assert res.json() == {"entries": []}
 
