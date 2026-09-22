@@ -26,7 +26,9 @@ CREATE TABLE IF NOT EXISTS repos (
     pr_source_enabled INTEGER NOT NULL DEFAULT 0,
     issue_source_enabled INTEGER NOT NULL DEFAULT 0,
     last_indexed_commit TEXT,
-    mentions_enabled INTEGER NOT NULL DEFAULT 0
+    mentions_enabled INTEGER NOT NULL DEFAULT 0,
+    project_config_enabled INTEGER NOT NULL DEFAULT 1,
+    schema_hash TEXT
 );
 """
 
@@ -46,6 +48,11 @@ _MIGRATIONS = (
         "mentions_enabled",
         "ALTER TABLE repos ADD COLUMN mentions_enabled INTEGER NOT NULL DEFAULT 0",
     ),
+    (
+        "project_config_enabled",
+        "ALTER TABLE repos ADD COLUMN project_config_enabled INTEGER NOT NULL DEFAULT 1",
+    ),
+    ("schema_hash", "ALTER TABLE repos ADD COLUMN schema_hash TEXT"),
 )
 
 _SLUG_RE = re.compile(r"[^a-z0-9_-]+")
@@ -68,6 +75,8 @@ class RepoRecord:
     issue_source_enabled: bool = False
     last_indexed_commit: str | None = None
     mentions_enabled: bool = False
+    project_config_enabled: bool = True
+    schema_hash: str | None = None
 
 
 class RepoRegistry:
@@ -263,9 +272,25 @@ class RepoRegistry:
             )
             self._conn.commit()
 
+    def set_project_config_enabled(self, repo_id: str, enabled: bool) -> None:
+        """Opt this repo in/out of loading its project schema config. Default is on."""
+        self._set_flag(repo_id, "project_config_enabled", enabled)
+
+    def set_schema_hash(self, repo_id: str, schema_hash: str | None) -> None:
+        """Record (or clear, with None) the last successfully indexed effective-schema hash."""
+        with self._lock:
+            repo = self.get(repo_id)
+            if repo is None:
+                raise ValueError(f"no such repo_id: {repo_id}")
+            self._conn.execute(
+                "UPDATE repos SET schema_hash = ? WHERE repo_id = ?", (schema_hash, repo_id)
+            )
+            self._conn.commit()
+
     _COLUMNS = (
         "repo_id, path, active, watch_enabled, last_indexed, docs_path, "
-        "pr_source_enabled, issue_source_enabled, last_indexed_commit, mentions_enabled"
+        "pr_source_enabled, issue_source_enabled, last_indexed_commit, mentions_enabled, "
+        "project_config_enabled, schema_hash"
     )
 
     def get(self, repo_id: str) -> RepoRecord | None:
@@ -297,6 +322,8 @@ class RepoRegistry:
             issue_source_enabled,
             last_indexed_commit,
             mentions_enabled,
+            project_config_enabled,
+            schema_hash,
         ) = row
         return RepoRecord(
             repo_id,
@@ -309,4 +336,6 @@ class RepoRegistry:
             bool(issue_source_enabled),
             last_indexed_commit,
             bool(mentions_enabled),
+            bool(project_config_enabled),
+            schema_hash,
         )
