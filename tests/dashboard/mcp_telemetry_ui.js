@@ -374,6 +374,16 @@ const populated = () =>
   check("the stale query-log-store copy is gone",
     !/Needs a query-log store/.test(html) && !/dbms\.listQueries/.test(html),
     "index.html still carries the pre-wiring Query telemetry note");
+  /* The same lie can hide outside this card -- the sibling query-rate card's
+     tooltip and the loadQueryLog comment both used to send the reader to a
+     "still unwired" Query telemetry card that now reports live MCP figures.
+     Scoped by sentence rather than by counting words, so unrelated "Not wired"
+     pills on other cards stay legal and only a claim *about this telemetry*
+     fails. */
+  const unwiredClaims = (html.match(/[^.<>]*\b(?:un-?wired|not wired)\b[^.<>]*/gi) || [])
+    .filter(s => /\bMCP\b|Query telemetry/i.test(s));
+  check("nothing on the page still calls MCP tool telemetry unwired",
+    unwiredClaims.length === 0, unwiredClaims.join(" || "));
   check("every MCP row says it is MCP, and the call row states the 500-record window",
     /Tool calls \(MCP, last 500\)/.test(html) && /Top tools \(MCP\)/.test(html) &&
     /P50 \/ P95 \/ P99 latency \(MCP\)/.test(html) && /Error rate \(MCP\)/.test(html),

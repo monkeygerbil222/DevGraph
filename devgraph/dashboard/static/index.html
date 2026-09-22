@@ -546,7 +546,7 @@ table.dstable input[type="text"] { width: 100%; }
       </div>
 
       <div class="card" data-od-id="query-log-card">
-        <div class="card-head"><h3>Cypher query rate</h3><span class="live-pill" title="Real counts of queries run through this dashboard's own Cypher console — not database-wide load, and not per-MCP-tool telemetry (that's still unwired, see the Query telemetry card).">Console queries</span></div>
+        <div class="card-head"><h3>Cypher query rate</h3><span class="live-pill" title="Real counts of queries run through this dashboard's own Cypher console — not database-wide load, and not per-MCP-tool telemetry (MCP tool calls are counted separately in the Query telemetry card).">Console queries</span></div>
         <div class="chart-controls" style="margin-bottom:10px">
           <select id="chartInterval"><option value="auto" selected>Auto interval</option><option value="60">1 min</option><option value="300">5 min</option><option value="3600">1 hr</option></select>
           <select id="chartSpan"><option value="900">Last 15m</option><option value="3600" selected>Last 1h</option><option value="86400">Last 24h</option><option value="604800">Last 7d</option></select>
@@ -2995,8 +2995,8 @@ window.addEventListener("resize", drawChart);
 /* Real history of queries run through this console (see /api/query-log,
    backed by dashboard/query_log.py) -- "Tool" is always "console" because
    only the dashboard's own Cypher box is instrumented here, not per-MCP-tool
-   calls from other clients (that's separate, still-unwired telemetry — see
-   the Query telemetry card). */
+   calls from other clients (that's separate telemetry, read from the MCP
+   store and shown in the Query telemetry card). */
 const logBody = document.getElementById("logTableBody");
 let logRows = [];
 async function loadQueryLog() {
