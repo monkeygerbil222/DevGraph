@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+import click
 import typer
 from rich.console import Console
 from rich.markup import escape
@@ -810,6 +811,52 @@ def _project_tools_findings(repos: list[Any]) -> list[dict[str, Any]]:
     return findings
 
 
+def _global_tools_findings(repos: list[Any]) -> list[dict[str, Any]]:
+    """The global tools store's state, plus a non-failing notice for each project
+    tool that overrides a global one. No finding when there is no store."""
+    from devgraph.config.global_tools import GLOBAL_TOOLS_FILENAME, load_global_tools
+    from devgraph.config.project_switch import project_config_enabled
+    from devgraph.config.project_tools import ProjectToolsError, load_project_tools
+    from devgraph.mcp.catalog import builtin_tool_names
+
+    try:
+        declared = load_global_tools()
+    except ProjectToolsError as exc:
+        return [{"repo_id": "global", "status": "invalid", "detail": str(exc), "failed": True}]
+    if declared is None:
+        return []
+    names = {tool.name for tool in declared.tools}
+    findings: list[dict[str, Any]] = [{
+        "repo_id": "global",
+        "status": "valid",
+        "detail": f"tools: {', '.join(tool.name for tool in declared.tools) or 'none'}",
+        "failed": False,
+    }]
+    builtin = builtin_tool_names()
+    for tool in declared.tools:
+        if tool.name in builtin:
+            findings.append({
+                "repo_id": "global",
+                "status": "warning",
+                "detail": f"{GLOBAL_TOOLS_FILENAME}: tool {tool.name!r} has the name of a built-in tool; the built-in will be used",
+                "failed": False,
+            })
+    for repo in sorted(repos, key=lambda r: r.repo_id):
+        try:
+            project = load_project_tools(repo.path) if project_config_enabled(repo.path) else None
+        except ProjectToolsError:
+            continue  # reported by the project tools check
+        for tool in project.tools if project else ():
+            if tool.name in names and tool.name not in builtin:
+                findings.append({
+                    "repo_id": repo.repo_id,
+                    "status": "notice",
+                    "detail": f"tool {tool.name!r} overrides the global tool of the same name",
+                    "failed": False,
+                })
+    return findings
+
+
 def _schema_drift_findings(engine: Any, repos: list[Any]) -> list[dict[str, Any]]:
     """Per active repository: is the graph built with the schema the file hashes to?
 
@@ -992,6 +1039,20 @@ def doctor() -> None:
             console.print(f"  [red][X] {subject}:[/red] {escape(finding['detail'])}")
             any_failed = True
         elif finding["status"] in ("warning", "disabled"):
+            console.print(f"  [yellow][!] {subject}:[/yellow] {escape(finding['detail'])}")
+        else:
+            console.print(f"  [green][OK][/green] {subject}: {escape(finding['detail'])}")
+
+    console.print("[bold]Global tools[/bold]")
+    global_findings = _global_tools_findings(registered_repos)
+    if not global_findings:
+        console.print("  [green][OK][/green] no global tools")
+    for finding in global_findings:
+        subject = escape(str(finding["repo_id"]))
+        if finding["failed"]:
+            console.print(f"  [red][X] {subject}:[/red] {escape(finding['detail'])}")
+            any_failed = True
+        elif finding["status"] in ("warning", "notice"):
             console.print(f"  [yellow][!] {subject}:[/yellow] {escape(finding['detail'])}")
         else:
             console.print(f"  [green][OK][/green] {subject}: {escape(finding['detail'])}")
@@ -1642,6 +1703,36 @@ def _repo_dir(repo: Path) -> Path:
     return root
 
 
+def _registered_repos() -> list[Any]:
+    """Every registered repository; [] when there is no registry yet (it is not created)."""
+    if not get_settings().registry_db_path.exists():
+        return []
+    registry = _get_registry()
+    try:
+        return registry.list_repos()
+    finally:
+        registry.close()
+
+
+def _containing_repo(repos: list[Any], target: Path) -> Any | None:
+    """The deepest of `repos` whose root contains `target` (as the MCP session scope is chosen)."""
+    best = None
+    for repo in repos:
+        root = Path(repo.path).expanduser().resolve()
+        if target == root or target.is_relative_to(root):
+            if best is None or len(root.parts) > len(Path(best.path).expanduser().resolve().parts):
+                best = repo
+    return best
+
+
+def _default_repo_root() -> tuple[Path, bool]:
+    """The scope when no `--repo` is given: the deepest active registered repository
+    containing the current directory, else the current directory. Also: was one found."""
+    cwd = _repo_dir(Path("."))
+    match = _containing_repo([r for r in _registered_repos() if r.active], cwd)
+    return (_repo_dir(Path(match.path)), True) if match is not None else (cwd, False)
+
+
 @config_app.command("eject")
 def config_eject(
     repo: Path = typer.Option(Path("."), "--repo", help="Repository root (default: current directory)."),
@@ -1753,6 +1844,29 @@ def _schema_report(repo_root: Path | None) -> dict[str, Any]:
     }
 
 
+def _global_tools_report(repo_root: Path | None) -> dict[str, Any]:
+    """The global tools store for `config show`, with the ones a project tool overrides. Raises ProjectToolsError."""
+    from devgraph.config.global_tools import global_tools_path, load_global_tools
+    from devgraph.config.project_switch import project_config_enabled
+    from devgraph.config.project_tools import load_project_tools
+
+    declared = load_global_tools()
+    if declared is None:
+        return {"status": "absent", "tools_file": None, "tools": []}
+    project = None
+    if repo_root is not None and project_config_enabled(repo_root):
+        project = load_project_tools(repo_root)
+    overriding = {tool.name for tool in project.tools} if project else set()
+    return {
+        "status": "valid",
+        "tools_file": str(global_tools_path()),
+        "tools": [
+            {"name": tool.name, "description": tool.description, "overridden": tool.name in overriding}
+            for tool in declared.tools
+        ],
+    }
+
+
 def _tools_report(repo_root: Path) -> dict[str, Any]:
     """A repository's project tools for `config show`. Raises ProjectToolsError."""
     from devgraph.config.project_switch import project_config_enabled
@@ -1799,7 +1913,7 @@ def config_show(
 
     if global_only and repo is not None:
         ctx.fail("use either --global or --repo, not both")
-    root = None if global_only else _repo_dir(repo or Path("."))
+    root = None if global_only else (_repo_dir(repo) if repo is not None else _default_repo_root()[0])
     try:
         report = _schema_report(root)
     except ProjectSchemaError as exc:
@@ -1814,6 +1928,12 @@ def config_show(
         except ProjectToolsError as exc:
             console.print(f"[red][X] Invalid project tools:[/red] {escape(str(exc))}")
             raise typer.Exit(code=1)
+
+    try:
+        report["global_tools"] = _global_tools_report(root)
+    except ProjectToolsError as exc:
+        console.print(f"[red][X] Invalid global tools:[/red] {escape(str(exc))}")
+        raise typer.Exit(code=1)
 
     if as_json:
         typer.echo(json.dumps(report, indent=2))
@@ -1866,6 +1986,18 @@ def config_show(
                 table.add_row(tool["name"], params, str(tool["max_rows"]), f"{tool['timeout_s']}s")
             console.print(table)
 
+    global_tools = report["global_tools"]
+    if global_tools["status"] == "absent":
+        console.print("No global tools")
+    else:
+        table = Table(title=f"Global tools ({escape(global_tools['tools_file'])})")
+        table.add_column("Name", style="cyan")
+        table.add_column("Description")
+        table.add_column("Overridden by project")
+        for tool in global_tools["tools"]:
+            table.add_row(tool["name"], escape(tool["description"]), "yes" if tool["overridden"] else "")
+        console.print(table)
+
 
 @config_app.command("validate")
 def config_validate(
@@ -1890,19 +2022,342 @@ def config_validate(
             console.print("No registered repositories.")
             return
     else:
-        root = _repo_dir(repo or Path("."))
+        root = _repo_dir(repo) if repo is not None else _default_repo_root()[0]
         # `hint_id` is only needed (and the registry only opened) for a disabled repo,
         # which is necessarily registered.
         hint_id = "<repo_id>" if project_config_enabled(root) else _registered_repo_id(root)
         repos = [SimpleNamespace(repo_id=str(root), path=root, hint_id=hint_id)]
 
-    findings = _project_schema_findings(repos) + _project_tools_findings(repos)
+    findings = _project_schema_findings(repos) + _project_tools_findings(repos) + _global_tools_findings(repos)
     for finding in findings:
-        colour = "red" if finding["failed"] else ("yellow" if finding["status"] in ("warning", "disabled") else "green")
+        colour = "red" if finding["failed"] else ("yellow" if finding["status"] in ("warning", "disabled", "notice") else "green")
         subject = finding["repo_id"] or "cross-repository"
         console.print(f"[{colour}]{finding['status']}[/{colour}] {escape(str(subject))}: {escape(finding['detail'])}")
     if any(finding["failed"] for finding in findings):
         raise typer.Exit(code=1)
+
+
+tools_app = typer.Typer(
+    help="List, add, edit, delete or reset tools: a repository's devgraph.tools.yaml, or with --global the user's global tools.",
+    no_args_is_help=True,
+)
+config_app.add_typer(tools_app, name="tools")
+
+_TOOLS_RELOAD_NOTE = "Running MCP sessions pick this up within 2 seconds."
+_GLOBAL_TOOLS_NOTE = (
+    "Global tools are served only in MCP sessions scoped to a registered repository; "
+    "running sessions there pick up changes within 2 seconds."
+)
+
+
+def _tools_scope(ctx: typer.Context, repo: Optional[Path], global_: bool) -> Path | None:
+    """The repository root for a `config tools` command, or None for the global store.
+
+    Without `--repo`: the registered repository containing the current directory, else
+    the current directory itself (with a warning on stderr).
+    """
+    if global_ and repo is not None:
+        ctx.fail("use either --global or --repo, not both")
+    if global_:
+        return None
+    if repo is not None:
+        return _repo_dir(repo)
+    root, registered = _default_repo_root()
+    if not registered:
+        Console(stderr=True).print(
+            f"[yellow]Warning:[/yellow] {escape(str(root))} is not a registered repository (nor inside one), "
+            "so MCP sessions won't serve its tools; register it with `devgraph add`.",
+            soft_wrap=True,
+        )
+    return root
+
+
+def _tools_scope_note(root: Path | None) -> str:
+    """Whether running MCP sessions will serve what is in this scope's file."""
+    if root is None:
+        return _GLOBAL_TOOLS_NOTE
+    record = next((r for r in _registered_repos() if Path(r.path).expanduser().resolve() == root), None)
+    if record is None or not record.active:
+        return (f"{root} is not a registered repository, so MCP sessions won't serve its tools; "
+                "register it with `devgraph add`.")
+    if not record.project_config_enabled:
+        return (f"project config is disabled for {record.repo_id}, so MCP sessions won't serve its tools; "
+                f"enable it with `devgraph config enable {record.repo_id}`.")
+    return _TOOLS_RELOAD_NOTE
+
+
+def _tools_store_path(root: Path | None) -> Path:
+    from devgraph.config.global_tools import global_tools_path
+    from devgraph.config.project_tools import tools_file_path
+
+    return global_tools_path() if root is None else tools_file_path(root)
+
+
+def _tools_fail(message: str) -> typer.Exit:
+    console.print(f"[red][X] Error:[/red] {escape(message)}")
+    return typer.Exit(code=1)
+
+
+def _read_tool_source(source: str) -> dict:
+    """One tool mapping from a YAML/JSON file, or stdin for `-`."""
+    try:
+        text = sys.stdin.read() if source == "-" else Path(source).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise _tools_fail(f"cannot read {source}: {exc}")
+    return _parse_tool_text(text, "stdin" if source == "-" else source)
+
+
+def _parse_tool_text(text: str, label: str) -> dict:
+    import yaml
+
+    from devgraph.config.project_tools import YAML_LOAD_ERRORS
+
+    try:
+        tool = yaml.safe_load(text)
+    except YAML_LOAD_ERRORS as exc:
+        raise _tools_fail(f"{label}: malformed YAML: {exc}")
+    if not isinstance(tool, dict):
+        raise _tools_fail(f"{label}: expected one tool as a YAML mapping")
+    return tool
+
+
+def _tools_text(root: Path | None) -> str:
+    path = _tools_store_path(root)
+    try:
+        return path.read_text(encoding="utf-8") if path.exists() else ""
+    except (OSError, UnicodeDecodeError) as exc:
+        raise _tools_fail(f"{path}: cannot be read: {exc}")
+
+
+def _write_tools(root: Path | None, edit) -> Path:
+    """Apply `edit(text) -> new text` to the scope's file, validate the whole result, then write.
+
+    Nothing is written unless the resulting file is valid. Exits 1 on any failure.
+    """
+    from devgraph.config.global_tools import save_global_tools
+    from devgraph.config.project_tools import ProjectToolsError, parse_project_tools
+    from devgraph.config.tools_edit import ToolsEditError, tool_mappings
+
+    path = _tools_store_path(root)
+    text = _tools_text(root)
+    try:
+        if root is None:
+            # The store is JSON: edit the mapping list (as one-per-line text), re-serialised by the store.
+            import yaml
+
+            mappings = tool_mappings(text)
+            new_mappings = tool_mappings(edit(yaml.safe_dump({"tools": mappings}, sort_keys=False) if mappings else ""))
+            save_global_tools(new_mappings)
+        else:
+            new_text = edit(text)
+            parse_project_tools(new_text, path)
+            _write_atomically(path, new_text)
+    except (ToolsEditError, ProjectToolsError, OSError) as exc:
+        raise _tools_fail(str(exc))
+    return path
+
+
+def _write_atomically(path: Path, text: str) -> None:
+    """Replace `path` with `text` via a temporary file in the same directory, keeping its mode."""
+    import tempfile
+
+    mode = path.stat().st_mode & 0o7777 if path.exists() else None
+    fd, temp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+            handle.write(text)
+        if mode is not None:
+            os.chmod(temp, mode)
+        else:
+            umask = os.umask(0)
+            os.umask(umask)
+            os.chmod(temp, 0o666 & ~umask)
+        os.replace(temp, path)
+    except BaseException:
+        try:
+            os.unlink(temp)
+        except OSError:
+            pass
+        raise
+
+
+def _refuse_builtin(name: Any) -> None:
+    from devgraph.mcp.catalog import builtin_tool_names
+
+    if isinstance(name, str) and name in builtin_tool_names():
+        raise _tools_fail(f"{name!r} is the name of a built-in tool; built-in tools are locked, choose another name")
+
+
+def _tools_done(verb: str, name: str, path: Path, root: Path | None) -> None:
+    console.print(f"[green]{verb}[/green] tool {escape(repr(name))}: {escape(str(path))}", soft_wrap=True)
+    console.print(escape(_tools_scope_note(root)), soft_wrap=True)
+
+
+@tools_app.command("list")
+def config_tools_list(
+    ctx: typer.Context,
+    repo: Optional[Path] = typer.Option(None, "--repo", help="Repository root (default: current directory)."),
+    global_: bool = typer.Option(False, "--global", help="List only the global tools store."),
+    as_json: bool = typer.Option(False, "--json", help="Output as JSON."),
+) -> None:
+    """List the tools in effect: built-in (locked), global, and project, with overrides marked."""
+    from devgraph.config.global_tools import load_global_tools
+    from devgraph.config.project_switch import project_config_enabled
+    from devgraph.config.project_tools import ProjectToolsError, load_project_tools
+    from devgraph.mcp.catalog import builtin_tool_names
+
+    root = _tools_scope(ctx, repo, global_)
+    builtin = builtin_tool_names()
+    try:
+        declared_global = load_global_tools()
+        declared_project = None if root is None or not project_config_enabled(root) else load_project_tools(root)
+    except ProjectToolsError as exc:
+        raise _tools_fail(str(exc))
+    global_tools = {t.name: t for t in (declared_global.tools if declared_global else ())}
+    project_names = [t.name for t in (declared_project.tools if declared_project else ())]
+    ignored = {"ignored": "built-in name"}  # a built-in name in a tools file: MCP serves the built-in
+
+    rows: list[dict[str, Any]] = []
+    if root is None:
+        rows = [{"name": name, "origin": "global", "locked": False, **(ignored if name in builtin else {})}
+                for name in global_tools]
+    else:
+        # run_cypher is served (and so in effect) only with enable_run_cypher.
+        served_builtin = builtin if get_settings().enable_run_cypher else builtin - {"run_cypher"}
+        rows = [{"name": name, "origin": "built-in", "locked": True} for name in sorted(served_builtin)]
+        rows += [{"name": n, "origin": "global", "locked": False} for n in global_tools if n not in project_names and n not in builtin]
+        for name in project_names:
+            if name in builtin:
+                continue
+            origin = "project (overrides global)" if name in global_tools else "project"
+            rows.append({"name": name, "origin": origin, "locked": False})
+        rows += [{"name": n, "origin": "global", "locked": False, **ignored} for n in global_tools if n in builtin]
+        rows += [{"name": n, "origin": "project", "locked": False, **ignored} for n in project_names if n in builtin]
+
+    if as_json:
+        typer.echo(json.dumps({"tools": rows}, indent=2))
+        return
+    table = Table(title="Global tools" if root is None else escape(f"Tools for {root}"))
+    table.add_column("Name", style="cyan")
+    table.add_column("Origin")
+    for row in rows:
+        origin = row["origin"] + (" (locked)" if row["locked"] else "")
+        if row.get("ignored"):
+            origin += f" — ignored: {row['ignored']}"
+        table.add_row(escape(row["name"]), origin)
+    console.print(table)
+    note = _tools_scope_note(root)
+    if note != _TOOLS_RELOAD_NOTE:  # unregistered or disabled; or the global note for --global
+        console.print(escape(note), soft_wrap=True)
+    elif not project_config_enabled(root):
+        console.print("Project config disabled: project tools are not served")
+    if root is not None:
+        console.print(_GLOBAL_TOOLS_NOTE, soft_wrap=True)
+
+
+@tools_app.command("add")
+def config_tools_add(
+    ctx: typer.Context,
+    source: str = typer.Option(..., "--from", help="YAML or JSON file holding one tool, or - for stdin."),
+    repo: Optional[Path] = typer.Option(None, "--repo", help="Repository root (default: current directory)."),
+    global_: bool = typer.Option(False, "--global", help="Add to the global tools store."),
+) -> None:
+    """Add one tool. Fails if the name exists (use `edit`) or is a built-in name."""
+    from devgraph.config.tools_edit import add_tool_text
+
+    root = _tools_scope(ctx, repo, global_)
+    tool = _read_tool_source(source)
+    name = tool.get("name")
+    _refuse_builtin(name)
+    from devgraph.config.tools_edit import ToolsEditError, tool_mappings
+
+    try:
+        existing = tool_mappings(_tools_text(root))
+    except ToolsEditError as exc:
+        raise _tools_fail(str(exc))
+    if any(isinstance(m, dict) and m.get("name") == name for m in existing):
+        raise _tools_fail(f"a tool named {name!r} already exists in this scope; use `devgraph config tools edit {name}`")
+    path = _write_tools(root, lambda text: add_tool_text(text, tool))
+    _tools_done("Added", str(name), path, root)
+
+
+@tools_app.command("edit")
+def config_tools_edit(
+    ctx: typer.Context,
+    name: str = typer.Argument(..., help="Tool to replace."),
+    source: Optional[str] = typer.Option(None, "--from", help="YAML or JSON file holding the new tool, or - for stdin. Default: open $EDITOR."),
+    repo: Optional[Path] = typer.Option(None, "--repo", help="Repository root (default: current directory)."),
+    global_: bool = typer.Option(False, "--global", help="Edit a global tool."),
+) -> None:
+    """Replace one tool, from a file or in $EDITOR. Nothing is written if the result is unchanged or invalid."""
+    from devgraph.config.tools_edit import ToolsEditError, dump_tool, replace_tool_text, tool_mappings
+
+    root = _tools_scope(ctx, repo, global_)
+    try:
+        current = next((m for m in tool_mappings(_tools_text(root)) if isinstance(m, dict) and m.get("name") == name), None)
+    except ToolsEditError as exc:
+        raise _tools_fail(str(exc))
+    if current is None:
+        raise _tools_fail(f"no tool named {name!r} in this scope")
+    if source is not None:
+        tool = _read_tool_source(source)
+    else:
+        original = dump_tool(current)
+        edited = click.edit(original, extension=".yaml")
+        if edited is None or edited == original:
+            console.print("No changes.")
+            return
+        tool = _parse_tool_text(edited, "edited tool")
+        if tool == current:
+            console.print("No changes.")
+            return
+    if tool.get("name") != name:
+        _refuse_builtin(tool.get("name"))
+    path = _write_tools(root, lambda text: replace_tool_text(text, name, tool))
+    _tools_done("Updated", name, path, root)
+
+
+@tools_app.command("delete")
+def config_tools_delete(
+    ctx: typer.Context,
+    name: str = typer.Argument(..., help="Tool to remove."),
+    repo: Optional[Path] = typer.Option(None, "--repo", help="Repository root (default: current directory)."),
+    global_: bool = typer.Option(False, "--global", help="Delete a global tool."),
+) -> None:
+    """Remove one tool. Unknown names exit 1."""
+    from devgraph.config.tools_edit import delete_tool_text
+
+    root = _tools_scope(ctx, repo, global_)
+    path = _write_tools(root, lambda text: delete_tool_text(text, name))
+    _tools_done("Deleted", name, path, root)
+
+
+@tools_app.command("reset")
+def config_tools_reset(
+    ctx: typer.Context,
+    repo: Optional[Path] = typer.Option(None, "--repo", help="Repository root (default: current directory)."),
+    global_: bool = typer.Option(False, "--global", help="Empty the global tools store."),
+    yes: bool = typer.Option(False, "--yes", help="Do not ask for confirmation."),
+) -> None:
+    """Remove every tool in the scope: delete devgraph.tools.yaml, or empty the global store."""
+    from devgraph.config.global_tools import save_global_tools
+
+    root = _tools_scope(ctx, repo, global_)
+    path = _tools_store_path(root)
+    if not path.exists():
+        console.print(f"Nothing to reset: {escape(str(path))} does not exist.", soft_wrap=True)
+        return
+    if not yes:
+        typer.confirm(f"Remove every tool in {path}?", abort=True)
+    try:
+        if root is None:
+            save_global_tools([])
+        else:
+            path.unlink()
+    except OSError as exc:
+        raise _tools_fail(str(exc))
+    console.print(f"[green]Reset[/green] {escape(str(path))}", soft_wrap=True)
+    console.print(escape(_tools_scope_note(root)), soft_wrap=True)
 
 
 @app.command()
