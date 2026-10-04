@@ -696,9 +696,8 @@ def _reset_snapshot(path: Path) -> tuple[str, bool, Any, str]:
     """(fingerprint, readable, data, text) of one read of the file, so a reset's listing, its warnings
     and the fingerprint its confirm must match all describe the same bytes. Never raises: reset must
     work on a broken file."""
-    import yaml
-
     from devgraph.config.project_tools import YAML_LOAD_ERRORS
+    from devgraph.config.yaml_bound import bounded_safe_load
 
     try:
         raw = read_bounded(path)
@@ -710,7 +709,7 @@ def _reset_snapshot(path: Path) -> tuple[str, bool, Any, str]:
     except UnicodeDecodeError:
         return fingerprint, False, None, ""
     try:
-        return fingerprint, True, yaml.safe_load(text), text
+        return fingerprint, True, bounded_safe_load(text), text
     except YAML_LOAD_ERRORS:
         return fingerprint, False, None, text
 

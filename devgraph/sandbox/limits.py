@@ -19,8 +19,8 @@ GROWTH_FACTOR = 2  # flag a matched count above GROWTH_FACTOR x the approved cou
 # Multiple digests (§5.6).
 MAX_ACTIVE_DIGESTS = 5
 
-# Schema YAML (§4.2).
-YAML_ALIAS_MAX_NODES = 10_000
+# Schema YAML (§4.2): the alias bound is `devgraph.config.yaml_bound.YAML_MAX_NODES`
+# (10,000), shared by every config reader.
 
 # Static-scan worker (§4.2).
 SCAN_WALL_SECONDS = 5

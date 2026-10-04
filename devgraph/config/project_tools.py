@@ -25,6 +25,7 @@ from typing import Any, Literal
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, ValidationInfo, field_validator, model_validator
 
+from devgraph.config.yaml_bound import bounded_safe_load
 from devgraph.paths import is_within, read_bounded
 
 TOOLS_FILENAME = "devgraph.tools.yaml"
@@ -82,54 +83,6 @@ _APOC = re.compile(r"(?<![A-Za-z_.$])apoc\s*\.", re.I)
 # raises ValueError/TypeError/AttributeError (e.g. `2001-13-45`, `!!int 0x`) and deep
 # nesting raises RecursionError. Every one of them means "this file is malformed".
 YAML_LOAD_ERRORS: tuple[type[BaseException], ...] = (yaml.YAMLError, ValueError, TypeError, AttributeError, RecursionError)
-
-
-def bounded_safe_load(text: str, max_nodes: int) -> Any:
-    """`yaml.safe_load`, refusing a document whose alias-expanded size exceeds `max_nodes`.
-
-    The size is measured on the composed node graph before anything is constructed,
-    counting an aliased node once per reference and memoising per node, so a
-    billion-laughs document is measured without being built. A recursive alias is
-    infinitely large and refused. Every refusal is a `yaml.YAMLError`.
-    """
-    loader = yaml.SafeLoader(text)
-    try:
-        node = loader.get_single_node()
-        if node is None:
-            return None
-        _check_expanded_size(node, max_nodes)
-        return loader.construct_document(node)
-    finally:
-        loader.dispose()
-
-
-def _check_expanded_size(root: yaml.Node, max_nodes: int) -> None:
-    sizes: dict[int, int] = {}
-    in_progress: set[int] = set()
-
-    def size(node: yaml.Node) -> int:
-        known = sizes.get(id(node))
-        if known is not None:
-            return known
-        if id(node) in in_progress:
-            raise yaml.YAMLError("a YAML alias refers to itself; the document has no finite expansion")
-        in_progress.add(id(node))
-        if isinstance(node, yaml.MappingNode):
-            children = [child for pair in node.value for child in pair]
-        elif isinstance(node, yaml.SequenceNode):
-            children = node.value
-        else:
-            children = []
-        total = 1
-        for child in children:
-            total += size(child)
-            if total > max_nodes:
-                raise yaml.YAMLError(f"the document expands to more than {max_nodes} YAML nodes")
-        in_progress.discard(id(node))
-        sizes[id(node)] = total
-        return total
-
-    size(root)
 
 
 class ProjectToolsError(Exception):
@@ -384,7 +337,7 @@ def load_project_tools(repo_root: Path) -> ProjectTools | None:
 def parse_project_tools(text: str, path: Path) -> ProjectTools:
     """Parse and validate the text of a tools file; `path` only labels errors."""
     try:
-        document = yaml.safe_load(text)
+        document = bounded_safe_load(text)
     except YAML_LOAD_ERRORS as exc:
         raise ProjectToolsError(f"{path}: malformed YAML: {exc}") from exc
     if document is None:

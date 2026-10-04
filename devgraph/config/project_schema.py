@@ -40,7 +40,8 @@ from pydantic import (
 )
 
 from devgraph.config.project_switch import project_config_enabled
-from devgraph.config.project_tools import YAML_LOAD_ERRORS, bounded_safe_load
+from devgraph.config.project_tools import YAML_LOAD_ERRORS
+from devgraph.config.yaml_bound import bounded_safe_load
 from devgraph.graph.schema import (
     _REPO_SCOPED_LABELS,
     NODE_LABELS,
@@ -49,7 +50,6 @@ from devgraph.graph.schema import (
 )
 from devgraph.graph.schema import constraint_statements as builtin_constraint_statements
 from devgraph.paths import is_within, read_bounded
-from devgraph.sandbox.limits import YAML_ALIAS_MAX_NODES
 
 SCHEMA_FILENAME = "devgraph.schema.yaml"
 SCHEMA_VERSION = 1
@@ -712,7 +712,7 @@ def load_project_schema(repo_root: Path, *, respect_switch: bool = True) -> Proj
 def parse_project_schema(text: str, path: Path) -> ProjectSchema:
     """Parse and validate the text of a schema file; `path` only labels errors."""
     try:
-        document = bounded_safe_load(text, max_nodes=YAML_ALIAS_MAX_NODES)
+        document = bounded_safe_load(text)
     except YAML_LOAD_ERRORS as exc:
         raise ProjectSchemaError(f"{path}: malformed YAML: {exc}") from exc
 
