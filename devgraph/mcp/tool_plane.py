@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import datetime
 import inspect
+import logging
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -21,8 +22,9 @@ from devgraph.config.project_tools import (
     INJECTED_PARAMETER,
     TOOLS_FILENAME,
     CypherTool,
+    ProjectTools,
     ProjectToolsError,
-    load_project_tools,
+    parse_project_tools,
     tools_file_path,
 )
 from devgraph.mcp.catalog import builtin_tool_names
@@ -31,7 +33,10 @@ from mcp.server.mcpserver.exceptions import ToolError
 from neo4j import time as neo4j_time
 from neo4j.spatial import Point
 
+logger = logging.getLogger(__name__)
+
 SESSION_REPO_ENV = "DEVGRAPH_MCP_REPO"
+RELOAD_INTERVAL_S = 2.0
 
 _PYTHON_TYPES: dict[str, type] = {"string": str, "integer": int, "float": float, "boolean": bool}
 
@@ -93,6 +98,7 @@ class ToolPlaneStatus:
     served: list[str] = field(default_factory=list)
     parameter_names: dict[str, list[str]] = field(default_factory=dict)  # served tool -> declared parameters
     notices: list[str] = field(default_factory=list)
+    definitions: dict[str, CypherTool] = field(default_factory=dict, repr=False)  # served tool -> its declaration
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -182,6 +188,7 @@ def register_project_tools(
     annotations: Any,
     pinned: str | None = None,
     registry: Any | None = None,
+    fingerprint: bytes | str | None = None,
 ) -> ToolPlaneStatus:
     """Register the session repository's tools on `server`; report what happened."""
     if repo is None:
@@ -201,16 +208,40 @@ def register_project_tools(
         return status
 
     status = ToolPlaneStatus(repo_id=repo.repo_id, source=source)
-    if not Path(repo.path).is_dir():
+    _serve_repository(server, engine, repo, status, instrument=instrument, annotations=annotations,
+                      fingerprint=fingerprint)
+    return status
+
+
+def _serve_repository(
+    server: Any,
+    engine: Any,
+    repo: Any,
+    status: ToolPlaneStatus,
+    *,
+    instrument: Callable[[Callable[..., Any]], Callable[..., Any]],
+    annotations: Any,
+    fingerprint: bytes | str | None = None,
+    declared: ProjectTools | None = None,
+) -> None:
+    """Parse the repository's tools file and register its tools, recording the outcome on `status`.
+
+    The file is read once, as `fingerprint` (its bytes); the tools served are exactly
+    the ones those bytes declare. Without a `fingerprint` it is read now.
+    """
+    if fingerprint is None:
+        fingerprint = tools_fingerprint(repo.path)
+    if fingerprint == "root-missing":
         status.notices.append(f"the root of repository {repo.repo_id!r} ({repo.path}) does not exist; no project tools are served")
-        return status
-    try:
-        declared = load_project_tools(repo.path)
-    except ProjectToolsError as exc:
-        status.notices.append(f"invalid {TOOLS_FILENAME}; no project tools are served: {str(exc).splitlines()[0]}")
-        return status
+        return
+    if fingerprint == "absent":
+        return
     if declared is None:
-        return status
+        try:
+            declared = _parse_fingerprint(repo, fingerprint)
+        except ProjectToolsError as exc:
+            status.notices.append(f"invalid {TOOLS_FILENAME}; no project tools are served: {str(exc).splitlines()[0]}")
+            return
 
     status.tools_file = str(tools_file_path(repo.path))
     builtin = builtin_tool_names()
@@ -232,4 +263,80 @@ def register_project_tools(
             continue
         status.served.append(tool.name)
         status.parameter_names[tool.name] = [p.name for p in tool.parameters]
-    return status
+        status.definitions[tool.name] = tool
+
+
+def _parse_fingerprint(repo: Any, fingerprint: bytes | str) -> ProjectTools:
+    """The tools declared by `fingerprint` (file bytes or 'unreadable:<error>'); raises ProjectToolsError."""
+    path = tools_file_path(repo.path)
+    if not isinstance(fingerprint, bytes):
+        raise ProjectToolsError(f"{path}: cannot be read: {fingerprint.partition(':')[2]}")
+    try:
+        text = fingerprint.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ProjectToolsError(f"{path}: is not valid UTF-8: {exc}") from exc
+    return parse_project_tools(text, path)
+
+
+def tools_fingerprint(repo_path: Path | str) -> bytes | str:
+    """What the tools file looks like now: its bytes, 'root-missing', 'absent', or 'unreadable:<error>'."""
+    if not Path(repo_path).is_dir():
+        return "root-missing"
+    try:
+        return tools_file_path(Path(repo_path)).read_bytes()
+    except (FileNotFoundError, NotADirectoryError):
+        return "absent"
+    except OSError as exc:
+        return f"unreadable:{type(exc).__name__}"
+
+
+class ProjectToolPlane:
+    """The session's served project tools, reloadable when the tools file changes.
+
+    The scope (`repo`) never changes; only the tools file is re-read, under the
+    same rules as at startup.
+    """
+
+    def __init__(self, server: Any, engine: Any, repo: Any | None, status: ToolPlaneStatus, *,
+                 instrument: Callable[[Callable[..., Any]], Callable[..., Any]], annotations: Any,
+                 fingerprint: bytes | str | None = None) -> None:
+        """`fingerprint` is the tools file as the initial load read it (see `register_project_tools`)."""
+        self.server, self.engine, self.repo, self.status = server, engine, repo, status
+        self._instrument, self._annotations = instrument, annotations
+        self._fingerprint = fingerprint
+
+    def reload_if_changed(self) -> bool:
+        """Re-serve the tools file if its bytes changed. True when the served tools changed."""
+        if self.repo is None:
+            return False
+        fingerprint = tools_fingerprint(self.repo.path)
+        if fingerprint == self._fingerprint:
+            return False
+        declared = None
+        if fingerprint not in ("absent", "root-missing") and self.status.tools_file is not None:
+            # A good file is being served: an invalid save keeps it rather than dropping the tools.
+            try:
+                declared = _parse_fingerprint(self.repo, fingerprint)
+            except ProjectToolsError as exc:
+                self._fingerprint = fingerprint
+                notice = f"invalid {TOOLS_FILENAME}; keeping the last good tools: {str(exc).splitlines()[0]}"
+                self.status.notices[:] = [n for n in self.status.notices if not n.startswith(f"invalid {TOOLS_FILENAME}")]
+                self.status.notices.append(notice)
+                logger.warning("%s", notice)
+                return False
+        self._fingerprint = None  # until the reload succeeds, so a failure is retried
+        before = dict(self.status.definitions)
+        for name in self.status.served:
+            self.server.remove_tool(name)
+        self.status.tools_file = None
+        self.status.served.clear()
+        self.status.parameter_names.clear()
+        self.status.definitions.clear()
+        self.status.notices.clear()
+        _serve_repository(self.server, self.engine, self.repo, self.status,
+                          instrument=self._instrument, annotations=self._annotations, fingerprint=fingerprint,
+                          declared=declared)
+        self._fingerprint = fingerprint  # the reload parsed exactly these bytes
+        if self.status.notices:
+            logger.warning("reloaded %s with problems: %s", tools_file_path(self.repo.path), self.status.notices[0])
+        return self.status.definitions != before

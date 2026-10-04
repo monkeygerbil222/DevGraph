@@ -45,6 +45,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+import anyio
 from mcp.server.mcpserver import MCPServer
 from mcp.types import ToolAnnotations
 
@@ -55,7 +56,14 @@ from devgraph.graph.engine import GraphEngine
 from devgraph.mcp import tools as devgraph_tools
 from devgraph.mcp.catalog import TOOL_CATALOG as _TOOL_CATALOG
 from devgraph.mcp.catalog import builtin_tool_names  # noqa: F401  (re-exported)
-from devgraph.mcp.tool_plane import SESSION_REPO_ENV, register_project_tools, resolve_session_repo
+from devgraph.mcp.tool_plane import (
+    SESSION_REPO_ENV,
+    ProjectToolPlane,
+    register_project_tools,
+    resolve_session_repo,
+    tools_fingerprint,
+)
+from devgraph.mcp.tool_reload import run_stdio
 from devgraph.registry.store import RepoRegistry
 
 logger = logging.getLogger(__name__)
@@ -481,9 +489,15 @@ def build_server(
             the purpose-built tools above whenever one of them fits."""
             return devgraph_tools.run_cypher(engine, query, parameters)
 
+    fingerprint = tools_fingerprint(session_repo.path) if session_repo is not None else None  # the load parses these bytes
     status = register_project_tools(
         server, engine, session_repo, session_source, instrument=_instrument, annotations=_READ_ONLY, pinned=session_pinned,
-        registry=registry,
+        registry=registry, fingerprint=fingerprint,
+    )
+    # main() polls this for tools-file reloads.
+    server.devgraph_tool_plane = ProjectToolPlane(  # type: ignore[attr-defined]
+        server, engine, session_repo, status, instrument=_instrument, annotations=_READ_ONLY,
+        fingerprint=fingerprint,
     )
 
     @server.resource(
@@ -602,7 +616,7 @@ def main() -> None:
             session_source=source,
             session_pinned=os.environ.get(SESSION_REPO_ENV),
         )
-        server.run("stdio")
+        anyio.run(run_stdio, server)
     finally:
         engine.close()
         registry.close()
