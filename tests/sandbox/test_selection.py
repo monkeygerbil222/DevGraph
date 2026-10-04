@@ -232,3 +232,186 @@ def test_git_binary_comes_from_the_fixed_path(monkeypatch, tmp_path):
     fake.chmod(0o755)
     monkeypatch.setenv("PATH", f"{tmp_path}:{os.environ.get('PATH', '')}")
     assert git_binary() == shutil.which("git", path="/usr/bin:/bin")
+
+
+def _exit_marker(tmp_path: Path, name: str) -> tuple[Path, Path]:
+    """A marker program that records it ran and then fails, so no transport waits on it."""
+    marker = tmp_path / f"{name}.ran"
+    program = tmp_path / f"{name}.sh"
+    program.write_text(f"#!/bin/sh\ntouch '{marker}'\nexit 1\n")
+    program.chmod(0o755)
+    return program, marker
+
+
+def _promisor_sparse_repo(path: Path) -> Path:
+    """A partial clone with a sparse index whose `far` trees are missing, so a
+    full-index read would lazily fetch them from the promisor remote."""
+    root = _repo(path, {"keep/a": b"a", "far/b": b"b", "far/sub/c": b"c"})
+    _git(root, "sparse-checkout", "set", "--cone", "--sparse-index", "keep")
+    trees = []
+    for tree in ("far", "far/sub"):
+        out = subprocess.run(
+            [GIT, "-C", str(root), "rev-parse", f"HEAD:{tree}"],
+            env=_SETUP_ENV,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        trees.append(out.stdout.strip())
+    for sha in trees:
+        (root / ".git" / "objects" / sha[:2] / sha[2:]).unlink()
+    _git(root, "config", "core.repositoryformatversion", "1")
+    _git(root, "config", "extensions.partialClone", "origin")
+    _git(root, "config", "remote.origin.promisor", "true")
+    return root
+
+
+def _ssh_command(root: Path, program: Path) -> None:
+    _git(root, "config", "remote.origin.url", "ssh://example.invalid/repo")
+    _git(root, "config", "core.sshCommand", str(program))
+
+
+def _upload_pack(root: Path, program: Path) -> None:
+    _git(root, "config", "remote.origin.url", str(root.parent / "elsewhere"))
+    _git(root, "config", "remote.origin.uploadpack", str(program))
+
+
+def _ext_transport(root: Path, program: Path) -> None:
+    _git(root, "config", "remote.origin.url", f"ext::{program}")
+    _git(root, "config", "protocol.ext.allow", "always")
+
+
+@needs_git
+@pytest.mark.parametrize(
+    "configure",
+    [
+        pytest.param(_ssh_command, id="core.sshCommand"),
+        pytest.param(_upload_pack, id="remote.uploadpack"),
+        pytest.param(_ext_transport, id="ext-transport"),
+    ],
+)
+def test_lazy_fetch_runs_no_repository_program(tmp_path, configure):
+    root = _promisor_sparse_repo(tmp_path / "repo")
+    (tmp_path / "elsewhere").mkdir()
+    program, marker = _exit_marker(tmp_path, "fetch")
+    configure(root, program)
+
+    result = select_inputs(root, ["**/*"], git=GIT)
+    assert result.matched == ("keep/a",)
+    assert not marker.exists()
+
+    # The premise: the pre-fix hardened command, without the lazy-fetch guard
+    # or `--sparse`, expands the index and runs the configured program.
+    with __import__("tempfile").TemporaryDirectory() as home:
+        env = {
+            "PATH": "/usr/bin:/bin",
+            "HOME": home,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_CEILING_DIRECTORIES": str(root.parent),
+            "GIT_PAGER": "cat",
+            "LC_ALL": "C",
+        }
+        subprocess.run(
+            [
+                GIT,
+                "--no-pager",
+                "-C",
+                str(root),
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "core.untrackedCache=false",
+                "ls-files",
+                "-z",
+                "--cached",
+            ],
+            env=env,
+            check=False,
+            capture_output=True,
+            timeout=30,
+        )
+    assert marker.exists()
+
+
+def _fake_git(tmp_path: Path, body: str) -> str:
+    fake = tmp_path / "fake-git"
+    fake.write_text(f"#!/bin/sh\n{body}\n")
+    fake.chmod(0o755)
+    return str(fake)
+
+
+@pytest.mark.parametrize(
+    "version", ["git version 2.44.2", "git version 1.9", "not git"]
+)
+def test_git_older_than_2_45_is_refused(tmp_path, version):
+    root = tmp_path / "repo"
+    root.mkdir()
+    fake = _fake_git(tmp_path, f"echo '{version}'")
+    with pytest.raises(InputError) as info:
+        tracked_files(root, git=fake)
+    assert info.value.code == "input_unavailable"
+    assert "2.45" in info.value.reason
+
+
+@needs_git
+def test_nfd_repository_directory(tmp_path):
+    root = _repo(tmp_path / "cafe\u0301", {"a.py": b"x"})
+    assert tracked_files(root, git=GIT) == ["a.py"]
+    assert select_inputs(root, ["*.py"], git=GIT).matched == ("a.py",)
+
+
+@needs_git
+def test_denylist_catches_compatibility_forms(tmp_path):
+    root = _repo(
+        tmp_path / "repo",
+        {
+            "\uff53\uff45\uff43\uff52\uff45\uff54.txt": b"x",
+            "\uff0eenv": b"x",
+            "ok.txt": b"x",
+        },
+    )
+    result = select_inputs(root, ["*"], git=GIT)
+    assert result.matched == ("ok.txt",)
+    assert result.denied == 2
+
+
+def test_selection_stops_reading_past_the_cap(tmp_path, monkeypatch):
+    """Matches past the cap end the read and kill git, rather than buffering everything."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    done = tmp_path / "finished"
+    fake = _fake_git(
+        tmp_path,
+        'case "$1" in --version) echo "git version 2.55.0"; exit 0;; esac\n'
+        "yes a.py | head -n 2000000 | tr '\\n' '\\0'\n"
+        f"touch '{done}'",
+    )
+    monkeypatch.setattr(selection, "INPUT_MAX_FILES", 3)
+    with pytest.raises(InputError) as info:
+        select_inputs(root, ["*.py"], git=fake)
+    assert info.value.code == "input_cap"
+    assert not done.exists()
+
+
+def test_git_environment_is_constructed():
+    env = selection.git_env("/tmp/home", "/srv")
+    assert env == {
+        "PATH": "/usr/bin:/bin",
+        "HOME": "/tmp/home",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_CEILING_DIRECTORIES": "/srv",
+        "GIT_NO_LAZY_FETCH": "1",
+        "GIT_PAGER": "cat",
+        "LC_ALL": "C",
+    }
+
+
+@needs_git
+def test_sparse_index_is_not_expanded(tmp_path):
+    """Sparse directories stay collapsed (`--sparse`): their files are outside the
+    work tree, and expanding them is what reads tree objects at all."""
+    root = _repo(tmp_path / "repo", {"keep/a": b"a", "far/b": b"b", "far/sub/c": b"c"})
+    _git(root, "sparse-checkout", "set", "--cone", "--sparse-index", "keep")
+    assert select_inputs(root, ["**/*"], git=GIT).matched == ("keep/a",)

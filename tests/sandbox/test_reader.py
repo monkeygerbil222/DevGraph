@@ -346,3 +346,121 @@ def test_openat2_unavailable_falls_back(repo, monkeypatch):
     assert read_repo_file(repo, "real.txt", cap=100) == b"hello"
     (repo / "link").symlink_to(repo / "real.txt")
     _refused("input_unavailable", read_repo_file, repo, "link", cap=100)
+
+
+@pytest.mark.parametrize("errno_name", ["ENOSYS", "EPERM"])
+def test_default_fallback_follows_nothing(repo, monkeypatch, errno_name):
+    """Where the kernel refuses openat2, the default path is still no-follow."""
+    import errno
+
+    def no_openat2(*args, **kwargs):
+        code = getattr(errno, errno_name)
+        raise OSError(code, os.strerror(code))
+
+    outside = repo.parent / "outside"
+
+    def swap_leaf(path):
+        (repo / "real.txt").unlink()
+        (repo / "real.txt").symlink_to(outside / "secret.txt")
+
+    monkeypatch.setattr(reader, "_openat2", no_openat2)
+    monkeypatch.setattr(reader, "_after_check", swap_leaf)
+    _refused("input_unavailable", read_repo_file, repo, "real.txt", cap=100)
+
+    def swap_dir(path):
+        (repo / "realdir").rename(repo / "realdir.bak")
+        (repo / "realdir").symlink_to(outside)
+
+    (outside / "f.txt").write_bytes(b"TOP-SECRET")
+    monkeypatch.setattr(reader, "_after_check", swap_dir)
+    _refused("input_unavailable", read_repo_file, repo, "realdir/f.txt", cap=100)
+
+
+def test_openat2_resolve_beneath_holds_without_the_path_check(repo, monkeypatch):
+    """With `..` let through the lexical check, openat2 itself refuses the escape."""
+    if not reader.openat2_supported():
+        pytest.skip("openat2 is not available on this kernel")
+    monkeypatch.setattr(reader, "_split", lambda rel: rel.split("/"))
+    _refused(
+        "input_unavailable",
+        read_repo_file,
+        repo,
+        "../outside/secret.txt",
+        cap=100,
+        use_openat2=True,
+    )
+
+
+def test_root_must_be_canonical(repo, use_openat2):
+    linked = repo.parent / "linked-repo"
+    linked.symlink_to(repo)
+    _refused(
+        "input_unavailable",
+        read_repo_file,
+        linked,
+        "real.txt",
+        cap=100,
+        use_openat2=use_openat2,
+    )
+    _refused(
+        "input_unavailable",
+        read_repo_file,
+        repo / ".." / "repo",
+        "real.txt",
+        cap=100,
+        use_openat2=use_openat2,
+    )
+    _refused(
+        "input_unavailable",
+        read_repo_file,
+        Path("/"),
+        "etc/hostname",
+        cap=100,
+        use_openat2=use_openat2,
+    )
+    _refused(
+        "input_unavailable",
+        read_repo_file,
+        Path("relative"),
+        "real.txt",
+        cap=100,
+        use_openat2=use_openat2,
+    )
+
+
+@pytest.mark.parametrize(
+    "platform, machine, expected",
+    [
+        ("linux", "x86_64", True),
+        ("linux", "aarch64", True),
+        ("linux", "armv7l", True),
+        ("linux", "riscv64", True),
+        ("linux", "ppc64le", True),
+        ("linux", "s390x", True),
+        ("linux", "loongarch64", True),
+        ("linux", "mips64", False),
+        ("linux", "alpha", False),
+        ("linux", "ia64", False),
+        ("darwin", "arm64", False),
+        ("win32", "AMD64", False),
+    ],
+)
+def test_openat2_platform_gate(platform, machine, expected):
+    assert reader.openat2_platform_ok(platform, machine) is expected
+
+
+def test_unknown_platform_never_calls_openat2(repo, monkeypatch):
+    def forbidden(*args, **kwargs):
+        raise AssertionError("openat2 called on an unsupported platform")
+
+    monkeypatch.setattr(reader, "_OPENAT2_PLATFORM", False)
+    monkeypatch.setattr(reader, "_openat2", forbidden)
+    assert not reader.openat2_supported()
+    assert read_repo_file(repo, "real.txt", cap=100) == b"hello"
+    (repo / "link").symlink_to("real.txt")
+    _refused("input_unavailable", read_repo_file, repo, "link", cap=100)
+
+
+def test_platform_without_no_follow_flags_refuses_every_read(repo, monkeypatch):
+    monkeypatch.setattr(reader, "_NO_FOLLOW_OK", False)
+    _refused("input_unavailable", read_repo_file, repo, "real.txt", cap=100)

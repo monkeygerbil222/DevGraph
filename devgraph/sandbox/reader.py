@@ -22,7 +22,9 @@ from __future__ import annotations
 import ctypes
 import errno
 import os
+import platform
 import stat
+import sys
 from collections.abc import Callable
 from pathlib import Path
 
@@ -32,14 +34,26 @@ from devgraph.sandbox.limits import INPUT_MAX_FILE_BYTES, SCRIPT_MAX_BYTES
 
 SCHEMA_FILE = "devgraph.schema.yaml"
 
-_SYS_OPENAT2 = 437  # the same number on every Linux architecture
+# 437 in the unified syscall table, which these Linux machines use. Others (alpha,
+# ia64, mips) number it differently and take the fallback.
+_SYS_OPENAT2 = 437
+_OPENAT2_MACHINES = ("x86_64", "aarch64", "riscv64", "s390x", "loongarch64")
+_OPENAT2_MACHINE_PREFIXES = ("arm", "ppc64")
 _RESOLVE_NO_MAGICLINKS = 0x02
 _RESOLVE_NO_SYMLINKS = 0x04
 _RESOLVE_BENEATH = 0x08
 
-_SAFE_FLAGS = os.O_NONBLOCK | os.O_CLOEXEC | os.O_NOCTTY
-_DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | _SAFE_FLAGS
-_LEAF_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | _SAFE_FLAGS
+# The flags the no-follow open needs. Where any is missing (Windows), or `os.open`
+# takes no `dir_fd`, every read is refused rather than made with weaker flags.
+_FLAG_NAMES = ("O_NOFOLLOW", "O_DIRECTORY", "O_NONBLOCK", "O_CLOEXEC", "O_NOCTTY")
+_NO_FOLLOW_OK = (
+    all(hasattr(os, name) for name in _FLAG_NAMES) and os.open in os.supports_dir_fd
+)
+_SAFE_FLAGS = os.O_NONBLOCK | os.O_CLOEXEC | os.O_NOCTTY if _NO_FOLLOW_OK else 0
+_DIR_FLAGS = (
+    os.O_RDONLY | (os.O_DIRECTORY | os.O_NOFOLLOW if _NO_FOLLOW_OK else 0) | _SAFE_FLAGS
+)
+_LEAF_FLAGS = os.O_RDONLY | (os.O_NOFOLLOW if _NO_FOLLOW_OK else 0) | _SAFE_FLAGS
 
 #: Test-only hook, called with the full path between the `lstat` walk and the open.
 _after_check: Callable[[Path], None] | None = None
@@ -63,8 +77,21 @@ class _OpenHow(ctypes.Structure):
     ]
 
 
-_libc = ctypes.CDLL(None, use_errno=True)
-_libc.syscall.restype = ctypes.c_long
+def openat2_platform_ok(platform_name: str, machine: str) -> bool:
+    """True on Linux machines where `openat2` is syscall 437."""
+    return platform_name == "linux" and (
+        machine in _OPENAT2_MACHINES or machine.startswith(_OPENAT2_MACHINE_PREFIXES)
+    )
+
+
+_OPENAT2_PLATFORM = openat2_platform_ok(sys.platform, platform.machine())
+_libc = None
+if _OPENAT2_PLATFORM:
+    try:
+        _libc = ctypes.CDLL(None, use_errno=True)
+        _libc.syscall.restype = ctypes.c_long
+    except (OSError, TypeError, AttributeError):
+        _OPENAT2_PLATFORM = False
 
 
 def _openat2(dir_fd: int, rel: str) -> int:
@@ -85,7 +112,9 @@ def _openat2(dir_fd: int, rel: str) -> int:
 
 
 def openat2_supported() -> bool:
-    """True when the kernel (and any seccomp filter) allows `openat2`."""
+    """True when the platform, the kernel and any seccomp filter allow `openat2`."""
+    if not _OPENAT2_PLATFORM:
+        return False
     try:
         fd = _openat2(-100, "/")  # AT_FDCWD; RESOLVE_BENEATH refuses an absolute path
     except OSError as exc:
@@ -124,7 +153,21 @@ def read_repo_file(
     `ENOSYS` or `EPERM`; `True` requires `openat2`; `False` forces the fallback.
     Raises `InputError` (`input_unavailable`, or `input_cap` over `cap`).
     """
+    if not _NO_FOLLOW_OK:
+        raise InputError(
+            "input_unavailable", "no-follow reads are not supported on this platform"
+        )
     root = Path(root)
+    # The root must already be the canonical real path (and not `/`): every check
+    # below is relative to it, and it is opened without following a final symlink.
+    if (
+        not root.is_absolute()
+        or str(root) != os.path.realpath(root)
+        or root.parent == root
+    ):
+        raise InputError(
+            "input_unavailable", "the repository root is not a canonical path"
+        )
     # 1. Containment, on components.
     if os.path.isabs(rel) or not (root / rel).is_relative_to(root):
         raise InputError("input_unavailable", f"{rel!r} is outside the repository")
@@ -150,14 +193,18 @@ def read_repo_file(
 
     # 3. Open without following anything; 4. decide on the descriptor.
     try:
-        root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        root_fd = os.open(root, _DIR_FLAGS)
     except OSError as exc:
         raise InputError(
             "input_unavailable", f"repository root: {exc.strerror}"
         ) from None
     try:
         fd = None
-        if use_openat2 is not False:
+        if use_openat2 and not _OPENAT2_PLATFORM:
+            raise InputError(
+                "input_unavailable", "openat2 is not available on this platform"
+            )
+        if use_openat2 is not False and _OPENAT2_PLATFORM:
             try:
                 fd = _openat2(root_fd, rel)
             except OSError as exc:

@@ -215,15 +215,15 @@ a plain `git ls-files -z` runs the program named by a repository-local
 invocation is therefore fixed:
 
 ```
-git --no-pager -C <canonical root>
+git --no-pager -C <real root path>
     -c core.fsmonitor=false -c core.untrackedCache=false
-    ls-files -z --cached
+    ls-files -z --cached --sparse
 ```
 
 run with a constructed environment, not a filtered copy of the caller's:
 `PATH` fixed, `HOME` set to an empty temporary directory, `GIT_CONFIG_NOSYSTEM=1`,
 `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CEILING_DIRECTORIES=<parent of root>`,
-`GIT_PAGER=cat`, `LC_ALL=C`, and nothing else (no `GIT_DIR`, `GIT_WORK_TREE`,
+`GIT_NO_LAZY_FETCH=1`, `GIT_PAGER=cat`, `LC_ALL=C`, and nothing else (no `GIT_DIR`, `GIT_WORK_TREE`,
 `GIT_INDEX_FILE`, `GIT_EXEC_PATH`, `GIT_CONFIG_*`, `GIT_TRACE*`). The git binary
 is resolved once to an absolute path from the fixed `PATH`.
 
@@ -237,6 +237,29 @@ resolving to an enclosing repository (verified). `ls-files` runs no hooks, so
 `core.hooksPath` is irrelevant. A repository owned by another user now fails
 `safe.directory`: `input_unavailable`, fail closed.
 
+`--cached` is not enough on its own (found in E1 review, verified on git
+2.55). In a partial clone (`extensions.partialClone` naming a promisor
+remote) with a sparse index, a plain `ls-files` expands the index, reads the
+collapsed directories' tree objects, finds them missing and lazily fetches
+them from the promisor remote. That fetch runs whatever the repository
+configures: `core.sshCommand` for an ssh URL, `remote.<name>.uploadpack` for a
+local one, or an `ext::<program>` URL when repository-local
+`protocol.ext.allow=always` (which also overrides a command-line
+`protocol.allow=never`). Two independent guards close it: `--sparse` lists
+sparse directories as `dir/` entries instead of expanding them (selection
+drops those entries; their files are outside the work tree and could not be
+read anyway), and `GIT_NO_LAZY_FETCH=1` makes git refuse any lazy fetch.
+`GIT_NO_LAZY_FETCH` exists from git 2.45, so an older git (checked with
+`git --version` under the same environment) is `input_unavailable`, and
+`doctor` reports it. Partial clones are allowed, not refused: blobless and
+treeless clones are common, and with both guards no fetch is attempted
+(E1's test covers all three transports with marker programs).
+
+The real resolved path, not the NFC trust-key form, goes to `-C`, so a
+repository directory with an NFD name still resolves. Output is streamed and
+filtered as it is read; once the matches exceed the per-run file cap, git is
+killed and the run is `input_cap`, so a huge index is never buffered whole.
+
 Any non-zero exit, or no git binary, means `input_unavailable` and the
 provider does not run. Reading the index directly was considered and rejected:
 index versions 2–4, split and sparse indexes are more parser surface than four
@@ -246,21 +269,26 @@ Candidates are then filtered by the declared globs, `IGNORED_DIR_NAMES`, and a
 **secret-name denylist** that always applies and cannot be overridden in E
 (`.env*`, `*.pem`, `*.key`, `*.p12`, `*.pfx`, `id_rsa*`, `id_ed25519*`,
 `id_ecdsa*`, `.netrc`, `.npmrc`, `.pypirc`, `.git-credentials`, `*.kdbx`,
-`*.tfstate*`, `*credential*`, `*secret*`). Matching is on the NFC-normalised,
-case-folded path for the denylist and on the NFC-normalised path for globs.
+`*.tfstate*`, `*credential*`, `*secret*`). The denylist matches each path
+component after NFKC normalisation and case folding (so fullwidth `ｓｅｃｒｅｔ`
+is caught); globs match the NFC-normalised path, case-sensitively.
 
 **Reading.** A new module, `devgraph/sandbox/reader.py`, is the only code that
 reads a sandbox input, a provider script, or the schema file whose declaration
 feeds a digest. For each path:
 
-1. Containment is decided on path components with `Path.is_relative_to`
-   against the canonical repository root; never by string prefix.
+1. The root must already be its own real path (`os.path.realpath`), absolute
+   and not `/`, and is opened `O_NOFOLLOW | O_DIRECTORY`. Containment is
+   decided on path components with `Path.is_relative_to` against it; never by
+   string prefix.
 2. `lstat` every component from the repository root down. Any symlink or any
    non-directory intermediate is refused.
 3. Open without following: `openat2` with
    `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS` relative to
-   a directory descriptor of the root; on kernels without `openat2` (before
-   5.6), component-by-component `openat(dir_fd, part, O_NOFOLLOW |
+   a directory descriptor of the root, called as syscall 437 on Linux machines
+   that use the unified syscall table (x86_64, aarch64, arm, riscv64, ppc64,
+   s390x, loongarch64); elsewhere, and on kernels without `openat2` (before
+   5.6, or `EPERM` from a seccomp filter), component-by-component `openat(dir_fd, part, O_NOFOLLOW |
    O_DIRECTORY)` and `O_NOFOLLOW | O_RDONLY` for the leaf.
 4. `fstat` the open descriptor: must be `S_ISREG`, size within the per-file
    cap. Read at most cap + 1 bytes from the descriptor; more is `input_cap`.
@@ -268,7 +296,23 @@ feeds a digest. For each path:
 Steps 3–4 close the race between check and use: no component is followed by
 name after the check, and the type and size decision is made on the
 descriptor that is read. (A Windows reader is part of the platform follow-up,
-§4.5; it cannot make the same claim.)
+§4.5; it cannot make the same claim. Where the no-follow flags or `dir_fd`
+are missing, every read is refused.)
+
+Residuals, stated plainly:
+- **Hardlinks are read.** A hardlink inside the repository to a file elsewhere
+  on the same filesystem is a regular file and passes every check. Kernel
+  `protected_hardlinks` stops links to files the user does not own, not to the
+  user's own files; a declared input that is a hardlink to a secret is read.
+- **Mount points are crossed.** `RESOLVE_BENEATH` does not stop at a bind
+  mount inside the repository (`RESOLVE_NO_XDEV` is not set), so a bind mount
+  placed in the work tree is read through.
+- **The fallback has a rename race.** The component-wise fallback opens one
+  directory at a time. A concurrent rename can move an already-opened
+  directory out of the repository; the file then read was beneath the root,
+  with no symlink followed, when its parent was opened, but may not be by the
+  time it is read. `openat2` resolves the whole path in one call and does not
+  have this gap.
 
 **Shown at approval:** the matched-file count, a sample (first 20 sorted
 paths), how many tracked files the denylist excluded, and the total input
@@ -1091,6 +1135,7 @@ starts before this document is signed off.
 | `test_selection_excludes_untracked_and_ignored_files` | Untracked, ignored and denylisted files never match, whatever the globs. |
 | `test_no_git_work_tree_is_input_unavailable` | A non-repository directory nested inside another repository is not resolved to the outer one; no git binary; non-zero exit. |
 | `test_ls_files_runs_no_repository_program` | Repository config sets `core.fsmonitor`, `pager.ls-files`, `filter.x.clean`/`smudge`, `diff.x.textconv` with `.gitattributes`, and an `include.path` to a file setting `core.fsmonitor`; a marker file is never created. |
+| `test_lazy_fetch_runs_no_repository_program` | A partial clone with a sparse index whose collapsed trees are missing, its promisor remote reached through `core.sshCommand`, `remote.origin.uploadpack`, or `ext::` with repository-local `protocol.ext.allow=always`; a marker file is never created, and a control run without the guards creates it. |
 | `test_reader_refusals` | Symlinked leaf and intermediate, `..`, FIFO, oversize, swapped-in symlink between check and open. |
 | `test_normalisation_rejection_table`, `test_digest_stability_and_sensitivity` | §5.2–5.3. |
 | `test_approval_display_escapes_non_ascii_identifiers` | Full-width `eval` is shown escaped; non-ASCII in strings and comments is shown as text; control characters escaped everywhere. |
