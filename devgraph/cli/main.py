@@ -127,7 +127,9 @@ def remove(repo_id: str) -> None:
             settings = get_settings()
             engine = GraphEngine(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password)
             try:
+                recorded = engine.read_applied_schema(repo_id) or {}
                 engine.delete_repository(repo_id)
+                _release_labels(engine, recorded.get("labels") or [])
             finally:
                 engine.close()
 
@@ -141,6 +143,18 @@ def remove(repo_id: str) -> None:
     except Exception as e:
         console.print(f"[red][X] Unexpected error:[/red] {e}")
         raise typer.Exit(code=1)
+
+
+def _release_labels(engine: GraphEngine, labels: list[str]) -> None:
+    """After deleting a repository's graph data: drop the generated constraints/indexes
+    of its labels no other repository uses. A failure is a warning; the data is gone either way."""
+    from devgraph.indexer.schema_constraints import release_labels
+
+    try:
+        for name in release_labels(engine, labels):
+            console.print(f"[green][OK][/green] Dropped {name} (no repository declares it any more)")
+    except Exception as e:
+        console.print(f"[yellow]Warning:[/yellow] could not drop unused schema constraints: {e}")
 
 
 @app.command(name="list")
@@ -746,8 +760,8 @@ def _project_schema_findings(repos: list[Any]) -> list[dict[str, Any]]:
     for folded, entries in sorted(declared.items()):
         if len({(label, key) for _repo_id, label, key in entries}) < 2:
             continue
-        # A disabled repo stays in conflict detection: its constraints are
-        # still in the shared database until constraint drop ships.
+        # A disabled repo stays in conflict detection: its constraints stay
+        # in the shared database until its next rescan applies the built-in schema.
         described = "; ".join(
             f"{repo_id}{' (disabled)' if repo_id in disabled_ids else ''} "
             f"declares {label} keyed on ({', '.join(key)})"
@@ -806,7 +820,7 @@ def _project_tools_findings(repos: list[Any]) -> list[dict[str, Any]]:
                 findings.append({
                     "repo_id": repo.repo_id,
                     "status": "warning",
-                    "detail": f"{TOOLS_FILENAME}: tool {tool.name!r} has the name of a built-in tool; the built-in will be used",
+                    "detail": f"{TOOLS_FILENAME}: tool {tool.name!r} shadows a locked tool; the fixed implementation is used",
                     "failed": False,
                 })
     return findings
@@ -839,7 +853,7 @@ def _global_tools_findings(repos: list[Any]) -> list[dict[str, Any]]:
             findings.append({
                 "repo_id": "global",
                 "status": "warning",
-                "detail": f"{GLOBAL_TOOLS_FILENAME}: tool {tool.name!r} has the name of a built-in tool; the built-in will be used",
+                "detail": f"{GLOBAL_TOOLS_FILENAME}: tool {tool.name!r} shadows a locked tool; the fixed implementation is used",
                 "failed": False,
             })
     for repo in sorted(repos, key=lambda r: r.repo_id):
@@ -856,6 +870,22 @@ def _global_tools_findings(repos: list[Any]) -> list[dict[str, Any]]:
                     "failed": False,
                 })
     return findings
+
+
+def _stale_schema_objects(engine: Any, repos: list[Any]) -> list[Any]:
+    """Generated constraints/indexes no repository uses (schema_constraints.stale_generated_objects),
+    also counting the labels registered repositories' files declare but have not applied yet."""
+    from devgraph.config.project_schema import ProjectSchemaError, resolve_effective_schema
+    from devgraph.indexer.schema_constraints import stale_generated_objects
+
+    declared: set[str] = set()
+    for repo in repos:
+        try:
+            effective = resolve_effective_schema(repo.path)
+        except ProjectSchemaError:
+            continue  # what it applied is in the graph's recorded state
+        declared.update(node_type.label.casefold() for node_type in effective.node_types)
+    return stale_generated_objects(engine, declared)
 
 
 def _schema_drift_findings(engine: Any, repos: list[Any]) -> list[dict[str, Any]]:
@@ -1076,6 +1106,46 @@ def doctor() -> None:
                 console.print(f"  [green][OK][/green] {subject}: applied ({escape(finding['detail'])})")
             else:
                 console.print(f"  [yellow][!] {subject}:[/yellow] {finding['status']}: {escape(finding['detail'])}")
+
+    # 7d. Stale generated constraints/indexes: also needs the graph.
+    console.print("[bold]Schema constraints[/bold]")
+    if not neo4j_reachable:
+        console.print("  [yellow]skipped[/yellow]: Neo4j is not reachable")
+    else:
+        from devgraph.indexer.schema_constraints import constraint_drift
+
+        constraint_engine = GraphEngine(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password)
+        try:
+            stale = _stale_schema_objects(constraint_engine, registered_repos)
+            drift = constraint_drift(constraint_engine)
+        except Exception as e:
+            stale = drift = None
+            console.print(f"  [yellow][!][/yellow] could not check: {escape(str(e))}")
+        finally:
+            constraint_engine.close()
+        if stale == [] and drift == []:
+            console.print("  [green][OK][/green] generated constraints and indexes match the applied schemas")
+        for obj in stale or []:
+            console.print(
+                f"  [yellow][!] {escape(obj.name)}:[/yellow] stale {obj.kind} on {escape(obj.label)} "
+                f"(no repository declares it); remove with `devgraph config schema prune-constraints`",
+                soft_wrap=True,
+            )
+        for finding in drift or []:
+            subject, label = escape(finding["repo_id"]), escape(finding["label"])
+            key = escape(", ".join(finding["key"]))
+            if finding["status"] == "missing":
+                detail = (
+                    f"applied {label} has no uniqueness constraint; re-provision with "
+                    f"`devgraph rescan {finding['repo_id']} --now`"
+                )
+            else:
+                detail = (
+                    f"key change blocked by duplicate nodes: {label} nodes share a (repo_id, {key}) value, "
+                    f"so the constraint keeps its old key; remove the duplicates, then "
+                    f"`devgraph rescan {finding['repo_id']} --now`"
+                )
+            console.print(f"  [yellow][!] {subject}:[/yellow] {detail}", soft_wrap=True)
 
     # 8. Tray/watcher liveness
     console.print("[bold]Live Watcher[/bold]")
@@ -2229,7 +2299,7 @@ def config_tools_list(
         raise _tools_fail(str(exc))
     global_tools = {t.name: t for t in (declared_global.tools if declared_global else ())}
     project_names = [t.name for t in (declared_project.tools if declared_project else ())]
-    ignored = {"ignored": "built-in name"}  # a built-in name in a tools file: MCP serves the built-in
+    ignored = {"ignored": "shadows a locked tool"}  # a built-in name in a tools file: MCP serves the built-in
 
     rows: list[dict[str, Any]] = []
     if root is None:
@@ -2569,9 +2639,9 @@ def _schema_follow_up(root: Path, before, after, entry: dict | None = None) -> N
     _warn_removed(*_removed_types(before, after), _pruned_types(before, after), root=root)
     for label, old_key in _changed_keys(before, after):
         console.print(
-            f"[yellow]Warning:[/yellow] the existing uniqueness constraint on {escape(label)} keeps the old key "
-            f"({escape(', '.join(old_key))}) until constraints are dropped (dropping constraints/indexes for "
-            f"removed labels is still open; see PROJECT_STATUS.md).",
+            f"[yellow]Warning:[/yellow] the uniqueness constraint on {escape(label)} keeps the old key "
+            f"({escape(', '.join(old_key))}) until this schema is applied and every repository declaring "
+            f"{escape(label)} uses the new key; it also stays if existing nodes violate the new key.",
             soft_wrap=True,
         )
     if entry is not None and "label" in entry and entry.get("source") is None:
@@ -2586,6 +2656,45 @@ def _schema_follow_up(root: Path, before, after, entry: dict | None = None) -> N
     for finding in _project_schema_findings(_registered_repos()):
         if finding["status"] == "conflict" and record.repo_id in finding.get("repo_ids", ()):
             console.print(f"[yellow]Warning:[/yellow] {escape(finding['detail'])}", soft_wrap=True)
+
+
+@schema_app.command("prune-constraints")
+def config_schema_prune_constraints(
+    labels: Optional[list[str]] = typer.Option(None, "--label", help="Only this label (repeatable)."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Show what would be dropped without dropping it."),
+) -> None:
+    """Drop DevGraph-generated constraints/indexes no repository declares any more.
+
+    Database-wide. Stale means: no repository's applied schema records the
+    label, no registered repository's schema file declares it, and no node
+    carries it. Built-in constraints are never touched.
+    """
+    from devgraph.indexer.schema_constraints import release_labels
+
+    settings = get_settings()
+    engine = GraphEngine(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password)
+    try:
+        engine.verify_connectivity()
+        stale = _stale_schema_objects(engine, _registered_repos())
+        if labels:
+            wanted = {label.casefold() for label in labels}
+            stale = [obj for obj in stale if obj.label.casefold() in wanted]
+        if not stale:
+            console.print("[green]No stale generated constraints or indexes.[/green]")
+            return
+        for obj in stale:
+            console.print(f"  {obj.kind} {escape(obj.name)} on {escape(obj.label)}")
+        if dry_run:
+            console.print("[yellow]Dry run — nothing dropped.[/yellow]")
+            return
+        dropped = release_labels(engine, [obj.label for obj in stale])
+        for name in dropped:
+            console.print(f"[green][OK][/green] Dropped {escape(name)}")
+    except Exception as e:
+        console.print(f"[red][X] Error:[/red] {escape(str(e))}")
+        raise typer.Exit(code=1)
+    finally:
+        engine.close()
 
 
 @schema_app.command("list")
@@ -2913,8 +3022,10 @@ def prune(
             return
 
         for rid in sorted(orphaned):
+            recorded = engine.read_applied_schema(rid) or {}
             engine.delete_repository(rid)
             console.print(f"[green][OK][/green] Deleted: {rid}")
+            _release_labels(engine, recorded.get("labels") or [])
     finally:
         engine.close()
 

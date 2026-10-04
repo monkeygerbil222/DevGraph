@@ -61,6 +61,29 @@ def require_neo4j():
         engine.close()
 
 
+@pytest.fixture
+def purge_registered_repos(temp_registry_db, require_neo4j):
+    """Delete from live Neo4j every repo this test registered, even if it failed.
+
+    Yields a list; a test that removes its registry row itself should append
+    the repo_id so teardown still purges the graph data.
+    """
+    extra_ids = []
+    yield extra_ids
+    from devgraph.graph.engine import GraphEngine
+
+    db_path, _ = temp_registry_db
+    reg = RepoRegistry(db_path)
+    ids = {r.repo_id for r in reg.list_repos()} | set(extra_ids)
+    reg.close()
+    engine = GraphEngine("bolt://127.0.0.1:7687", "neo4j", "devgraph-local-dev")
+    try:
+        for repo_id in ids:
+            engine.delete_repository(repo_id)
+    finally:
+        engine.close()
+
+
 @pytest.fixture(autouse=True)
 def _block_real_registry(monkeypatch, tmp_path):
     """Safety net: any CLI invocation that forgets to patch get_settings falls
@@ -113,7 +136,7 @@ def _mock_settings(db_path):
     return settings
 
 
-def test_cli_add_repo(runner, temp_git_repo, temp_registry_db, require_neo4j):
+def test_cli_add_repo(runner, temp_git_repo, temp_registry_db, purge_registered_repos):
     """Test 'devgraph add' command — now runs a real initial scan."""
     db_path, registry = temp_registry_db
 
@@ -143,7 +166,6 @@ def test_cli_add_repo(runner, temp_git_repo, temp_registry_db, require_neo4j):
         )
         assert found[0]["c"] > 0
     finally:
-        engine.delete_repository(repo_id)
         engine.close()
 
 
@@ -209,7 +231,7 @@ def test_cli_remove_repo(runner, temp_git_repo, temp_registry_db, require_neo4j)
         assert repo_id in result.stdout
 
 
-def test_cli_remove_repo_purges_graph_data(runner, temp_git_repo, temp_registry_db, require_neo4j):
+def test_cli_remove_repo_purges_graph_data(runner, temp_git_repo, temp_registry_db, purge_registered_repos):
     """'devgraph remove' must delete the repo's Neo4j nodes, not just its registry row."""
     from devgraph.graph.engine import GraphEngine
 
@@ -217,6 +239,7 @@ def test_cli_remove_repo_purges_graph_data(runner, temp_git_repo, temp_registry_
 
     repo_record = registry.add_repo(temp_git_repo)
     repo_id = repo_record.repo_id
+    purge_registered_repos.append(repo_id)  # `remove` deletes the registry row
     registry.close()
 
     engine = GraphEngine("bolt://127.0.0.1:7687", "neo4j", "devgraph-local-dev")
@@ -237,7 +260,6 @@ def test_cli_remove_repo_purges_graph_data(runner, temp_git_repo, temp_registry_
         )
         assert remaining[0]["c"] == 0
     finally:
-        engine.delete_repository(repo_id)
         engine.close()
 
 
@@ -290,7 +312,7 @@ def test_cli_watch_disable(runner, temp_git_repo, temp_registry_db):
         assert "Watch disabled" in result.stdout
 
 
-def test_cli_rescan_repo(runner, temp_git_repo, temp_registry_db, require_neo4j):
+def test_cli_rescan_repo(runner, temp_git_repo, temp_registry_db, purge_registered_repos):
     """Test 'devgraph rescan' command — now runs a real full scan."""
     db_path, registry = temp_registry_db
 
@@ -318,7 +340,6 @@ def test_cli_rescan_repo(runner, temp_git_repo, temp_registry_db, require_neo4j)
         )
         assert found[0]["c"] == 1
     finally:
-        engine.delete_repository(repo_id)
         engine.close()
 
 
@@ -506,7 +527,7 @@ def test_cli_index_history_nonexistent_repo(runner, temp_registry_db):
         assert "Error" in result.stdout
 
 
-def test_cli_add_full_flag_also_indexes_history(runner, temp_registry_db, require_neo4j):
+def test_cli_add_full_flag_also_indexes_history(runner, temp_registry_db, purge_registered_repos):
     """Test 'devgraph add --full' runs both the file scan and history indexing."""
     db_path, registry = temp_registry_db
 
@@ -551,7 +572,6 @@ def test_cli_add_full_flag_also_indexes_history(runner, temp_registry_db, requir
             )
             assert found[0]["c"] >= 1
         finally:
-            engine.delete_repository(repo_id)
             engine.close()
 
 
@@ -1280,6 +1300,119 @@ def test_cli_doctor_reports_an_unreadable_schema_file_not_pending(runner, temp_r
     collapsed = _collapsed(_doctor_with_engine(runner, db_path, _stub_engine({"hash": "sha256:old"})).stdout)
     assert "schema file unreadable" in collapsed
     assert "the schema changed" not in collapsed and "pending" not in collapsed
+
+
+def _constraint_engine_or_skip():
+    from devgraph.graph.engine import GraphEngine
+
+    engine = GraphEngine("bolt://127.0.0.1:7687", "neo4j", "devgraph-local-dev")
+    try:
+        engine.verify_connectivity()
+    except Exception as e:
+        engine.close()
+        pytest.skip(f"Neo4j not available: {e}")
+    return engine
+
+
+def _has_constraint(engine, name):
+    return bool(engine.run_cypher("SHOW CONSTRAINTS YIELD name WHERE name = $n RETURN name", {"n": name}))
+
+
+@pytest.fixture
+def stale_label():
+    """A random label with a DevGraph-named constraint no repository declares."""
+    import uuid
+
+    engine = _constraint_engine_or_skip()
+    label = f"Zz{uuid.uuid4().hex[:10]}"
+    name = f"{label.lower()}_repo_key"
+    engine.run_cypher(f"CREATE CONSTRAINT {name} FOR (n:{label}) REQUIRE (n.repo_id, n.slug) IS UNIQUE")
+    yield engine, label, name
+    engine.run_cypher(f"DROP CONSTRAINT {name} IF EXISTS")
+    engine.close()
+
+
+def _invoke_live(runner, db_path, args):
+    from devgraph.cli import main as cli_main
+
+    config_module.get_settings.cache_clear()
+    with patch.object(config_module, "get_settings", return_value=_mock_settings(db_path)), \
+         patch.object(cli_main, "get_settings", return_value=_mock_settings(db_path)), \
+         patch.object(cli_main, "resolve_podman", return_value=None):
+        return runner.invoke(app, args)
+
+
+def test_cli_doctor_reports_a_stale_constraint_and_prune_constraints_drops_it(runner, temp_registry_db, stale_label):
+    engine, label, name = stale_label
+    db_path, registry = temp_registry_db
+    registry.close()
+
+    doctor = _collapsed(_invoke_live(runner, db_path, ["doctor"]).stdout)
+    assert "Schema constraints" in doctor
+    assert name in doctor and "devgraph config schema prune-constraints" in doctor
+
+    dry = _invoke_live(runner, db_path, ["config", "schema", "prune-constraints", "--label", label, "--dry-run"])
+    assert dry.exit_code == 0 and name in dry.stdout
+    assert _has_constraint(engine, name)
+
+    result = _invoke_live(runner, db_path, ["config", "schema", "prune-constraints", "--label", label])
+    assert result.exit_code == 0 and name in result.stdout
+    assert not _has_constraint(engine, name)
+
+
+def test_cli_prune_constraints_keeps_a_label_a_registered_repo_declares(runner, temp_registry_db, tmp_path, stale_label):
+    engine, label, name = stale_label
+    db_path, registry = temp_registry_db
+    root = _repo_with_schema(
+        tmp_path, "declares",
+        f"version: 1\nnode_types:\n  - label: {label}\n    key: [slug]\n    metadata: [{{name: slug}}]\n",
+    )
+    registry.add_repo(root)
+    registry.close()
+
+    result = _invoke_live(runner, db_path, ["config", "schema", "prune-constraints", "--label", label])
+    assert result.exit_code == 0
+    assert _has_constraint(engine, name)
+
+
+def test_cli_remove_releases_the_constraints_of_the_repos_labels(runner, temp_registry_db, tmp_path, stale_label):
+    engine, label, name = stale_label
+    db_path, registry = temp_registry_db
+    root = tmp_path / "leaving"
+    (root / ".git").mkdir(parents=True)
+    repo_id = registry.add_repo(root, repo_id=f"_smoketest_remove_{label.lower()}").repo_id
+    registry.close()
+    engine.upsert_repository(repo_id, repo_id, str(root))
+    engine.record_applied_schema(repo_id, "sha256:x", [label], [], [f"{label}:slug"])
+    try:
+        result = _invoke_live(runner, db_path, ["remove", repo_id])
+    finally:
+        engine.delete_repository(repo_id)
+    assert result.exit_code == 0, result.stdout
+    assert not _has_constraint(engine, name)
+
+
+def test_cli_doctor_reports_a_missing_or_blocked_generated_constraint(runner, temp_registry_db, stale_label):
+    engine, label, name = stale_label  # constraint on (repo_id, slug)
+    db_path, registry = temp_registry_db
+    registry.close()
+    blocked, missing = f"_smoketest_blocked_{label.lower()}", f"_smoketest_missing_{label.lower()}"
+    other = f"{label}b"
+    try:
+        engine.upsert_repository(blocked, blocked, "/tmp/blocked")
+        engine.record_applied_schema(blocked, "sha256:x", [label], [], [f"{label}:code"])
+        engine.run_cypher(
+            f"CREATE (:{label} {{repo_id: $r, slug: 'a', code: 'same'}}), (:{label} {{repo_id: $r, slug: 'b', code: 'same'}})",
+            {"r": blocked},
+        )
+        engine.upsert_repository(missing, missing, "/tmp/missing")
+        engine.record_applied_schema(missing, "sha256:x", [other], [], [f"{other}:slug"])
+        doctor = _collapsed(_invoke_live(runner, db_path, ["doctor"]).stdout)
+    finally:
+        engine.delete_repository(blocked)
+        engine.delete_repository(missing)
+    assert f"key change blocked by duplicate nodes" in doctor and label in doctor
+    assert f"devgraph rescan {missing} --now" in doctor
 
 
 def test_cli_dashboard_url_points_a_wildcard_bind_at_loopback(runner, temp_registry_db):

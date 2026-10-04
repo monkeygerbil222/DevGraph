@@ -234,6 +234,28 @@ def _instrument(fn: Callable[..., Any]) -> Callable[..., Any]:
     return wrapper
 
 
+def _with_shadow_notices(fn: Callable[..., Any], shadowed: Callable[[], dict[str, list[str]]]) -> Callable[..., Any]:
+    """Wrap a built-in tool so its dict result carries the notices for declared tools its name shadows.
+
+    `shadowed()` is read on every call, so a tools-file reload is reflected at once.
+    Every dict-returning built-in is typed `dict[str, Any]`, so the extra `notices` key
+    fits its schema. A list result can't carry a key and passes through unchanged; for
+    those built-ins `devgraph://project-tools`, `config validate`, `config tools list`
+    and `doctor` report the shadowing. Nothing shadowing the tool: the result is untouched.
+    """
+
+    @functools.wraps(fn)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        result = fn(*args, **kwargs)
+        notices = shadowed().get(fn.__name__)
+        if notices and isinstance(result, dict):
+            existing = result.get("notices")
+            result = {**result, "notices": [*(existing if isinstance(existing, list) else []), *notices]}
+        return result
+
+    return wrapper
+
+
 def build_server(
     engine: GraphEngine,
     registry: RepoRegistry | None = None,
@@ -281,7 +303,8 @@ def build_server(
 
     def _instrumented_tool(*args: Any, **kwargs: Any) -> Callable[[Callable[..., Any]], Any]:
         register = _register_tool(*args, **kwargs)
-        return lambda fn: register(_instrument(fn))
+        # `status` (the tool plane's, assigned below) is looked up at call time.
+        return lambda fn: register(_instrument(_with_shadow_notices(fn, lambda: status.shadowed)))
 
     server.tool = _instrumented_tool  # type: ignore[method-assign]
 

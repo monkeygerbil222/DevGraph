@@ -96,12 +96,25 @@ _PRUNE_EXTRACTED_CYPHER = (
 _READ_APPLIED_SCHEMA_CYPHER = (
     "MATCH (r:Repository {repo_id: $repo_id}) WHERE r.schema_hash IS NOT NULL "
     "RETURN r.schema_hash AS hash, coalesce(r.schema_labels, []) AS labels, "
-    "coalesce(r.schema_relationship_types, []) AS relationship_types"
+    "coalesce(r.schema_relationship_types, []) AS relationship_types, "
+    "coalesce(r.schema_keys, []) AS keys"
+)
+_READ_ALL_APPLIED_SCHEMAS_CYPHER = (
+    "MATCH (r:Repository) WHERE r.schema_hash IS NOT NULL "
+    "RETURN r.repo_id AS repo_id, coalesce(r.schema_labels, []) AS labels, "
+    "coalesce(r.schema_keys, []) AS keys"
 )
 _RECORD_APPLIED_SCHEMA_CYPHER = (
     "MERGE (r:Repository {repo_id: $repo_id}) "
     "SET r.schema_hash = $hash, r.schema_labels = $labels, "
-    "r.schema_relationship_types = $relationship_types"
+    "r.schema_relationship_types = $relationship_types, r.schema_keys = $keys"
+)
+# Constraints, and the indexes no constraint owns: the objects a project
+# schema can generate (see devgraph/indexer/schema_constraints.py).
+_SHOW_CONSTRAINTS_CYPHER = "SHOW CONSTRAINTS YIELD name, type, entityType, labelsOrTypes, properties"
+_SHOW_INDEXES_CYPHER = (
+    "SHOW INDEXES YIELD name, type, entityType, labelsOrTypes, properties, owningConstraint "
+    "WHERE owningConstraint IS NULL RETURN name, type, entityType, labelsOrTypes, properties"
 )
 
 # Transient Neo4j failures worth retrying: a connection blip, an expired
@@ -562,15 +575,66 @@ class GraphEngine:
             records = [record.data() for record in result or []]
         return records[0] if records else None
 
+    def read_all_applied_schemas(self) -> list[dict[str, Any]]:
+        """Every repository's recorded user labels and keys, from the graph itself."""
+        with self._driver.session() as session:
+            result = _retry_transient(session.run, _READ_ALL_APPLIED_SCHEMAS_CYPHER)
+            return [record.data() for record in result or []]
+
     def record_applied_schema(
-        self, repo_id: str, schema_hash: str, labels: list[str], relationship_types: list[str]
+        self,
+        repo_id: str,
+        schema_hash: str,
+        labels: list[str],
+        relationship_types: list[str],
+        keys: list[str] | None = None,
     ) -> None:
-        """Record the schema hash and user labels/relationship types the repo's graph was last built with."""
+        """Record the schema hash and user labels/relationship types/keys the repo's graph was last built with.
+
+        `keys` holds one "Label:k1,k2" string per label.
+        """
         with self._driver.session() as session:
             _retry_transient(
                 session.run, _RECORD_APPLIED_SCHEMA_CYPHER, repo_id=repo_id, hash=schema_hash,
-                labels=labels, relationship_types=relationship_types,
+                labels=labels, relationship_types=relationship_types, keys=keys or [],
             )
+
+    def list_schema_objects(self) -> list[dict[str, Any]]:
+        """Every constraint and every index no constraint owns, each tagged with `kind`."""
+        with self._driver.session() as session:
+            constraints = [
+                {**record.data(), "kind": "constraint"}
+                for record in _retry_transient(session.run, _SHOW_CONSTRAINTS_CYPHER) or []
+            ]
+            indexes = [
+                {**record.data(), "kind": "index"}
+                for record in _retry_transient(session.run, _SHOW_INDEXES_CYPHER) or []
+            ]
+        return constraints + indexes
+
+    def run_schema_statement(self, statement: str) -> None:
+        """Run one CREATE/DROP CONSTRAINT/INDEX statement. The caller builds it from validated names."""
+        with self._driver.session() as session:
+            _retry_transient(session.run, statement).consume()
+
+    def has_duplicate_keys(self, label: str, properties: tuple[str, ...]) -> bool:
+        """Whether two `label` nodes share every one of `properties` (all non-null), i.e. a
+        uniqueness constraint on them could not be created. The caller validates the names."""
+        values = ", ".join(f"n.`{p}` AS `{p}`" for p in properties)
+        present = " AND ".join(f"n.`{p}` IS NOT NULL" for p in properties)
+        query = (
+            f"MATCH (n:`{label}`) WHERE {present} WITH {values}, count(*) AS c "
+            "WHERE c > 1 RETURN 1 AS dup LIMIT 1"
+        )
+        with self._driver.session() as session:
+            result = _retry_transient(session.run, query)
+            return bool([record for record in result or []])
+
+    def label_has_nodes(self, label: str) -> bool:
+        """Whether any node, in any repository, carries `label`. The caller validates `label`."""
+        with self._driver.session() as session:
+            result = _retry_transient(session.run, f"MATCH (n:`{label}`) RETURN n LIMIT 1")
+            return bool([record for record in result or []])
 
     def delete_label_nodes(self, repo_id: str, label: str) -> int:
         """Delete one repo's nodes of a user label. The caller validates `label`."""
