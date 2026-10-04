@@ -63,6 +63,7 @@ class EditResult:
     after: Any = None
     warnings: list[str] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    removed: dict[str, list[str] | None] | None = None  # resets: names the file declared; None = not readable
 
 
 # --- files -----------------------------------------------------------------------------------------
@@ -147,6 +148,14 @@ def read_text(path: Path) -> str:
         return path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as exc:
         raise ConfigEditError(f"{path}: cannot be read: {exc}", "unreadable")
+
+
+def read_text_lossy(path: Path) -> str:
+    """Like `read_text`, but "" when the file cannot be read: the project-config toggle only warns, so a broken file must not block it."""
+    try:
+        return read_text(path)
+    except ConfigEditError:
+        return ""
 
 
 def write_atomically(path: Path, text: str) -> None:
@@ -655,3 +664,167 @@ def delete_schema_entry(
             dry_run=dry_run,
         )
         return _schema_result(path, old_text, new_text, None, record, dry_run)
+
+
+# --- whole-file reset ------------------------------------------------------------------------------
+
+
+def _reset_snapshot(path: Path) -> tuple[str, bool, Any, str]:
+    """(fingerprint, readable, data, text) of one read of the file, so a reset's listing, its warnings
+    and the fingerprint its confirm must match all describe the same bytes. Never raises: reset must
+    work on a broken file."""
+    import yaml
+
+    from devgraph.config.project_tools import YAML_LOAD_ERRORS
+
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return file_fingerprint(path), False, None, ""
+    fingerprint = "sha256:" + hashlib.sha256(raw).hexdigest()
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return fingerprint, False, None, ""
+    try:
+        return fingerprint, True, yaml.safe_load(text), text
+    except YAML_LOAD_ERRORS:
+        return fingerprint, False, None, text
+
+
+def _names(data: Any, key: str, ident: str) -> list[str]:
+    entries = data.get(key) if isinstance(data, dict) else None
+    return [e[ident] for e in entries if isinstance(e, dict) and isinstance(e.get(ident), str)] if isinstance(entries, list) else []
+
+
+def _nothing_to_reset(path: Path, removed: dict[str, list[str] | None]) -> EditResult:
+    return EditResult(path, "", False, "absent", notes=[f"Nothing to reset: {path} does not exist."], removed=removed)
+
+
+def reset_tools(
+    root: Path | None,
+    *,
+    record: Any = None,
+    expected_fingerprint: str | None = None,
+    dry_run: bool = False,
+) -> EditResult:
+    """Remove every tool in the scope: delete `devgraph.tools.yaml`, or empty the global store.
+
+    The `removed` listing is best effort and never blocks the reset (it is the way out of a broken file).
+    A dry run changes nothing and reports the fingerprint of the exact bytes it listed (what a confirm must match).
+    """
+    from devgraph.config.global_tools import ProjectToolsError, load_global_tools, save_global_tools
+    from devgraph.mcp.catalog import builtin_tool_names
+
+    path = tools_path(root)
+    with _guard(path, expected_fingerprint):
+        if not path.exists():
+            return _nothing_to_reset(path, {"tools": []})
+        fingerprint, readable, data, _ = _reset_snapshot(path)
+        names = _names(data, "tools", "name") if readable else None
+        notes: list[str] = []
+        if root is None:
+            if names:
+                notes.append(
+                    f"Removes {len(names)} global tool(s) from every repository's MCP sessions; "
+                    "repositories with a project tool of the same name keep theirs."
+                )
+        elif names:
+            try:
+                store = load_global_tools()
+            except ProjectToolsError:
+                store = None
+            builtin = builtin_tool_names()
+            serves_project = record is None or record.project_config_enabled
+            served = {t.name for t in store.tools if t.name not in builtin} if store is not None and serves_project else set()
+            where = record.repo_id if record is not None else path.parent.name
+            notes += [f"After the reset, global tool {n} is served in {where}." for n in names if n in served]
+        if dry_run:
+            return EditResult(path, "", False, fingerprint, notes=notes, removed={"tools": names})
+        try:
+            if root is None:
+                save_global_tools([])
+            else:
+                path.unlink()
+        except (OSError, ProjectToolsError) as exc:
+            raise ConfigEditError(str(exc), "io")
+        return EditResult(path, "", True, file_fingerprint(path), notes=notes, removed={"tools": names})
+
+
+def reset_schema(
+    root: Path, *, record: Any = None, expected_fingerprint: str | None = None, dry_run: bool = False
+) -> EditResult:
+    """Delete `devgraph.schema.yaml`, returning the repository to the built-in schema."""
+    from devgraph.config.project_schema import project_schema_path
+
+    path = project_schema_path(root)
+    with _guard(path, expected_fingerprint):
+        if not path.exists():
+            return _nothing_to_reset(path, {"node_types": [], "relationships": []})
+        fingerprint, readable, data, text = _reset_snapshot(path)
+        removed = {
+            "node_types": _names(data, "node_types", "label") if readable else None,
+            "relationships": _names(data, "relationships", "type") if readable else None,
+        }
+        before = schema_declaration(text, path)
+        if before is None and not (readable and data is None):
+            warnings = [
+                "The file is invalid, so what it declared can't be listed; the next rescan returns this repository "
+                "to the built-in schema and deletes the nodes of any project type applied earlier."
+            ]
+        else:
+            warnings = schema_change_warnings(before, None, record)
+        if not dry_run:
+            try:
+                path.unlink()
+            except OSError as exc:
+                raise ConfigEditError(str(exc), "io")
+        return EditResult(
+            path, "", not dry_run, file_fingerprint(path) if not dry_run else fingerprint,
+            before=before, warnings=warnings, removed=removed,
+        )
+
+
+def project_config_notes(repo_id: str) -> list[str]:
+    """When flipping a repository's project-config switch takes effect (both directions; shared by the CLI and the dashboard)."""
+    return [
+        f"schema: applied at the next rescan (`devgraph rescan {repo_id} --now` to apply now)",
+        "project tools: picked up by running MCP sessions within 2 s",
+    ]
+
+
+def project_config_change(record: Any, enabled: bool) -> tuple[list[str], list[str]]:
+    """(warnings, notes) of switching `record`'s project config on or off. Pure; nothing is written.
+
+    The project tools that stop being served are read from the tools file itself, not from what the
+    tool plane resolves now, so the answer does not depend on the switch's current position.
+    """
+    from devgraph.config.global_tools import ProjectToolsError, load_global_tools
+    from devgraph.config.project_schema import project_schema_path
+    from devgraph.config.project_tools import parse_project_tools, tools_file_path
+    from devgraph.mcp.catalog import builtin_tool_names
+
+    root = Path(record.path)
+    path = project_schema_path(root)
+    decl = schema_declaration(read_text_lossy(path), path) if path.is_file() else None
+    warnings = schema_change_warnings(None, decl, record) if enabled else schema_change_warnings(decl, None, record)
+    tools_file = tools_file_path(root)
+    if not enabled and tools_file.is_file():
+        try:
+            names = sorted({t.name for t in parse_project_tools(read_text(tools_file), tools_file).tools} - builtin_tool_names())
+        except (ConfigEditError, ProjectToolsError):
+            warnings.append(
+                f"{tools_file.name} is invalid; project tools may still be served from the last good file "
+                f"until the session restarts."
+            )
+            names = []
+        if names:
+            warnings.append(f"Project tools no longer served in {record.repo_id}: {', '.join(names)}")
+            try:
+                store = load_global_tools()
+            except ProjectToolsError:
+                store = None
+            takeover = [n for n in names if store is not None and any(t.name == n for t in store.tools)]
+            if takeover:
+                warnings.append(f"Global tools of the same name take over in {record.repo_id}: {', '.join(takeover)}")
+    return warnings, project_config_notes(record.repo_id)

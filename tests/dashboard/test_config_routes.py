@@ -14,7 +14,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from devgraph.config import global_tools, project_switch
+from devgraph.config import edits, global_tools, project_switch
 from devgraph.config.project_schema import SCHEMA_FILENAME, schema_file_hash
 from devgraph.config.project_tools import TOOLS_FILENAME
 from devgraph.dashboard import routes
@@ -1158,3 +1158,284 @@ def test_exists_messages_say_edit_it_instead_without_cli_commands(client, regist
         message = response.json()["detail"]["message"]
         assert "already exists" in message and message.endswith("— edit it instead")
         assert "devgraph config" not in message
+
+
+# --- whole-file reset ----------------------------------------------------------------------------
+
+BAD_HEADERS = [{"origin": "http://evil.test"}, {"sec-fetch-site": "cross-site"}]
+
+
+def test_reset_project_tools_dry_run_then_delete(client, registry, tmp_path, global_store):
+    record = _repo(tmp_path, registry)
+    path = _write(record.path, TOOLS_FILENAME, TOOL.format(name="hot_paths"))
+    _global_store(global_store, "hot_paths")
+    before = _snapshot(tmp_path)
+    fp = _fp(client, "repo-a")
+
+    dry = _send(client, "POST", "/api/config/repo-a/reset/tools", fp, {"dry_run": True})
+    assert dry.status_code == 200, dry.text
+    body = dry.json()
+    assert body["written"] is False and body["removed"] == {"tools": ["hot_paths"]} and body["fingerprint"] == fp
+    assert "After the reset, global tool hot_paths is served in repo-a." in body["notes"]
+    assert _snapshot(tmp_path) == before
+
+    done = _send(client, "POST", "/api/config/repo-a/reset/tools", body["fingerprint"], {})
+    assert done.status_code == 200, done.text
+    assert not path.exists() and done.json()["written"] is True and done.json()["fingerprint"] == "absent"
+    assert done.json()["scope"]["tools"]["state"] == "absent"
+    assert "global" in done.json()
+    assert f"Deleted {TOOLS_FILENAME}; not staged or committed." in done.json()["notes"]
+    assert not any("Written to" in n for n in done.json()["notes"])
+
+
+def test_reset_global_tools_empties_the_store(client, global_store):
+    _global_store(global_store, "hot_paths", "other")
+    fp = _fp(client, "__global__")
+    dry = _send(client, "POST", "/api/config/__global__/reset/tools", fp, {"dry_run": True})
+    assert dry.json()["removed"] == {"tools": ["hot_paths", "other"]} and len(json.loads(global_store.read_text())["tools"]) == 2
+    done = _send(client, "POST", "/api/config/__global__/reset/tools", fp, {})
+    assert done.status_code == 200 and json.loads(global_store.read_text())["tools"] == []
+    assert "Emptied the global tools store." in done.json()["notes"]
+    assert not any("Written to" in n or "Deleted" in n for n in done.json()["notes"])
+    assert done.json()["scope"]["tools"]["entries"] == [] and done.json()["global"]["tools"]["entries"] == []
+
+
+def test_reset_schema_dry_run_then_delete(client, registry, tmp_path):
+    record = _repo(tmp_path, registry)
+    path = _write(record.path, SCHEMA_FILENAME, SCHEMA)
+    fp = _fp(client, "repo-a", "schema")
+    dry = _send(client, "POST", "/api/config/repo-a/reset/schema", fp, {"dry_run": True})
+    assert dry.status_code == 200, dry.text
+    assert dry.json()["removed"] == {"node_types": ["Widget"], "relationships": ["HAS_PART"]}
+    assert any("Widget" in w for w in dry.json()["warnings"]) and path.exists()
+    done = _send(client, "POST", "/api/config/repo-a/reset/schema", fp, {})
+    assert done.status_code == 200 and not path.exists()
+    assert f"Deleted {SCHEMA_FILENAME}; not staged or committed." in done.json()["notes"]
+    assert done.json()["scope"]["schema"]["state"] == "absent" and "global" not in done.json()
+
+
+@pytest.mark.parametrize("headers", BAD_HEADERS)
+def test_reset_cross_site_is_403(client, registry, tmp_path, headers):
+    record = _repo(tmp_path, registry)
+    _write(record.path, TOOLS_FILENAME, TOOL.format(name="a_tool"))
+    _write(record.path, SCHEMA_FILENAME, SCHEMA)
+    before = _snapshot(tmp_path)
+    for url in ("/api/config/repo-a/reset/tools", "/api/config/__global__/reset/tools", "/api/config/repo-a/reset/schema"):
+        assert _send(client, "POST", url, "absent", {}, headers=headers).status_code == 403
+    assert _snapshot(tmp_path) == before
+
+
+@pytest.mark.parametrize("url", [
+    "/api/config/nope/reset/tools", "/api/config/nope/reset/schema", "/api/config/__global__/reset/schema",
+])
+def test_reset_unknown_scope_is_404(client, url):
+    assert _send(client, "POST", url, "absent", {}).status_code == 404
+
+
+def test_reset_inactive_repo_is_404(client, registry, tmp_path):
+    _repo(tmp_path, registry)
+    registry.remove_repo("repo-a")
+    assert _send(client, "POST", "/api/config/repo-a/reset/tools", "absent", {}).status_code == 404
+
+
+@pytest.mark.parametrize("kind,name", [("tools", TOOLS_FILENAME), ("schema", SCHEMA_FILENAME)])
+def test_reset_dry_run_fingerprint_is_of_the_listed_bytes(client, registry, tmp_path, monkeypatch, kind, name):
+    """A file changed after the dry run evaluated it, but before the response re-reads the scope:
+    the response carries the fingerprint of what it listed, so a confirm with it is a 412."""
+    record = _repo(tmp_path, registry)
+    v1 = TOOL.format(name="listed_tool") if kind == "tools" else SCHEMA
+    path = _write(record.path, name, v1)
+    fp = _fp(client, "repo-a", kind)
+    v1_fp = "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+    real = getattr(edits, "reset_" + kind)
+
+    def then_change(*args, **kwargs):
+        result = real(*args, **kwargs)
+        if kwargs.get("dry_run"):
+            path.write_text(TOOL.format(name="unseen_tool") if kind == "tools" else SCHEMA.replace("Widget", "Unseen"))
+        return result
+
+    monkeypatch.setattr(edits, "reset_" + kind, then_change)
+    dry = _send(client, "POST", f"/api/config/repo-a/reset/{kind}", fp, {"dry_run": True})
+    assert dry.status_code == 200, dry.text
+    assert dry.json()["fingerprint"] == v1_fp == fp
+    confirm = _send(client, "POST", f"/api/config/repo-a/reset/{kind}", dry.json()["fingerprint"], {})
+    assert confirm.status_code == 412 and path.exists() and "unseen" in path.read_text().lower()
+
+
+@pytest.mark.parametrize("url,name", [("/api/config/repo-a/reset/tools", TOOLS_FILENAME), ("/api/config/repo-a/reset/schema", SCHEMA_FILENAME)])
+def test_reset_requires_if_match_and_rejects_stale(client, registry, tmp_path, url, name):
+    record = _repo(tmp_path, registry)
+    path = _write(record.path, name, TOOL.format(name="a_tool") if name == TOOLS_FILENAME else SCHEMA)
+    assert _send(client, "POST", url, None, {}).status_code == 428
+    stale = _send(client, "POST", url, "sha256:stale", {})
+    assert stale.status_code == 412 and stale.json()["detail"]["code"] == "stale" and "scope" in stale.json()["detail"]
+    assert path.exists()
+
+
+def test_reset_bad_body_is_400_415(client, registry, tmp_path):
+    record = _repo(tmp_path, registry)
+    path = _write(record.path, TOOLS_FILENAME, TOOL.format(name="a_tool"))
+    url, fp = "/api/config/repo-a/reset/tools", _fp(client, "repo-a")
+    assert _send(client, "POST", url, fp, {"dry_run": "maybe"}).status_code == 400
+    assert _send(client, "POST", url, fp, "[]").status_code == 400
+    assert _send(client, "POST", url, fp, "{}", headers={"content-type": "text/plain"}).status_code == 415
+    assert path.exists()
+
+
+@pytest.mark.parametrize("url", ["/api/config/repo-a/tools", "/api/config/repo-a/schema", "/api/config/__global__/tools"])
+def test_bare_collection_delete_is_not_a_route(client, registry, tmp_path, url):
+    record = _repo(tmp_path, registry)
+    _write(record.path, TOOLS_FILENAME, TOOL.format(name="a_tool"))
+    _write(record.path, SCHEMA_FILENAME, SCHEMA)
+    before = _snapshot(tmp_path)
+    assert _send(client, "DELETE", url, _fp(client, "repo-a")).status_code in (404, 405)
+    assert _snapshot(tmp_path) == before
+
+
+@pytest.mark.parametrize("dots", ["..", "%2e%2e", "%2E%2E", ".%2e", "..%2f"])
+def test_entry_deletes_ending_in_dot_segments_never_reach_reset(client, registry, tmp_path, global_store, dots):
+    record = _repo(tmp_path, registry)
+    _write(record.path, TOOLS_FILENAME, TOOL.format(name="a_tool"))
+    _write(record.path, SCHEMA_FILENAME, SCHEMA)
+    _global_store(global_store, "hot_paths")
+    before = _snapshot(tmp_path)
+    for url in (
+        f"/api/config/repo-a/schema/node_types/{dots}", f"/api/config/repo-a/schema/relationships/{dots}",
+        f"/api/config/repo-a/tools/{dots}", f"/api/config/__global__/tools/{dots}",
+    ):
+        for method in ("DELETE", "POST", "PUT"):
+            response = _send(client, method, url, _fp(client, "repo-a"), {} if method != "DELETE" else None)
+            assert response.status_code in (400, 404, 405, 412, 415), (method, url, response.status_code)
+    assert _snapshot(tmp_path) == before
+
+
+@pytest.mark.parametrize("url,name", [("/api/config/repo-a/reset/tools", TOOLS_FILENAME), ("/api/config/repo-a/reset/schema", SCHEMA_FILENAME)])
+def test_reset_symlinked_file_is_409(client, registry, tmp_path, url, name):
+    record = _repo(tmp_path, registry)
+    real = tmp_path / "real.yaml"
+    real.write_text(textwrap.dedent(TOOL.format(name="a_tool") if name == TOOLS_FILENAME else SCHEMA))
+    (record.path / name).symlink_to(real)
+    from devgraph.config.edits import file_fingerprint
+
+    response = _send(client, "POST", url, file_fingerprint(record.path / name), {})
+    assert response.status_code == 409 and response.json()["detail"]["code"] == "not_regular"
+    assert (record.path / name).is_symlink() and real.exists()
+
+
+def test_reset_absent_file_is_a_no_op(client, registry, tmp_path):
+    _repo(tmp_path, registry)
+    response = _send(client, "POST", "/api/config/repo-a/reset/tools", "absent", {})
+    assert response.status_code == 200 and response.json()["written"] is False
+    assert any(n.startswith("Nothing to reset") for n in response.json()["notes"])
+
+
+def test_reset_touches_no_git_state(client, registry, tmp_path):
+    import subprocess
+
+    record = _repo(tmp_path, registry)
+    subprocess.run(["git", "init", "-q"], cwd=record.path, check=True)
+    _write(record.path, TOOLS_FILENAME, TOOL.format(name="a_tool"))
+    subprocess.run(["git", "add", TOOLS_FILENAME], cwd=record.path, check=True)
+    staged = subprocess.run(["git", "diff", "--cached", "--name-only"], cwd=record.path, capture_output=True, text=True).stdout
+    _send(client, "POST", "/api/config/repo-a/reset/tools", _fp(client, "repo-a"), {}).raise_for_status()
+    assert subprocess.run(["git", "diff", "--cached", "--name-only"], cwd=record.path, capture_output=True, text=True).stdout == staged
+
+
+# --- project-config toggle ---------------------------------------------------------------------
+
+
+@pytest.fixture
+def switch_db(registry, tmp_path, monkeypatch):
+    monkeypatch.setattr(project_switch, "_registry_db_path", lambda: tmp_path / "registry.sqlite3")
+
+
+def _toggle(client, scope, body, **kw):
+    return client.put(f"/api/config/{scope}/project-config", json=body, **kw)
+
+
+def test_toggle_disables_and_enables_and_refreshes_badges(client, registry, tmp_path, global_store, switch_db):
+    record = _repo(tmp_path, registry)
+    _global_store(global_store, "hot_paths")
+    _write(record.path, TOOLS_FILENAME, TOOL.format(name="hot_paths"))
+    _write(record.path, SCHEMA_FILENAME, SCHEMA)
+
+    response = _toggle(client, "repo-a", {"enabled": False})
+
+    body = response.json()
+    assert response.status_code == 200 and body["ok"] and body["written"] and body["changed"]
+    assert body["enabled"] is False and registry.get("repo-a").project_config_enabled is False
+    assert any("Widget" in w for w in body["warnings"])
+    assert body["notes"] == edits.project_config_notes("repo-a")
+    assert body["scope"]["project_config_enabled"] is False
+    assert _kinds(body["scope"]["tools"]["entries"][0]["badges"]) == ["not-served"]
+    assert body["scope"]["schema"]["state"] == "disabled"
+    assert all(e["badges"] == [] for e in body["global"]["tools"]["entries"])  # no longer "Overridden in"
+
+    response = _toggle(client, "repo-a", {"enabled": True})
+    assert response.json()["changed"] and registry.get("repo-a").project_config_enabled is True
+    assert response.json()["warnings"] == []
+    assert _kinds(response.json()["scope"]["tools"]["entries"][0]["badges"]) == ["overrides-global"]
+
+
+def test_toggle_is_idempotent_and_needs_no_if_match(client, registry, tmp_path, switch_db):
+    _repo(tmp_path, registry)
+
+    response = _toggle(client, "repo-a", {"enabled": True})
+
+    body = response.json()
+    assert response.status_code == 200 and body["changed"] is False and body["written"] is False
+    assert body["notes"] == ["Project config for repo-a is already enabled."]
+    assert _toggle(client, "repo-a", {"enabled": False}).json()["changed"] is True
+    again = _toggle(client, "repo-a", {"enabled": False}).json()
+    assert again["changed"] is False and again["notes"] == ["Project config for repo-a is already disabled."]
+
+
+def test_toggle_dry_run_reports_warnings_and_changes_nothing(client, registry, tmp_path, switch_db):
+    record = _repo(tmp_path, registry)
+    _write(record.path, SCHEMA_FILENAME, SCHEMA)
+    before = _snapshot(tmp_path)
+
+    body = _toggle(client, "repo-a", {"enabled": False, "dry_run": True}).json()
+
+    assert body["written"] is False and body["changed"] is True and body["enabled"] is False
+    assert any("Widget" in w for w in body["warnings"])
+    assert registry.get("repo-a").project_config_enabled is True
+    assert body["scope"]["project_config_enabled"] is True
+    assert _snapshot(tmp_path) == before
+
+
+def test_toggle_cross_site_is_403(client, registry, tmp_path, switch_db):
+    _repo(tmp_path, registry)
+    for headers in ({"Origin": "http://evil.test"}, {"Sec-Fetch-Site": "cross-site"}):
+        response = _toggle(client, "repo-a", {"enabled": False}, headers=headers)
+        assert response.status_code == 403 and response.json()["detail"]["code"] == "forbidden"
+    assert registry.get("repo-a").project_config_enabled is True
+
+
+def test_toggle_unknown_inactive_and_global_scopes_are_404(client, registry, tmp_path, switch_db):
+    _repo(tmp_path, registry, "repo-b")
+    registry._set_flag("repo-b", "active", False)
+    for scope in ("nope", "repo-b", "__global__", "__all__"):
+        response = _toggle(client, scope, {"enabled": False})
+        assert response.status_code == 404 and response.json()["detail"]["code"] == "not_found", scope
+
+
+@pytest.mark.parametrize("body", [{}, {"enabled": "yes"}, {"enabled": 1}, {"enabled": None}, {"enabled": True, "dry_run": "no"}, [True]])
+def test_toggle_bad_bodies_are_400(client, registry, tmp_path, body, switch_db):
+    _repo(tmp_path, registry)
+    response = _toggle(client, "repo-a", body)
+    assert response.status_code == 400 and response.json()["detail"]["code"] == "bad_request"
+    assert registry.get("repo-a").project_config_enabled is True
+
+
+def test_toggle_non_json_is_415_and_oversized_is_413(client, registry, tmp_path, switch_db):
+    _repo(tmp_path, registry)
+    response = client.put("/api/config/repo-a/project-config", content='{"enabled": false}', headers={"content-type": "text/plain"})
+    assert response.status_code == 415
+    response = client.put(
+        "/api/config/repo-a/project-config", content=b'{"enabled": false, "x": "' + b"a" * 70000 + b'"}',
+        headers={"content-type": "application/json"},
+    )
+    assert response.status_code == 413
+    assert registry.get("repo-a").project_config_enabled is True

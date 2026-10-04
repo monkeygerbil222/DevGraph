@@ -371,3 +371,162 @@ def test_exists_says_edit_it_instead(tmp_path):
     with pytest.raises(ConfigEditError) as exc:
         edits.add_tool(tmp_path, TOOL)
     assert exc.value.message.endswith("already exists in this scope — edit it instead")
+
+
+# --- whole-file reset ----------------------------------------------------------------------------
+
+
+def test_reset_tools_project_dry_run_then_write(tmp_path):
+    path = tmp_path / "devgraph.tools.yaml"
+    path.write_text(TOOLS_FILE)
+    fp = edits.file_fingerprint(path)
+    dry = edits.reset_tools(tmp_path, expected_fingerprint=fp, dry_run=True)
+    assert not dry.written and dry.removed == {"tools": ["count_things"]} and dry.fingerprint == fp
+    assert path.read_text() == TOOLS_FILE
+    done = edits.reset_tools(tmp_path, expected_fingerprint=fp)
+    assert done.written and done.fingerprint == "absent" and not path.exists()
+
+
+def test_reset_tools_project_notes_global_takeover(tmp_path, store):
+    (tmp_path / "devgraph.tools.yaml").write_text(TOOLS_FILE)
+    edits.add_tool(None, TOOL)
+    result = edits.reset_tools(tmp_path, record=record(), dry_run=True)
+    assert result.notes == ["After the reset, global tool count_things is served in repo-a."]
+
+
+def test_reset_tools_takeover_note_only_when_the_global_tool_is_served(tmp_path, store, monkeypatch):
+    (tmp_path / "devgraph.tools.yaml").write_text(TOOLS_FILE)
+    edits.add_tool(None, TOOL)
+    off = edits.reset_tools(tmp_path, record=record(project_config_enabled=False), dry_run=True)
+    assert off.notes == []
+    from devgraph.mcp import catalog
+
+    monkeypatch.setattr(catalog, "builtin_tool_names", lambda: frozenset({"count_things"}))
+    assert edits.reset_tools(tmp_path, record=record(), dry_run=True).notes == []
+
+
+def test_reset_tools_global_empties_the_store(store):
+    edits.add_tool(None, TOOL)
+    dry = edits.reset_tools(None, dry_run=True)
+    assert not dry.written and dry.removed == {"tools": ["count_things"]}
+    assert "Removes 1 global tool(s)" in dry.notes[0]
+    assert json.loads(store.read_text())["tools"] == [TOOL]
+    done = edits.reset_tools(None, expected_fingerprint=dry.fingerprint)
+    assert done.written and json.loads(store.read_text())["tools"] == []
+    assert done.fingerprint == edits.file_fingerprint(store)
+
+
+def test_reset_tools_stale_and_symlink_and_absent(tmp_path):
+    path = tmp_path / "devgraph.tools.yaml"
+    assert edits.reset_tools(tmp_path).written is False
+    assert edits.reset_tools(tmp_path).notes == [f"Nothing to reset: {path} does not exist."]
+    path.write_text(TOOLS_FILE)
+    with pytest.raises(ConfigEditError) as exc:
+        edits.reset_tools(tmp_path, expected_fingerprint="sha256:nope")
+    assert code(exc) == "stale" and path.exists()
+    path.unlink()
+    target = tmp_path / "real.yaml"
+    target.write_text(TOOLS_FILE)
+    path.symlink_to(target)
+    with pytest.raises(ConfigEditError) as exc:
+        edits.reset_tools(tmp_path)
+    assert code(exc) == "not_regular" and path.is_symlink() and target.exists()
+
+
+def test_reset_tools_unreadable_file_still_resets(tmp_path):
+    path = tmp_path / "devgraph.tools.yaml"
+    path.write_text("tools: [unclosed\n")
+    dry = edits.reset_tools(tmp_path, dry_run=True)
+    assert dry.removed == {"tools": None}
+    assert edits.reset_tools(tmp_path).written and not path.exists()
+
+
+def test_reset_schema_dry_run_write_and_warnings_match_the_cli(tmp_path):
+    path = tmp_path / "devgraph.schema.yaml"
+    path.write_text(SCHEMA_FILE)
+    dry = edits.reset_schema(tmp_path, record=record(), dry_run=True)
+    assert not dry.written and dry.removed == {"node_types": ["Ticket"], "relationships": []}
+    assert dry.warnings == edits.schema_change_warnings(edits.schema_declaration(SCHEMA_FILE, path), None, record())
+    assert dry.warnings == ["the next rescan deletes the nodes of the removed node type(s): Ticket."]
+    assert path.read_text() == SCHEMA_FILE
+    done = edits.reset_schema(tmp_path, record=record(), expected_fingerprint=dry.fingerprint)
+    assert done.written and done.fingerprint == "absent" and not path.exists()
+
+
+def test_reset_schema_invalid_file_gets_the_generic_warning(tmp_path):
+    path = tmp_path / "devgraph.schema.yaml"
+    path.write_text("version: 1\nnode_types:\n  - label: Bad\n")
+    result = edits.reset_schema(tmp_path, dry_run=True)
+    assert [w[:31] for w in result.warnings] == ["The file is invalid, so what it"]
+    path.write_text("node_types: [unclosed\n")
+    assert edits.reset_schema(tmp_path, dry_run=True).removed == {"node_types": None, "relationships": None}
+    assert edits.reset_schema(tmp_path).written and not path.exists()
+
+
+def test_reset_schema_stale_symlink_absent(tmp_path):
+    path = tmp_path / "devgraph.schema.yaml"
+    assert edits.reset_schema(tmp_path).notes == [f"Nothing to reset: {path} does not exist."]
+    path.write_text(SCHEMA_FILE)
+    with pytest.raises(ConfigEditError) as exc:
+        edits.reset_schema(tmp_path, expected_fingerprint="sha256:nope")
+    assert code(exc) == "stale" and path.exists()
+    path.unlink()
+    target = tmp_path / "real.yaml"
+    target.write_text(SCHEMA_FILE)
+    path.symlink_to(target)
+    with pytest.raises(ConfigEditError) as exc:
+        edits.reset_schema(tmp_path)
+    assert code(exc) == "not_regular" and path.is_symlink()
+
+
+# --- project config switch -------------------------------------------------------------------------
+
+
+@pytest.fixture
+def no_registry(monkeypatch, tmp_path):
+    from devgraph.config import project_switch
+
+    monkeypatch.setattr(project_switch, "_registry_db_path", lambda: tmp_path / "absent.sqlite3")
+
+
+def test_project_config_notes_match_the_cli_wording():
+    assert edits.project_config_notes("demo") == [
+        "schema: applied at the next rescan (`devgraph rescan demo --now` to apply now)",
+        "project tools: picked up by running MCP sessions within 2 s",
+    ]
+
+
+def test_disabling_warns_about_project_node_types_and_unserved_tools(tmp_path, no_registry, store):
+    (tmp_path / "devgraph.schema.yaml").write_text(SCHEMA_FILE)
+    (tmp_path / "devgraph.tools.yaml").write_text(TOOLS_FILE)
+
+    warnings, notes = edits.project_config_change(record(path=tmp_path), False)
+
+    assert any("Ticket" in w and "next rescan" in w for w in warnings)
+    assert "Project tools no longer served in repo-a: count_things" in warnings
+    assert notes == edits.project_config_notes("repo-a")
+
+
+def test_disabling_reads_the_tools_file_whatever_the_switch_says_and_names_global_takeovers(tmp_path, no_registry, store):
+    (tmp_path / "devgraph.tools.yaml").write_text(TOOLS_FILE)
+    edits.add_tool(None, TOOL)
+
+    warnings, _ = edits.project_config_change(record(path=tmp_path, project_config_enabled=False), False)
+
+    assert "Project tools no longer served in repo-a: count_things" in warnings
+    assert "Global tools of the same name take over in repo-a: count_things" in warnings
+
+
+def test_disabling_with_an_invalid_tools_file_says_the_last_good_file_may_still_be_served(tmp_path, no_registry, store):
+    (tmp_path / "devgraph.tools.yaml").write_text("tools: [unclosed")
+
+    warnings, _ = edits.project_config_change(record(path=tmp_path), False)
+
+    assert any("invalid" in w and "may still be served from the last good file until the session restarts" in w for w in warnings)
+    assert not any("no longer served" in w for w in warnings)
+
+
+def test_enabling_and_bare_repos_have_no_warnings(tmp_path, no_registry, store):
+    assert edits.project_config_change(record(path=tmp_path), False)[0] == []
+    (tmp_path / "devgraph.schema.yaml").write_text(SCHEMA_FILE)
+    assert edits.project_config_change(record(path=tmp_path, project_config_enabled=False), True)[0] == []

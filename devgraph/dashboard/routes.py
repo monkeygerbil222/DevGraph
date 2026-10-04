@@ -26,6 +26,8 @@ import hashlib
 import inspect
 import json
 import logging
+import math
+import sqlite3
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -36,6 +38,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
 from devgraph.analytics.insights import read_insights, refresh_insights, top_nodes
+from devgraph.config import edits
 from devgraph.config.project_schema import (
     ABSENT_SCHEMA_HASH,
     LABEL_PATTERN,
@@ -45,7 +48,6 @@ from devgraph.config.project_schema import (
     load_project_schema,
     schema_file_hash,
 )
-from devgraph.config import edits
 from devgraph.config.settings import get_settings
 from devgraph.dashboard import queries
 from devgraph.dashboard.db_metrics import MetricsHistory
@@ -165,13 +167,13 @@ def _dry_run_flag(value: str | None) -> bool:
     raise _config_error(400, "bad_request", "dry_run must be 1, true, 0 or false")
 
 
-async def _config_body(request: Request) -> tuple[dict, bool]:
-    """The entry mapping and `dry_run` flag of a Config write body.
+async def _json_payload(request: Request) -> dict:
+    """A Config write's JSON object body.
 
     Strict `application/json` (what a cross-site page can't send without a
     preflight), at most `_CONFIG_PAYLOAD_LIMIT_BYTES` (checked on
-    Content-Length, then while reading), and the entry parsed with
-    `yaml.safe_load` only.
+    Content-Length, then while reading), and the parsed body must be a JSON
+    object.
     """
     media_type = (request.headers.get("content-type") or "").split(";")[0].strip().lower()
     if media_type != "application/json":
@@ -191,12 +193,23 @@ async def _config_body(request: Request) -> tuple[dict, bool]:
         raise _config_error(400, "bad_request", "payload must be valid JSON") from exc
     if not isinstance(payload, dict):
         raise _config_error(400, "bad_request", "payload must be a JSON object")
-    text = payload.get("yaml")
-    if not isinstance(text, str):
-        raise _config_error(400, "bad_request", "yaml must be a string")
+    return payload
+
+
+def _body_dry_run(payload: dict) -> bool:
     dry_run = payload.get("dry_run", False)
     if not isinstance(dry_run, bool):
         raise _config_error(400, "bad_request", "dry_run must be true or false")
+    return dry_run
+
+
+async def _config_body(request: Request) -> tuple[dict, bool]:
+    """The entry mapping and `dry_run` flag of a Config entry write body (entry parsed with `yaml.safe_load` only)."""
+    payload = await _json_payload(request)
+    text = payload.get("yaml")
+    if not isinstance(text, str):
+        raise _config_error(400, "bad_request", "yaml must be a string")
+    dry_run = _body_dry_run(payload)
     try:
         entry = yaml.safe_load(text)
     except yaml.YAMLError as exc:
@@ -761,22 +774,33 @@ def build_router(
         block = _config_scope(scope)
         part = block["tools"] if kind == "tools" else block["schema"]
         if result.written:
-            notes.append(f"Written to {path.name}; not committed.")
+            if result.removed is None:
+                notes.append(f"Written to {path.name}; not committed.")
+            elif root is None:
+                notes.append("Emptied the global tools store.")
+            else:
+                notes.append(f"Deleted {path.name}; not staged or committed.")
             # The fingerprint edits.py took under the lock, of exactly what was written: if the file
             # changed again since, the client's next write is a 412 rather than a blind overwrite.
             part["fingerprint"] = result.fingerprint
-        return JSONResponse(
-            status_code=201 if created and result.written else 200,
-            content={
-                "ok": True,
-                "written": result.written,
-                "file": path.name,
-                "fingerprint": part["fingerprint"],
-                "warnings": [scrub(w, path, root) for w in result.warnings],
-                "notes": [scrub(n, path, root) for n in notes],
-                "scope": block,
-            },
-        )
+        # A reset's dry run reports the fingerprint of the bytes it listed, taken in the same read under
+        # the lock, not the scope re-read below: the confirm sends it back, so a file that changed after
+        # it was listed is a 412 rather than a reset of content nobody saw.
+        fingerprint = result.fingerprint if result.removed is not None else part["fingerprint"]
+        content: dict[str, Any] = {
+            "ok": True,
+            "written": result.written,
+            "file": path.name,
+            "fingerprint": fingerprint,
+            "warnings": [scrub(w, path, root) for w in result.warnings],
+            "notes": [scrub(n, path, root) for n in notes],
+            "scope": block,
+        }
+        if result.removed is not None:
+            content["removed"] = result.removed
+        if kind == "tools":  # a tools write can change other scopes' badges ("Overridden in")
+            content["global"] = block if scope == GLOBAL_SCOPE else _config_scope(GLOBAL_SCOPE)
+        return JSONResponse(status_code=201 if created and result.written else 200, content=content)
 
     @router.post("/config/{scope}/tools")
     async def add_config_tool(scope: str, request: Request) -> JSONResponse:
@@ -810,6 +834,66 @@ def build_router(
             _apply_edit, scope, record, "tools",
             lambda root: edits.delete_tool(root, name, expected_fingerprint=expected, dry_run=dry), False,
         )
+
+    @router.post("/config/{scope}/reset/tools")
+    async def reset_config_tools(scope: str, request: Request) -> JSONResponse:
+        _reject_cross_site_config(request)
+        record = _write_record(scope)
+        dry = _body_dry_run(await _json_payload(request))
+        expected = _if_match(request)
+        return await run_in_threadpool(
+            _apply_edit, scope, record, "tools",
+            lambda root: edits.reset_tools(root, record=record, expected_fingerprint=expected, dry_run=dry), False,
+        )
+
+    @router.post("/config/{scope}/reset/schema")
+    async def reset_config_schema(scope: str, request: Request) -> JSONResponse:
+        _reject_cross_site_config(request)
+        record = _write_record(scope, schema=True)
+        dry = _body_dry_run(await _json_payload(request))
+        expected = _if_match(request)
+        return await run_in_threadpool(
+            _apply_edit, scope, record, "schema",
+            lambda root: edits.reset_schema(root, record=record, expected_fingerprint=expected, dry_run=dry), False,
+        )
+
+    @router.put("/config/{scope}/project-config")
+    async def set_config_project_config(scope: str, request: Request) -> JSONResponse:
+        """Switch a repository's project config on or off. Names the end state, so it is idempotent: no If-Match."""
+        _reject_cross_site_config(request)
+        record = _write_record(scope, schema=True)
+        payload = await _json_payload(request)
+        enabled = payload.get("enabled")
+        if not isinstance(enabled, bool):
+            raise _config_error(400, "bad_request", "enabled must be true or false")
+        dry = _body_dry_run(payload)
+        word = "enabled" if enabled else "disabled"
+
+        def apply() -> JSONResponse:
+            changed = record.project_config_enabled != enabled
+            warnings, notes = edits.project_config_change(record, enabled) if changed else ([], [])
+            if not changed:
+                notes = [f"Project config for {scope} is already {word}."]
+            elif not dry:
+                try:
+                    registry.set_project_config_enabled(scope, enabled)
+                except ValueError as exc:  # removed since the scope check
+                    raise _config_error(404, "not_found", f"unknown scope: {scope}") from exc
+                except sqlite3.Error as exc:
+                    logger.warning("project config switch for %s failed: %s", scope, exc)
+                    raise _config_error(500, "io", "could not update the registry") from exc
+            return JSONResponse(content={
+                "ok": True,
+                "written": changed and not dry,
+                "changed": changed,
+                "enabled": enabled,
+                "warnings": warnings,
+                "notes": notes,
+                "scope": _config_scope(scope),
+                "global": _config_scope(GLOBAL_SCOPE),
+            })
+
+        return await run_in_threadpool(apply)
 
     @router.post("/config/{scope}/schema/{section}")
     async def add_config_schema_entry(scope: str, section: str, request: Request) -> JSONResponse:
