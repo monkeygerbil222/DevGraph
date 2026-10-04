@@ -509,7 +509,7 @@ def removed_types(before, after) -> tuple[list[str], list[str]]:
 
 
 def pruned_types(before, after) -> list[str]:
-    """Labels kept in `after` whose filesystem-sourced nodes the next apply deletes: source dropped or kind changed."""
+    """Labels kept in `after` whose sourced nodes the next apply deletes: source dropped, provider or kind changed."""
     if before is None or after is None:
         return []
     now = {n.label: n for n in after.node_types}
@@ -520,6 +520,8 @@ def pruned_types(before, after) -> list[str]:
             continue
         if new.source is None:
             pruned.append(f"{old.label} (source removed)")
+        elif new.source.provider != old.source.provider:
+            pruned.append(f"{old.label} (provider {old.source.provider} -> {new.source.provider})")
         elif new.source.kind != old.source.kind:
             pruned.append(f"{old.label} (kind {old.source.kind} -> {new.source.kind})")
     return sorted(pruned)
@@ -559,8 +561,15 @@ def schema_change_warnings(before, after, record: Any = None) -> list[str]:
 
 
 def schema_entry_notes(entry: dict | None) -> list[str]:
-    """Notes about a just-written entry: a node type with no source is never populated."""
-    if entry is not None and "label" in entry and entry.get("source") is None:
+    """Notes about a just-written entry: a node type with no source is never populated, and a
+    custom-sourced one only once its provider's script is approved and run (a later slice)."""
+    source = entry.get("source") if entry is not None else None
+    if isinstance(source, dict) and source.get("provider") == "custom":
+        return [
+            f"Note: {entry['label']} nodes come from the custom provider {source.get('name')!r}; they are "
+            f"populated only once its script is approved and run, which this version does not do yet."
+        ]
+    if entry is not None and "label" in entry and source is None:
         return [
             f"Note: no provider produces {entry['label']} nodes yet; only node types with "
             f"`source: {{provider: filesystem}}` are populated."

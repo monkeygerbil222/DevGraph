@@ -571,3 +571,16 @@ def test_reset_refuses_a_symlinked_file(runner, repo, tmp_path):
     result = run(runner, "reset", "--yes", "--repo", str(repo))
     assert result.exit_code == 1 and "symlink" in flat(result.output)
     assert schema_file(repo).is_symlink() and real.read_text() == SCHEMA
+
+
+def test_list_shows_custom_source_name(runner, settings, repo):
+    register(settings, repo)
+    schema_file(repo).write_text(
+        "version: 1\ncustom_providers: [{name: runbook_links, inputs: ['docs/*.md']}]\n"
+        "node_types:\n  - label: Runbook\n    key: [slug]\n    metadata: [{name: slug}]\n"
+        "    source: {provider: custom, name: runbook_links}\n"
+    )
+    data = json.loads(run(runner, "list", "--repo", str(repo), "--json").output)
+    runbook = next(n for n in data["node_types"] if n["label"] == "Runbook")
+    assert runbook["source"] == {"provider": "custom", "name": "runbook_links"}
+    assert "custom (runbook_links)" in flat(run(runner, "list", "--repo", str(repo)).output)

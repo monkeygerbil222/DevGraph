@@ -429,3 +429,58 @@ def test_newlines_and_tabs_stay_allowed(tmp_path):
         '    cypher: "MATCH (n {repo_id: $repo_id})\\n\\tRETURN n"\n'
     )
     assert load_project_tools(tmp_path).tools[0].description == "two\n\tlines"
+
+
+# --- YAML alias bound (sandbox spec §4.2) ------------------------------------
+
+
+def _expanded(entries: int, extra_scalars: int) -> str:
+    """A sequence of `entries` copies of one 100-node list (one anchored, the rest
+    aliases) plus `extra_scalars` scalars: 1 + 100 * entries + extra_scalars nodes expanded."""
+    base = "- &b [" + ", ".join(["0"] * 99) + "]\n"
+    return base + "- *b\n" * (entries - 1) + "- 0\n" * extra_scalars
+
+
+BILLION_LAUGHS = "a: &a [x, x, x, x, x, x, x, x, x, x]\n" + "".join(
+    f"{chr(ord('a') + i)}: &{chr(ord('a') + i)} [" + ", ".join([f"*{chr(ord('a') + i - 1)}"] * 10) + "]\n"
+    for i in range(1, 9)
+)
+
+
+def test_yaml_alias_bound():
+    import time
+
+    import yaml
+
+    from devgraph.config.project_tools import YAML_LOAD_ERRORS, bounded_safe_load
+
+    started = time.monotonic()
+    with pytest.raises(yaml.YAMLError, match="10000"):
+        bounded_safe_load(BILLION_LAUGHS, max_nodes=10_000)
+    assert time.monotonic() - started < 2
+
+    under = bounded_safe_load(_expanded(99, 99), max_nodes=10_000)  # exactly 10,000 nodes
+    assert len(under) == 99 + 99 and under[1] == [0] * 99
+    with pytest.raises(yaml.YAMLError):
+        bounded_safe_load(_expanded(99, 100), max_nodes=10_000)  # 10,001 nodes
+    assert issubclass(yaml.YAMLError, YAML_LOAD_ERRORS)
+
+    anchored = "defaults: &d {type: string, required: true}\nfields:\n  - {<<: *d, name: slug}\n  - {<<: *d, name: owner}\n"
+    assert bounded_safe_load(anchored, max_nodes=10_000)["fields"][1] == {"type": "string", "required": True, "name": "owner"}
+
+
+def test_bounded_safe_load_matches_safe_load():
+    import yaml
+
+    from devgraph.config.project_tools import bounded_safe_load
+
+    for text in ("", "# only a comment\n", "a: 1\nb: [x, {c: 2001-01-01}]\n", "- 1\n- 2\n"):
+        assert bounded_safe_load(text, max_nodes=10_000) == yaml.safe_load(text)
+
+
+@pytest.mark.parametrize("text", ["a: &a [*a]\n", "a: &a {k: *a}\n", "--- 1\n--- 2\n", "!!python/object:os.system x\n"])
+def test_bounded_safe_load_refuses_recursion_streams_and_unsafe_tags(text):
+    from devgraph.config.project_tools import YAML_LOAD_ERRORS, bounded_safe_load
+
+    with pytest.raises(YAML_LOAD_ERRORS):
+        bounded_safe_load(text, max_nodes=10_000)

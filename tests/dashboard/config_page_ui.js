@@ -1495,6 +1495,8 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
     ["a source with an extra key", "node_types", { ...NODE_OK(), source: { provider: "filesystem", kind: "file", glob: "*" } }, FIELD("source.glob")],
     ["a source with another provider", "node_types", { ...NODE_OK(), source: { provider: "git", kind: "file" } }, FIELD("source.provider")],
     ["a source with no kind", "node_types", { ...NODE_OK(), source: { provider: "filesystem" } }, FIELD("source.kind")],
+    ["a custom source", "node_types", { ...NODE_OK(), source: { provider: "custom", name: "runbook_links" } }, FIELD("source.provider")],
+    ["a filesystem source with a name", "node_types", { ...NODE_OK(), source: { provider: "filesystem", kind: "file", name: "x" } }, FIELD("source.name")],
     ["an unknown metadata key", "node_types", { ...NODE_OK(), metadata: [{ name: "slug", unique: true }] }, FIELD("metadata.0.unique")],
     ["a metadata type outside the enum", "node_types", { ...NODE_OK(), metadata: [{ name: "slug", type: "date" }] }, FIELD("metadata.0.type")],
     ["a metadata field declared twice", "node_types", { label: "X", key: ["a"], metadata: [{ name: "a" }, { name: "a" }] },

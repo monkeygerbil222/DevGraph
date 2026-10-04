@@ -219,6 +219,9 @@ def test_disabled_project_config_marks_tools_not_served(client, registry, tmp_pa
 
 SCHEMA = """
     version: 1
+    custom_providers:
+      - {name: widget_parts, inputs: ["*.md"]}
+      - {name: gadget_feeds, inputs: ["*.md"]}
     node_types:
       - label: Widget
         key: [slug]
@@ -1234,6 +1237,25 @@ def test_reset_cross_site_is_403(client, registry, tmp_path, headers):
 ])
 def test_reset_unknown_scope_is_404(client, url):
     assert _send(client, "POST", url, "absent", {}).status_code == 404
+
+
+CUSTOM_NODE = "label: Runbook\nkey: [slug]\nmetadata: [{name: slug}]\nsource: {provider: custom, name: runbook_links}\n"
+CUSTOM_REL = "type: DOCUMENTS\nprovider: custom\ncustom: {name: runbook_links}\nfrom: Runbook\nto: Service\n"
+
+
+@pytest.mark.parametrize("method,url,body", [
+    ("POST", "/api/config/__global__/schema/node_types", CUSTOM_NODE),
+    ("POST", "/api/config/__global__/schema/relationships", CUSTOM_REL),
+    ("PUT", "/api/config/__global__/schema/node_types/Runbook", CUSTOM_NODE),
+    ("PUT", "/api/config/__global__/schema/relationships/DOCUMENTS", CUSTOM_REL),
+])
+def test_global_scope_has_no_schema_to_hold_custom_providers(client, tmp_path, method, url, body):
+    """Custom providers are repository-only (spec §3.1): there is no global schema store,
+    so every global schema write is a 404 and nothing is written."""
+    before = _snapshot(tmp_path)
+    response = _send(client, method, url, "absent", {"yaml": body})
+    assert response.status_code == 404
+    assert _snapshot(tmp_path) == before
 
 
 def test_reset_inactive_repo_is_404(client, registry, tmp_path):

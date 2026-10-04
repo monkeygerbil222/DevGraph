@@ -99,7 +99,9 @@ def write_schema(root, text):
 
 def worktree_with_gadgets(links=True):
     text = WORKTREE.replace("    relationships:", WIDGETS.rstrip("\n") + "\n    relationships:")
-    return text + (LINKS if links else "")
+    if not links:
+        return text
+    return text.replace("    version: 1\n", "    version: 1\n    custom_providers: [{name: linker, inputs: ['*.md']}]\n", 1) + LINKS
 
 
 def fs_nodes(engine):

@@ -19,6 +19,7 @@ DOC = """\
 # Header comment
 version: 1
 extends: default
+custom_providers: [{name: c, inputs: ["*.md"]}]
 
 node_types:
   # the widget

@@ -164,6 +164,7 @@ def test_eject_needs_an_existing_directory(runner, settings, tmp_path, make):
 
 WIDGET = """
     version: 1
+    custom_providers: [{name: linker, inputs: ["*.md"]}]
     node_types:
       - label: Widget
         key: [slug]

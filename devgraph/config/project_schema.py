@@ -7,7 +7,7 @@ validator, and nothing more: resolving a project schema itself changes no
 indexing behaviour, opens no file the declaration names, and runs no code.
 Only the filesystem provider (devgraph/indexer/providers/filesystem.py) turns
 filesystem-sourced declarations into indexing; a custom provider declaration
-is validated as inert data only.
+(`custom_providers`, sandbox spec §3.1) is validated as inert data only.
 
 Built-in labels, relationship types and constraint statements are always
 imported from `devgraph.graph.schema`, never restated here, so a repository
@@ -29,7 +29,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
-import yaml
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -40,14 +39,16 @@ from pydantic import (
 )
 
 from devgraph.config.project_switch import project_config_enabled
-from devgraph.config.project_tools import YAML_LOAD_ERRORS
+from devgraph.config.project_tools import YAML_LOAD_ERRORS, bounded_safe_load
 from devgraph.graph.schema import (
+    _REPO_SCOPED_LABELS,
     NODE_LABELS,
     RELATIONSHIP_TYPES,
     RESERVED_NODE_PROPERTIES,
 )
 from devgraph.graph.schema import constraint_statements as builtin_constraint_statements
 from devgraph.paths import is_within
+from devgraph.sandbox.limits import YAML_ALIAS_MAX_NODES
 
 SCHEMA_FILENAME = "devgraph.schema.yaml"
 SCHEMA_VERSION = 1
@@ -64,8 +65,9 @@ EXTENDS_MODES: tuple[str, ...] = ("default", "none")
 PROVIDER_KINDS: tuple[str, ...] = ("builtin", "custom", "filesystem")
 
 #: Where a user-declared node type's nodes come from. Built-in labels are
-#: produced by DevGraph's own extractors and never declare a source.
-NODE_SOURCE_PROVIDERS: tuple[str, ...] = ("filesystem",)
+#: produced by DevGraph's own extractors and never declare a source. A
+#: "custom" source names a `custom_providers` entry.
+NODE_SOURCE_PROVIDERS: tuple[str, ...] = ("filesystem", "custom")
 
 #: What a filesystem-sourced node type represents.
 FILESYSTEM_KINDS: tuple[str, ...] = ("file", "folder")
@@ -163,12 +165,38 @@ def _check_color(value: object) -> object:
 
 
 class NodeSource(BaseModel):
-    """Where a user-declared node type's nodes are extracted from."""
+    """Where a user-declared node type's nodes are extracted from.
+
+    A filesystem source declares a `kind`; a custom source declares the
+    `name` of a `custom_providers` entry. Neither declares the other's field.
+    """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     provider: NodeSourceProvider
-    kind: FilesystemKind
+    kind: FilesystemKind | None = None
+    name: str | None = None
+
+    @field_validator("name")
+    @classmethod
+    def _check_name(cls, value: str | None) -> str | None:
+        if value is not None:
+            _require_identifier(value, PROPERTY_NAME_PATTERN, "custom provider name")
+        return value
+
+    @model_validator(mode="after")
+    def _check_fields(self) -> NodeSource:
+        if self.provider == "filesystem":
+            if self.kind is None:
+                raise ValueError("a filesystem source must declare its kind (file or folder)")
+            if self.name is not None:
+                raise ValueError("a filesystem source must not declare a name; only a custom source names a provider")
+        else:
+            if self.name is None:
+                raise ValueError("a custom source must declare the name of a custom_providers entry")
+            if self.kind is not None:
+                raise ValueError("a custom source must not declare a kind; kind is filesystem-only")
+        return self
 
 
 class NodeTypeDecl(BaseModel):
@@ -235,7 +263,7 @@ class NodeTypeDecl(BaseModel):
                     f"node type {self.label!r} key component {component!r} is "
                     f"not a declared metadata field"
                 )
-        if self.source is not None:
+        if self.source is not None and self.source.provider == "filesystem":
             if self.key != FILESYSTEM_KEY:
                 raise ValueError(
                     f"node type {self.label!r} is sourced from the filesystem, so "
@@ -266,6 +294,53 @@ class CustomProvider(BaseModel):
     @classmethod
     def _check_name(cls, value: str) -> str:
         return _require_identifier(value, PROPERTY_NAME_PATTERN, "custom provider name")
+
+    @field_validator("params")
+    @classmethod
+    def _check_params(cls, value: dict[str, ScalarParam]) -> dict[str, ScalarParam]:
+        for key in value:
+            _require_identifier(key, PROPERTY_NAME_PATTERN, "custom provider parameter")
+        return value
+
+
+#: A drive letter (`C:`) at the start of an input glob.
+_DRIVE_PREFIX = re.compile(r"[A-Za-z]:")
+
+
+class CustomProviderDecl(BaseModel):
+    """A `custom_providers` entry: one script at `.devgraph/providers/<name>.py`.
+
+    Recorded as data; nothing in this module reads the script or its inputs.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    name: str
+    inputs: tuple[str, ...]
+    params: dict[str, ScalarParam] = Field(default_factory=dict)
+
+    @field_validator("name")
+    @classmethod
+    def _check_name(cls, value: str) -> str:
+        return _require_identifier(value, PROPERTY_NAME_PATTERN, "custom provider name")
+
+    @field_validator("inputs")
+    @classmethod
+    def _check_inputs(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if not value:
+            raise ValueError("a custom provider must declare at least one input glob in inputs")
+        for glob in value:
+            if not glob:
+                raise ValueError("an input glob must not be empty")
+            if "\\" in glob:
+                raise ValueError(f"input glob {glob!r} must not contain a backslash; use / as the separator")
+            if glob.startswith("/"):
+                raise ValueError(f"input glob {glob!r} must be repo-relative, not start with /")
+            if _DRIVE_PREFIX.match(glob):
+                raise ValueError(f"input glob {glob!r} must be repo-relative, not start with a drive letter")
+            if ".." in glob.split("/"):
+                raise ValueError(f"input glob {glob!r} must not contain a .. segment")
+        return value
 
     @field_validator("params")
     @classmethod
@@ -366,8 +441,33 @@ class ProjectSchema(BaseModel):
 
     version: SchemaVersion
     extends: ExtendsMode = "default"
+    custom_providers: tuple[CustomProviderDecl, ...] = ()
     node_types: tuple[NodeTypeDecl, ...] = ()
     relationships: tuple[RelationshipDecl, ...] = ()
+
+    def custom_declaration_set(self, name: str) -> dict[str, Any]:
+        """The full declaration of one custom provider, in declared order.
+
+        Its `custom_providers` entry, every node type sourced from it and every
+        relationship it produces, each dumped as JSON by alias. Raises KeyError
+        for an undeclared name.
+        """
+        provider = next((p for p in self.custom_providers if p.name == name), None)
+        if provider is None:
+            raise KeyError(name)
+        return {
+            "provider": provider.model_dump(mode="json", by_alias=True),
+            "node_types": [
+                n.model_dump(mode="json", by_alias=True)
+                for n in self.node_types
+                if n.source is not None and n.source.provider == "custom" and n.source.name == name
+            ],
+            "relationships": [
+                r.model_dump(mode="json", by_alias=True)
+                for r in self.relationships
+                if r.provider == "custom" and r.custom is not None and r.custom.name == name
+            ],
+        }
 
     @model_validator(mode="after")
     def _check_labels(self) -> ProjectSchema:
@@ -405,7 +505,7 @@ class ProjectSchema(BaseModel):
     def _check_filesystem(self) -> ProjectSchema:
         by_kind: dict[str, str] = {}
         for node_type in self.node_types:
-            if node_type.source is None:
+            if node_type.source is None or node_type.source.provider != "filesystem":
                 continue
             kind = node_type.source.kind
             if kind in by_kind:
@@ -438,6 +538,47 @@ class ProjectSchema(BaseModel):
                     )
         return self
 
+    @model_validator(mode="after")
+    def _check_custom(self) -> ProjectSchema:
+        declared: set[str] = set()
+        for provider in self.custom_providers:
+            if provider.name in declared:
+                raise ValueError(f"custom provider {provider.name!r} is declared more than once")
+            declared.add(provider.name)
+
+        def require_declared(name: str, where: str) -> None:
+            if name not in declared:
+                raise ValueError(
+                    f"{where} names {name!r}, which is not a declared custom provider; "
+                    f"add it under custom_providers"
+                )
+
+        for node_type in self.node_types:
+            if node_type.source is not None and node_type.source.provider == "custom":
+                require_declared(node_type.source.name, f"node type {node_type.label!r} source")
+
+        owners: dict[str, set[tuple[str, str | None]]] = {}
+        for relationship in self.relationships:
+            name = relationship.custom.name if relationship.provider == "custom" else None
+            owners.setdefault(relationship.type, set()).add((relationship.provider, name))
+            if relationship.provider != "custom":
+                continue
+            require_declared(name, f"relationship {relationship.type!r}")
+            for label in (*relationship.from_labels, relationship.to):
+                if label in NODE_LABELS and label not in _REPO_SCOPED_LABELS:
+                    raise ValueError(
+                        f"custom relationship {relationship.type!r} endpoint {label!r} is not "
+                        f"repository-scoped; a custom provider may end only at repository-scoped "
+                        f"built-in labels or at declared node types"
+                    )
+        for rel_type, providers in owners.items():
+            if len(providers) > 1 and any(provider == "custom" for provider, _ in providers):
+                raise ValueError(
+                    f"custom relationship type {rel_type!r} is also declared by another provider; "
+                    f"a custom relationship type belongs to exactly one provider"
+                )
+        return self
+
 
 @dataclass(frozen=True, slots=True)
 class EffectiveSchema:
@@ -461,7 +602,7 @@ class EffectiveSchema:
         )
         for node_type in self.node_types:
             statements.append(_user_constraint_statement(node_type))
-            if node_type.source is not None:
+            if node_type.source is not None and node_type.source.provider == "filesystem":
                 statements.append(_filesystem_index_statement(node_type))
         return statements
 
@@ -566,7 +707,7 @@ def load_project_schema(repo_root: Path, *, respect_switch: bool = True) -> Proj
 def parse_project_schema(text: str, path: Path) -> ProjectSchema:
     """Parse and validate the text of a schema file; `path` only labels errors."""
     try:
-        document = yaml.safe_load(text)
+        document = bounded_safe_load(text, max_nodes=YAML_ALIAS_MAX_NODES)
     except YAML_LOAD_ERRORS as exc:
         raise ProjectSchemaError(f"{path}: malformed YAML: {exc}") from exc
 
@@ -645,7 +786,7 @@ def resolve_declaration(
                 f"lower-cased, so labels must not differ only by case"
             )
         used_names.add(name)
-        if node_type.source is not None:
+        if node_type.source is not None and node_type.source.provider == "filesystem":
             index_name = _filesystem_index_name(node_type.label)
             if index_name in used_names:
                 raise ProjectSchemaError(
@@ -707,6 +848,10 @@ _STARTER_TEMPLATE = """\
 version: {version}
 extends: default
 
+# custom_providers:
+#   - name: runbook_links
+#     inputs: ["docs/runbooks/**/*.md"]   # repo-relative globs; the script is .devgraph/providers/runbook_links.py
+#
 # node_types:
 #   - label: Runbook
 #     key: [slug]

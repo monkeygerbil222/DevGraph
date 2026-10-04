@@ -2521,7 +2521,8 @@ def config_schema_list(
             "label": n.label,
             "origin": "project",
             "key": list(n.key),
-            "source": {"provider": n.source.provider, "kind": n.source.kind} if n.source else None,
+            # kind for a filesystem source, name for a custom one
+            "source": n.source.model_dump(exclude_none=True) if n.source else None,
             "color": n.color,
         }
         for n in effective.node_types
@@ -2544,7 +2545,7 @@ def config_schema_list(
         source = row["source"]
         nodes.add_row(
             escape(row["label"]), row["origin"], escape(", ".join(row["key"] or ())),
-            f"{source['provider']} ({source['kind']})" if source else "\u2014",
+            escape(f"{source['provider']} ({source.get('kind') or source.get('name')})") if source else "\u2014",
             row["color"] or "\u2014",
         )
     console.print(nodes)

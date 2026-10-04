@@ -3834,11 +3834,11 @@ const CONFIG_FORM_FIELDS = {
   parameter: ["name", "type", "required", "default", "description"],
   node_type: ["label", "key", "description", "color", "source", "metadata"],
   metadata: ["name", "type", "required", "description"],
-  source: ["provider", "kind"],
+  source: ["provider", "kind", "name"],
   parameter_types: ["string", "integer", "float", "boolean"],
   metadata_types: ["string", "integer", "float", "boolean"],
   filesystem_kinds: ["file", "folder"],
-  source_providers: ["filesystem"],
+  source_providers: ["filesystem", "custom"],
 };
 /* the validators' patterns (used as fullmatch) and limits, for advisory hints only */
 const CONFIG_FORM_LIMITS = {
@@ -3877,7 +3877,8 @@ const CONFIG_FORM_CHECKS = {
     source: v => v === null || configIsMap(v), metadata: Array.isArray },
   metadata: { name: configFormLine, type: v => CONFIG_FORM_FIELDS.metadata_types.includes(v),
     required: v => typeof v === "boolean", description: v => v === null || configFormLine(v) },
-  source: { provider: v => CONFIG_FORM_FIELDS.source_providers.includes(v), kind: v => CONFIG_FORM_FIELDS.filesystem_kinds.includes(v) },
+  /* only filesystem sources: a custom source (and its YAML-only `name`) opens as YAML */
+  source: { provider: v => v === "filesystem", kind: v => CONFIG_FORM_FIELDS.filesystem_kinds.includes(v) },
 };
 /* the path of the first field of `map` the form can't show, or null */
 function configFormBadField(map, kind, prefix) {
@@ -3915,7 +3916,7 @@ function configFormFromEntry(section, entry) {
   let bad = configFormBadField(entry, "node_type", "") || configFormBadRows(metadata, "metadata", "metadata.");
   if (!bad && configIsMap(entry.source)) {
     bad = configFormBadField(entry.source, "source", "source.") ||
-      CONFIG_FORM_FIELDS.source.map(k => "source." + k).find(k => !(k.slice(7) in entry.source)) || null;
+      Object.keys(CONFIG_FORM_CHECKS.source).map(k => "source." + k).find(k => !(k.slice(7) in entry.source)) || null;
   }
   if (bad) return { ok: false, reason: CONFIG_FORM_REASONS.field(bad) };
   const names = metadata.map(m => m.name);

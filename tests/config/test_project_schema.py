@@ -615,6 +615,8 @@ def test_relationship_types_accumulate_declared_types(tmp_path):
         tmp_path,
         """
         version: 1
+        custom_providers:
+          - {name: widget_tracker, inputs: ['**/*.widget']}
         node_types:
           - label: Widget
             key: [slug]
@@ -873,6 +875,8 @@ def test_custom_provider_validates_as_data(tmp_path):
         tmp_path,
         """
         version: 1
+        custom_providers:
+          - {name: widget_tracker, inputs: ['**/*.widget']}
         node_types:
           - label: Widget
             key: [slug]
@@ -962,6 +966,8 @@ def test_provider_name_is_never_imported(tmp_path, monkeypatch):
         tmp_path,
         """
         version: 1
+        custom_providers:
+          - {name: sentinel_provider_20, inputs: ['**/*.widget']}
         node_types:
           - label: Widget
             key: [slug]
@@ -997,6 +1003,8 @@ def test_loading_starts_no_process(tmp_path, monkeypatch):
         tmp_path,
         """
         version: 1
+        custom_providers:
+          - {name: widget_tracker, inputs: ['**/*.widget']}
         node_types:
           - label: Widget
             key: [slug]
@@ -1072,6 +1080,7 @@ def test_json_schema_is_emitted_and_documented_as_descriptive():
     assert set(emitted["properties"]) == {
         "version",
         "extends",
+        "custom_providers",
         "node_types",
         "relationships",
     }
@@ -1250,6 +1259,7 @@ def test_extractor_is_a_reserved_property(tmp_path):
 def test_every_label_in_a_from_list_must_resolve(tmp_path):
     text = """
         version: 1
+        custom_providers: [{name: linker, inputs: ['*.md']}]
         node_types:
           - label: Widget
             key: [slug]
@@ -1267,7 +1277,8 @@ def test_every_label_in_a_from_list_must_resolve(tmp_path):
 
 def test_json_schema_describes_node_sources_and_list_from():
     defs = project_schema_json_schema()["$defs"]
-    assert defs["NodeSource"]["properties"]["kind"]["enum"] == ["file", "folder"]
+    kind = defs["NodeSource"]["properties"]["kind"]
+    assert [b["enum"] for b in kind["anyOf"] if "enum" in b] == [["file", "folder"]]
     assert "source" in defs["NodeTypeDecl"]["properties"]
     from_schema = defs["RelationshipDecl"]["properties"]["from"]
     assert {variant.get("type") for variant in from_schema["anyOf"]} == {"string", "array"}
@@ -1405,3 +1416,242 @@ def test_json_schema_documents_colour_pattern():
 
 def test_starter_template_mentions_colour():
     assert 'color: "#1f77b4"' in project_schema.starter_schema_text()
+
+
+# --- Custom providers (sandbox spec §3.1) -----------------------------------
+
+RUNBOOKS = """
+    version: 1
+    custom_providers:
+      - name: runbook_links
+        inputs: ["docs/runbooks/**/*.md"]
+        params: {owner_prefix: "team-"}
+    node_types:
+      - label: Runbook
+        key: [slug]
+        metadata: [{name: slug, required: true}, {name: owner}]
+        source: {provider: custom, name: runbook_links}
+    relationships:
+      - type: DOCUMENTS
+        provider: custom
+        custom: {name: runbook_links}
+        from: Runbook
+        to: Service
+"""
+
+
+def _load(tmp_path, text):
+    return load_project_schema(write_schema(tmp_path, text))
+
+
+def test_custom_provider_example_loads(tmp_path):
+    declaration = _load(tmp_path, RUNBOOKS)
+    (provider,) = declaration.custom_providers
+    assert (provider.name, provider.inputs, provider.params) == (
+        "runbook_links", ("docs/runbooks/**/*.md",), {"owner_prefix": "team-"}
+    )
+    source = declaration.node_types[0].source
+    assert (source.provider, source.name, source.kind) == ("custom", "runbook_links", None)
+    effective = resolve_declaration(declaration)
+    # A custom node type gets its key constraint but never the filesystem lookup index.
+    assert effective.constraint_statements()[len(constraint_statements()):] == [
+        "CREATE CONSTRAINT runbook_repo_key IF NOT EXISTS FOR (n:Runbook) REQUIRE (n.repo_id, n.slug) IS UNIQUE"
+    ]
+
+
+def test_custom_declaration_set(tmp_path):
+    text = RUNBOOKS.replace(
+        "        to: Service\n",
+        "        to: Service\n"
+        "      - type: OWNS\n        provider: custom\n        custom: {name: runbook_links, params: {depth: 2}}\n"
+        "        from: [Runbook]\n        to: Module\n",
+    )
+    declaration = _load(tmp_path, text)
+    assert declaration.custom_declaration_set("runbook_links") == {
+        "provider": {"name": "runbook_links", "inputs": ["docs/runbooks/**/*.md"], "params": {"owner_prefix": "team-"}},
+        "node_types": [declaration.node_types[0].model_dump(mode="json", by_alias=True)],
+        "relationships": [r.model_dump(mode="json", by_alias=True) for r in declaration.relationships],
+    }
+    assert declaration.custom_declaration_set("runbook_links")["relationships"][1]["from"] == ["Runbook"]
+    assert declaration.custom_declaration_set("runbook_links")["relationships"][1]["custom"]["params"] == {"depth": 2}
+    with pytest.raises(KeyError):
+        declaration.custom_declaration_set("nope")
+
+
+def test_declaration_set_excludes_other_providers(tmp_path):
+    text = RUNBOOKS.replace(
+        "        params: {owner_prefix: \"team-\"}\n",
+        "        params: {owner_prefix: \"team-\"}\n      - {name: other, inputs: ['*.txt']}\n",
+    ).replace(
+        "    relationships:\n",
+        "      - label: Note\n        key: [slug]\n        metadata: [{name: slug}]\n"
+        "        source: {provider: custom, name: other}\n    relationships:\n",
+    )
+    declaration = _load(tmp_path, text)
+    other = declaration.custom_declaration_set("other")
+    assert [n["label"] for n in other["node_types"]] == ["Note"] and other["relationships"] == []
+    assert [n["label"] for n in declaration.custom_declaration_set("runbook_links")["node_types"]] == ["Runbook"]
+
+
+def test_custom_providers_need_non_empty_inputs(tmp_path):
+    with pytest.raises(ProjectSchemaError, match="inputs"):
+        _load(tmp_path, RUNBOOKS.replace('["docs/runbooks/**/*.md"]', "[]"))
+    with pytest.raises(ProjectSchemaError, match="inputs"):
+        _load(tmp_path, RUNBOOKS.replace('        inputs: ["docs/runbooks/**/*.md"]\n', ""))
+
+
+@pytest.mark.parametrize("glob", [
+    "docs/../secrets/*.md", "..", "../x", "a/..", "/etc/*", "C:/x/*.md", "c:x", "\\\\\\\\host/share/*", "docs\\\\*.md", "",
+])
+def test_custom_provider_bad_input_globs(tmp_path, glob):
+    with pytest.raises(ProjectSchemaError, match="input glob"):
+        _load(tmp_path, RUNBOOKS.replace('"docs/runbooks/**/*.md"', f'"{glob}"'))
+
+
+def test_custom_provider_names_are_identifiers_and_unique(tmp_path):
+    with pytest.raises(ProjectSchemaError, match="not a valid identifier"):
+        _load(tmp_path, RUNBOOKS.replace("- name: runbook_links", "- name: '../evil'"))
+    dup = RUNBOOKS.replace(
+        "        params: {owner_prefix: \"team-\"}\n",
+        "        params: {owner_prefix: \"team-\"}\n      - {name: runbook_links, inputs: ['*.txt']}\n",
+    )
+    with pytest.raises(ProjectSchemaError, match="declared more than once"):
+        _load(tmp_path, dup)
+
+
+def test_custom_provider_params_are_scalar_identifiers(tmp_path):
+    with pytest.raises(ProjectSchemaError, match="params"):
+        _load(tmp_path, RUNBOOKS.replace('{owner_prefix: "team-"}', "{nested: {a: 1}}"))
+    with pytest.raises(ProjectSchemaError, match="not a valid identifier"):
+        _load(tmp_path, RUNBOOKS.replace('{owner_prefix: "team-"}', "{'Bad Name': 1}"))
+
+
+def test_unknown_custom_name_is_rejected(tmp_path):
+    with pytest.raises(ProjectSchemaError, match="'nope', which is not a declared custom provider"):
+        _load(tmp_path, RUNBOOKS.replace("custom: {name: runbook_links}", "custom: {name: nope}"))
+
+
+def test_unknown_source_name_is_rejected(tmp_path):
+    with pytest.raises(ProjectSchemaError, match="'nope', which is not a declared custom provider"):
+        _load(tmp_path, RUNBOOKS.replace("source: {provider: custom, name: runbook_links}", "source: {provider: custom, name: nope}"))
+
+
+def test_custom_relationship_to_repository_is_rejected(tmp_path):
+    with pytest.raises(ProjectSchemaError, match="Repository"):
+        _load(tmp_path, RUNBOOKS.replace("to: Service", "to: Repository"))
+    with pytest.raises(ProjectSchemaError, match="Repository"):
+        _load(tmp_path, RUNBOOKS.replace("from: Runbook", "from: [Runbook, Repository]"))
+
+
+def test_custom_relationship_to_non_repo_scoped_builtin_is_rejected(tmp_path, monkeypatch):
+    scoped = tuple(label for label in project_schema._REPO_SCOPED_LABELS if label != "Service")
+    monkeypatch.setattr(project_schema, "_REPO_SCOPED_LABELS", scoped)
+    with pytest.raises(ProjectSchemaError, match="'Service' is not repository-scoped"):
+        _load(tmp_path, RUNBOOKS)
+
+
+def test_custom_relationship_type_cannot_be_shared_with_filesystem(tmp_path):
+    text = WORKTREE.replace("    version: 1\n", "    version: 1\n    custom_providers: [{name: linker, inputs: ['*']}]\n") + (
+        "      - type: IS_CHILD_OF\n        provider: custom\n        custom: {name: linker}\n"
+        "        from: File\n        to: File\n"
+    )
+    with pytest.raises(ProjectSchemaError, match="IS_CHILD_OF.*another provider"):
+        _load(tmp_path, text)
+
+
+def test_custom_relationship_type_cannot_be_shared_between_custom_providers(tmp_path):
+    text = RUNBOOKS.replace(
+        "        params: {owner_prefix: \"team-\"}\n",
+        "        params: {owner_prefix: \"team-\"}\n      - {name: other, inputs: ['*.txt']}\n",
+    ) + "      - type: DOCUMENTS\n        provider: custom\n        custom: {name: other}\n        from: Runbook\n        to: Module\n"
+    with pytest.raises(ProjectSchemaError, match="DOCUMENTS.*another provider"):
+        _load(tmp_path, text)
+
+
+def test_one_custom_provider_may_declare_a_type_twice(tmp_path):
+    text = RUNBOOKS + "      - type: DOCUMENTS\n        provider: custom\n        custom: {name: runbook_links}\n        from: Runbook\n        to: Module\n"
+    assert len(_load(tmp_path, text).relationships) == 2
+
+
+def test_custom_node_type_accepts_any_declared_key(tmp_path):
+    text = RUNBOOKS.replace("key: [slug]", "key: [slug, owner]")
+    assert _load(tmp_path, text).node_types[0].key == ("slug", "owner")
+    with pytest.raises(ProjectSchemaError, match="not a declared metadata field"):
+        _load(tmp_path, RUNBOOKS.replace("key: [slug]", "key: [team]"))
+
+
+def test_filesystem_source_still_needs_kind_and_path_key(tmp_path):
+    with pytest.raises(ProjectSchemaError, match="kind"):
+        _load(tmp_path, WORKTREE.replace("{provider: filesystem, kind: file}", "{provider: filesystem}"))
+    with pytest.raises(ProjectSchemaError, match=r"exactly \[path\]"):
+        _load(tmp_path, WORKTREE.replace("key: [path]\n        metadata: [{name: path}]\n        source: {provider: filesystem, kind: file}",
+                                         "key: [slug]\n        metadata: [{name: slug}]\n        source: {provider: filesystem, kind: file}"))
+    with pytest.raises(ProjectSchemaError, match="name"):
+        _load(tmp_path, WORKTREE.replace("{provider: filesystem, kind: file}", "{provider: filesystem, kind: file, name: x}"))
+
+
+def test_custom_source_refuses_kind_and_needs_name(tmp_path):
+    with pytest.raises(ProjectSchemaError, match="kind"):
+        _load(tmp_path, RUNBOOKS.replace("{provider: custom, name: runbook_links}", "{provider: custom, name: runbook_links, kind: file}"))
+    with pytest.raises(ProjectSchemaError, match="name"):
+        _load(tmp_path, RUNBOOKS.replace("{provider: custom, name: runbook_links}", "{provider: custom}"))
+
+
+def test_relationship_level_custom_params_are_accepted(tmp_path):
+    text = RUNBOOKS.replace("custom: {name: runbook_links}", "custom: {name: runbook_links, params: {depth: 3}}")
+    assert _load(tmp_path, text).relationships[0].custom.params == {"depth": 3}
+
+
+def test_custom_types_do_not_count_against_filesystem_kinds(tmp_path):
+    text = WORKTREE.replace("    version: 1\n", "    version: 1\n    custom_providers: [{name: notes, inputs: ['*.md']}]\n").replace(
+        "    relationships:\n",
+        "      - label: Note\n        key: [path]\n        metadata: [{name: path}]\n"
+        "        source: {provider: custom, name: notes}\n    relationships:\n",
+    )
+    effective = resolve_effective_schema(write_schema(tmp_path, text))
+    statements = effective.constraint_statements()
+    assert any("INDEX file_repo_name" in s for s in statements)
+    assert not any(s.startswith("CREATE INDEX note_repo_name") for s in statements)
+
+
+@pytest.mark.parametrize("reserved", ["custom_sources", "custom_source"])
+@pytest.mark.parametrize("schema", ["custom", "plain"])
+def test_reserved_custom_provenance_names(tmp_path, reserved, schema):
+    assert reserved in RESERVED_NODE_PROPERTIES
+    plain = "version: 1\nnode_types:\n  - label: Widget\n    key: [slug]\n    metadata: [{name: slug}, {name: owner}]\n"
+    base = RUNBOOKS if schema == "custom" else plain
+    as_metadata = base.replace("{name: owner}", f"{{name: {reserved}}}")
+    with pytest.raises(ProjectSchemaError, match="reserved by DevGraph"):
+        _load(tmp_path, as_metadata)
+    as_key = base.replace("key: [slug]", f"key: [slug, {reserved}]")
+    with pytest.raises(ProjectSchemaError, match="reserved by DevGraph"):
+        _load(tmp_path, as_key)
+
+
+def test_schema_yaml_alias_bound(tmp_path):
+    bomb = "version: 1\nx: &a [y, y, y, y, y, y, y, y, y, y]\n" + "".join(
+        f"x{i}: &a{i} [" + ", ".join([f"*a{i - 1}" if i > 1 else "*a"] * 10) + "]\n" for i in range(1, 9)
+    )
+    (tmp_path / SCHEMA_FILENAME).write_text(bomb, encoding="utf-8")
+    with pytest.raises(ProjectSchemaError, match="malformed YAML"):
+        load_project_schema(tmp_path)
+    anchored = WIDGET.replace("          - name: slug\n            type: string\n            required: true\n",
+                              "          - &slug {name: slug, type: string, required: true}\n          - *slug\n")
+    assert _load(tmp_path, anchored).node_types[0].key == ("slug",)
+
+
+def test_json_schema_describes_custom_providers():
+    document = project_schema_json_schema()
+    assert "custom_providers" in document["properties"]
+    defs = document["$defs"]
+    assert {"name", "inputs", "params"} <= set(defs["CustomProviderDecl"]["properties"])
+    assert "name" in defs["NodeSource"]["properties"]
+    assert defs["NodeSource"]["properties"]["provider"]["enum"] == ["filesystem", "custom"]
+
+
+def test_starter_example_declares_its_custom_provider(tmp_path):
+    lines = project_schema.starter_schema_text().splitlines()
+    start = lines.index("extends: default") + 1
+    text = "\n".join(lines[:start] + [l[2:] if l.startswith("# ") else l for l in lines[start:]]) + "\n"
+    declaration = load_project_schema(write_schema(tmp_path, text))
+    assert [p.name for p in declaration.custom_providers] == ["runbook_links"]

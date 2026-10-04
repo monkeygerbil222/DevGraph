@@ -156,7 +156,8 @@ def realign_keys(engine: GraphEngine, node_types: Iterable[NodeTypeDecl]) -> lis
         ):
             wanted.append((constraint, _user_constraint_statement(node_type)))
         index = existing.get(_filesystem_index_name(node_type.label))
-        if node_type.source is not None and index is not None and index.label != node_type.label:
+        filesystem = node_type.source is not None and node_type.source.provider == "filesystem"
+        if filesystem and index is not None and index.label != node_type.label:
             wanted.append((index, _filesystem_index_statement(node_type)))
         if not wanted:
             continue

@@ -209,7 +209,7 @@ def test_schema_add_duplicate_and_wrong_shape(tmp_path):
 
 
 def test_schema_exists_carries_the_name_for_node_types_only(tmp_path):
-    (tmp_path / "devgraph.schema.yaml").write_text(SCHEMA_FILE)
+    (tmp_path / "devgraph.schema.yaml").write_text(SCHEMA_FILE + "custom_providers: [{name: f, inputs: ['*.md']}]\n")
     with pytest.raises(ConfigEditError) as exc:
         edits.add_schema_entry(tmp_path, TICKET)
     assert exc.value.name == "Ticket"
@@ -545,3 +545,35 @@ def test_enabling_and_bare_repos_have_no_warnings(tmp_path, no_registry, store):
     assert edits.project_config_change(record(path=tmp_path), False)[0] == []
     (tmp_path / "devgraph.schema.yaml").write_text(SCHEMA_FILE)
     assert edits.project_config_change(record(path=tmp_path, project_config_enabled=False), True)[0] == []
+
+
+def _declared(text):
+    from pathlib import Path
+
+    from devgraph.config.project_schema import parse_project_schema
+
+    return parse_project_schema(text, Path("devgraph.schema.yaml"))
+
+
+def _doc_sourced(source: str) -> str:
+    return (
+        "version: 1\ncustom_providers: [{name: docs, inputs: ['*.md']}]\n"
+        f"node_types:\n  - label: Doc\n    key: [path]\n    metadata: [{{name: path}}]\n    source: {source}\n"
+    )
+
+
+def test_pruned_types_compares_provider_and_kind():
+    fs_file = _declared(_doc_sourced("{provider: filesystem, kind: file}"))
+    fs_folder = _declared(_doc_sourced("{provider: filesystem, kind: folder}"))
+    custom = _declared(_doc_sourced("{provider: custom, name: docs}"))
+    assert edits.pruned_types(fs_file, custom) == ["Doc (provider filesystem -> custom)"]
+    assert edits.pruned_types(custom, fs_file) == ["Doc (provider custom -> filesystem)"]
+    assert edits.pruned_types(fs_file, fs_folder) == ["Doc (kind file -> folder)"]
+    assert edits.pruned_types(custom, custom) == []
+
+
+def test_schema_entry_notes_for_a_custom_node_type():
+    entry = {"label": "Runbook", "key": ["slug"], "metadata": [{"name": "slug"}], "source": {"provider": "custom", "name": "runbook_links"}}
+    (note,) = edits.schema_entry_notes(entry)
+    assert "Runbook" in note and "runbook_links" in note and "approved" in note and "no provider produces" not in note
+    assert edits.schema_entry_notes({**entry, "source": {"provider": "filesystem", "kind": "file"}}) == []

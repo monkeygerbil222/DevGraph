@@ -58,9 +58,11 @@ RELATIONSHIP_TYPES: tuple[str, ...] = (
 # delete cleanup keys off. A per-project schema may not redeclare any of
 # them: a user-defined field of the same name would silently collide with
 # the value the pipeline writes. `extractor` marks nodes a schema-declared
-# provider owns (see devgraph/indexer/providers/).
+# provider owns (see devgraph/indexer/providers/). `custom_sources` and
+# `custom_source` are the provenance a custom provider's writes carry
+# (sandbox spec §3.4), so neither a declaration nor a script record may set them.
 RESERVED_NODE_PROPERTIES: frozenset[str] = frozenset(
-    {"repo_id", "name", "file", "source_file", "source", "sources", "extractor"}
+    {"repo_id", "name", "file", "source_file", "source", "sources", "extractor", "custom_sources", "custom_source"}
 )
 
 # Labels other than Repository must be uniquely keyed on (repo_id, name)
