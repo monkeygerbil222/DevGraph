@@ -32,6 +32,7 @@ const allEls = [];
 const mkEl = tag => {
   const classes = new Set();
   const listeners = {};
+  const attrs = {};
   const el = {
     tagName: tag.toUpperCase(), children: [], dataset: {}, style: { display: "" }, title: "", type: "",
     value: "", disabled: false, readOnly: false, parentNode: null, _text: "", _html: "",
@@ -54,21 +55,53 @@ const mkEl = tag => {
       for (const fn of listeners[type] || []) await fn(ev);
       if (el["on" + type]) await el["on" + type](ev);
     },
-    focus() { focused = el; },
+    setAttribute(k, v) { attrs[k] = String(v); },
+    getAttribute(k) { return k in attrs ? attrs[k] : null; },
+    removeAttribute(k) { delete attrs[k]; },
+    /* as in a browser: a disabled control, or one inside a disabled fieldset, can't take focus */
+    focus() {
+      for (let e = el; e; e = e.parentNode) {
+        if (e.disabled && (e === el || e.tagName === "FIELDSET")) return;
+        /* ...and nothing inside a modal that isn't open yet */
+        if ((e === els.configModal || e === els.configResetModal) && !e.classList.contains("open")) return;
+      }
+      focused = el;
+    },
   };
+  /* like a browser's: a select reads back only a value one of its options has */
+  if (tag === "select") {
+    let v = null;
+    Object.defineProperty(el, "value", {
+      get() { const opts = el.children; return v === null ? (opts[0] ? opts[0].value : "") : opts.some(o => o.value === v) ? v : ""; },
+      set(x) { v = String(x); },
+    });
+  }
   allEls.push(el);
   return el;
 };
 const ids = ["configScopes", "configStatus", "configModal", "configModalTitle", "configModalWarn", "configModalWarnText",
   "configDestField", "configDestLabel", "configDest", "configYaml", "configModalConfirm", "configModalError", "configModalReload",
   "configModalCancel", "configModalSave", "pane-config",
+  "configEditorSwitch", "configModeForm", "configModeYaml", "configFormNotice", "configFormNoticeText", "configFormDiscard", "configForm",
+  "configFormHelp", "configFormScroll",
   "configResetModal", "configResetTitle", "configResetList", "configResetPhraseField", "configResetPhraseLabel", "configResetTyped",
   "configResetError", "configResetRecheck", "configResetCancel", "configResetConfirm"];
 const tagFor = id => id === "configYaml" ? "textarea" : id === "configDest" ? "select" : id === "configResetTyped" ? "input" :
-  /^configReset(Recheck|Cancel|Confirm)$/.test(id) ? "button" : "div";
+  id === "configForm" ? "fieldset" : /^configReset(Recheck|Cancel|Confirm)$|^configModal(Reload|Cancel|Save)$|^configMode|^configFormDiscard$/.test(id) ? "button" : "div";
 const els = Object.fromEntries(ids.map(id => [id, mkEl(tagFor(id))]));
 els["pane-config"].classList.add("active");
-const document = { getElementById: id => els[id] || null, createElement: mkEl };
+/* the modal's own controls sit inside it, in the page's order (the page's other ids don't) */
+const nest = (parent, kids) => kids.forEach(k => { els[k].parentNode = els[parent]; els[parent].children.push(els[k]); });
+nest("configDestField", ["configDestLabel", "configDest"]);
+nest("configFormNotice", ["configFormNoticeText", "configFormDiscard"]);
+nest("configFormScroll", ["configForm"]);
+nest("configModalWarn", ["configModalWarnText"]);
+nest("configModal", ["configModalTitle", "configModalWarn", "configDestField", "configEditorSwitch", "configFormHelp", "configFormNotice",
+  "configFormScroll", "configYaml", "configModalConfirm", "configModalError", "configModalReload", "configModalCancel", "configModalSave"]);
+nest("configEditorSwitch", ["configModeForm", "configModeYaml"]);
+nest("configResetPhraseField", ["configResetPhraseLabel", "configResetTyped"]);
+nest("configResetModal", ["configResetTitle", "configResetList", "configResetPhraseField", "configResetError", "configResetRecheck", "configResetCancel", "configResetConfirm"]);
+const document = { getElementById: id => els[id] || null, createElement: mkEl, get activeElement() { return focused; } };
 
 let tooltips = [];
 let focused = null;
@@ -98,6 +131,7 @@ const api = new Function(...Object.keys(globals),
   configSrc + "\nreturn { CONFIG_GLOBAL, renderConfigPage, renderConfigScope, configWriteRequest, describeConfigError," +
   " openConfigEditor, configEditTarget, configCopyDestinations, configCanCopy, loadConfigPage, applyConfigScope, configModalKey, CONFIG_SECTIONS," +
   " configResetRequest, configResetPhrase, configResetReady, describeConfigReset, configToggleRequest," +
+  " CONFIG_FORM_FIELDS, configFormFromEntry, configEntryFromForm, configYamlScalar, configEntryYaml, configFormHints, configFormSwitch," +
   " get model() { return configModel; }, get edit() { return configEdit; }, get reset() { return configReset; } };")(...Object.values(globals));
 
 // --- fixtures -----------------------------------------------------------
@@ -152,7 +186,7 @@ const card = scope => els.configScopes.children.find(c => c.dataset.scope === sc
 const shown = el => el.style.display !== "none";
 const lastCall = () => fetchCalls[fetchCalls.length - 1];
 /* a deliberate click: well after the button last changed meaning */
-const press = async (el, detail = 1) => { clock += 1000; await el.fire("click", detail); };
+const press = async (el, detail = 1) => { clock += 1000; el.focus(); await el.fire("click", detail); };
 const yamlName = text => (/^name:\s*(\S+)/m.exec(text || "") || [])[1];
 const writes = () => fetchCalls.filter(c => c.init.method && c.init.method !== "GET");
 const body = call => JSON.parse(call.init.body);
@@ -1402,6 +1436,729 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
   cypherRow = rowFor(card("__global__"), "run_cypher");
   check("run_cypher's state is the dashboard process's environment, not every MCP session's",
     /off for MCP sessions started with this environment/.test(cypherRow.textContent), cypherRow.textContent);
+
+  // 36. the form shows only entries it can carry exactly
+  const j = v => JSON.stringify(v);
+  const CY = "MATCH (n {repo_id: $repo_id})\nRETURN n\n";
+  const TOOL_OK = () => ({ name: "hot_paths", description: "d", cypher: CY, parameters: [
+    { name: "s" }, { name: "i", type: "integer", required: false, default: 3 },
+    { name: "f", type: "float", required: false, default: 0.5, description: "Rows." },
+    { name: "b", type: "boolean", required: false, default: true, description: null }], max_rows: 200, timeout_s: 5 });
+  const NODE_OK = () => ({ label: "Runbook", key: ["slug", "team"], description: null, color: "#1f77b4", metadata: [
+    { name: "slug", type: "string", required: true }, { name: "owner", description: "Who" }, { name: "team", type: "integer" }] });
+  const okEntries = [["tools", TOOL_OK()], ["tools", { name: "x" }], ["tools", { description: "only" }],
+    ["node_types", NODE_OK()], ["node_types", { ...NODE_OK(), source: null }],
+    ["node_types", { label: "Doc", key: ["path"], source: { provider: "filesystem", kind: "file" }, metadata: [{ name: "path" }] }],
+    ["node_types", { label: "Dir", source: { kind: "folder", provider: "filesystem" }, key: ["path"], metadata: [{ name: "path" }] }],
+    ["node_types", api.CONFIG_SECTIONS.node_types.entry], ["tools", api.CONFIG_SECTIONS.tools.entry],
+    /* textareas carry line feeds */
+    ["tools", { name: "x", description: "two\nlines", cypher: "a\nb\n" }], ["node_types", { label: "X", description: "two\nlines" }]];
+  okEntries.forEach(([section, e], i) => {
+    const rep = api.configFormFromEntry(section, e);
+    check("the form can show representable " + section + " entry #" + i, rep.ok && rep.form, j(rep));
+  });
+  const FIELD = p => "This entry has a field the form doesn't edit: `" + p + "`. Edit it as YAML.";
+  const ORDER = "This entry's key order differs from its metadata order; the form can't show that. Edit it as YAML.";
+  const VALUE = "This entry contains a value the page can't carry exactly (for example a date or a very large number). Edit it as YAML.";
+  const refusals = [
+    ["an unknown tool key", "tools", { ...TOOL_OK(), version: 1 }, FIELD("version")],
+    ["an unknown parameter key", "tools", { ...TOOL_OK(), parameters: [{ name: "x", kind: "y" }] }, FIELD("parameters.0.kind")],
+    ["a parameter type outside the enum", "tools", { ...TOOL_OK(), parameters: [{ name: "x" }, { name: "y", type: "text" }] }, FIELD("parameters.1.type")],
+    ["a non-boolean required", "tools", { ...TOOL_OK(), parameters: [{ name: "x", required: "yes" }] }, FIELD("parameters.0.required")],
+    ["a list default", "tools", { ...TOOL_OK(), parameters: [{ name: "x", default: [1] }] }, FIELD("parameters.0.default")],
+    ["a boolean max_rows", "tools", { ...TOOL_OK(), max_rows: true }, FIELD("max_rows")],
+    ["a fractional timeout", "tools", { ...TOOL_OK(), timeout_s: 1.5 }, FIELD("timeout_s")],
+    ["a null description", "tools", { ...TOOL_OK(), description: null }, FIELD("description")],
+    ["parameters that are not a list", "tools", { ...TOOL_OK(), parameters: { name: "x" } }, FIELD("parameters")],
+    ["an entry JSON couldn't carry", "tools", null, VALUE],
+    ["an unknown node type key", "node_types", { ...NODE_OK(), extends: "x" }, FIELD("extends")],
+    ["a key order differing from metadata order", "node_types", { ...NODE_OK(), key: ["team", "slug"] }, ORDER],
+    ["a repeated key component", "node_types", { ...NODE_OK(), key: ["slug", "slug"] }, ORDER],
+    ["a key naming no metadata row", "node_types", { ...NODE_OK(), key: ["slug", "nope"] },
+      "This entry's key names `nope`, which is not one of its metadata fields; the form can't show that. Edit it as YAML."],
+    ["a string key", "node_types", { ...NODE_OK(), key: "slug" }, FIELD("key")],
+    ["a source with an extra key", "node_types", { ...NODE_OK(), source: { provider: "filesystem", kind: "file", glob: "*" } }, FIELD("source.glob")],
+    ["a source with another provider", "node_types", { ...NODE_OK(), source: { provider: "git", kind: "file" } }, FIELD("source.provider")],
+    ["a source with no kind", "node_types", { ...NODE_OK(), source: { provider: "filesystem" } }, FIELD("source.kind")],
+    ["an unknown metadata key", "node_types", { ...NODE_OK(), metadata: [{ name: "slug", unique: true }] }, FIELD("metadata.0.unique")],
+    ["a metadata type outside the enum", "node_types", { ...NODE_OK(), metadata: [{ name: "slug", type: "date" }] }, FIELD("metadata.0.type")],
+    ["a metadata field declared twice", "node_types", { label: "X", key: ["a"], metadata: [{ name: "a" }, { name: "a" }] },
+      "This entry declares metadata field `a` more than once; the form can't show that. Edit it as YAML."],
+    ["a relationship", "relationships", { type: "DOCUMENTS" }, "The form covers tools and node types; edit relationships as YAML."],
+    /* a single-line input can't hold a line break; a textarea turns CR / CRLF into LF */
+    ["a line feed in a tool name", "tools", { ...TOOL_OK(), name: "a\nb" }, FIELD("name")],
+    ["a CR in a parameter name", "tools", { ...TOOL_OK(), parameters: [{ name: "a\rb" }] }, FIELD("parameters.0.name")],
+    ["a line separator in a parameter default", "tools", { ...TOOL_OK(), parameters: [{ name: "x", default: "a\u2028b" }] }, FIELD("parameters.0.default")],
+    ["a NEL in a parameter description", "tools", { ...TOOL_OK(), parameters: [{ name: "x", description: "a\x85b" }] }, FIELD("parameters.0.description")],
+    ["a paragraph separator in a node label", "node_types", { ...NODE_OK(), label: "a\u2029b" }, FIELD("label")],
+    ["a line feed in a colour", "node_types", { ...NODE_OK(), color: "#1f77b4\n" }, FIELD("color")],
+    ["a line feed in a metadata name", "node_types", { label: "X", metadata: [{ name: "a\nb" }] }, FIELD("metadata.0.name")],
+    ["a line feed in a metadata description", "node_types", { ...NODE_OK(), metadata: [{ name: "slug", description: "a\nb" }], key: ["slug"] }, FIELD("metadata.0.description")],
+    ["a CRLF in a tool description", "tools", { ...TOOL_OK(), description: "a\r\nb" }, FIELD("description")],
+    ["a CR in Cypher", "tools", { ...TOOL_OK(), cypher: "MATCH (n)\rRETURN n" }, FIELD("cypher")],
+    ["a CR in a node description", "node_types", { ...NODE_OK(), description: "a\rb" }, FIELD("description")],
+  ];
+  refusals.forEach(([what, section, e, reason]) => {
+    const rep = api.configFormFromEntry(section, e);
+    check("the form refuses " + what + ", saying why", !rep.ok && rep.reason === reason, j(rep));
+  });
+  api.CONFIG_FORM_FIELDS.tool.push("version");
+  const yamlOnly = api.configFormFromEntry("tools", { ...TOOL_OK(), version: 1 });
+  const plainOk = api.configFormFromEntry("tools", TOOL_OK()).ok;
+  api.CONFIG_FORM_FIELDS.tool.pop();
+  check("a model field the form lists but has no check for opens as YAML, naming the field (no TypeError)",
+    !yamlOnly.ok && yamlOnly.reason === FIELD("version") && plainOk, j(yamlOnly));
+
+  // 37. form state -> mapping
+  const back = (section, e) => api.configEntryFromForm(section, api.configFormFromEntry(section, e).form, Object.keys(e));
+  okEntries.concat([["tools", { cypher: CY, name: "n", description: "", parameters: [], max_rows: 100 }],
+    ["tools", { name: "n", parameters: [{ name: "p", type: "string", required: true, default: null, description: "" }] }],
+    ["tools", { name: "n", parameters: [{ name: "p", type: "integer", default: "12" }, { name: "q", type: "boolean", default: "yes" },
+      { name: "r", type: "float", default: 1e21 }, { name: "s", default: "" }] }],
+    ["node_types", { label: "N", key: [], metadata: [], description: "", color: null, source: null }],
+    ["node_types", { metadata: [{ description: null, required: false, name: "a", type: "string" }], key: ["a"], label: "N" }]])
+    .forEach(([section, e], i) => {
+      check("mapping -> form -> mapping is the identity, key order included (" + section + " #" + i + ")", j(back(section, e)) === j(e), j(back(section, e)));
+    });
+  const toolForm = e => api.configFormFromEntry("tools", e).form;
+  let tf = toolForm(api.CONFIG_SECTIONS.tools.entry);
+  tf.max_rows = "250"; tf.timeout_s = "abc"; tf.description = "";
+  tf.parameters.push({ name: "i", type: "integer", required: false, default: "12", description: "" },
+    { name: "f", type: "float", required: false, default: "2.5", description: "" },
+    { name: "g", type: "float", required: false, default: "0x10", description: "" },
+    { name: "h", type: "integer", required: false, default: "1.5", description: "" },
+    { name: "b", type: "boolean", required: false, default: "false", description: "" },
+    { name: "s", type: "string", required: false, default: "12", description: "" },
+    { name: "r", type: "string", required: true, default: "", description: "Plain." });
+  let m = api.configEntryFromForm("tools", tf, ["name", "description", "cypher"]);
+  check("integer text becomes a number, other text stays the string typed",
+    m.max_rows === 250 && m.timeout_s === "abc", j(m));
+  check("typed defaults: integer and float text become numbers, a boolean select a boolean, the rest stays text",
+    j(m.parameters.map(p => p.default)) === j([12, 2.5, "0x10", "1.5", false, "12", undefined]), j(m.parameters));
+  check("an emptied description is omitted", !("description" in m), j(m));
+  check("model defaults are not written into new rows (type string, required true)",
+    j(m.parameters[6]) === j({ name: "r", description: "Plain." }), j(m.parameters[6]));
+  check("a new row's keys come in model order", j(Object.keys(m.parameters[0])) === j(["name", "type", "required", "default"]),
+    j(m.parameters[0]));
+  check("new keys follow the opened ones in model order",
+    j(Object.keys(m)) === j(["name", "cypher", "parameters", "max_rows", "timeout_s"]), j(Object.keys(m)));
+  tf = toolForm({ cypher: CY, name: "n", description: "d", parameters: [{ required: true, type: "string", name: "p" }] });
+  tf.max_rows = "5";
+  m = api.configEntryFromForm("tools", tf, ["cypher", "name", "description", "parameters"]);
+  check("a hand-ordered entry keeps its order; a new key goes last",
+    j(Object.keys(m)) === j(["cypher", "name", "description", "parameters", "max_rows"]), j(m));
+  check("defaults the opened entry spelled out are kept", j(m.parameters[0]) === j({ required: true, type: "string", name: "p" }), j(m));
+  tf.parameters[0].required = false; tf.parameters[0].type = "integer"; tf.parameters[0].default = "3";
+  m = api.configEntryFromForm("tools", tf, ["cypher", "name", "description", "parameters"]);
+  check("a changed row keeps its own key order", j(m.parameters[0]) === j({ required: false, type: "integer", name: "p", default: 3 }), j(m));
+  tf = toolForm({ name: "n", parameters: [{ name: "p", type: "string", required: false, default: "5" }] });
+  tf.parameters[0].type = "integer";
+  m = api.configEntryFromForm("tools", tf, ["name", "parameters"]);
+  check("a default re-reads as its new type when the type changes", m.parameters[0].default === 5, j(m));
+  tf = toolForm({ name: "n", description: "d", max_rows: 7 });
+  tf.description = ""; tf.max_rows = "";
+  m = api.configEntryFromForm("tools", tf, ["name", "description", "max_rows"]);
+  check("clearing optional fields removes them", j(m) === j({ name: "n" }), j(m));
+  tf = toolForm({ name: "n", parameters: [{ name: "p" }] });
+  tf.parameters = [];
+  m = api.configEntryFromForm("tools", tf, ["name", "parameters"]);
+  check("an emptied list the entry had stays as an empty list", j(m) === j({ name: "n", parameters: [] }), j(m));
+  const nodeForm = e => api.configFormFromEntry("node_types", e).form;
+  let nf = nodeForm(api.CONFIG_SECTIONS.node_types.entry);
+  check("key components are ticks on metadata rows", nf.metadata[0].key === true, j(nf));
+  nf.metadata.push({ name: "path", type: "string", required: false, key: true, description: "" },
+    { name: "owner", type: "string", required: true, key: false, description: "" });
+  nf.description = "Runbooks."; nf.color = "#00ff00"; nf.source = "folder";
+  m = api.configEntryFromForm("node_types", nf, ["label", "key", "metadata"]);
+  check("the key is the ticked rows' names in row order", j(m.key) === j(["slug", "path"]), j(m));
+  check("a new metadata row omits model defaults", j(m.metadata.slice(1)) === j([{ name: "path" }, { name: "owner", required: true }]), j(m));
+  check("a filesystem source is {provider, kind}", j(m.source) === j({ provider: "filesystem", kind: "folder" }), j(m));
+  check("node type keys: opened order, then model order",
+    j(Object.keys(m)) === j(["label", "key", "metadata", "description", "color", "source"]), j(Object.keys(m)));
+  nf = nodeForm({ label: "N", key: ["a"], metadata: [{ name: "a" }], source: { provider: "filesystem", kind: "file" }, color: "#000000" });
+  nf.source = ""; nf.color = "";
+  m = api.configEntryFromForm("node_types", nf, ["label", "key", "metadata", "source", "color"]);
+  check("choosing no source and clearing the colour removes them", j(m) === j({ label: "N", key: ["a"], metadata: [{ name: "a" }] }), j(m));
+
+  // 38. the serialiser
+  const sc = v => api.configYamlScalar(v);
+  check("identifiers are plain", sc("hot_paths") === "hot_paths" && sc("Runbook") === "Runbook", sc("hot_paths"));
+  [["yes", '"yes"'], ["No", '"No"'], ["null", '"null"'], ["Y", '"Y"'], ["off", '"off"'], ["#1f77b4", '"#1f77b4"'], ["1e3", '"1e3"'],
+    ["123", '"123"'], ["a: b", '"a: b"'], [" lead", '" lead"'], ["", '""'], ["2026-10-05", '"2026-10-05"'],
+    ["two words", '"two words"'], ["say \"hi\"", '"say \\"hi\\""'],
+    ["a\u2028b", '"a\\u2028b"'], ["a\u2029b\x85c", '"a\\u2029b\\u0085c"'], ["del\x7f", '"del\\u007f"'],
+    ["a\r\nb\r\n", '"a\\r\\nb\\r\\n"'], ["lone\ud800\nx\n", '"lone\\ud800\\nx\\n"'], ["lo\nne\udc00", '"lo\\nne\\udc00"'], ["x\n\n", '"x\\n\\n"'], ["  lead\nx", '"  lead\\nx"'], ["\n", '"\\n"'],
+    [true, "true"], [false, "false"], [12, "12"], [-3, "-3"], [0.5, "0.5"], [1e-7, "1.0e-7"], [1e21, "1.0e+21"], [null, "null"]]
+    .forEach(([v, want]) => check("scalar " + j(v) + " -> " + want, sc(v) === want, sc(v)));
+  check("text ending in one line break is a | block", api.configYamlScalar("A\nB\n", "  ") === "|\n  A\n  B", j(api.configYamlScalar("A\nB\n", "  ")));
+  check("a surrogate pair stays in a block", api.configYamlScalar("a \ud83d\ude42\nb\n", "  ") === "|\n  a \ud83d\ude42\n  b",
+    j(api.configYamlScalar("a \ud83d\ude42\nb\n", "  ")));
+  check("text ending in none is a |- block", api.configYamlScalar("A\n\nB", "    ") === "|-\n    A\n\n    B", j(api.configYamlScalar("A\n\nB", "    ")));
+  check("the node type template serialises to its own text",
+    api.configEntryYaml("node_types", api.CONFIG_SECTIONS.node_types.entry, ["label", "key", "metadata"]) === api.CONFIG_SECTIONS.node_types.template,
+    j(api.configEntryYaml("node_types", api.CONFIG_SECTIONS.node_types.entry, ["label", "key", "metadata"])));
+  const toolYaml = api.configEntryYaml("tools", TOOL_OK(), Object.keys(TOOL_OK()));
+  check("a tool serialises as block YAML with a | Cypher block and a parameter sequence", toolYaml ===
+    "name: hot_paths\ndescription: d\ncypher: |\n  MATCH (n {repo_id: $repo_id})\n  RETURN n\nparameters:\n  - name: s\n" +
+    "  - name: i\n    type: integer\n    required: false\n    default: 3\n" +
+    "  - name: f\n    type: float\n    required: false\n    default: 0.5\n    description: \"Rows.\"\n" +
+    "  - name: b\n    type: boolean\n    required: false\n    default: true\n    description: null\nmax_rows: 200\ntimeout_s: 5\n", toolYaml);
+  check("keys follow the given order, then model order",
+    api.configEntryYaml("tools", { cypher: "c", name: "nm", max_rows: 1, description: "d" }, ["cypher"]) ===
+    "cypher: c\nname: nm\ndescription: d\nmax_rows: 1\n", api.configEntryYaml("tools", { cypher: "c", name: "nm", max_rows: 1, description: "d" }, ["cypher"]));
+  check("key is a flow list, quoting what needs it; source a nested mapping; empty lists are []",
+    api.configEntryYaml("node_types", { label: "Nd", key: ["path", "a b"], source: { provider: "filesystem", kind: "file" }, metadata: [] }, []) ===
+    'label: Nd\nkey: [path, "a b"]\nsource:\n  provider: filesystem\n  kind: file\nmetadata: []\n',
+    api.configEntryYaml("node_types", { label: "Nd", key: ["path", "a b"], source: { provider: "filesystem", kind: "file" }, metadata: [] }, []));
+  const nested = api.configEntryYaml("node_types", { label: "Nd", metadata: [{ name: "a", description: "two\nlines\n" }] }, []);
+  check("a block inside a sequence item is indented under its key", nested ===
+    "label: Nd\nmetadata:\n  - name: a\n    description: |\n      two\n      lines\n", nested);
+
+  // 39. advisory hints
+  const hints = (section, e, edit) => {
+    const f = api.configFormFromEntry(section, e).form;
+    if (edit) edit(f);
+    return api.configFormHints(section, f);
+  };
+  const VALID_TOOL = { name: "hot_paths", description: "d", cypher: "MATCH (n {repo_id: $repo_id}) WHERE n.x = $p RETURN n",
+    parameters: [{ name: "p", type: "integer", required: false, default: 3 }], max_rows: 10, timeout_s: 60 };
+  check("no hints for a valid tool", j(hints("tools", VALID_TOOL)) === "[]", j(hints("tools", VALID_TOOL)));
+  const VALID_NODE = { label: "Doc", key: ["path"], color: "#A0b0C0", source: { provider: "filesystem", kind: "file" },
+    metadata: [{ name: "path", type: "string" }, { name: "title" }] };
+  check("no hints for a valid node type", j(hints("node_types", VALID_NODE)) === "[]", j(hints("node_types", VALID_NODE)));
+  const hintCases = [
+    ["tools", "an empty tool name", f => { f.name = ""; }, "name", /required/],
+    ["tools", "a tool name off the pattern", f => { f.name = "Hot"; }, "name", /lowercase/],
+    ["tools", "a blank description", f => { f.description = "  "; }, "description", /agent reads/],
+    ["tools", "a description over the limit", f => { f.description = "x".repeat(1025); }, "description", /1025 characters.*1024/],
+    ["tools", "a blank cypher", f => { f.cypher = " \n"; }, "cypher", /required/],
+    ["tools", "cypher without $repo_id", f => { f.cypher = "MATCH (n) WHERE n.x = $p RETURN n"; }, "cypher", /doesn't appear to filter on `\$repo_id`/],
+    ["tools", "duplicate parameter names", f => { f.parameters.push({ ...f.parameters[0], open: {} }); }, "parameters.1.name", /Another parameter is also named p/],
+    ["tools", "an empty parameter name", f => { f.parameters[0].name = ""; }, "parameters.0.name", /required/],
+    ["tools", "a default on a required parameter", f => { f.parameters[0].required = true; }, "parameters.0.default", /optional/],
+    ["tools", "a default not reading as its type", f => { f.parameters[0].default = "3.5"; }, "parameters.0.default", /doesn't read as an integer/],
+    ["tools", "a float default not reading as a float", f => { f.parameters[0].type = "float"; f.parameters[0].default = "x"; }, "parameters.0.default", /doesn't read as a float/],
+    ["tools", "max_rows out of range", f => { f.max_rows = "1001"; }, "max_rows", /1 to 1000/],
+    ["tools", "timeout_s not an integer", f => { f.timeout_s = "2.5"; }, "timeout_s", /1 to 60/],
+    ["node_types", "an empty label", f => { f.label = ""; }, "label", /required/],
+    ["node_types", "a label off the pattern", f => { f.label = "1Doc"; }, "label", /letter/],
+    ["node_types", "no key ticked", f => { f.source = ""; f.metadata[0].key = false; }, "key", /Tick Key/],
+    ["node_types", "a metadata name off the pattern", f => { f.metadata[1].name = "Title"; }, "metadata.1.name", /lowercase/],
+    ["node_types", "duplicate metadata names", f => { f.metadata[1].name = "path"; }, "metadata.1.name", /Another field is also named path/],
+    ["node_types", "a colour that isn't #rrggbb", f => { f.color = "red"; }, "color", /#rrggbb/],
+    ["node_types", "a filesystem source without a string path key", f => { f.metadata[0].type = "integer"; }, "source", /path/],
+    ["node_types", "a filesystem source keyed on more than path", f => { f.metadata[1].key = true; }, "source", /path/],
+  ];
+  hintCases.forEach(([section, what, edit, field, re]) => {
+    const got = hints(section, section === "tools" ? VALID_TOOL : VALID_NODE, edit);
+    check("a hint for " + what, got.some(h => h.field === field && re.test(h.text)), j(got));
+  });
+
+  // 40. switching back to the form
+  const openText = "name: hot_paths\n";
+  const swEdit = { section: "tools", openEntry: { name: "hot_paths" }, openText, formText: openText, formState: null };
+  let s = api.configFormSwitch(swEdit, openText);
+  check("the opening text can go back to the form, rebuilt from the opening entry", s.available && s.restore === "open" && !s.reason, j(s));
+  swEdit.formState = toolForm({ name: "renamed" }); swEdit.formText = "name: renamed\n";
+  s = api.configFormSwitch(swEdit, "name: renamed\n");
+  check("the form's last text restores the form state", s.available && s.restore === "state", j(s));
+  s = api.configFormSwitch(swEdit, "name: renamed\n# mine\n");
+  check("hand-edited text can't go back to the form, saying why", !s.available && s.restore === null &&
+    s.reason === "The YAML was edited by hand, and the form can only show text it produced. Keep editing as YAML, or discard the hand edits to return to the form.", j(s));
+  s = api.configFormSwitch({ ...swEdit, openEntry: { name: "x", extra: 1 }, formState: null }, openText);
+  check("an entry the form can't show never switches to it", !s.available && s.reason === FIELD("extra"), j(s));
+
+  // 41. the form view in the editor (DOM): opening, editing, saving through the same dry run
+  const TOOL_ENTRY = { name: "hot_paths", description: "Hot paths.", cypher: "MATCH (f:Function {repo_id: $repo_id})\nRETURN f.name AS name\n",
+    parameters: [{ name: "limit", type: "integer", required: false, default: 10 }, { name: "flag", type: "boolean", required: false, default: "yes" }] };
+  /* what the server dumped: deliberately not what the form's emitter would write */
+  const TOOL_YAML = "name: hot_paths\ndescription: 'Hot paths.'\ncypher: |\n  MATCH (f:Function {repo_id: $repo_id})\n  RETURN f.name AS name\nparameters:\n- {name: limit, type: integer, required: false, default: 10}\n- {name: flag, type: boolean, required: false, default: 'yes'}\n";
+  const RUNBOOK = { label: "Runbook", key: ["slug"], metadata: [{ name: "slug", type: "string", required: true }, { name: "owner", type: "string" }] };
+  const FM = () => {
+    const m = MODEL();
+    m.global.tools.entries[0].entry = { name: "hot_paths", description: "d", cypher: "x" };
+    const b = m.projects[1];
+    b.tools.entries = [
+      { name: "hot_paths", tool_id: "repo-b_hot_paths", yaml: TOOL_YAML, entry: TOOL_ENTRY, origin: "project", badges: [] },
+      { name: "dated", tool_id: "repo-b_dated", yaml: "name: dated\nsince: 2024-01-01\n", entry: null, origin: "project", badges: [] },
+      { name: "extra", tool_id: "repo-b_extra", yaml: "name: extra\nversion: 2\n", entry: { name: "extra", version: 2 }, origin: "project", badges: [] },
+      { name: "hostile", tool_id: "repo-b_hostile", yaml: "name: hostile\n", entry: { name: HOSTILE, description: HOSTILE, cypher: HOSTILE }, origin: "project", badges: [] },
+      { name: "multi", tool_id: "repo-b_multi", yaml: "name: multi\n", entry: { name: "multi", parameters: [{ name: "x", description: "line one\nline two" }] }, origin: "project", badges: [] },
+    ];
+    b.schema.node_types = [{ label: "Runbook", yaml: "label: Runbook\nkey: [slug]\n", entry: RUNBOOK, editable: true, badges: [] }];
+    b.schema.relationships = [{ type: "OWNS", yaml: "type: OWNS\n", editable: true, badges: [] }];
+    return m;
+  };
+  const formCtl = (label, n = 0, root = els.configForm) => {
+    const lab = find(root, e => e.tagName === "LABEL" && e.textContent === label)[n];
+    return lab && find(els.configForm, e => e.id === lab.htmlFor)[0];
+  };
+  const typeIn = async (el, v) => { el.value = v; await el.fire("input"); };
+  const group = title => find(els.configForm, e => e.tagName === "FIELDSET" && e.children[0] && e.children[0].textContent === title)[0];
+  const rowsOf = title => group(title).children.filter(e => e.tagName === "FIELDSET");
+  const legendOf = row => row.children[0].textContent;
+  const removeOf = row => find(row, e => e.tagName === "BUTTON" && e.textContent === "Remove")[0];
+  const editRow = async (scope, name, label = "Edit") => { await buttons(rowFor(card(scope), name), label)[0].fire("click"); };
+  const warnDry = (url, init) => JSON.parse(init.body).dry_run
+    ? { status: 200, body: { ok: true, written: false, warnings: ["Renaming keeps the old tool id."], notes: [], scope: FM().projects[1] } }
+    : ok(FM().projects[1]);
+  const quiet = (url, init) => ({ status: 200, body: { ok: true, written: !JSON.parse(init.body).dry_run, warnings: [], notes: [], scope: FM().projects[1] } });
+  configPayload = FM();
+  api.renderConfigPage(FM());
+  fetchCalls = [];
+  respond = quiet;
+  await editRow("repo-b", "hot_paths");
+  check("a tool with an entry opens in the form", shown(els.configForm) && !shown(els.configYaml) && shown(els.configEditorSwitch) &&
+    els.configModeForm.getAttribute("aria-pressed") === "true" && els.configModeYaml.getAttribute("aria-pressed") === "false" &&
+    els.configModeForm.getAttribute("aria-disabled") === "false" && !shown(els.configFormNotice),
+    JSON.stringify([els.configForm.style.display, els.configYaml.style.display]));
+  check("...the switch is a group labelled Editor; the form is a fieldset with no <form> (Enter never submits)",
+    /id="configEditorSwitch" role="group" aria-labelledby="configEditorLabel"[^>]*><span id="configEditorLabel">Editor<\/span>/.test(html) &&
+    /<fieldset class="cfg-form" id="configForm"/.test(html) && !/<form[\s>]/.test(html.slice(html.indexOf('id="configModal"'), html.indexOf('id="configResetModal"'))), "");
+  check("...showing the entry", formCtl("Name").value === "hot_paths" && formCtl("Cypher").value === TOOL_ENTRY.cypher &&
+    formCtl("Description").value === "Hot paths.", formCtl("Name").value);
+  check("...the textarea keeps the server's text untouched", els.configYaml.value === TOOL_YAML, els.configYaml.value);
+  check("...and focus is on the form's first control", focused === formCtl("Name"), focused && focused.tagName);
+  check("...with one help line under the switch", shown(els.configFormHelp) &&
+    html.includes('id="configFormHelp" style="display:none">The form writes the YAML; Save checks it first, as before.</div>'), els.configFormHelp.style.display);
+  await press(els.configModalSave);
+  check("open then save without changes sends the model's yaml byte for byte, dry run then write",
+    writes().length === 2 && body(writes()[0]).dry_run === true && body(writes()[1]).dry_run === false &&
+    writes().every(c => body(c).yaml === TOOL_YAML && c.url === "/api/config/repo-b/tools/hot_paths" && c.init.method === "PUT" &&
+      ifMatch(c) === '"sha256:repo-b-tools"'), JSON.stringify(writes()));
+
+  // 41b. a form edit is a textarea edit: serialised text, crossName cleared, the same request
+  api.renderConfigPage(FM());
+  fetchCalls = [];
+  await editRow("repo-b", "hot_paths");
+  api.edit.crossName = "stale";
+  await typeIn(formCtl("Description"), "Hotter paths.");
+  const edited = api.configEntryYaml("tools", { ...TOOL_ENTRY, description: "Hotter paths." }, Object.keys(TOOL_ENTRY));
+  check("a form edit writes the serialised entry into the textarea", els.configYaml.value === edited, els.configYaml.value);
+  check("...and clears a known-taken name like a textarea edit", api.edit.crossName === null, String(api.edit.crossName));
+  check("...keeping a value the form didn't touch exactly (the boolean parameter's 'yes')", /default: "yes"/.test(els.configYaml.value), els.configYaml.value);
+  await press(els.configModalSave);
+  check("Save from the form sends the textarea's text: same URL, method, If-Match, dry run then write",
+    writes().length === 2 && body(writes()[0]).dry_run === true && body(writes()[1]).dry_run === false &&
+    writes().every(c => body(c).yaml === edited && c.url === "/api/config/repo-b/tools/hot_paths" && c.init.method === "PUT" &&
+      ifMatch(c) === '"sha256:repo-b-tools"'), JSON.stringify(writes()));
+
+  // 41c. a form edit after a warning confirm forces a new dry run
+  api.renderConfigPage(FM());
+  fetchCalls = [];
+  respond = warnDry;
+  await editRow("repo-b", "hot_paths");
+  await press(els.configModalSave);
+  check("a dry run with warnings asks for 'Save anyway' in form mode too", els.configModalSave.textContent === "Save anyway" &&
+    shown(els.configModalConfirm), els.configModalSave.textContent);
+  check("...moving focus off the button to the form's first control (not left on Save once the form unlocks)",
+    focused === formCtl("Name") && focused !== els.configModalSave, focused && focused.tagName);
+  const cy = formCtl("Cypher");
+  cy.focus();
+  await typeIn(cy, TOOL_ENTRY.cypher + "LIMIT 5\n");
+  check("a form edit drops the confirm exactly as typing does", els.configModalSave.textContent === "Save" && !shown(els.configModalConfirm) &&
+    api.edit.confirmed === false, els.configModalSave.textContent);
+  check("...without pulling focus away from the field being typed in", focused === cy, focused && focused.tagName);
+  await press(els.configModalSave);
+  check("...so the next click dry-runs the new text instead of writing it",
+    writes().length === 2 && writes().every(c => body(c).dry_run === true) && body(writes()[1]).yaml === els.configYaml.value &&
+    /LIMIT 5/.test(body(writes()[1]).yaml) && els.configModalSave.textContent === "Save anyway", JSON.stringify(writes()));
+  await typeIn(formCtl("Description"), formCtl("Description").value);
+  check("an input event that leaves the text as it was keeps the confirm", els.configModalSave.textContent === "Save anyway" &&
+    api.edit.confirmed === true, els.configModalSave.textContent);
+  /* a confirm bound to text the form then changed (an edit landing after the click) re-dry-runs too */
+  api.edit.confirmed = true;
+  await typeIn(cy, TOOL_ENTRY.cypher + "LIMIT 6\n");
+  api.edit.confirmed = true;
+  await press(els.configModalSave);
+  check("a confirm never covers text the form changed after its dry run", writes().length === 3 && body(writes()[2]).dry_run === true &&
+    /LIMIT 6/.test(body(writes()[2]).yaml), JSON.stringify(writes()));
+  await press(els.configModalSave);
+  check("...and the confirmed write sends exactly the reviewed text", writes().length === 4 && body(writes()[3]).dry_run === false &&
+    body(writes()[3]).yaml === body(writes()[2]).yaml, JSON.stringify(writes()));
+
+  // 41d. busy: the form and the switch are locked like the textarea
+  api.renderConfigPage(FM());
+  fetchCalls = [];
+  await editRow("repo-b", "hot_paths");
+  gate = new Promise(r => { release = r; });
+  clock += 1000;
+  pending = els.configModalSave.fire("click");
+  await Promise.resolve();
+  check("while a dry run is out the form fieldset and both switch buttons are disabled",
+    els.configForm.disabled === true && els.configModeForm.disabled === true && els.configModeYaml.disabled === true,
+    JSON.stringify([els.configForm.disabled, els.configModeForm.disabled, els.configModeYaml.disabled]));
+  const busyText = els.configYaml.value;
+  await typeIn(formCtl("Description"), "typed while busy");
+  await press(find(els.configForm, e => e.tagName === "BUTTON" && e.textContent === "Add parameter")[0]);
+  check("...a form event that lands anyway changes neither the text nor the rows", els.configYaml.value === busyText &&
+    rowsOf("Parameters").length === 2 && api.edit.formState.description === "Hot paths.", els.configYaml.value);
+  await press(els.configModeYaml);
+  check("...and switching to YAML meanwhile does nothing", shown(els.configForm) && !shown(els.configYaml), els.configForm.style.display);
+  gate = null; release(); await pending;
+  check("...unlocked once the check is back", els.configForm.disabled === false && els.configModeForm.disabled === false &&
+    els.configModeYaml.disabled === false && els.configModalSave.textContent === "Save anyway", els.configModalSave.textContent);
+  els.configModalCancel.fire("click");
+
+  // 41e. YAML only, with the reason: entries the form can't carry, and relationships
+  const formOff = reason => !shown(els.configForm) && shown(els.configYaml) && shown(els.configEditorSwitch) && shown(els.configFormNotice) &&
+    els.configFormNoticeText.textContent === reason && els.configModeForm.getAttribute("aria-disabled") === "true" &&
+    els.configModeForm.getAttribute("aria-describedby") === "configFormNoticeText" && els.configModeForm.disabled === false &&
+    !shown(els.configFormDiscard);
+  await editRow("repo-b", "dated");
+  check("an entry JSON can't carry (entry: null) opens in YAML with the reason; Form stays focusable but unavailable",
+    formOff("This entry contains a value the page can't carry exactly (for example a date or a very large number). Edit it as YAML."),
+    els.configFormNoticeText.textContent);
+  await press(els.configModeForm);
+  check("...and pressing Form does nothing", !shown(els.configForm) && shown(els.configYaml), els.configForm.style.display);
+  await editRow("repo-b", "extra");
+  check("an entry with a field the form doesn't edit names it", formOff(FIELD("version")), els.configFormNoticeText.textContent);
+  await editRow("repo-b", "multi");
+  check("a line break in a single-line field opens in YAML, naming the field", formOff(FIELD("parameters.0.description")),
+    els.configFormNoticeText.textContent);
+  await editRow("repo-b", "OWNS");
+  check("a relationship opens in YAML with a quiet note that the form covers tools and node types",
+    formOff("Form: tools and node types only") && els.configFormNotice.classList.contains("quiet"), els.configFormNoticeText.textContent);
+  await editRow("repo-b", "dated");
+  check("...other reasons are not quiet", !els.configFormNotice.classList.contains("quiet"), els.configFormNotice.className);
+  els.configModalCancel.fire("click");
+
+  // 41f. delete and copy never show the form: the read-only YAML, no switch, no notice
+  await editRow("repo-b", "hot_paths", "Delete");
+  check("Delete shows the read-only YAML, never the form", !shown(els.configForm) && !shown(els.configEditorSwitch) && !shown(els.configFormNotice) &&
+    shown(els.configYaml) && els.configYaml.readOnly === true && els.configYaml.value === TOOL_YAML, els.configForm.style.display);
+  els.configModalCancel.fire("click");
+  await editRow("repo-b", "hot_paths", "Copy to…");
+  check("Copy shows the read-only YAML, never the form", !shown(els.configForm) && !shown(els.configEditorSwitch) && !shown(els.configFormNotice) &&
+    shown(els.configYaml) && els.configYaml.readOnly === true, els.configForm.style.display);
+  els.configModalCancel.fire("click");
+  await editRow("repo-b", "Runbook", "Delete");
+  check("...a node type's Delete too", !shown(els.configForm) && !shown(els.configEditorSwitch) && shown(els.configYaml), els.configForm.style.display);
+  els.configModalCancel.fire("click");
+
+  // 41g. the global warning step shows no editor; Continue shows the form
+  await editRow("__global__", "hot_paths");
+  check("the global warning step shows neither the form, the YAML nor the switch",
+    !shown(els.configForm) && !shown(els.configYaml) && !shown(els.configEditorSwitch) && !shown(els.configFormNotice), els.configForm.style.display);
+  await press(els.configModalSave);
+  check("...Continue shows the form", shown(els.configForm) && shown(els.configEditorSwitch) && shown(els.configDestField), els.configForm.style.display);
+  els.configModalCancel.fire("click");
+
+  // 41h. Form -> YAML -> a hand edit: Form explains itself; Discard returns and drops the confirm
+  fetchCalls = [];
+  respond = warnDry;
+  await editRow("repo-b", "hot_paths");
+  await typeIn(formCtl("Description"), "Edited.");
+  const formText = els.configYaml.value;
+  await press(els.configModeYaml);
+  check("Form -> YAML shows the form's own text", shown(els.configYaml) && !shown(els.configForm) && els.configYaml.value === formText &&
+    els.configModeYaml.getAttribute("aria-pressed") === "true" && els.configModeForm.getAttribute("aria-disabled") === "false" &&
+    !shown(els.configFormNotice) && !shown(els.configFormHelp), els.configYaml.value);
+  els.configYaml.value = formText + "# mine\n";
+  await els.configYaml.fire("input");
+  check("after a hand edit Form is unavailable, with the reason and a Discard button",
+    els.configModeForm.getAttribute("aria-disabled") === "true" && els.configModeForm.getAttribute("aria-describedby") === "configFormNoticeText" &&
+    els.configFormNoticeText.textContent === "The YAML was edited by hand, and the form can only show text it produced. Keep editing as YAML, or discard the hand edits to return to the form." &&
+    shown(els.configFormNotice) && shown(els.configFormDiscard), els.configFormNoticeText.textContent);
+  await press(els.configModeForm);
+  check("...pressing Form keeps the hand edit in YAML", shown(els.configYaml) && els.configYaml.value === formText + "# mine\n", els.configYaml.value);
+  await press(els.configModalSave);
+  check("...the hand edit is what gets dry-run", writes().length === 1 && body(writes()[0]).yaml === formText + "# mine\n" &&
+    els.configModalSave.textContent === "Save anyway", JSON.stringify(writes()));
+  await press(els.configFormDiscard);
+  check("Discard YAML edits puts the form's text back and returns to the form", els.configYaml.value === formText && shown(els.configForm) &&
+    !shown(els.configYaml) && formCtl("Description").value === "Edited.", els.configYaml.value);
+  check("...dropping the confirm", api.edit.confirmed === false && els.configModalSave.textContent === "Save" && !shown(els.configModalConfirm),
+    els.configModalSave.textContent);
+  check("...and focus lands in the form", focused === formCtl("Name"), focused && focused.tagName);
+  await press(els.configModalSave);
+  check("...so the next Save dry-runs the form's text", writes().length === 2 && body(writes()[1]).dry_run === true &&
+    body(writes()[1]).yaml === formText, JSON.stringify(writes()));
+  els.configModalCancel.fire("click");
+
+  // 41i. the last picked editor wins for the page session, when it is available
+  await editRow("repo-b", "hot_paths");
+  await press(els.configModeYaml);
+  els.configModalCancel.fire("click");
+  await editRow("repo-b", "hot_paths");
+  check("after picking YAML the next entry opens in YAML, with Form available",
+    shown(els.configYaml) && !shown(els.configForm) && els.configModeForm.getAttribute("aria-disabled") === "false" && els.configYaml.value === TOOL_YAML,
+    els.configYaml.style.display);
+  await press(els.configModeForm);
+  check("...Form from the untouched opening text shows the opened entry", shown(els.configForm) && formCtl("Description").value === "Hot paths." &&
+    els.configYaml.value === TOOL_YAML, els.configYaml.value);
+  els.configModalCancel.fire("click");
+  await buttons(card("repo-b"), "Add tool")[0].fire("click");
+  check("Add opens the template in the form", shown(els.configForm) && els.configYaml.value === api.CONFIG_SECTIONS.tools.template &&
+    formCtl("Name").value === "my_tool", els.configYaml.value);
+  els.configModalCancel.fire("click");
+
+  // 41j. accessibility: labels, legends, named row buttons, focus after Add and Remove
+  await editRow("repo-b", "hot_paths");
+  const labelled = root => find(root, e => ["INPUT", "SELECT", "TEXTAREA"].includes(e.tagName)).filter(c =>
+    !(c.id && find(root, l => l.tagName === "LABEL" && l.htmlFor === c.id).length === 1) && !c.getAttribute("aria-label"));
+  check("every tool form control has a label", labelled(els.configForm).length === 0, JSON.stringify(labelled(els.configForm).map(c => c.id)));
+  check("every button in the form has a name", find(els.configForm, e => e.tagName === "BUTTON").every(b => b.textContent || b.getAttribute("aria-label")), "");
+  check("parameter rows are legended with position and name", JSON.stringify(rowsOf("Parameters").map(legendOf)) ===
+    JSON.stringify(["Parameter 1: limit", "Parameter 2: flag"]), JSON.stringify(rowsOf("Parameters").map(legendOf)));
+  check("...and Remove names its row", removeOf(rowsOf("Parameters")[0]).getAttribute("aria-label") === "Remove parameter limit",
+    removeOf(rowsOf("Parameters")[0]).getAttribute("aria-label"));
+  await typeIn(formCtl("Name", 0, rowsOf("Parameters")[0]), "top_n");
+  check("...both follow a renamed row", legendOf(rowsOf("Parameters")[0]) === "Parameter 1: top_n" &&
+    removeOf(rowsOf("Parameters")[0]).getAttribute("aria-label") === "Remove parameter top_n", legendOf(rowsOf("Parameters")[0]));
+  await typeIn(formCtl("Name"), "Bad Name");
+  const nameHint = find(els.configForm, e => e.id === formCtl("Name").getAttribute("aria-describedby").split(" ").pop())[0];
+  check("...a hint shows under its field, linked by aria-describedby", nameHint && shown(nameHint) && /lowercase/.test(nameHint.textContent),
+    nameHint && nameHint.textContent);
+  await press(find(els.configForm, e => e.tagName === "BUTTON" && e.textContent === "Add parameter")[0]);
+  check("Add parameter adds a row and focuses its Name", rowsOf("Parameters").length === 3 &&
+    focused === formCtl("Name", 0, rowsOf("Parameters")[2]) && legendOf(rowsOf("Parameters")[2]) === "Parameter 3",
+    JSON.stringify(rowsOf("Parameters").map(legendOf)));
+  await press(removeOf(rowsOf("Parameters")[0]));
+  check("Remove focuses the next row's Name", rowsOf("Parameters").length === 2 && focused === formCtl("Name", 0, rowsOf("Parameters")[0]) &&
+    legendOf(rowsOf("Parameters")[0]) === "Parameter 1: flag", JSON.stringify(rowsOf("Parameters").map(legendOf)));
+  await press(removeOf(rowsOf("Parameters")[1]));
+  check("...or the Add button after the last row", focused && focused.textContent === "Add parameter", focused && focused.textContent);
+  check("removed rows leave the YAML", !/top_n/.test(els.configYaml.value) && /name: flag/.test(els.configYaml.value), els.configYaml.value);
+  els.configModalCancel.fire("click");
+
+  // 41k. never rebuild state from a control that could rewrite it
+  await editRow("repo-b", "hot_paths");
+  const flagDefault = formCtl("Default", 1);
+  check("a boolean default the select has no word for gets its own option, and shows it",
+    flagDefault.tagName === "SELECT" && flagDefault.value === "yes" && flagDefault.children.some(o => o.value === "yes"), flagDefault.value);
+  flagDefault.value = "true";
+  await flagDefault.fire("change");
+  check("...choosing true writes a boolean", /default: true/.test(els.configYaml.value), els.configYaml.value);
+  await press(find(els.configForm, e => e.tagName === "BUTTON" && e.textContent === "Add parameter")[0]);
+  check("...and the opened value keeps its option after a rebuild", formCtl("Default", 1).value === "true" &&
+    formCtl("Default", 1).children.some(o => o.value === "yes"), JSON.stringify(formCtl("Default", 1).children.map(o => o.value)));
+  const limitDefault = formCtl("Default", 0);
+  check("a typed default is a text input (a number input would read '' for '12abc')", limitDefault.tagName === "INPUT" && limitDefault.type === "text",
+    limitDefault.type);
+  await typeIn(limitDefault, "12abc");
+  check("...text that isn't an integer is kept as typed", limitDefault.value === "12abc" && /default: "12abc"/.test(els.configYaml.value), els.configYaml.value);
+  await typeIn(limitDefault, "12");
+  check("...an integer becomes a number", /default: 12\n/.test(els.configYaml.value), els.configYaml.value);
+  const maxRows = formCtl("Max rows");
+  check("Max rows is a text input too", maxRows.tagName === "INPUT" && maxRows.type === "text", maxRows.type);
+  await typeIn(maxRows, "12abc");
+  check("...keeping what was typed", /max_rows: "12abc"/.test(els.configYaml.value), els.configYaml.value);
+  await typeIn(maxRows, "50");
+  check("...or the number", /max_rows: 50\n/.test(els.configYaml.value), els.configYaml.value);
+  const typeSel = formCtl("Type", 0);
+  typeSel.focus();
+  typeSel.value = "float";
+  await typeSel.fire("change");
+  check("changing a parameter's type keeps the same select, focused (arrow keys don't churn)", formCtl("Type", 0) === typeSel &&
+    focused === typeSel && /type: float/.test(els.configYaml.value), focused && focused.tagName);
+  typeSel.value = "boolean";
+  await typeSel.fire("change");
+  check("...and swaps the default control for the type", formCtl("Default", 0).tagName === "SELECT" && focused === typeSel,
+    formCtl("Default", 0).tagName);
+  typeSel.value = "integer";
+  await typeSel.fire("change");
+  const req = formCtl("Required", 0);
+  req.focus();
+  req.checked = true;
+  await req.fire("change");
+  check("ticking Required disables the default and keeps focus on the box", formCtl("Default", 0).disabled === true &&
+    focused === formCtl("Required", 0), String(formCtl("Default", 0).disabled));
+  els.configModalCancel.fire("click");
+
+  // 41l. node types: ticks make the key, the source select, the colour text
+  await editRow("repo-b", "Runbook");
+  check("a node type opens in the form", shown(els.configForm) && formCtl("Label").value === "Runbook" &&
+    JSON.stringify(rowsOf("Metadata").map(legendOf)) === JSON.stringify(["Field 1: slug", "Field 2: owner"]), els.configForm.style.display);
+  check("every node type form control has a label", labelled(els.configForm).length === 0, JSON.stringify(labelled(els.configForm).map(c => c.id)));
+  const key2 = formCtl("Key", 1);
+  key2.checked = true;
+  await key2.fire("change");
+  check("ticking Key on a row appends it to the key in row order", /^key: \[slug, owner\]$/m.test(els.configYaml.value), els.configYaml.value);
+  const src = formCtl("Source");
+  src.value = "folder";
+  await src.fire("change");
+  check("a filesystem source writes provider and kind", /source:\n  provider: filesystem\n  kind: folder/.test(els.configYaml.value), els.configYaml.value);
+  const srcHint = find(els.configForm, e => e.id === src.getAttribute("aria-describedby").split(" ").pop())[0];
+  check("...with the path-key hint", shown(srcHint) && /path/.test(srcHint.textContent), srcHint.textContent);
+  await typeIn(formCtl("Colour"), "#1F77B4");
+  const swatch = find(els.configForm, e => e.type === "color")[0];
+  check("a colour is text; the swatch follows it", /color: "#1F77B4"/.test(els.configYaml.value) && swatch.value === "#1f77b4", els.configYaml.value);
+  await press(find(els.configForm, e => e.getAttribute && e.getAttribute("aria-label") === "Clear colour")[0]);
+  check("...and Clear removes it", !/color:/.test(els.configYaml.value) && formCtl("Colour").value === "", els.configYaml.value);
+  els.configModalCancel.fire("click");
+
+  // 41m. hostile values land only in .value / textContent
+  await editRow("repo-b", "hostile");
+  check("hostile name, description and Cypher are control values", formCtl("Name").value === HOSTILE && formCtl("Description").value === HOSTILE &&
+    formCtl("Cypher").value === HOSTILE, formCtl("Name").value);
+  await typeIn(formCtl("Name"), HOSTILE + "2");
+  check("...and nothing reaches innerHTML", allEls.every(e => !e._html.includes("<img") && !e._html.includes("onerror")),
+    JSON.stringify(allEls.filter(e => e._html.includes("<img")).map(e => e._html)));
+  els.configModalCancel.fire("click");
+
+  // 42. the editor is a dialog: focus lands inside once it is open, Tab wraps, focus goes back to the opener
+  api.renderConfigPage(FM());
+  fetchCalls = [];
+  const dlg = html.slice(html.indexOf('id="configModal"') - 40, html.indexOf('id="configModalWarn"'));
+  check("the Config modal is a labelled modal dialog", /role="dialog"/.test(dlg) && /aria-modal="true"/.test(dlg) &&
+    /aria-labelledby="configModalTitle"/.test(dlg), dlg);
+  check("the hand-edit notice is a polite live region", /id="configFormNotice"[^>]*aria-live="polite"/.test(html), "");
+  const opener = buttons(rowFor(card("repo-b"), "hot_paths"), "Edit")[0];
+  await press(opener);
+  check("opening the editor focuses its first control once the modal is open (form mode)", focused === formCtl("Name"), focused && focused.tagName);
+  const tab = (shift = false) => { const ev = { key: "Tab", shiftKey: shift, defaultPrevented: false, preventDefault() { ev.defaultPrevented = true; } }; api.configModalKey(ev); return ev; };
+  focused = els.configModalSave;
+  check("Tab from Save wraps to the first control (the Form switch)", tab().defaultPrevented && focused === els.configModeForm, focused && focused.id);
+  check("Shift+Tab from the first control wraps to Save", tab(true).defaultPrevented && focused === els.configModalSave, focused && focused.id);
+  focused = formCtl("Name");
+  check("Tab in the middle is left to the browser", !tab().defaultPrevented && !tab(true).defaultPrevented && focused === formCtl("Name"), "");
+  focused = opener;
+  check("Tab from outside the modal pulls focus in", tab().defaultPrevented && focused === els.configModeForm, focused && focused.id);
+  els.configModalSave.disabled = true;
+  focused = els.configModalCancel;
+  check("a disabled last control is skipped: Tab from Cancel wraps", tab().defaultPrevented && focused === els.configModeForm, focused && focused.id);
+  els.configModalSave.disabled = false;
+  await els.configModalCancel.fire("click");
+  check("Cancel returns focus to the Edit button that opened it", focused === opener && api.edit === null, focused && focused.tagName);
+  await press(opener);
+  api.configModalKey({ key: "Escape" });
+  check("Escape returns focus to the opener too", focused === opener && !els.configModal.classList.contains("open"), focused && focused.tagName);
+  await press(opener);
+  await els.configModal.onclick({ target: els.configModal });
+  check("an overlay click returns focus to the opener too", focused === opener, focused && focused.tagName);
+  api.renderConfigPage(MODEL());
+  await press(buttons(rowFor(card("repo-a"), "Runbook"), "Edit")[0]);
+  check("a YAML-only entry focuses the textarea", focused === els.configYaml, focused && focused.id);
+  focused = els.configModalSave;
+  const firstCtl = shown(els.configEditorSwitch) ? els.configModeForm : els.configYaml;
+  check("in YAML mode Tab from Save wraps to the first visible control; Shift+Tab back", tab().defaultPrevented && focused === firstCtl && tab(true).defaultPrevented && focused === els.configModalSave, focused && focused.id);
+  els.configModalCancel.fire("click");
+  respond = () => ok(globalBlock());
+  await press(buttons(rowFor(card("__global__"), "hot_paths"), "Delete")[0]);
+  check("the global warning step focuses its Continue button (no editor yet)", focused === els.configModalSave && els.configModalSave.textContent === "Continue", focused && focused.id);
+  els.configModalCancel.fire("click");
+  // the arming focus move after a warned dry run is unchanged: off Save, onto the editor
+  api.renderConfigPage(FM());
+  respond = warnDry;
+  await editRow("repo-b", "hot_paths");
+  await press(els.configModalSave);
+  check("after a warned dry run focus is still off Save, on the form's first control", els.configModalSave.textContent === "Save anyway" &&
+    focused === formCtl("Name"), focused && focused.tagName);
+  els.configModalCancel.fire("click");
+
+  // 43. the description count is the server's: stripped (Python's whitespace), then code points
+  const descCount = () => find(els.configForm, e => /characters$/.test(e.textContent) && e.children.length === 0)[0].textContent;
+  const hintFor = d => { const f = api.configFormFromEntry("tools", TOOL_ENTRY).form; f.description = d; return api.configFormHints("tools", f).filter(h => h.field === "description"); };
+  const A = n => "a".repeat(n);
+  check("1024 characters padded with spaces is within the limit", hintFor("  " + A(1024) + "\n").length === 0, "");
+  check("1025 characters is over, and says so", /1025 characters; the limit is 1024/.test((hintFor(A(1025))[0] || {}).text || ""), JSON.stringify(hintFor(A(1025))));
+  check("1024 astral characters count as 1024 (code points, not UTF-16 units)", hintFor("\u{1F600}".repeat(1024)).length === 0 && hintFor("\u{1F600}".repeat(1025)).length === 1, "");
+  check("Python's str.strip removes NEL and the separator controls, so they pad for free", hintFor(A(1024) + "\x85\x1c").length === 0 && hintFor("\x1f" + A(1024)).length === 0, "");
+  check("...and keeps a BOM, which it does not strip", hintFor(A(1024) + "\uFEFF").length === 1, "");
+  await editRow("repo-b", "hot_paths");
+  await typeIn(formCtl("Description"), A(1024) + "\x85");
+  check("the live count agrees: 1024 / 1024", descCount() === "1024 / 1024 characters", descCount());
+  await typeIn(formCtl("Description"), A(1024) + "\uFEFF");
+  check("...and a BOM counts: 1025 / 1024", descCount() === "1025 / 1024 characters", descCount());
+  els.configModalCancel.fire("click");
+
+  // 44. the Reset dialog gets the editor's dialog handling
+  const rdlg = html.slice(html.indexOf('id="configResetModal"') - 40, html.indexOf('id="configResetTitle"'));
+  check("the Reset modal is a labelled modal dialog", /role="dialog"/.test(rdlg) && /aria-modal="true"/.test(rdlg) &&
+    /aria-labelledby="configResetTitle"/.test(rdlg), rdlg);
+  const inside = (el, root) => { for (let e = el; e; e = e.parentNode) if (e === root) return true; return false; };
+  const tickOnce = () => new Promise(r => setImmediate(r));
+  const rdry = { status: 200, body: { ok: true, written: false, file: "devgraph.tools.yaml", fingerprint: "sha256:dry-fp",
+    removed: { tools: ["hot_paths"] }, warnings: [], notes: [], scope: project("repo-a"), global: globalBlock() } };
+  api.renderConfigPage(MODEL());
+  fetchCalls = [];
+  respond = () => rdry;
+  const ropener = buttons(card("repo-a"), "Reset devgraph.tools.yaml…")[0];
+  let openGate;
+  gate = new Promise(r => { openGate = r; });
+  const opening = press(ropener);
+  await tickOnce();
+  check("opening Reset moves focus inside the dialog before the dry run answers", focused === els.configResetCancel, focused && focused.id);
+  openGate(); gate = null;
+  await opening;
+  check("...and onto the phrase input once the list is shown", focused === els.configResetTyped, focused && focused.id);
+  const rtab = (shift = false) => { const ev = { key: "Tab", shiftKey: shift, defaultPrevented: false, preventDefault() { ev.defaultPrevented = true; } }; api.configModalKey(ev); return ev; };
+  focused = els.configResetCancel;
+  check("Tab from Cancel wraps to the phrase input (the disabled Reset is skipped)", rtab().defaultPrevented && focused === els.configResetTyped, focused && focused.id);
+  check("Shift+Tab from the phrase input wraps to Cancel", rtab(true).defaultPrevented && focused === els.configResetCancel, focused && focused.id);
+  focused = els.configResetTyped;
+  check("Tab from the phrase input is left to the browser", !rtab().defaultPrevented && focused === els.configResetTyped, "");
+  focused = ropener;
+  check("Tab from outside the dialog pulls focus in", rtab().defaultPrevented && focused === els.configResetTyped, focused && focused.id);
+  els.configResetTyped.value = "repo-a";
+  await els.configResetTyped.fire("input");
+  clock += 1000;
+  api.configModalKey({ key: "Escape" });
+  check("Escape closes the dialog, returns focus to the opener and sends no reset", !els.configResetModal.classList.contains("open") &&
+    api.reset === null && focused === ropener && fetchCalls.length === 1 && body(fetchCalls[0]).dry_run === true, JSON.stringify(fetchCalls));
+  await press(ropener);
+  await els.configResetCancel.fire("click");
+  check("Cancel returns focus to the opener", focused === ropener && api.reset === null, focused && focused.id);
+  await press(ropener);
+  await els.configResetModal.onclick({ target: els.configResetModal });
+  check("an overlay click returns focus to the opener", focused === ropener && api.reset === null, focused && focused.id);
+
+  // 45. after a save or reset re-renders the card, focus lands on the same entry's Edit button, else its section's Add button
+  const FMNamed = (from, to) => { const m = FM(); m.projects[1].tools.entries.find(e => e.name === from).name = to; return m; };
+  const FMWithout = name => { const m = FM(); m.projects[1].tools.entries = m.projects[1].tools.entries.filter(e => e.name !== name); return m; };
+  const editBtn = (scope, name) => buttons(rowFor(card(scope), name), "Edit")[0];
+  const addBtn = (scope, section) => buttons(card(scope), "Add " + api.CONFIG_SECTIONS[section].noun)[0];
+  const answer = model => (url, init) => ({ status: 200, body: { ok: true, written: !(init.body && JSON.parse(init.body).dry_run), warnings: [], notes: [], scope: model.projects[1] } });
+  const desc = () => focused && focused.tagName + " " + focused.textContent;
+  api.renderConfigPage(FM());
+  configPayload = FM();
+  respond = answer(FM());
+  let old = editBtn("repo-b", "hot_paths");
+  await press(old);
+  await press(els.configModalSave);
+  check("a saved edit re-renders the card and focuses the same entry's new Edit button", api.edit === null && editBtn("repo-b", "hot_paths") !== old &&
+    focused === editBtn("repo-b", "hot_paths"), desc());
+  api.renderConfigPage(FM());
+  configPayload = FMNamed("hot_paths", "renamed");
+  respond = answer(configPayload);
+  await press(editBtn("repo-b", "hot_paths"));
+  await typeIn(formCtl("Name"), "renamed");
+  await press(els.configModalSave);
+  check("a renamed entry has no old-name Edit button, so focus goes to its section's Add button",
+    !rowFor(card("repo-b"), "hot_paths") && focused === addBtn("repo-b", "tools"), desc());
+  api.renderConfigPage(FM());
+  configPayload = FMWithout("hot_paths");
+  respond = answer(configPayload);
+  old = buttons(rowFor(card("repo-b"), "hot_paths"), "Delete")[0];
+  await press(old);
+  await press(els.configModalSave);
+  check("a deleted entry: focus goes to its section's Add button, not the removed opener", !rowFor(card("repo-b"), "hot_paths") &&
+    focused === addBtn("repo-b", "tools") && focused !== old, desc());
+  check("the card heading can take focus by script (the last resort)", find(card("repo-b"), e => e.tagName === "H3")[0].getAttribute("tabindex") === "-1", "no tabindex on the card heading");
+  // a reset: the file is gone, so its Reset button is too
+  api.renderConfigPage(MODEL());
+  const afterA2 = project("repo-a"); afterA2.tools.state = "absent"; afterA2.tools.fingerprint = "absent";
+  respond = (url, init) => JSON.parse(init.body).dry_run ? rdry
+    : { status: 200, body: { ok: true, written: true, file: "devgraph.tools.yaml", fingerprint: "absent", removed: { tools: ["hot_paths"] }, warnings: [], notes: [], scope: afterA2, global: globalBlock() } };
+  configPayload = MODEL();
+  await press(buttons(card("repo-a"), "Reset devgraph.tools.yaml…")[0]);
+  els.configResetTyped.value = "repo-a";
+  await els.configResetTyped.fire("input");
+  await press(els.configResetConfirm);
+  check("after a reset focus goes to the card's Add button for that file, not the body", api.reset === null && focused === addBtn("repo-a", "tools") &&
+    buttons(card("repo-a"), "Reset devgraph.tools.yaml…").length === 0, desc());
+  // the global store: the whole page reloads after it
+  api.renderConfigPage(MODEL());
+  respond = (url, init) => JSON.parse(init.body).dry_run ? { status: 200, body: { ...rdry.body, scope: globalBlock() } }
+    : { status: 200, body: { ok: true, written: true, file: "global-tools.json", fingerprint: "sha256:g2", removed: { tools: ["hot_paths"] }, warnings: [], notes: [], scope: globalBlock() } };
+  old = buttons(card("__global__"), "Reset global-tools.json…")[0];
+  await press(old);
+  els.configResetTyped.value = "global";
+  await els.configResetTyped.fire("input");
+  await press(els.configResetConfirm);
+  check("after resetting the global store focus is on a control in the re-rendered global card, not the removed opener", api.reset === null &&
+    focused !== old && inside(focused, card("__global__")), desc());
 
   console.log(failures ? "\n" + failures + " FAILED" : "\nall passed");
   process.exit(failures ? 1 : 0);

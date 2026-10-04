@@ -837,7 +837,7 @@ def test_unicode_line_breaks_in_values_cannot_inject_keys(client, registry, tmp_
     import yaml
 
     record = _repo(tmp_path, registry)
-    entry = {"name": "find_parents", "description": "a\nb     max_rows: 7",
+    entry = {"name": "find_parents", "description": "a\nb\u2028    max_rows: 7",
              "cypher": "MATCH (n {repo_id: $repo_id}) RETURN n LIMIT 1"}
 
     response = _send(client, "POST", "/api/config/repo-a/tools", "absent", {"yaml": yaml.safe_dump(entry)})
@@ -1069,7 +1069,8 @@ def test_registration_failures_give_fallback_and_not_served_badges(registry, tmp
     _write(record.path, TOOLS_FILENAME, TOOL.format(name="hot_paths") + "      - name: lonely\n"
            "        description: L.\n        cypher: \"MATCH (n {repo_id: $repo_id}) RETURN n LIMIT 1\"\n")
     live = resolve_tools(record, server=_RefusingServer({"A tool.", "L."}))
-    schema_info = lambda r: {"state": "absent", "error": None}
+    def schema_info(r):
+        return {"state": "absent", "error": None}
 
     block = config_model.build_project(record, schema_info, status=live)
 
@@ -1565,3 +1566,143 @@ def test_global_block_run_cypher_enabled_follows_the_setting(client, monkeypatch
     assert client.get("/api/config").json()["global"]["tools"]["run_cypher_enabled"] is False
     monkeypatch.setattr(settings, "enable_run_cypher", True, raising=False)
     assert client.get("/api/config").json()["global"]["tools"]["run_cypher_enabled"] is True
+
+
+# --- parsed entries for the form editor -------------------------------------
+
+def test_form_entry_keeps_plain_data_and_refuses_what_json_cannot_carry():
+    import datetime
+
+    from devgraph.dashboard.config_model import form_entry
+
+    plain = {"name": "t", "n": 5, "f": 1.5, "b": True, "z": None, "l": [1, {"a": ["x", False]}], "d": {"k": "v"}}
+    assert form_entry(plain) == plain
+    assert form_entry({"b": True})["b"] is True
+    limit = 2**53 - 1
+    assert form_entry({"n": limit, "m": -limit}) == {"n": limit, "m": -limit}
+    for bad in (
+        {1: "x"}, {"d": datetime.date(2020, 1, 1)}, {"f": float("nan")}, {"f": float("inf")},
+        {"n": limit + 1}, {"n": -limit - 1}, {"l": [{2: 1}]}, {"s": {"a", "b"}}, {"b": b"x"},
+    ):
+        assert form_entry(bad) is None
+
+
+def test_tool_and_node_type_rows_carry_the_files_mapping_in_key_order(client, registry, tmp_path, global_store):
+    _global_store(global_store, "hot_paths")
+    record = _repo(tmp_path, registry)
+    _write(record.path, TOOLS_FILENAME, """
+        version: 1
+        tools:
+          - description: Counts things.
+            max_rows: 7
+            name: counter
+            cypher: "MATCH (n {repo_id: $repo_id}) RETURN count(n) AS c"
+        """)
+    _write(record.path, SCHEMA_FILENAME, SCHEMA)
+
+    [g] = client.get("/api/config/__global__").json()["tools"]["entries"]
+    assert g["entry"] == {"name": "hot_paths", "description": "G.",
+                          "cypher": "MATCH (n {repo_id: $repo_id}) RETURN n LIMIT 1"}
+    project = client.get("/api/config/repo-a").json()
+    [tool] = project["tools"]["entries"]
+    assert list(tool["entry"]) == ["description", "max_rows", "name", "cypher"] and tool["entry"]["max_rows"] == 7
+    [node] = project["schema"]["node_types"]
+    assert node["entry"]["label"] == "Widget"
+    [rel] = project["schema"]["relationships"]
+    assert "entry" not in rel
+
+
+def test_entries_json_cannot_carry_are_null(client, registry, tmp_path):
+    record = _repo(tmp_path, registry)
+    _write(record.path, TOOLS_FILENAME, """
+        version: 1
+        tools:
+          - name: dated
+            description: 2020-01-01
+            cypher: RETURN 1
+          - name: big
+            description: Big.
+            cypher: RETURN 1
+            max_rows: 1152921504606846976
+          - name: fine
+            description: Fine.
+            cypher: RETURN 1
+        """)
+    _write(record.path, SCHEMA_FILENAME, """
+        version: 1
+        node_types:
+          - label: Widget
+            key: [slug]
+            metadata:
+              - {name: slug, type: string, description: .nan}
+        """)
+
+    project = client.get("/api/config/repo-a").json()
+
+    assert {e["name"]: e["entry"] is None for e in project["tools"]["entries"]} == {
+        "dated": True, "big": True, "fine": False}
+    [node] = project["schema"]["node_types"]
+    assert node["entry"] is None and "yaml" in node
+
+
+def test_form_entry_refuses_self_referencing_data_but_keeps_shared_data():
+    from devgraph.dashboard.config_model import form_entry
+
+    cyclic_list: list = []
+    cyclic_list.append(cyclic_list)
+    cyclic_dict: dict = {}
+    cyclic_dict["self"] = cyclic_dict
+    assert form_entry({"parameters": cyclic_list}) is None
+    assert form_entry(cyclic_dict) is None
+    shared = ["x"]
+    assert form_entry({"a": shared, "b": shared}) == {"a": ["x"], "b": ["x"]}
+
+
+def test_self_referencing_yaml_does_not_break_the_page(client, registry, tmp_path):
+    record = _repo(tmp_path, registry)
+    _write(record.path, TOOLS_FILENAME, """
+        version: 1
+        tools:
+          - name: loopy
+            description: Loops.
+            cypher: RETURN 1
+            parameters: &a [*a]
+        """)
+
+    response = client.get("/api/config/repo-a")
+
+    assert response.status_code == 200
+    assert all(e["entry"] is None for e in response.json()["tools"]["entries"])
+
+
+def test_form_entry_refuses_integral_floats_the_browser_cannot_tell_from_ints():
+    from devgraph.dashboard.config_model import form_entry
+
+    for bad in (3.0, -0.0, 1e16):
+        assert form_entry({"default": bad}) is None
+        assert form_entry({"parameters": [{"default": bad}]}) is None
+    assert form_entry({"default": 2.5}) == {"default": 2.5}
+
+
+def test_integral_float_values_make_the_row_yaml_only(client, registry, tmp_path):
+    record = _repo(tmp_path, registry)
+    _write(record.path, TOOLS_FILENAME, """
+        version: 1
+        tools:
+          - name: rows
+            description: Rows.
+            cypher: RETURN 1
+            max_rows: 5.0
+          - name: defaulted
+            description: Defaulted.
+            cypher: RETURN 1
+            parameters:
+              - {name: n, type: float, required: false, default: 3.0}
+          - name: fine
+            description: Fine.
+            cypher: RETURN 1
+        """)
+
+    entries = client.get("/api/config/repo-a").json()["tools"]["entries"]
+
+    assert {e["name"]: e["entry"] is None for e in entries} == {"rows": True, "defaulted": True, "fine": False}
