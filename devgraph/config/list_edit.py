@@ -22,15 +22,31 @@ def _a(noun: str) -> str:
 
 
 class ListEditError(Exception):
-    """A list document cannot be edited as asked."""
+    """A list document cannot be edited as asked.
+
+    `code`: malformed, invalid, flow_list, not_found, ambiguous, exists, unsupported or anchor.
+    """
+
+    def __init__(self, message: str, code: str = "invalid") -> None:
+        super().__init__(message)
+        self.code = code
 
 
 class _EntryDumper(yaml.SafeDumper):
     pass
 
 
+# Characters YAML reads as line breaks that `_Doc.render` (which re-indents on
+# "\n" only) would leave unindented inside a block scalar; such values are
+# double-quoted, where the emitter escapes them.
+_OTHER_LINE_BREAKS = ("\r", "\x85", "\u2028", "\u2029")
+
+
 def _represent_str(dumper: yaml.SafeDumper, value: str) -> yaml.ScalarNode:
-    style = "|" if "\n" in value else None
+    if any(ch in value for ch in _OTHER_LINE_BREAKS):
+        style = '"'
+    else:
+        style = "|" if "\n" in value else None
     return dumper.represent_scalar("tag:yaml.org,2002:str", value, style=style)
 
 
@@ -48,7 +64,7 @@ def _load(text: str) -> object:
     try:
         return yaml.safe_load(text)
     except YAML_LOAD_ERRORS as exc:
-        raise ListEditError(f"malformed YAML: {exc}") from exc
+        raise ListEditError(f"malformed YAML: {exc}", "malformed") from exc
 
 
 def entries(text: str, *, key: str) -> list[dict]:
@@ -82,7 +98,7 @@ class _Doc:
         try:
             root = yaml.compose(normalized)
         except YAML_LOAD_ERRORS as exc:
-            raise ListEditError(f"malformed YAML: {exc}") from exc
+            raise ListEditError(f"malformed YAML: {exc}", "malformed") from exc
         if root is None:
             return
         for node_key, value in root.value:
@@ -92,7 +108,8 @@ class _Doc:
             self.items = self.value.value
             if self.value.flow_style and self.items:
                 raise ListEditError(
-                    f"{key!r} is a flow-style list; edit it by hand or rewrite it as a block list"
+                    f"{key!r} is a flow-style list; edit it by hand or rewrite it as a block list",
+                    "flow_list",
                 )
 
     def _matches(self, name: object) -> list[int]:
@@ -105,9 +122,9 @@ class _Doc:
     def index(self, name: str) -> int:
         matches = self._matches(name)
         if not matches:
-            raise ListEditError(f"no {self.noun} named {name!r}")
+            raise ListEditError(f"no {self.noun} named {name!r}", "not_found")
         if len(matches) > 1:
-            raise ListEditError(f"{self.noun} {name!r} is declared {len(matches)} times; edit the file by hand")
+            raise ListEditError(f"{self.noun} {name!r} is declared {len(matches)} times; edit the file by hand", "ambiguous")
         return matches[0]
 
     def has(self, name: object) -> bool:
@@ -130,7 +147,7 @@ class _Doc:
         if not before.endswith("-") and line != node.start_mark.line:
             before = self.lines[line].split("-", 1)[0] + "-"
         if not before.endswith("-"):
-            raise ListEditError(f"{_a(self.noun)} entry does not start on its '- ' line; edit the file by hand")
+            raise ListEditError(f"{_a(self.noun)} entry does not start on its '- ' line; edit the file by hand", "unsupported")
         return len(before) - 1
 
     def span(self, position: int) -> tuple[int, int]:
@@ -179,13 +196,33 @@ class _Doc:
             if anchors:
                 raise ListEditError(
                     f"{self.noun} {name!r} defines an anchor used elsewhere ({', '.join(repr('&' + a) for a in anchors)}); "
-                    "edit the file by hand"
+                    "edit the file by hand",
+                    "anchor",
                 ) from exc
-            raise ListEditError(f"the edit would produce malformed YAML: {exc}") from exc
+            raise ListEditError(f"the edit would produce malformed YAML: {exc}", "malformed") from exc
 
     def result(self) -> str:
         eol = "\r\n" if self.crlf else "\n"
         return eol.join(self.lines) + eol
+
+
+def _require_identity(entry: dict, ident: str, noun: str) -> None:
+    if type(entry.get(ident)) is not str:
+        raise ListEditError(f"{_a(noun)} needs a string `{ident}`", "invalid")
+
+
+def _verified(doc: _Doc, expected: list) -> str:
+    """The edited text, refused unless it parses to exactly `expected` entries.
+
+    Guards the line splice: if rendering ever diverges from what YAML reads back
+    (an injected key, a swallowed neighbour), nothing is written.
+    """
+    text = doc.result()
+    if entries(text, key=doc.list_key) != expected:
+        raise ListEditError(
+            f"the edited {doc.noun} would not read back as written; edit the file by hand", "invalid"
+        )
+    return text
 
 
 def add_entry_text(
@@ -195,9 +232,10 @@ def add_entry_text(
 
     `unique=False` skips the same-identity refusal, for lists whose identity may repeat.
     """
+    _require_identity(entry, ident, noun)
     doc = _Doc(text, key, ident, noun)
     if unique and doc.has(entry.get(ident)):
-        raise ListEditError(f"{_a(noun)} named {entry.get(ident)!r} already exists")
+        raise ListEditError(f"{_a(noun)} named {entry.get(ident)!r} already exists", "exists")
     if not doc.lines:
         doc.lines = [f"version: {version}", f"{key}:"] + doc.render(entry, 0)
     elif doc.key_node is None:
@@ -220,18 +258,19 @@ def add_entry_text(
         rest = line[end:].strip()
         head = line[:start].rstrip() + ("  " + rest if rest else "")
         doc.lines[line_no : line_no + 1] = [head] + doc.render(entry, doc.key_node.start_mark.column)
-    return doc.result()
+    return _verified(doc, [*doc.mappings, entry])
 
 
 def replace_entry_text(text: str, name: str, entry: dict, *, key: str, ident: str, noun: str = "entry") -> str:
     """Swap one entry for a new mapping, in place."""
+    _require_identity(entry, ident, noun)
     doc = _Doc(text, key, ident, noun)
     position = doc.index(name)
     start, end = doc.span(position)
     removed = doc.lines[start:end]
     doc.lines[start:end] = doc.render(entry, doc.dash_column(position))
     doc.check_anchors(removed, name)
-    return doc.result()
+    return _verified(doc, [*doc.mappings[:position], entry, *doc.mappings[position + 1 :]])
 
 
 def delete_entry_text(text: str, name: str, *, key: str, ident: str, noun: str = "entry") -> str:
@@ -247,4 +286,4 @@ def delete_entry_text(text: str, name: str, *, key: str, ident: str, noun: str =
         colon = line.index(":", doc.key_node.end_mark.column)
         doc.lines[line_no] = line[: colon + 1] + " []" + line[colon + 1 :].rstrip()
     doc.check_anchors(removed, name)
-    return doc.result()
+    return _verified(doc, [*doc.mappings[:position], *doc.mappings[position + 1 :]])

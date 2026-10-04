@@ -15,6 +15,8 @@ from __future__ import annotations
 import datetime
 import inspect
 import logging
+import os
+import stat
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -110,6 +112,11 @@ class ToolPlaneStatus:
     functions: dict[str, Callable[..., Any]] = field(default_factory=dict, repr=False)  # served tool -> registered function
     # built-in tool -> the response notices saying which declared tools of its name were ignored
     shadowed: dict[str, list[str]] = field(default_factory=dict)
+    # why the project file served none of its tools because it is invalid (None otherwise), and the names it declares as far as readable
+    project_invalid: str | None = None
+    project_invalid_names: set[str] | None = None
+    # project tool -> why registering it failed (the global tool of its name, if any, is served instead)
+    fallback_reasons: dict[str, str] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -202,20 +209,44 @@ def make_tool_function(
     return call
 
 
-def register_project_tools(
-    server: Any,
-    engine: Any,
+class _NullServer:
+    """A server that registers nothing: dry resolution only needs the outcome, not a live MCP server."""
+
+    def add_tool(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
+
+def _identity(fn: Callable[..., Any]) -> Callable[..., Any]:
+    return fn
+
+
+def resolve_tools(
     repo: Any | None,
-    source: str,
+    source: str = "dashboard",
     *,
-    instrument: Callable[[Callable[..., Any]], Callable[..., Any]],
-    annotations: Any,
+    server: Any | None = None,
+    engine: Any | None = None,
+    instrument: Callable[[Callable[..., Any]], Callable[..., Any]] = _identity,
+    annotations: Any = None,
     pinned: str | None = None,
     registry: Any | None = None,
     fingerprint: bytes | str | None = None,
     global_fingerprint: bytes | str | None = None,
 ) -> ToolPlaneStatus:
-    """Register the session repository's project and global tools on `server`; report what happened."""
+    """What a session scoped to `repo` serves (None: an unscoped session): the one resolution, for MCP and the dashboard.
+
+    With a `server` the resolved tools are registered on it; without one (the
+    dashboard) nothing is registered and no engine is touched, but `served`, `origins`,
+    `notices`, `shadowed`, `definitions` and `project_invalid` are exactly what a
+    session would report. `pinned`/`registry` only refine the unscoped notice.
+
+    One thing the dry path cannot predict: a tool the live server refuses at
+    registration (`server.add_tool` raising, e.g. a parameter schema the SDK
+    can't build). Live, that project tool is not served -- the global tool of its
+    name stands in if there is one -- and the reason lands in `fallback_reasons`
+    and `notices`; dry, the null server accepts everything, so `fallback_reasons`
+    stays empty and the tool is reported as served.
+    """
     if repo is None:
         status = ToolPlaneStatus(repo_id=None, source=source)
         if source == "env":
@@ -240,9 +271,29 @@ def register_project_tools(
         return status
 
     status = ToolPlaneStatus(repo_id=repo.repo_id, source=source)
-    _serve_repository(server, engine, repo, status, instrument=instrument, annotations=annotations,
+    _serve_repository(server if server is not None else _NullServer(), engine, repo, status,
+                      instrument=instrument, annotations=annotations,
                       fingerprint=fingerprint, global_fingerprint=global_fingerprint)
     return status
+
+
+def register_project_tools(
+    server: Any,
+    engine: Any,
+    repo: Any | None,
+    source: str,
+    *,
+    instrument: Callable[[Callable[..., Any]], Callable[..., Any]],
+    annotations: Any,
+    pinned: str | None = None,
+    registry: Any | None = None,
+    fingerprint: bytes | str | None = None,
+    global_fingerprint: bytes | str | None = None,
+) -> ToolPlaneStatus:
+    """Register the session repository's project and global tools on `server`; report what happened."""
+    return resolve_tools(repo, source, server=server, engine=engine, instrument=instrument,
+                         annotations=annotations, pinned=pinned, registry=registry,
+                         fingerprint=fingerprint, global_fingerprint=global_fingerprint)
 
 
 @dataclass
@@ -292,7 +343,8 @@ def _project_layer(repo: Any, fingerprint: bytes | str, last_good: ProjectTools 
         if last_good is None:
             status.notices.append(f"invalid {TOOLS_FILENAME}; no project tools are served: {reason}")
             short = reason.replace(str(tools_file_path(repo.path)), TOOLS_FILENAME)
-            return _Resolved(invalid=short, invalid_names=_declared_names(fingerprint))
+            status.project_invalid, status.project_invalid_names = short, _declared_names(fingerprint)
+            return _Resolved(invalid=short, invalid_names=status.project_invalid_names)
         status.notices.append(f"invalid {TOOLS_FILENAME}; keeping the last good tools: {reason}")
         declared = last_good
     status.tools_file = str(tools_file_path(repo.path))
@@ -390,19 +442,20 @@ def _register_layers(
         status.functions[tool.name] = fn
         return None
 
-    fallback_reasons: dict[str, str] = {}  # global tool -> why the project tool of its name isn't served
+    fallback_reasons = status.fallback_reasons  # project tool -> why it isn't served
     for tool in project_tools:
         if tool.name in builtin:
             continue
-        if tool.name not in globals_by_name:
-            register(tool, "project", [])
-            continue
-        failure = register(tool, "project (overrides global)",
-                           [f"resolved: project override of global tool {tool.name!r}"])
-        if failure is None:
-            del globals_by_name[tool.name]
+        overrides = tool.name in globals_by_name
+        if overrides:
+            failure = register(tool, "project (overrides global)",
+                               [f"resolved: project override of global tool {tool.name!r}"])
         else:
+            failure = register(tool, "project", [])
+        if failure is not None:
             fallback_reasons[tool.name] = failure
+        elif overrides:
+            del globals_by_name[tool.name]
     for name, tool in globals_by_name.items():
         if name in fallback_reasons:
             reason = fallback_reasons[name]
@@ -444,8 +497,11 @@ def tools_fingerprint(repo_path: Path | str) -> bytes | str:
         return "root-missing"
     if not project_config_enabled(repo_path):
         return "disabled"
+    path = tools_file_path(Path(repo_path))
     try:
-        return tools_file_path(Path(repo_path)).read_bytes()
+        if not stat.S_ISREG(os.stat(path).st_mode):
+            return "unreadable:not_regular"  # never open a FIFO or device: the read would block
+        return path.read_bytes()
     except (FileNotFoundError, NotADirectoryError):
         return "absent"
     except OSError as exc:
@@ -522,7 +578,8 @@ class ProjectToolPlane:
     def _adopt(self, new: ToolPlaneStatus) -> None:
         """Make `new` the session's status, in place (the status resource holds this object)."""
         for name in ("tools_file", "global_tools_file", "served", "parameter_names", "notices",
-                     "definitions", "origins", "functions", "shadowed"):
+                     "definitions", "origins", "functions", "shadowed",
+                     "project_invalid", "project_invalid_names", "fallback_reasons"):
             setattr(self.status, name, getattr(new, name))
 
     def _restore_served(self, partial: ToolPlaneStatus, removed: list[str]) -> None:
