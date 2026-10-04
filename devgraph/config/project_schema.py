@@ -26,6 +26,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -34,6 +35,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    FiniteFloat,
     ValidationError,
     field_validator,
     model_validator,
@@ -43,9 +45,9 @@ from devgraph.config.project_switch import project_config_enabled
 from devgraph.config.project_tools import YAML_LOAD_ERRORS
 from devgraph.config.yaml_bound import bounded_safe_load
 from devgraph.graph.schema import (
-    _REPO_SCOPED_LABELS,
     NODE_LABELS,
     RELATIONSHIP_TYPES,
+    REPO_SCOPED_LABELS,
     RESERVED_NODE_PROPERTIES,
 )
 from devgraph.graph.schema import constraint_statements as builtin_constraint_statements
@@ -113,7 +115,8 @@ NodeSourceProvider = Literal[NODE_SOURCE_PROVIDERS]
 FilesystemKind = Literal[FILESYSTEM_KINDS]
 MetadataType = Literal[METADATA_TYPES]
 
-ScalarParam = str | int | float | bool | None
+# NaN and the infinities are refused: a script would receive them as non-standard JSON.
+ScalarParam = str | int | FiniteFloat | bool | None
 
 
 class ProjectSchemaError(Exception):
@@ -307,6 +310,11 @@ class CustomProvider(BaseModel):
 #: A drive letter (`C:`) at the start of an input glob.
 _DRIVE_PREFIX = re.compile(r"[A-Za-z]:")
 
+#: Unicode categories an input glob may not contain: control (NUL, newline and
+#: tab included) and format characters, surrogates, private-use and unassigned
+#: code points -- the set `project_tools` refuses in the text its trust prompt shows.
+_GLOB_REFUSED_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Co", "Cn"})
+
 
 class CustomProviderDecl(BaseModel):
     """A `custom_providers` entry: one script at `.devgraph/providers/<name>.py`.
@@ -333,6 +341,12 @@ class CustomProviderDecl(BaseModel):
         for glob in value:
             if not glob:
                 raise ValueError("an input glob must not be empty")
+            for offset, char in enumerate(glob):
+                if unicodedata.category(char) in _GLOB_REFUSED_CATEGORIES:
+                    raise ValueError(
+                        f"input glob {glob!r} contains a control, format, surrogate, private-use or "
+                        f"unassigned character (U+{ord(char):04X} at offset {offset}); remove it"
+                    )
             if "\\" in glob:
                 raise ValueError(f"input glob {glob!r} must not contain a backslash; use / as the separator")
             if glob.startswith("/"):
@@ -566,7 +580,7 @@ class ProjectSchema(BaseModel):
                 continue
             require_declared(name, f"relationship {relationship.type!r}")
             for label in (*relationship.from_labels, relationship.to):
-                if label in NODE_LABELS and label not in _REPO_SCOPED_LABELS:
+                if label in NODE_LABELS and label not in REPO_SCOPED_LABELS:
                     raise ValueError(
                         f"custom relationship {relationship.type!r} endpoint {label!r} is not "
                         f"repository-scoped; a custom provider may end only at repository-scoped "

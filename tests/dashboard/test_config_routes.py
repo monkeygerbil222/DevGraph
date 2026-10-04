@@ -15,7 +15,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from devgraph.config import edits, global_tools, project_switch
-from devgraph.config.project_schema import SCHEMA_FILENAME, schema_file_hash
+from devgraph.config.project_schema import SCHEMA_FILENAME, load_project_schema, schema_file_hash
 from devgraph.config.project_tools import TOOLS_FILENAME
 from devgraph.dashboard import routes
 from devgraph.dashboard.app import build_app
@@ -270,6 +270,8 @@ def test_relationship_declared_twice_is_not_editable(client, registry, tmp_path)
     record = _repo(tmp_path, registry)
     _write(record.path, SCHEMA_FILENAME, """
         version: 1
+        custom_providers:
+          - {name: widget_parts, inputs: ["parts/*.yaml"]}
         node_types:
           - label: Widget
             key: [slug]
@@ -285,11 +287,13 @@ def test_relationship_declared_twice_is_not_editable(client, registry, tmp_path)
             to: Widget
           - type: HAS_PART
             provider: custom
-            custom: {name: other_parts}
+            custom: {name: widget_parts}
             from: Widget
-            to: Widget
+            to: Service
     """)
 
+    # one custom provider may declare a type twice, so the duplicate is a legal declaration, not an invalid file listed as text
+    assert len(load_project_schema(record.path).relationships) == 2
     rels = client.get("/api/config/repo-a").json()["schema"]["relationships"]
 
     assert [r["editable"] for r in rels] == [False, False]

@@ -1508,6 +1508,30 @@ def test_custom_provider_bad_input_globs(tmp_path, glob):
         _load(tmp_path, RUNBOOKS.replace('"docs/runbooks/**/*.md"', f'"{glob}"'))
 
 
+@pytest.mark.parametrize("glob", [
+    "docs/\\0*.md",  # NUL
+    "docs/\\e[31m*.md",  # ESC: Cc
+    "docs/\\t*.md",  # tab: Cc
+    "docs/\\n*.md",  # newline: Cc
+    "docs/\\u202e*.md",  # right-to-left override: Cf
+    "docs/\\ud800*.md",  # lone surrogate: Cs
+    "docs/\\ue000*.md",  # private use: Co
+    "docs/\\u0378*.md",  # unassigned: Cn
+])
+def test_custom_provider_input_globs_refuse_control_and_invisible_characters(tmp_path, glob):
+    with pytest.raises(ProjectSchemaError, match="input glob .* contains a"):
+        _load(tmp_path, RUNBOOKS.replace('"docs/runbooks/**/*.md"', f'"{glob}"'))
+
+
+@pytest.mark.parametrize("value", [".nan", ".inf", "-.inf", ".NaN", "+.Inf"])
+def test_custom_params_refuse_non_finite_numbers(tmp_path, value):
+    with pytest.raises(ProjectSchemaError, match="finite"):
+        _load(tmp_path, RUNBOOKS.replace('{owner_prefix: "team-"}', f"{{owner_prefix: {value}}}"))
+    with pytest.raises(ProjectSchemaError, match="finite"):
+        _load(tmp_path, RUNBOOKS.replace("custom: {name: runbook_links}", f"custom: {{name: runbook_links, params: {{depth: {value}}}}}"))
+    assert _load(tmp_path, RUNBOOKS.replace('{owner_prefix: "team-"}', "{ratio: 0.5}")).custom_providers[0].params == {"ratio": 0.5}
+
+
 def test_custom_provider_names_are_identifiers_and_unique(tmp_path):
     with pytest.raises(ProjectSchemaError, match="not a valid identifier"):
         _load(tmp_path, RUNBOOKS.replace("- name: runbook_links", "- name: '../evil'"))
@@ -1544,8 +1568,8 @@ def test_custom_relationship_to_repository_is_rejected(tmp_path):
 
 
 def test_custom_relationship_to_non_repo_scoped_builtin_is_rejected(tmp_path, monkeypatch):
-    scoped = tuple(label for label in project_schema._REPO_SCOPED_LABELS if label != "Service")
-    monkeypatch.setattr(project_schema, "_REPO_SCOPED_LABELS", scoped)
+    scoped = tuple(label for label in project_schema.REPO_SCOPED_LABELS if label != "Service")
+    monkeypatch.setattr(project_schema, "REPO_SCOPED_LABELS", scoped)
     with pytest.raises(ProjectSchemaError, match="'Service' is not repository-scoped"):
         _load(tmp_path, RUNBOOKS)
 
@@ -1629,12 +1653,14 @@ def test_reserved_custom_provenance_names(tmp_path, reserved, schema):
 
 
 def test_schema_yaml_alias_bound(tmp_path):
-    bomb = "version: 1\nx: &a [y, y, y, y, y, y, y, y, y, y]\n" + "".join(
-        f"x{i}: &a{i} [" + ", ".join([f"*a{i - 1}" if i > 1 else "*a"] * 10) + "]\n" for i in range(1, 9)
-    )
-    (tmp_path / SCHEMA_FILENAME).write_text(bomb, encoding="utf-8")
-    with pytest.raises(ProjectSchemaError, match="malformed YAML"):
-        load_project_schema(tmp_path)
+    # The bomb sits inside a legal field (a node type's description), so neither an
+    # unknown key nor anything but the alias bound can be what refuses it.
+    levels = ["&a0 [" + ", ".join(["y"] * 10) + "]"] + [
+        f"&a{i} [" + ", ".join([f"*a{i - 1}"] * 10) + "]" for i in range(1, 9)
+    ]
+    bomb = WIDGET.replace("        key: [slug]\n", "        key: [slug]\n        description: [" + ", ".join(levels) + "]\n")
+    with pytest.raises(ProjectSchemaError, match="malformed YAML: the document expands to more than 10000 YAML nodes"):
+        _load(tmp_path, bomb)
     anchored = WIDGET.replace("          - name: slug\n            type: string\n            required: true\n",
                               "          - &slug {name: slug, type: string, required: true}\n          - *slug\n")
     assert _load(tmp_path, anchored).node_types[0].key == ("slug",)
