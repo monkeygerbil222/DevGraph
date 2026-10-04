@@ -15,6 +15,9 @@ from devgraph.config.settings import Settings
 from devgraph.graph.schema import NODE_LABELS, RELATIONSHIP_TYPES
 from devgraph.registry.store import RepoRegistry
 
+# Written before the per-repository opt-in: these tests assume project tools are served.
+pytestmark = pytest.mark.usefixtures("trusted_project_tools")
+
 
 @pytest.fixture
 def runner():
@@ -266,7 +269,8 @@ def test_validate_one_repo(runner, settings, tmp_path):
 
 def test_validate_all_checks_every_registered_repo_and_conflicts(runner, settings, tmp_path):
     a, b = tmp_path / "a", tmp_path / "b"
-    a.mkdir(); b.mkdir()
+    a.mkdir()
+    b.mkdir()
     for d in (a, b):
         subprocess.run(["git", "init", "-q"], cwd=d, check=True)
     write(a, WIDGET)

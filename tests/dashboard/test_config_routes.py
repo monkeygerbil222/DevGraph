@@ -22,6 +22,9 @@ from devgraph.dashboard.app import build_app
 from devgraph.dashboard.events import EventBroadcaster
 from devgraph.registry.store import RepoRegistry
 
+# Written before the per-repository opt-in: these tests assume project tools are served.
+pytestmark = pytest.mark.usefixtures("trusted_project_tools")
+
 TOOL = """
     version: 1
     tools:
@@ -1069,7 +1072,8 @@ def test_registration_failures_give_fallback_and_not_served_badges(registry, tmp
     _write(record.path, TOOLS_FILENAME, TOOL.format(name="hot_paths") + "      - name: lonely\n"
            "        description: L.\n        cypher: \"MATCH (n {repo_id: $repo_id}) RETURN n LIMIT 1\"\n")
     live = resolve_tools(record, server=_RefusingServer({"A tool.", "L."}))
-    schema_info = lambda r: {"state": "absent", "error": None}
+    def schema_info(r):
+        return {"state": "absent", "error": None}
 
     block = config_model.build_project(record, schema_info, status=live)
 

@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+from devgraph.config import project_trust
 from devgraph.config.global_tools import GLOBAL_TOOLS_FILENAME, global_tools_fingerprint, global_tools_path
 from devgraph.config.project_switch import project_config_enabled
 from devgraph.config.project_tools import (
@@ -33,6 +34,7 @@ from devgraph.config.project_tools import (
     YAML_LOAD_ERRORS,
     ProjectToolsError,
     parse_project_tools,
+    tools_file_outside,
     tools_file_path,
 )
 from devgraph.mcp.catalog import builtin_tool_names, scoped_tool_id
@@ -60,6 +62,8 @@ def _deepest_containing(repos: list[Any], target: Path) -> Any | None:
     target = _resolved(target)
     best, best_depth = None, -1
     for repo in repos:
+        if not Path(repo.path).is_absolute():  # would resolve against the working directory
+            continue
         root = _resolved(repo.path)
         if target == root or target.is_relative_to(root):
             depth = len(root.parts)
@@ -115,8 +119,11 @@ class ToolPlaneStatus:
     # why the project file served none of its tools because it is invalid (None otherwise), and the names it declares as far as readable
     project_invalid: str | None = None
     project_invalid_names: set[str] | None = None
-    # project tool -> why registering it failed (the global tool of its name, if any, is served instead)
+    # project tool -> why it isn't served: registering it failed, or the file is not trusted
+    # (the global tool of its name, if any, is served instead)
     fallback_reasons: dict[str, str] = field(default_factory=dict)
+    # the tools file's trust state (see `project_trust`); None when there is no file to trust
+    project_trust: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -125,6 +132,7 @@ class ToolPlaneStatus:
             "global_tools_file": self.global_tools_file,
             "served": list(self.served),
             "origins": dict(self.origins),
+            "project_tools_trust": self.project_trust,
             "notices": list(self.notices),
         }
 
@@ -299,6 +307,18 @@ def register_project_tools(
                          fingerprint=fingerprint, global_fingerprint=global_fingerprint)
 
 
+@dataclass(frozen=True)
+class UntrustedTools:
+    """The fingerprint of a tools file the user has not approved (`devgraph config tools trust`).
+
+    `state` is the trust state ("untrusted", "changed" or "error"); `data` the file's bytes,
+    read only for the names it declares. Equality covers both, so a trust change reloads.
+    """
+
+    state: str
+    data: bytes
+
+
 @dataclass
 class _Resolved:
     """What one layer's file contributes: its tools (None for none).
@@ -310,6 +330,7 @@ class _Resolved:
     declared: ProjectTools | None = None
     invalid: str | None = None
     invalid_names: set[str] | None = None
+    untrusted: str | None = None  # why an unapproved file serves none of its tools, worded for the model
 
 
 def _declared_names(fingerprint: bytes | str) -> set[str] | None:
@@ -325,9 +346,14 @@ def _declared_names(fingerprint: bytes | str) -> set[str] | None:
     return {e["name"] for e in entries if isinstance(e, dict) and isinstance(e.get("name"), str)}
 
 
-def _project_layer(repo: Any, fingerprint: bytes | str, last_good: ProjectTools | None,
+def _project_layer(repo: Any, fingerprint: bytes | str | UntrustedTools, last_good: ProjectTools | None,
                    status: ToolPlaneStatus) -> _Resolved:
-    """The project file's tools; an invalid file keeps `last_good` when there is one."""
+    """The project file's tools; trusted bytes that fail to parse keep `last_good` when there is one.
+
+    An untrusted or unreadable file serves none and keeps nothing: `last_good` only ever
+    holds trusted content, and only trusted bytes can fall back to it (an unreadable file
+    can't be checked against its approval, so a revoke must not leave the old tools served).
+    """
     if fingerprint == "root-missing":
         status.notices.append(f"the root of repository {repo.repo_id!r} ({repo.path}) does not exist; no project tools are served")
         return _Resolved()
@@ -339,11 +365,22 @@ def _project_layer(repo: Any, fingerprint: bytes | str, last_good: ProjectTools 
         return _Resolved()
     if fingerprint == "absent":
         return _Resolved()
+    if isinstance(fingerprint, UntrustedTools):  # never parsed for serving, and never the last good
+        status.project_trust = fingerprint.state
+        reason = project_trust.untrusted_reason(repo.repo_id, fingerprint.state)
+        to_model = project_trust.untrusted_reason(repo.repo_id, fingerprint.state, to_model=True)
+        status.notices.append(f"{to_model}; no project tools are served")
+        builtin = builtin_tool_names()
+        for name in sorted((_declared_names(fingerprint.data) or set()) - builtin):
+            status.fallback_reasons[name] = reason
+        return _Resolved(untrusted=to_model)
+    if isinstance(fingerprint, bytes):
+        status.project_trust = "trusted"
     try:
         declared = _parse_fingerprint(repo, fingerprint)
     except ProjectToolsError as exc:
         reason = str(exc).splitlines()[0]
-        if last_good is None:
+        if last_good is None or not isinstance(fingerprint, bytes):
             status.notices.append(f"invalid {TOOLS_FILENAME}; no project tools are served: {reason}")
             short = reason.replace(str(tools_file_path(repo.path)), TOOLS_FILENAME)
             status.project_invalid, status.project_invalid_names = short, _declared_names(fingerprint)
@@ -445,7 +482,7 @@ def _register_layers(
         status.functions[tool.name] = fn
         return None
 
-    fallback_reasons = status.fallback_reasons  # project tool -> why it isn't served
+    fallback_reasons = status.fallback_reasons  # project tool -> why it isn't served (an untrusted file's are already in)
     for tool in project_tools:
         if tool.name in builtin:
             continue
@@ -460,7 +497,9 @@ def _register_layers(
         elif overrides:
             del globals_by_name[tool.name]
     for name, tool in globals_by_name.items():
-        if name in fallback_reasons:
+        if project.untrusted is not None and name in fallback_reasons:
+            reason = project.untrusted  # worded for the model reading the response
+        elif name in fallback_reasons:
             reason = fallback_reasons[name]
         elif project.invalid and project.invalid_names is None:
             reason = f"{TOOLS_FILENAME} is invalid, so a project tool of this name (if any) can't be served: {project.invalid}"
@@ -494,21 +533,31 @@ def _parse_bytes(path: Path, fingerprint: bytes | str) -> ProjectTools:
     return parse_project_tools(text, path)
 
 
-def tools_fingerprint(repo_path: Path | str) -> bytes | str:
-    """What the tools file looks like now: its bytes, 'root-missing', 'disabled', 'absent', or 'unreadable:<error>'."""
+def tools_fingerprint(repo_path: Path | str) -> bytes | str | UntrustedTools:
+    """What the tools file looks like now: its bytes when trusted, `UntrustedTools` when not,
+    'root-missing', 'disabled', 'absent', or 'unreadable:<error>' (including a file that
+    resolves outside the repository)."""
     if not Path(repo_path).is_dir():
         return "root-missing"
     if not project_config_enabled(repo_path):
         return "disabled"
     path = tools_file_path(Path(repo_path))
     try:
+        if tools_file_outside(Path(repo_path)):
+            return "unreadable:outside_repository"
         if not stat.S_ISREG(os.stat(path).st_mode):
             return "unreadable:not_regular"  # never open a FIFO or device: the read would block
-        return path.read_bytes()
+        data = path.read_bytes()
     except (FileNotFoundError, NotADirectoryError):
         return "absent"
     except OSError as exc:
         return f"unreadable:{type(exc).__name__}"
+    try:
+        state = project_trust.project_tools_trust(repo_path, data)
+    except Exception:  # fail closed, whatever went wrong
+        logger.debug("project tools trust lookup failed", exc_info=True)
+        state = "error"
+    return data if state == "trusted" else UntrustedTools(state, data)
 
 
 class ProjectToolPlane:
@@ -582,7 +631,7 @@ class ProjectToolPlane:
         """Make `new` the session's status, in place (the status resource holds this object)."""
         for name in ("tools_file", "global_tools_file", "served", "parameter_names", "notices",
                      "definitions", "origins", "functions", "shadowed",
-                     "project_invalid", "project_invalid_names", "fallback_reasons"):
+                     "project_invalid", "project_invalid_names", "fallback_reasons", "project_trust"):
             setattr(self.status, name, getattr(new, name))
 
     def _restore_served(self, partial: ToolPlaneStatus, removed: list[str]) -> None:

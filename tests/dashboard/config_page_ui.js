@@ -63,7 +63,7 @@ const mkEl = tag => {
       for (let e = el; e; e = e.parentNode) {
         if (e.disabled && (e === el || e.tagName === "FIELDSET")) return;
         /* ...and nothing inside a modal that isn't open yet */
-        if (e === els.configModal && !e.classList.contains("open")) return;
+        if ((e === els.configModal || e === els.configResetModal) && !e.classList.contains("open")) return;
       }
       focused = el;
     },
@@ -99,6 +99,8 @@ nest("configModalWarn", ["configModalWarnText"]);
 nest("configModal", ["configModalTitle", "configModalWarn", "configDestField", "configEditorSwitch", "configFormHelp", "configFormNotice",
   "configFormScroll", "configYaml", "configModalConfirm", "configModalError", "configModalReload", "configModalCancel", "configModalSave"]);
 nest("configEditorSwitch", ["configModeForm", "configModeYaml"]);
+nest("configResetPhraseField", ["configResetPhraseLabel", "configResetTyped"]);
+nest("configResetModal", ["configResetTitle", "configResetList", "configResetPhraseField", "configResetError", "configResetRecheck", "configResetCancel", "configResetConfirm"]);
 const document = { getElementById: id => els[id] || null, createElement: mkEl, get activeElement() { return focused; } };
 
 let tooltips = [];
@@ -128,7 +130,7 @@ const globals = {
 const api = new Function(...Object.keys(globals),
   configSrc + "\nreturn { CONFIG_GLOBAL, renderConfigPage, renderConfigScope, configWriteRequest, describeConfigError," +
   " openConfigEditor, configEditTarget, configCopyDestinations, configCanCopy, loadConfigPage, applyConfigScope, configModalKey, CONFIG_SECTIONS," +
-  " configResetRequest, configResetPhrase, configResetReady, describeConfigReset, configToggleRequest," +
+  " configResetRequest, configResetPhrase, configResetReady, describeConfigReset, configToggleRequest, configRevokeTrustRequest," +
   " CONFIG_FORM_FIELDS, configFormFromEntry, configEntryFromForm, configYamlScalar, configEntryYaml, configFormHints, configFormSwitch," +
   " get model() { return configModel; }, get edit() { return configEdit; }, get reset() { return configReset; } };")(...Object.values(globals));
 
@@ -1124,6 +1126,7 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
       { label: HOSTILE, yaml: "label: '" + HOSTILE + "'\n", editable: true, badges: [] }];
     a.schema.relationships = [{ type: "DOCUMENTS", yaml: "type: DOCUMENTS\nfrom: Runbook\nto: Service\n", editable: true, badges: [] },
       { type: "OWNS", yaml: "type: OWNS\n", editable: false, badges: [{ level: "warn", kind: "ambiguous", text: "Declared more than once", detail: "" }] }];
+    a.tools.trust = { state: "trusted", command: "devgraph config tools trust repo-a", revocable: true };
     return { global: globalBlock(), projects: [a, project("repo-b"), project(HOSTILE)] };
   };
   api.renderConfigPage(COPY_MODEL());
@@ -1312,6 +1315,20 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
     writes().length === 2 && writes().every(c => c.url === "/api/config/__global__/tools" && c.init.method === "POST" && ifMatch(c) === '"sha256:g1"' &&
       body(c).yaml === "name: mine\ndescription: d\ncypher: x\n"), JSON.stringify(writes()));
   check("...then reloads the page", lastCall().url === "/api/config", lastCall().url);
+  for (const state of ["untrusted", "changed"]) {
+    const m = COPY_MODEL();
+    m.projects[0].tools.trust = { state, command: "devgraph config tools trust repo-a", revocable: state === "changed" };
+    api.renderConfigPage(m);
+    await copyBtn("repo-a", "mine")[0].fire("click");
+    els.configDest.value = "__global__";
+    await els.configDest.fire("change");
+    const text = els.configModalWarnText.textContent;
+    check("copying an untrusted (" + state + ") repo's tool to the global store warns it is served in every repo without trust",
+      text.includes("repo-a's devgraph.tools.yaml is not trusted") &&
+      text.includes("the global store serves this tool in every repository without any trust approval") &&
+      text.includes("can read the whole graph") && text.includes("convention, not a sandbox"), text);
+    els.configModalCancel.fire("click");
+  }
 
   // 33. Cancel while a copy is in flight: no write
   api.renderConfigPage(COPY_MODEL());
@@ -2060,6 +2077,149 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
   await typeIn(formCtl("Description"), A(1024) + "\uFEFF");
   check("...and a BOM counts: 1025 / 1024", descCount() === "1025 / 1024 characters", descCount());
   els.configModalCancel.fire("click");
+
+  // 44. the Reset dialog gets the editor's dialog handling
+  const rdlg = html.slice(html.indexOf('id="configResetModal"') - 40, html.indexOf('id="configResetTitle"'));
+  check("the Reset modal is a labelled modal dialog", /role="dialog"/.test(rdlg) && /aria-modal="true"/.test(rdlg) &&
+    /aria-labelledby="configResetTitle"/.test(rdlg), rdlg);
+  const inside = (el, root) => { for (let e = el; e; e = e.parentNode) if (e === root) return true; return false; };
+  const tickOnce = () => new Promise(r => setImmediate(r));
+  const rdry = { status: 200, body: { ok: true, written: false, file: "devgraph.tools.yaml", fingerprint: "sha256:dry-fp",
+    removed: { tools: ["hot_paths"] }, warnings: [], notes: [], scope: project("repo-a"), global: globalBlock() } };
+  api.renderConfigPage(MODEL());
+  fetchCalls = [];
+  respond = () => rdry;
+  const ropener = buttons(card("repo-a"), "Reset devgraph.tools.yaml…")[0];
+  let openGate;
+  gate = new Promise(r => { openGate = r; });
+  const opening = press(ropener);
+  await tickOnce();
+  check("opening Reset moves focus inside the dialog before the dry run answers", focused === els.configResetCancel, focused && focused.id);
+  openGate(); gate = null;
+  await opening;
+  check("...and onto the phrase input once the list is shown", focused === els.configResetTyped, focused && focused.id);
+  const rtab = (shift = false) => { const ev = { key: "Tab", shiftKey: shift, defaultPrevented: false, preventDefault() { ev.defaultPrevented = true; } }; api.configModalKey(ev); return ev; };
+  focused = els.configResetCancel;
+  check("Tab from Cancel wraps to the phrase input (the disabled Reset is skipped)", rtab().defaultPrevented && focused === els.configResetTyped, focused && focused.id);
+  check("Shift+Tab from the phrase input wraps to Cancel", rtab(true).defaultPrevented && focused === els.configResetCancel, focused && focused.id);
+  focused = els.configResetTyped;
+  check("Tab from the phrase input is left to the browser", !rtab().defaultPrevented && focused === els.configResetTyped, "");
+  focused = ropener;
+  check("Tab from outside the dialog pulls focus in", rtab().defaultPrevented && focused === els.configResetTyped, focused && focused.id);
+  els.configResetTyped.value = "repo-a";
+  await els.configResetTyped.fire("input");
+  clock += 1000;
+  api.configModalKey({ key: "Escape" });
+  check("Escape closes the dialog, returns focus to the opener and sends no reset", !els.configResetModal.classList.contains("open") &&
+    api.reset === null && focused === ropener && fetchCalls.length === 1 && body(fetchCalls[0]).dry_run === true, JSON.stringify(fetchCalls));
+  await press(ropener);
+  await els.configResetCancel.fire("click");
+  check("Cancel returns focus to the opener", focused === ropener && api.reset === null, focused && focused.id);
+  await press(ropener);
+  await els.configResetModal.onclick({ target: els.configResetModal });
+  check("an overlay click returns focus to the opener", focused === ropener && api.reset === null, focused && focused.id);
+
+  // 45. after a save or reset re-renders the card, focus lands on the same entry's Edit button, else its section's Add button
+  const FMNamed = (from, to) => { const m = FM(); m.projects[1].tools.entries.find(e => e.name === from).name = to; return m; };
+  const FMWithout = name => { const m = FM(); m.projects[1].tools.entries = m.projects[1].tools.entries.filter(e => e.name !== name); return m; };
+  const editBtn = (scope, name) => buttons(rowFor(card(scope), name), "Edit")[0];
+  const addBtn = (scope, section) => buttons(card(scope), "Add " + api.CONFIG_SECTIONS[section].noun)[0];
+  const answer = model => (url, init) => ({ status: 200, body: { ok: true, written: !(init.body && JSON.parse(init.body).dry_run), warnings: [], notes: [], scope: model.projects[1] } });
+  const desc = () => focused && focused.tagName + " " + focused.textContent;
+  api.renderConfigPage(FM());
+  configPayload = FM();
+  respond = answer(FM());
+  let old = editBtn("repo-b", "hot_paths");
+  await press(old);
+  await press(els.configModalSave);
+  check("a saved edit re-renders the card and focuses the same entry's new Edit button", api.edit === null && editBtn("repo-b", "hot_paths") !== old &&
+    focused === editBtn("repo-b", "hot_paths"), desc());
+  api.renderConfigPage(FM());
+  configPayload = FMNamed("hot_paths", "renamed");
+  respond = answer(configPayload);
+  await press(editBtn("repo-b", "hot_paths"));
+  await typeIn(formCtl("Name"), "renamed");
+  await press(els.configModalSave);
+  check("a renamed entry has no old-name Edit button, so focus goes to its section's Add button",
+    !rowFor(card("repo-b"), "hot_paths") && focused === addBtn("repo-b", "tools"), desc());
+  api.renderConfigPage(FM());
+  configPayload = FMWithout("hot_paths");
+  respond = answer(configPayload);
+  old = buttons(rowFor(card("repo-b"), "hot_paths"), "Delete")[0];
+  await press(old);
+  await press(els.configModalSave);
+  check("a deleted entry: focus goes to its section's Add button, not the removed opener", !rowFor(card("repo-b"), "hot_paths") &&
+    focused === addBtn("repo-b", "tools") && focused !== old, desc());
+  check("the card heading can take focus by script (the last resort)", find(card("repo-b"), e => e.tagName === "H3")[0].getAttribute("tabindex") === "-1", "no tabindex on the card heading");
+  // a reset: the file is gone, so its Reset button is too
+  api.renderConfigPage(MODEL());
+  const afterA2 = project("repo-a"); afterA2.tools.state = "absent"; afterA2.tools.fingerprint = "absent";
+  respond = (url, init) => JSON.parse(init.body).dry_run ? rdry
+    : { status: 200, body: { ok: true, written: true, file: "devgraph.tools.yaml", fingerprint: "absent", removed: { tools: ["hot_paths"] }, warnings: [], notes: [], scope: afterA2, global: globalBlock() } };
+  configPayload = MODEL();
+  await press(buttons(card("repo-a"), "Reset devgraph.tools.yaml…")[0]);
+  els.configResetTyped.value = "repo-a";
+  await els.configResetTyped.fire("input");
+  await press(els.configResetConfirm);
+  check("after a reset focus goes to the card's Add button for that file, not the body", api.reset === null && focused === addBtn("repo-a", "tools") &&
+    buttons(card("repo-a"), "Reset devgraph.tools.yaml…").length === 0, desc());
+  // the global store: the whole page reloads after it
+  api.renderConfigPage(MODEL());
+  respond = (url, init) => JSON.parse(init.body).dry_run ? { status: 200, body: { ...rdry.body, scope: globalBlock() } }
+    : { status: 200, body: { ok: true, written: true, file: "global-tools.json", fingerprint: "sha256:g2", removed: { tools: ["hot_paths"] }, warnings: [], notes: [], scope: globalBlock() } };
+  old = buttons(card("__global__"), "Reset global-tools.json…")[0];
+  await press(old);
+  els.configResetTyped.value = "global";
+  await els.configResetTyped.fire("input");
+  await press(els.configResetConfirm);
+  check("after resetting the global store focus is on a control in the re-rendered global card, not the removed opener", api.reset === null &&
+    focused !== old && inside(focused, card("__global__")), desc());
+
+  // project tools trust: a badge, and Revoke only -- the page can never trust
+  const trusting = (repo, state, revocable) => {
+    const p = project(repo, [{ name: "hot_paths", tool_id: repo + "_hot_paths", yaml: "name: hot_paths\n", origin: state === "trusted" ? "project" : null,
+      badges: state === "trusted" ? [] : [{ level: "warn", kind: "not-trusted", text: "Not served: not trusted", detail: "project tools not trusted (run devgraph config tools trust " + repo + ")" }] }]);
+    p.tools.trust = { state, command: "devgraph config tools trust " + repo, revocable };
+    p.tools.badges = [state === "trusted"
+      ? { level: "info", kind: "trusted", text: "Trusted", detail: "Served." }
+      : { level: "warn", kind: "not-trusted", text: state === "changed" ? "Changed since trusted" : "Not trusted", detail: "project tools not trusted (run devgraph config tools trust " + repo + ")." }];
+    return p;
+  };
+  const sectionHead = (scope, title) => byClass(card(scope), "cfg-section-head").find(h => h.children[0].textContent === title);
+  api.renderConfigPage({ global: globalBlock(), projects: [trusting("repo-a", "trusted", true), trusting("repo-b", "untrusted", false)] });
+  check("a trusted repository's Tools heading shows the Trusted badge",
+    byClass(sectionHead("repo-a", "Tools"), "cfg-badge").some(b => b.textContent === "Trusted" && b.classList.contains("info")), sectionHead("repo-a", "Tools").textContent);
+  check("an untrusted one shows Not trusted, naming the command on hover",
+    byClass(sectionHead("repo-b", "Tools"), "cfg-badge").some(b => b.textContent === "Not trusted" && b.dataset.tip.includes("devgraph config tools trust repo-b")),
+    sectionHead("repo-b", "Tools").textContent);
+  check("...and its tool row says it is not served", rowFor(card("repo-b"), "hot_paths").textContent.includes("Not served: not trusted"),
+    rowFor(card("repo-b"), "hot_paths").textContent);
+  check("Revoke trust is offered only where an approval is recorded",
+    buttons(card("repo-a"), "Revoke trust").length === 1 && buttons(card("repo-b"), "Revoke trust").length === 0, card("repo-b").textContent);
+  check("no control anywhere grants trust",
+    find(els.configScopes, e => e.tagName === "BUTTON" && /^trust|approve/i.test(e.textContent)).length === 0,
+    JSON.stringify(find(els.configScopes, e => e.tagName === "BUTTON").map(b => b.textContent)));
+  r = api.configRevokeTrustRequest("repo a");
+  check("configRevokeTrustRequest -> DELETE /api/config/<repo>/trust/tools, no body or If-Match",
+    r.url === "/api/config/repo%20a/trust/tools" && r.init.method === "DELETE" && r.init.body === undefined && !r.init.headers, JSON.stringify(r));
+  fetchCalls = [];
+  const revokedNote = "Revoked trust in repo-a's project tools; running MCP sessions stop serving them within 2 seconds.";
+  respond = () => ({ status: 200, body: { ok: true, written: true, notes: [revokedNote, "Trusting them again is done in a terminal: `devgraph config tools trust repo-a`."],
+    scope: trusting("repo-a", "untrusted", false), global: globalBlock() } });
+  await press(buttons(card("repo-a"), "Revoke trust")[0]);
+  check("Revoke sends exactly one DELETE to the trust route", writes().length === 1 && writes()[0].url === "/api/config/repo-a/trust/tools" &&
+    writes()[0].init.method === "DELETE", JSON.stringify(fetchCalls));
+  check("...redraws the card from the response (Not trusted, no Revoke)",
+    byClass(sectionHead("repo-a", "Tools"), "cfg-badge").some(b => b.textContent === "Not trusted") && buttons(card("repo-a"), "Revoke trust").length === 0,
+    card("repo-a").textContent);
+  check("...shows the notes, naming the CLI command to trust again",
+    els.configStatus.textContent.includes(revokedNote) && card("repo-a").textContent.includes("devgraph config tools trust repo-a"), els.configStatus.textContent);
+  check("...and keeps focus on the card", inside(focused, card("repo-a")), desc());
+  respond = () => ({ status: 403, body: { detail: { code: "forbidden", message: "cross-site request refused" } } });
+  api.renderConfigPage({ global: globalBlock(), projects: [trusting("repo-a", "trusted", true)] });
+  await press(buttons(card("repo-a"), "Revoke trust")[0]);
+  check("a refused revoke says so and leaves the badge", els.configStatus.textContent.includes("Revoke failed: cross-site request refused") &&
+    buttons(card("repo-a"), "Revoke trust").length === 1, els.configStatus.textContent);
 
   console.log(failures ? "\n" + failures + " FAILED" : "\nall passed");
   process.exit(failures ? 1 : 0);
