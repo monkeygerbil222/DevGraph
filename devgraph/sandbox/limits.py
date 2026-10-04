@@ -12,6 +12,10 @@ INPUT_MAX_FILE_BYTES = 1024 * 1024  # over: input_cap, file skipped
 INPUT_MAX_RUN_BYTES = 32 * 1024 * 1024  # over: input_cap, run refused
 INPUT_MAX_FILES = 5_000  # over: input_cap
 
+# The only PATH a sandbox subprocess (selection's `git`, the static-scan worker) sees.
+FIXED_PATH = "/usr/bin:/bin"
+GIT_TIMEOUT_SECONDS = 30
+
 # Approval display (§3.2, §5.4).
 APPROVAL_SAMPLE_SIZE = 20  # first N sorted matched paths
 GROWTH_FACTOR = 2  # flag a matched count above GROWTH_FACTOR x the approved count
