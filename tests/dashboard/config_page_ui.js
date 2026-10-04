@@ -402,6 +402,71 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
   els.configDest.value = "__global__";
   api.renderConfigPage(MODEL());
 
+  // 8d. the destination is locked while a dry run is out, and a write never
+  //     goes anywhere the dry run did not check
+  fetchCalls = [];
+  respond = (url, init) => ({ status: 200, body: { ok: true, written: !JSON.parse(init.body).dry_run, warnings: [], notes: [],
+    scope: url.includes("repo-a") ? project("repo-a") : project("repo-b") } });
+  await buttons(rowFor(card("__global__"), "hot_paths"), "Edit")[0].fire("click");
+  await press(els.configModalSave);
+  els.configDest.value = "repo-b";
+  await els.configDest.fire("change");
+  let releaseDest;
+  gate = new Promise(r => { releaseDest = r; });
+  clock += 1000;
+  let pendingDest = els.configModalSave.fire("click");
+  await Promise.resolve();
+  check("the destination dropdown is disabled while the dry run is out", els.configDest.disabled === true, String(els.configDest.disabled));
+  /* a change that lands anyway (a stale event, a script) */
+  els.configDest.value = "repo-a";
+  await els.configDest.fire("change");
+  gate = null; releaseDest(); await pendingDest;
+  check("switching destination mid-dry-run writes nowhere for real",
+    writes().length === 1 && body(writes()[0]).dry_run === true && writes()[0].url === "/api/config/repo-b/tools", JSON.stringify(writes()));
+  check("...leaves the editor open on Save, the dropdown enabled again",
+    els.configModal.classList.contains("open") && els.configModalSave.textContent === "Save" && els.configDest.disabled === false,
+    JSON.stringify([els.configModalSave.textContent, els.configDest.disabled]));
+  check("...and says to check the new destination", /destination changed/i.test(els.configModalError.textContent) && shown(els.configModalError),
+    els.configModalError.textContent);
+  els.configModalCancel.fire("click");
+  els.configDest.value = "__global__";
+
+  // 8e. a cross-repo replace whose real write failed asks for the replace confirm again
+  api.renderConfigPage(MODEL());
+  fetchCalls = [];
+  const freshA = project("repo-a", MODEL().projects[0].tools.entries);
+  freshA.tools.fingerprint = "sha256:repo-a-tools-2";
+  respond = (url, init) => {
+    if (init.method === undefined || init.method === "GET") return { status: 200, body: freshA };
+    const b = JSON.parse(init.body);
+    if (init.method === "POST" && yamlName(b.yaml) === "hot_paths")
+      return { status: 409, body: { detail: { code: "exists", name: "hot_paths", message: "a tool named 'hot_paths' already exists in this scope" } } };
+    if (!b.dry_run && ifMatch({ init }) === '"sha256:repo-a-tools"')
+      return { status: 412, body: { detail: { code: "stale", message: "devgraph.tools.yaml changed on disk", scope: freshA } } };
+    return { status: 200, body: { ok: true, written: !b.dry_run, warnings: [], notes: [], scope: freshA } };
+  };
+  await buttons(rowFor(card("__global__"), "hot_paths"), "Edit")[0].fire("click");
+  await press(els.configModalSave);
+  els.configDest.value = "repo-a";
+  await els.configDest.fire("change");
+  await press(els.configModalSave);
+  await press(els.configModalSave);
+  check("a confirmed replace that comes back 412 offers Reload", shown(els.configModalReload) &&
+    writes().filter(c => body(c).dry_run === false).length === 1, JSON.stringify(writes()));
+  await els.configModalReload.fire("click");
+  fetchCalls = [];
+  await press(els.configModalSave);
+  check("after Reload, Save stops at the replace confirm again", els.configModalSave.textContent === "Save anyway" &&
+    els.configModalConfirm.textContent.includes("Replaces repo-a's own hot_paths.") && writes().every(c => body(c).dry_run === true),
+    JSON.stringify([els.configModalSave.textContent, writes()]));
+  await press(els.configModalSave);
+  check("...and the confirmed write PUTs repo-a's hot_paths with the reloaded fingerprint",
+    lastCall().url === "/api/config" && writes().filter(c => body(c).dry_run === false).length === 1 &&
+    writes().some(c => body(c).dry_run === false && c.init.method === "PUT" && c.url === "/api/config/repo-a/tools/hot_paths" &&
+      ifMatch(c) === '"sha256:repo-a-tools-2"'), JSON.stringify(writes()));
+  els.configDest.value = "__global__";
+  api.renderConfigPage(MODEL());
+
   // 9. deleting a global tool warns too, and has no destination
   await buttons(rowFor(card("__global__"), "hot_paths"), "Delete")[0].fire("click");
   check("deleting a global tool warns first", shown(els.configModalWarn) && els.configModalWarnText.textContent.startsWith("Global tools are served"),
@@ -459,6 +524,54 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
   check("...then the save completes", writes().length === 2 && !els.configModal.classList.contains("open"), JSON.stringify(writes()));
   check("Save is enabled again for the next editor", (await buttons(rowFor(card("repo-a"), "Runbook"), "Edit")[0].fire("click"), els.configModalSave.disabled === false),
     String(els.configModalSave.disabled));
+  els.configModalCancel.fire("click");
+
+  // 13c. the text is locked while it is checked, and a confirm covers only the text it checked
+  api.renderConfigPage(MODEL());
+  fetchCalls = [];
+  respond = (url, init) => JSON.parse(init.body).dry_run
+    ? { status: 200, body: { ok: true, written: false, warnings: ["Changing the key keeps the old constraint."], notes: [], scope: project("repo-a") } }
+    : ok(project("repo-a"));
+  await buttons(rowFor(card("repo-a"), "Runbook"), "Edit")[0].fire("click");
+  const reviewed = els.configYaml.value;
+  gate = new Promise(r => { release = r; });
+  clock += 1000;
+  pending = els.configModalSave.fire("click");
+  await Promise.resolve();
+  check("the YAML is read-only while its dry run is out", els.configYaml.readOnly === true, String(els.configYaml.readOnly));
+  /* text that lands anyway (a stale input event, a script) */
+  els.configYaml.value = "label: Runbook\nkey: [sneaky]\n";
+  await els.configYaml.fire("input");
+  gate = null; release(); await pending;
+  check("...editable again once the check is back", els.configYaml.readOnly === false && els.configModalSave.textContent === "Save anyway",
+    JSON.stringify([els.configYaml.readOnly, els.configModalSave.textContent]));
+  await press(els.configModalSave);
+  check("a confirm never writes text its dry run did not check: the click dry-runs the new text",
+    writes().length === 2 && writes().every(c => body(c).dry_run === true) && body(writes()[0]).yaml === reviewed &&
+    body(writes()[1]).yaml === "label: Runbook\nkey: [sneaky]\n" && els.configModalSave.textContent === "Save anyway",
+    JSON.stringify([els.configModalSave.textContent, writes()]));
+  await press(els.configModalSave);
+  check("...and the next confirm writes exactly the text it reviewed",
+    writes().length === 3 && body(writes()[2]).dry_run === false && body(writes()[2]).yaml === "label: Runbook\nkey: [sneaky]\n",
+    JSON.stringify(writes()));
+
+  // no warnings: the editor closes after writing, so nothing may be typed during the check
+  api.renderConfigPage(MODEL());
+  fetchCalls = [];
+  respond = (url, init) => ({ status: 200, body: { ok: true, written: !JSON.parse(init.body).dry_run, warnings: [], notes: [], scope: project("repo-a") } });
+  await buttons(rowFor(card("repo-a"), "Runbook"), "Edit")[0].fire("click");
+  gate = new Promise(r => { release = r; });
+  clock += 1000;
+  pending = els.configModalSave.fire("click");
+  await Promise.resolve();
+  check("a warning-free save locks the YAML during its dry run too", els.configYaml.readOnly === true, String(els.configYaml.readOnly));
+  els.configYaml.value = "label: Runbook\nkey: [typed]\n";
+  await els.configYaml.fire("input");
+  gate = null; release(); await pending;
+  check("...and text that changed anyway is neither written unchecked nor thrown away",
+    writes().length === 1 && body(writes()[0]).dry_run === true && els.configModal.classList.contains("open") &&
+    els.configYaml.value === "label: Runbook\nkey: [typed]\n" && els.configYaml.readOnly === false && shown(els.configModalError),
+    JSON.stringify([writes(), els.configModal.className, els.configModalError.textContent]));
   els.configModalCancel.fire("click");
 
   // 14. Cancel while a save is in flight
