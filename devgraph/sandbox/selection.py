@@ -6,10 +6,14 @@ reads the repository's own `.git/config` and can run programs it names: a
 expanded, a lazy fetch through `core.sshCommand`, `remote.<name>.uploadpack`
 or an `ext::` transport. So the invocation is fixed: command-line `-c`
 overrides (which outrank every config file, includes too); `--cached` (index
-only, so no `filter.*` or `textconv` program); `--sparse` (sparse directories
-are listed, not expanded from tree objects); `GIT_NO_LAZY_FETCH=1` (git 2.45+,
-so older git is refused); `--no-pager` with `GIT_PAGER=cat` and a piped stdout;
-and an environment built from nothing rather than filtered from the caller's.
+only, so no `filter.*` or `textconv` program); `GIT_NO_LAZY_FETCH=1`, the
+lazy-fetch guard (git 2.45+, so older git is refused); `--sparse`, defence in
+depth that keeps a cone-mode sparse index collapsed (non-cone patterns still
+expand it); `--no-pager` with `GIT_PAGER=cat` and a piped stdout; and an
+environment built from nothing rather than filtered from the caller's.
+
+`-t --stage` adds each entry's tag and mode, so skip-worktree entries (not on
+disk) and gitlinks (submodules) are dropped whether or not the index is sparse.
 """
 
 from __future__ import annotations
@@ -34,6 +38,7 @@ from devgraph.sandbox.limits import (
     DENYLIST,
     FIXED_PATH,
     GIT_TIMEOUT_SECONDS,
+    INDEX_MAX_ENTRIES,
     INPUT_MAX_FILES,
 )
 from devgraph.sandbox.reader import InputError
@@ -70,7 +75,9 @@ def git_env(home: str, ceiling: str) -> dict[str, str]:
     }
 
 
-def _check_git_version(git: str, env: dict[str, str], cwd: str) -> None:
+def _check_git_version(
+    git: str, env: dict[str, str], cwd: str, deadline: float
+) -> None:
     try:
         proc = subprocess.run(
             [git, "--version"],
@@ -78,7 +85,7 @@ def _check_git_version(git: str, env: dict[str, str], cwd: str) -> None:
             cwd=cwd,
             stdin=subprocess.DEVNULL,
             capture_output=True,
-            timeout=GIT_TIMEOUT_SECONDS,
+            timeout=max(deadline - time.monotonic(), 0.001),
             check=False,
         )
     except (OSError, subprocess.SubprocessError):
@@ -129,10 +136,14 @@ def _iter_tracked(root: Path, git: str | None) -> Iterator[str]:
         "-z",
         "--cached",
         "--sparse",
+        "-t",
+        "--stage",
     ]
     with tempfile.TemporaryDirectory(prefix="devgraph-git-home-") as home:
         env = git_env(home, str(real.parent))
-        _check_git_version(git, env, home)
+        # One deadline covers the version check, the read and the final wait.
+        deadline = time.monotonic() + GIT_TIMEOUT_SECONDS
+        _check_git_version(git, env, home, deadline)
         try:
             proc = subprocess.Popen(
                 command,
@@ -148,8 +159,8 @@ def _iter_tracked(root: Path, git: str | None) -> Iterator[str]:
                 "input_unavailable", "git ls-files could not run"
             ) from None
         try:
-            yield from _read_names(proc)
-            returncode = proc.wait(timeout=GIT_TIMEOUT_SECONDS)
+            yield from _read_names(proc, deadline)
+            returncode = proc.wait(timeout=max(deadline - time.monotonic(), 0.001))
             if returncode != 0:
                 raise InputError(
                     "input_unavailable", f"git ls-files exited with status {returncode}"
@@ -161,10 +172,16 @@ def _iter_tracked(root: Path, git: str | None) -> Iterator[str]:
             proc.stdout.close()
 
 
-def _read_names(proc: subprocess.Popen) -> Iterator[str]:
-    deadline = time.monotonic() + GIT_TIMEOUT_SECONDS
+# Modes that name a file in the work tree; a gitlink (160000) or a sparse
+# directory (040000) does not.
+_FILE_MODES = (b"100644", b"100755", b"120000")
+
+
+def _read_names(proc: subprocess.Popen, deadline: float) -> Iterator[str]:
+    """Parse `ls-files -z -t --stage` entries (`<tag> <mode> <sha> <stage>\\t<path>`)
+    into the paths of files on disk, stopping past `INDEX_MAX_ENTRIES`."""
     fd = proc.stdout.fileno()
-    pending, skipped = b"", 0
+    pending, skipped, entries_seen, previous = b"", 0, 0, None
     with selectors.DefaultSelector() as selector:
         selector.register(fd, selectors.EVENT_READ)
         while True:
@@ -182,10 +199,23 @@ def _read_names(proc: subprocess.Popen) -> Iterator[str]:
                     "input_unavailable", "git ls-files printed an overlong name"
                 )
             for raw in entries:
-                if not raw or raw.endswith(b"/"):  # a sparse directory, not a file
-                    continue
+                entries_seen += 1
+                if entries_seen > INDEX_MAX_ENTRIES:
+                    raise InputError(
+                        "input_cap", f"index has more than {INDEX_MAX_ENTRIES} entries"
+                    )
+                header, tab, path = raw.partition(b"\t")
+                fields = header.split(b" ")
+                if not tab or not path or len(fields) != 4:
+                    raise InputError(
+                        "input_unavailable", "git ls-files printed an unexpected entry"
+                    )
+                tag, mode = fields[0], fields[1]
+                if tag == b"S" or mode not in _FILE_MODES or path == previous:
+                    continue  # skip-worktree, gitlink, sparse directory, or another stage
+                previous = path
                 try:
-                    yield raw.decode("utf-8")
+                    yield path.decode("utf-8")
                 except UnicodeDecodeError:
                     skipped += 1
     if pending:
@@ -196,9 +226,8 @@ def _read_names(proc: subprocess.Popen) -> Iterator[str]:
         )
 
 
-def tracked_files(root: Path, *, git: str | None) -> list[str]:
-    """The repository's tracked paths, from the index only. Names that are not valid
-    UTF-8 are skipped. Raises `InputError("input_unavailable")` on any failure."""
+def _tracked_files(root: Path, *, git: str | None) -> list[str]:
+    """Test helper: every selectable tracked path, as `select_inputs` sees them."""
     return list(_iter_tracked(root, git))
 
 

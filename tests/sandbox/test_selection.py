@@ -15,7 +15,7 @@ from devgraph.indexer.dispatch import IGNORED_DIR_NAMES
 from devgraph.sandbox import selection
 from devgraph.sandbox.limits import DENYLIST
 from devgraph.sandbox.reader import InputError
-from devgraph.sandbox.selection import git_binary, select_inputs, tracked_files
+from devgraph.sandbox.selection import _tracked_files, git_binary, select_inputs
 
 GIT = git_binary()
 needs_git = pytest.mark.skipif(GIT is None, reason="git is not installed")
@@ -109,18 +109,18 @@ def test_selection_input_cap(tmp_path, monkeypatch):
 
 
 @needs_git
-def test_tracked_files_skips_names_that_are_not_utf8(tmp_path):
+def test__tracked_files_skips_names_that_are_not_utf8(tmp_path):
     root = _repo(tmp_path / "repo", {"ok.py": b"x"})
     fd = os.open(os.fsencode(root) + b"/bad\xff.py", os.O_WRONLY | os.O_CREAT, 0o644)
     os.close(fd)
     _git(root, "add", "-A")
-    assert tracked_files(root, git=GIT) == ["ok.py"]
+    assert _tracked_files(root, git=GIT) == ["ok.py"]
 
 
 def test_no_git_work_tree_is_input_unavailable(tmp_path):
     # No git binary: no selection, whatever the directory.
     with pytest.raises(InputError) as info:
-        tracked_files(tmp_path, git=None)
+        _tracked_files(tmp_path, git=None)
     assert info.value.code == "input_unavailable"
     if GIT is None:
         pytest.skip("git is not installed")
@@ -128,19 +128,19 @@ def test_no_git_work_tree_is_input_unavailable(tmp_path):
     # A plain directory inside another repository is not that repository.
     outer = _repo(tmp_path / "outer", {"plain/inner.py": b"x"})
     with pytest.raises(InputError) as info:
-        tracked_files(outer / "plain", git=GIT)
+        _tracked_files(outer / "plain", git=GIT)
     assert info.value.code == "input_unavailable"
 
     # A corrupt index: git exits non-zero.
     broken = _repo(tmp_path / "broken", {"a.py": b"x"})
     (broken / ".git" / "index").write_bytes(b"not an index")
     with pytest.raises(InputError) as info:
-        tracked_files(broken, git=GIT)
+        _tracked_files(broken, git=GIT)
     assert info.value.code == "input_unavailable"
 
     # A path that does not exist.
     with pytest.raises(InputError) as info:
-        tracked_files(tmp_path / "missing", git=GIT)
+        _tracked_files(tmp_path / "missing", git=GIT)
     assert info.value.code == "input_unavailable"
 
 
@@ -222,7 +222,7 @@ def test_caller_git_environment_has_no_effect(tmp_path, monkeypatch):
     monkeypatch.setenv("GIT_CEILING_DIRECTORIES", "")
     monkeypatch.setenv("HOME", str(tmp_path))
 
-    assert tracked_files(root, git=GIT) == ["mine.py"]
+    assert _tracked_files(root, git=GIT) == ["mine.py"]
     assert not marker.exists()
 
 
@@ -243,9 +243,10 @@ def _exit_marker(tmp_path: Path, name: str) -> tuple[Path, Path]:
     return program, marker
 
 
-def _promisor_sparse_repo(path: Path) -> Path:
+def _promisor_sparse_repo(path: Path, *, cone: bool = True) -> Path:
     """A partial clone with a sparse index whose `far` trees are missing, so a
-    full-index read would lazily fetch them from the promisor remote."""
+    full-index read would lazily fetch them from the promisor remote. With
+    `cone=False` the patterns are non-cone, so even `--sparse` expands the index."""
     root = _repo(path, {"keep/a": b"a", "far/b": b"b", "far/sub/c": b"c"})
     _git(root, "sparse-checkout", "set", "--cone", "--sparse-index", "keep")
     trees = []
@@ -263,6 +264,9 @@ def _promisor_sparse_repo(path: Path) -> Path:
     _git(root, "config", "core.repositoryformatversion", "1")
     _git(root, "config", "extensions.partialClone", "origin")
     _git(root, "config", "remote.origin.promisor", "true")
+    if not cone:
+        _git(root, "config", "core.sparseCheckoutCone", "false")
+        (root / ".git" / "info" / "sparse-checkout").write_text("/keep/a\n!/far/\n")
     return root
 
 
@@ -290,8 +294,11 @@ def _ext_transport(root: Path, program: Path) -> None:
         pytest.param(_ext_transport, id="ext-transport"),
     ],
 )
-def test_lazy_fetch_runs_no_repository_program(tmp_path, configure):
-    root = _promisor_sparse_repo(tmp_path / "repo")
+@pytest.mark.parametrize(
+    "cone", [pytest.param(True, id="cone"), pytest.param(False, id="non_cone_patterns")]
+)
+def test_lazy_fetch_runs_no_repository_program(tmp_path, configure, cone):
+    root = _promisor_sparse_repo(tmp_path / "repo", cone=cone)
     (tmp_path / "elsewhere").mkdir()
     program, marker = _exit_marker(tmp_path, "fetch")
     configure(root, program)
@@ -349,7 +356,7 @@ def test_git_older_than_2_45_is_refused(tmp_path, version):
     root.mkdir()
     fake = _fake_git(tmp_path, f"echo '{version}'")
     with pytest.raises(InputError) as info:
-        tracked_files(root, git=fake)
+        _tracked_files(root, git=fake)
     assert info.value.code == "input_unavailable"
     assert "2.45" in info.value.reason
 
@@ -357,7 +364,7 @@ def test_git_older_than_2_45_is_refused(tmp_path, version):
 @needs_git
 def test_nfd_repository_directory(tmp_path):
     root = _repo(tmp_path / "cafe\u0301", {"a.py": b"x"})
-    assert tracked_files(root, git=GIT) == ["a.py"]
+    assert _tracked_files(root, git=GIT) == ["a.py"]
     assert select_inputs(root, ["*.py"], git=GIT).matched == ("a.py",)
 
 
@@ -384,7 +391,7 @@ def test_selection_stops_reading_past_the_cap(tmp_path, monkeypatch):
     fake = _fake_git(
         tmp_path,
         'case "$1" in --version) echo "git version 2.55.0"; exit 0;; esac\n'
-        "yes a.py | head -n 2000000 | tr '\\n' '\\0'\n"
+        "seq 2000000 | sed 's/.*/H 100644 0 0\\tf&.py/' | tr '\\n' '\\0'\n"
         f"touch '{done}'",
     )
     monkeypatch.setattr(selection, "INPUT_MAX_FILES", 3)
@@ -415,3 +422,87 @@ def test_sparse_index_is_not_expanded(tmp_path):
     root = _repo(tmp_path / "repo", {"keep/a": b"a", "far/b": b"b", "far/sub/c": b"c"})
     _git(root, "sparse-checkout", "set", "--cone", "--sparse-index", "keep")
     assert select_inputs(root, ["**/*"], git=GIT).matched == ("keep/a",)
+
+
+def _blob(root: Path, data: bytes) -> str:
+    out = subprocess.run(
+        [GIT, "-C", str(root), "hash-object", "-w", "--stdin"],
+        env=_SETUP_ENV,
+        input=data,
+        check=True,
+        capture_output=True,
+    )
+    return out.stdout.decode().strip()
+
+
+@needs_git
+def test_index_entry_cap(tmp_path, monkeypatch):
+    """A huge index ends the read with `input_cap`, whatever the globs match."""
+    root = _repo(tmp_path / "repo", {"seed": b"x"})
+    sha = _blob(root, b"x")
+    lines = "".join(f"100644 {sha}\tgen/f{i:03}.txt\n" for i in range(30))
+    subprocess.run(
+        [GIT, "-C", str(root), "update-index", "--index-info"],
+        env=_SETUP_ENV,
+        input=lines.encode(),
+        check=True,
+        capture_output=True,
+    )
+    monkeypatch.setattr(selection, "INDEX_MAX_ENTRIES", 31)
+    assert select_inputs(root, ["seed"], git=GIT).matched == ("seed",)
+    monkeypatch.setattr(selection, "INDEX_MAX_ENTRIES", 30)
+    with pytest.raises(InputError) as info:
+        select_inputs(root, ["seed"], git=GIT)
+    assert info.value.code == "input_cap"
+    assert "index" in info.value.reason
+
+
+def test_git_wall_time_is_bounded(tmp_path, monkeypatch):
+    """The read deadline and the final wait share one deadline: a git that closes
+    its output late and then hangs is killed at the timeout, not twice it."""
+    import time
+
+    root = tmp_path / "repo"
+    root.mkdir()
+    fake = _fake_git(
+        tmp_path,
+        'case "$1" in --version) echo "git version 2.55.0"; exit 0;; esac\n'
+        "sleep 1.5\nexec 1>&-\nsleep 30",
+    )
+    monkeypatch.setattr(selection, "GIT_TIMEOUT_SECONDS", 2)
+    started = time.monotonic()
+    with pytest.raises(InputError) as info:
+        select_inputs(root, ["*"], git=fake)
+    assert info.value.code == "input_unavailable"
+    assert time.monotonic() - started < 3
+
+
+@needs_git
+def test_skip_worktree_and_gitlinks_are_not_inputs(tmp_path):
+    root = _repo(
+        tmp_path / "repo",
+        {"keep/a": b"a", "far/b": b"b", "top.txt": b"t", "hidden.txt": b"h"},
+    )
+    sub = _repo(tmp_path / "sub", {"s": b"s"})
+    head = subprocess.run(
+        [GIT, "-C", str(sub), "rev-parse", "HEAD"],
+        env=_SETUP_ENV,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    _git(root, "update-index", "--add", "--cacheinfo", f"160000,{head},module")
+    _git(root, "update-index", "--skip-worktree", "hidden.txt")
+    assert select_inputs(root, ["**/*", "*"], git=GIT).matched == (
+        "far/b",
+        "keep/a",
+        "top.txt",
+    )
+
+    # A sparse checkout without a sparse index marks out-of-cone files skip-worktree
+    # (cone mode always includes top-level files, so hidden.txt is back on disk).
+    _git(root, "sparse-checkout", "set", "--cone", "--no-sparse-index", "keep")
+    assert select_inputs(root, ["**/*", "*"], git=GIT).matched == ("hidden.txt", "keep/a", "top.txt")
+    # With the sparse index the collapsed directory is dropped the same way.
+    _git(root, "sparse-checkout", "set", "--cone", "--sparse-index", "keep")
+    assert select_inputs(root, ["**/*", "*"], git=GIT).matched == ("hidden.txt", "keep/a", "top.txt")

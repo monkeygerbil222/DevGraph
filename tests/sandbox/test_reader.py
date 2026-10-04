@@ -464,3 +464,23 @@ def test_unknown_platform_never_calls_openat2(repo, monkeypatch):
 def test_platform_without_no_follow_flags_refuses_every_read(repo, monkeypatch):
     monkeypatch.setattr(reader, "_NO_FOLLOW_OK", False)
     _refused("input_unavailable", read_repo_file, repo, "real.txt", cap=100)
+
+
+def test_root_swapped_for_a_symlink_is_refused(repo, use_openat2, monkeypatch):
+    """The root itself is opened without following a symlink swapped in after the check."""
+    outside = repo.parent / "outside"
+    (outside / "real.txt").write_bytes(b"TOP-SECRET")
+
+    def swap_root(path):
+        repo.rename(repo.parent / "repo.bak")
+        repo.symlink_to(outside)
+
+    monkeypatch.setattr(reader, "_after_check", swap_root)
+    _refused(
+        "input_unavailable",
+        read_repo_file,
+        repo,
+        "real.txt",
+        cap=100,
+        use_openat2=use_openat2,
+    )

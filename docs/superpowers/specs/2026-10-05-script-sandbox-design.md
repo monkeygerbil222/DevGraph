@@ -217,7 +217,7 @@ invocation is therefore fixed:
 ```
 git --no-pager -C <real root path>
     -c core.fsmonitor=false -c core.untrackedCache=false
-    ls-files -z --cached --sparse
+    ls-files -z --cached --sparse -t --stage
 ```
 
 run with a constructed environment, not a filtered copy of the caller's:
@@ -245,20 +245,32 @@ them from the promisor remote. That fetch runs whatever the repository
 configures: `core.sshCommand` for an ssh URL, `remote.<name>.uploadpack` for a
 local one, or an `ext::<program>` URL when repository-local
 `protocol.ext.allow=always` (which also overrides a command-line
-`protocol.allow=never`). Two independent guards close it: `--sparse` lists
-sparse directories as `dir/` entries instead of expanding them (selection
-drops those entries; their files are outside the work tree and could not be
-read anyway), and `GIT_NO_LAZY_FETCH=1` makes git refuse any lazy fetch.
+`protocol.allow=never`). `GIT_NO_LAZY_FETCH=1` is the guard: git refuses
+any lazy fetch. `--sparse` is defence in depth for cone mode only: it keeps a
+cone-mode sparse index collapsed (no tree objects are read), but with
+non-cone patterns (`core.sparseCheckoutCone=false`) git expands the index
+anyway and, without the environment guard, the fetch runs (verified; E1's
+test covers both layouts).
 `GIT_NO_LAZY_FETCH` exists from git 2.45, so an older git (checked with
 `git --version` under the same environment) is `input_unavailable`, and
 `doctor` reports it. Partial clones are allowed, not refused: blobless and
 treeless clones are common, and with both guards no fetch is attempted
 (E1's test covers all three transports with marker programs).
 
+`-t --stage` gives each entry's tag and mode. Selection keeps only regular
+files and symlinks (modes 100644, 100755, 120000) that are not skip-worktree
+(`S`): out-of-cone files of a sparse checkout, collapsed sparse directories
+(mode 040000) and gitlinks (submodules, 160000) are dropped the same way
+whether or not the index is sparse. Repeated paths (an unmerged entry's
+stages) count once.
+
 The real resolved path, not the NFC trust-key form, goes to `-C`, so a
 repository directory with an NFD name still resolves. Output is streamed and
-filtered as it is read; once the matches exceed the per-run file cap, git is
-killed and the run is `input_cap`, so a huge index is never buffered whole.
+filtered as it is read; once the matches exceed the per-run file cap, or the
+index exceeds `INDEX_MAX_ENTRIES` (50 × the file cap) entries, git's process
+group is killed and the run is `input_cap`, so a huge index is never
+buffered whole. One 30 s deadline covers the version check, the read and the
+final wait.
 
 Any non-zero exit, or no git binary, means `input_unavailable` and the
 provider does not run. Reading the index directly was considered and rejected:
@@ -1135,7 +1147,7 @@ starts before this document is signed off.
 | `test_selection_excludes_untracked_and_ignored_files` | Untracked, ignored and denylisted files never match, whatever the globs. |
 | `test_no_git_work_tree_is_input_unavailable` | A non-repository directory nested inside another repository is not resolved to the outer one; no git binary; non-zero exit. |
 | `test_ls_files_runs_no_repository_program` | Repository config sets `core.fsmonitor`, `pager.ls-files`, `filter.x.clean`/`smudge`, `diff.x.textconv` with `.gitattributes`, and an `include.path` to a file setting `core.fsmonitor`; a marker file is never created. |
-| `test_lazy_fetch_runs_no_repository_program` | A partial clone with a sparse index whose collapsed trees are missing, its promisor remote reached through `core.sshCommand`, `remote.origin.uploadpack`, or `ext::` with repository-local `protocol.ext.allow=always`; a marker file is never created, and a control run without the guards creates it. |
+| `test_lazy_fetch_runs_no_repository_program` | A partial clone with a sparse index whose collapsed trees are missing, its promisor remote reached through `core.sshCommand`, `remote.origin.uploadpack`, or `ext::` with repository-local `protocol.ext.allow=always`, each with cone and with non-cone sparse patterns; a marker file is never created, and a control run without the guards creates it. |
 | `test_reader_refusals` | Symlinked leaf and intermediate, `..`, FIFO, oversize, swapped-in symlink between check and open. |
 | `test_normalisation_rejection_table`, `test_digest_stability_and_sensitivity` | §5.2–5.3. |
 | `test_approval_display_escapes_non_ascii_identifiers` | Full-width `eval` is shown escaped; non-ASCII in strings and comments is shown as text; control characters escaped everywhere. |

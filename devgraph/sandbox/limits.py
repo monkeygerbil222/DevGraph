@@ -11,6 +11,7 @@ SCRIPT_MAX_BYTES = 64 * 1024  # over: static_reject
 INPUT_MAX_FILE_BYTES = 1024 * 1024  # over: input_cap, file skipped
 INPUT_MAX_RUN_BYTES = 32 * 1024 * 1024  # over: input_cap, run refused
 INPUT_MAX_FILES = 5_000  # over: input_cap
+INDEX_MAX_ENTRIES = 50 * INPUT_MAX_FILES  # git index entries read for selection; over: input_cap
 
 # The only PATH a sandbox subprocess (selection's `git`, the static-scan worker) sees.
 FIXED_PATH = "/usr/bin:/bin"
