@@ -22,6 +22,7 @@ from pathlib import Path
 from git import Repo
 
 from devgraph.config.settings import get_settings
+from devgraph.git_safe import open_repo
 from devgraph.indexer.git_history.blame import compute_function_recency
 
 logger = logging.getLogger(__name__)
@@ -77,7 +78,7 @@ class GitHistoryExtractor:
             preserves history order.
         """
         result = ExtractionResult()
-        repo = Repo(str(self.repo_path))
+        repo = open_repo(self.repo_path)
         try:
             commits = list(repo.iter_commits(max_count=max_count))
             commits.reverse()  # iter_commits is newest-first; we want oldest-first
@@ -393,7 +394,7 @@ def sync_git_history(engine, registry, repo_id: str, max_count: int | None = Non
     if repo_record is None:
         raise ValueError(f"no such repo_id: {repo_id}")
 
-    repo = Repo(str(repo_record.path))
+    repo = open_repo(repo_record.path)
     try:
         try:
             head_sha = repo.head.commit.hexsha
