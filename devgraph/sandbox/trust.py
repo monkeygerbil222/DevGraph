@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import stat
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -21,6 +22,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from devgraph.sandbox.limits import MAX_ACTIVE_DIGESTS, TRUST_SCHEMA_VERSION
+from devgraph.sandbox.paths import SandboxPathError, check_private_dir, private_file_stat, same_file
 
 _READ_TIMEOUT = 0.5
 _WRITE_TIMEOUT = 5.0
@@ -73,30 +75,45 @@ class TrustStore:
 
     @classmethod
     def open_read(cls, path: Path) -> TrustStore | None:
-        """The store, read-only; None if it is missing, locked, corrupt or another version."""
+        """The store, read-only; None if it is missing, locked, corrupt, another version,
+        a symlink, or not private to the user (see `paths.private_file_stat`)."""
+        path = Path(path)
         conn = None
         try:
-            if not Path(path).is_file():
-                return None
-            conn = sqlite3.connect(f"{Path(path).resolve().as_uri()}?mode=ro", uri=True,
+            before = private_file_stat(path)
+            conn = sqlite3.connect(f"{path.parent.resolve().joinpath(path.name).as_uri()}?mode=ro", uri=True,
                                    timeout=_READ_TIMEOUT, isolation_level=None)
-            if conn.execute("PRAGMA user_version").fetchone()[0] != TRUST_SCHEMA_VERSION:
+            version = conn.execute("PRAGMA user_version").fetchone()[0]
+            if version != TRUST_SCHEMA_VERSION or not same_file(before, private_file_stat(path)):
                 conn.close()
                 return None
-        except (sqlite3.Error, OSError, ValueError):
+        except Exception:
             if conn is not None:
                 conn.close()
             return None
-        return cls(Path(path), conn)
+        return cls(path, conn)
 
     @classmethod
     def open_write(cls, path: Path) -> TrustStore:
-        """The store for writing, created (directory 0700, file 0600) if absent."""
+        """The store for writing, created (directory 0700, file 0600) if absent.
+
+        Refuses a symlinked store and a store or directory that is not private to the
+        user; an existing store is tightened to 0600."""
         path = Path(path)
         conn = None
         try:
             path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-            os.close(os.open(path, os.O_CREAT | os.O_RDWR | os.O_CLOEXEC, 0o600))
+            check_private_dir(path.parent)
+            fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+            try:
+                opened = os.fstat(fd)
+                if opened.st_uid != os.getuid():
+                    raise SandboxPathError(f"{path} is not owned by the current user")
+                if opened.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+                    raise SandboxPathError(f"{path} is writable by group or others")
+                os.fchmod(fd, 0o600)
+            finally:
+                os.close(fd)
             conn = sqlite3.connect(path, timeout=_WRITE_TIMEOUT, isolation_level=None)
             store = cls(path, conn)
             with store._transaction():
@@ -106,13 +123,19 @@ class TrustStore:
                         if statement.strip():
                             conn.execute(statement)
                     conn.execute(f"PRAGMA user_version = {TRUST_SCHEMA_VERSION}")
-        except (sqlite3.Error, OSError) as exc:
+            tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+            if not same_file(opened, private_file_stat(path)):
+                raise SandboxPathError(f"{path} was replaced while it was opened")
+        except (sqlite3.Error, OSError, SandboxPathError) as exc:
             if conn is not None:
                 conn.close()
             raise TrustStoreError(f"cannot open the trust store {path}: {exc}") from exc
-        if version not in (0, TRUST_SCHEMA_VERSION):
+        if version != TRUST_SCHEMA_VERSION and version != 0:
             conn.close()
             raise TrustStoreError(f"{path} has trust schema version {version}, expected {TRUST_SCHEMA_VERSION}")
+        if not {"repo_scripts", "approvals"} <= tables:
+            conn.close()
+            raise TrustStoreError(f"{path} is missing trust store tables")
         return store
 
     def close(self) -> None:

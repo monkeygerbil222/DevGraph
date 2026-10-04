@@ -175,3 +175,105 @@ def test_forget_repo_removes_every_row_for_the_id(store_path, store):
     assert store.forget_repo(REPO) == 3
     assert not _gate2(store_path) and not _gate3(store_path, DIGESTS[0])
     assert store.scripts_enabled("other-repo", "/srv/code/other")
+
+
+# --- fix round 1: ownership, modes, no-follow, read-only, empty store ---------
+
+
+def _good_store(store_path):
+    with TrustStore.open_write(store_path) as s:
+        s.set_scripts_enabled(REPO, CANON, True)
+        _approve(s, DIGESTS[0])
+    assert _gate2(store_path) and _gate3(store_path, DIGESTS[0])
+
+
+def test_normal_modes_work(store_path):
+    _good_store(store_path)
+    assert stat.S_IMODE(os.stat(store_path.parent).st_mode) == 0o700
+    assert stat.S_IMODE(os.stat(store_path).st_mode) == 0o600
+
+
+def test_world_writable_parent_turns_gates_off(store_path):
+    _good_store(store_path)
+    os.chmod(store_path.parent, 0o777)
+    try:
+        assert TrustStore.open_read(store_path) is None
+        assert not _gate2(store_path) and not _gate3(store_path, DIGESTS[0])
+        with pytest.raises(TrustStoreError):
+            TrustStore.open_write(store_path)
+    finally:
+        os.chmod(store_path.parent, 0o700)
+    assert _gate2(store_path)
+
+
+def test_group_or_world_writable_store_turns_gates_off(store_path):
+    _good_store(store_path)
+    for mode in (0o666, 0o620):
+        os.chmod(store_path, mode)
+        assert TrustStore.open_read(store_path) is None
+        assert not _gate2(store_path) and not _gate3(store_path, DIGESTS[0])
+    os.chmod(store_path, 0o600)
+    assert _gate2(store_path)
+
+
+def test_open_write_refuses_writable_store_and_never_widens(store_path):
+    _good_store(store_path)
+    os.chmod(store_path, 0o666)
+    with pytest.raises(TrustStoreError):
+        TrustStore.open_write(store_path)
+    os.chmod(store_path, 0o640)  # not writable by others: accepted and tightened
+    TrustStore.open_write(store_path).close()
+    assert stat.S_IMODE(os.stat(store_path).st_mode) == 0o600
+
+
+def test_store_owned_by_another_user_turns_gates_off(store_path, monkeypatch):
+    _good_store(store_path)
+    real_uid = os.getuid()
+    monkeypatch.setattr(os, "getuid", lambda: real_uid + 1)
+    assert TrustStore.open_read(store_path) is None
+    assert not _gate2(store_path) and not _gate3(store_path, DIGESTS[0])
+    with pytest.raises(TrustStoreError):
+        TrustStore.open_write(store_path)
+
+
+def test_symlinked_store_is_refused(store_path, tmp_path):
+    real = tmp_path / "real" / "script_trust.sqlite3"
+    _good_store(real)
+    store_path.parent.mkdir(mode=0o700, parents=True)
+    store_path.symlink_to(real)
+    assert TrustStore.open_read(store_path) is None
+    assert not _gate2(store_path) and not _gate3(store_path, DIGESTS[0])
+    with pytest.raises(TrustStoreError):
+        TrustStore.open_write(store_path)
+
+
+def test_open_write_on_empty_version_one_store_raises_trust_store_error(store_path):
+    store_path.parent.mkdir(mode=0o700, parents=True)
+    conn = sqlite3.connect(store_path)
+    conn.execute(f"PRAGMA user_version = {limits.TRUST_SCHEMA_VERSION}")
+    conn.commit()
+    conn.close()
+    os.chmod(store_path, 0o600)
+    with pytest.raises(TrustStoreError):
+        TrustStore.open_write(store_path)
+
+
+def test_open_read_connection_is_read_only(store_path):
+    _good_store(store_path)
+    store = TrustStore.open_read(store_path)
+    try:
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            store._conn.execute("DELETE FROM approvals")
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            store.set_scripts_enabled(REPO, CANON, False)
+    finally:
+        store.close()
+    assert _gate2(store_path) and _gate3(store_path, DIGESTS[0])
+
+
+def test_non_utf8_canonical_path_fails_closed(store_path):
+    _good_store(store_path)
+    bad = "/srv/code/caf\udcff"
+    assert not _gate2(store_path, canon=bad)
+    assert not _gate3(store_path, DIGESTS[0], canon=bad)
+    assert not gates.gate2_scripts_enabled("caf\udcff", CANON, store_path=store_path)

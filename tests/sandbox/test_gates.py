@@ -1,8 +1,10 @@
 """Sandbox home, fixed paths and the fail-closed gates (spec §5.1, §5.2)."""
 
 import importlib
+import os
 import sqlite3
 import subprocess
+import time
 import types
 import unicodedata
 from pathlib import Path
@@ -244,3 +246,115 @@ def test_sandbox_decisions_ignore_env_and_dotenv(tmp_path, monkeypatch):
     }
     assert after == before
     assert after["runtime"] == "podman"
+
+
+# --- fix round 1 --------------------------------------------------------------
+
+
+def test_canonical_repo_path_refuses_non_utf8(tmp_path):
+    bad = Path(os.fsdecode(bytes(tmp_path) + b"/caf\xff"))
+    bad.mkdir()
+    with pytest.raises(SandboxPathError):
+        paths.canonical_repo_path(bad)
+
+
+def test_gate1_fails_closed_on_non_utf8_input(repo, fixed_registry):
+    repo_id = _register(fixed_registry, repo)
+    canon = paths.canonical_repo_path(repo)
+    assert _gate1(repo_id, canon, fixed_registry)
+    assert not _gate1(repo_id, canon + "\udcff", fixed_registry)
+    assert not _gate1("acme\udcff", canon, fixed_registry)
+
+
+def test_gates_log_and_swallow_any_exception(repo, fixed_registry, monkeypatch, caplog):
+    repo_id = _register(fixed_registry, repo)
+    canon = paths.canonical_repo_path(repo)
+    store_path = paths.trust_store_path(paths.sandbox_home())
+    with TrustStore.open_write(store_path) as store:
+        store.set_scripts_enabled(repo_id, canon, True)
+        store.approve(repo_id, canon, PROVIDER, DIGEST, declaration_json="{}", script_text="",
+                      matched_count=0, keep_previous=False)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("unexpected")
+
+    monkeypatch.setattr(TrustStore, "scripts_enabled", boom)
+    monkeypatch.setattr(TrustStore, "active_digests", boom)
+    with caplog.at_level("WARNING", logger="devgraph.sandbox.gates"):
+        result = gates.evaluate_gates(repo_id, canon, PROVIDER, DIGEST,
+                                      registry_path=object(), store_path=store_path)
+    assert result == gates.GateResult(False, False, False)
+    assert caplog.text.count("unexpected") == 2
+    assert "TypeError" in caplog.text
+
+
+def test_gate1_strict_modes_on_registry(repo, fixed_registry, monkeypatch):
+    repo_id = _register(fixed_registry, repo)
+    canon = paths.canonical_repo_path(repo)
+    os.chmod(fixed_registry.parent, 0o700)
+    assert _gate1(repo_id, canon, fixed_registry)
+
+    os.chmod(fixed_registry.parent, 0o777)  # a pre-existing world-writable ~/.devgraph
+    assert not _gate1(repo_id, canon, fixed_registry)
+    os.chmod(fixed_registry.parent, 0o755)  # what a default umask gives: fine
+    assert _gate1(repo_id, canon, fixed_registry)
+
+    os.chmod(fixed_registry, 0o666)
+    assert not _gate1(repo_id, canon, fixed_registry)
+    os.chmod(fixed_registry, 0o644)
+    assert _gate1(repo_id, canon, fixed_registry)
+
+    real_uid = os.getuid()
+    monkeypatch.setattr(os, "getuid", lambda: real_uid + 1)
+    assert not _gate1(repo_id, canon, fixed_registry)
+
+
+def test_gate1_refuses_symlinked_registry(tmp_path, repo, fixed_registry):
+    real = tmp_path / "real" / "registry.sqlite3"
+    repo_id = _register(real, repo)
+    canon = paths.canonical_repo_path(repo)
+    assert _gate1(repo_id, canon, real)
+    fixed_registry.parent.mkdir(mode=0o700, parents=True)
+    fixed_registry.symlink_to(real)
+    assert not _gate1(repo_id, canon, fixed_registry)
+
+
+def test_gates_off_when_fixed_paths_lie_inside_the_repo(tmp_path, monkeypatch):
+    # A dotfiles repository at the home directory holds ~/.devgraph itself.
+    home = _git_repo(tmp_path / "dotfiles-home")
+    monkeypatch.setattr(paths, "sandbox_home", lambda: home)
+    registry = paths.fixed_registry_path(home)
+    store_path = paths.trust_store_path(home)
+    registry.parent.mkdir(mode=0o700)
+    repo_id = _register(registry, home)
+    canon = paths.canonical_repo_path(home)
+    with TrustStore.open_write(store_path) as store:
+        store.set_scripts_enabled(repo_id, canon, True)
+        store.approve(repo_id, canon, PROVIDER, DIGEST, declaration_json="{}", script_text="",
+                      matched_count=0, keep_previous=False)
+    assert _decide(repo_id, canon) == gates.GateResult(False, False, False)
+    # The same files read on for a repository elsewhere.
+    other = _git_repo(tmp_path / "work" / "other")
+    other_canon = paths.canonical_repo_path(other)
+    other_id = _register(registry, other)
+    with TrustStore.open_write(store_path) as store:
+        store.set_scripts_enabled(other_id, other_canon, True)
+        store.approve(other_id, other_canon, PROVIDER, DIGEST, declaration_json="{}", script_text="",
+                      matched_count=0, keep_previous=False)
+    assert _decide(other_id, other_canon) == gates.GateResult(True, True, True)
+
+
+def test_locked_registry_reads_off_quickly(repo, fixed_registry):
+    repo_id = _register(fixed_registry, repo)
+    canon = paths.canonical_repo_path(repo)
+    locker = sqlite3.connect(fixed_registry, isolation_level=None)
+    locker.execute("PRAGMA locking_mode=EXCLUSIVE")
+    locker.execute("BEGIN EXCLUSIVE")
+    locker.execute("UPDATE repos SET active = active")
+    try:
+        started = time.monotonic()
+        assert not _gate1(repo_id, canon, fixed_registry)
+        assert time.monotonic() - started < 2
+    finally:
+        locker.execute("ROLLBACK")
+        locker.close()

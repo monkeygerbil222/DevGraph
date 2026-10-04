@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import pwd
+import stat
 import sys
 import unicodedata
 from pathlib import Path
@@ -44,7 +45,50 @@ def canonical_repo_path(path: Path | str) -> str:
         resolved = Path(path).resolve(strict=True)
     except (OSError, RuntimeError, ValueError) as exc:
         raise SandboxPathError(f"cannot resolve {path!s}: {exc}") from exc
+    try:
+        str(resolved).encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise SandboxPathError(f"{path!r} is not valid UTF-8") from exc
     return unicodedata.normalize("NFC", str(resolved))
+
+
+def _check_private(st: os.stat_result, what: Path) -> None:
+    if st.st_uid != os.getuid():
+        raise SandboxPathError(f"{what} is not owned by the current user")
+    if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise SandboxPathError(f"{what} is writable by group or others")
+
+
+def private_file_stat(path: Path) -> os.stat_result:
+    """`lstat` of a sandbox state file (trust store, fixed registry), checked like ssh's
+    strict modes: the file must be a regular file, not a symlink, and the file and its
+    parent directory must be owned by the current user and not group- or world-writable.
+    Raises `SandboxPathError` (or `OSError`, e.g. when missing)."""
+    path = Path(path)
+    st = os.lstat(path)
+    if not stat.S_ISREG(st.st_mode):
+        raise SandboxPathError(f"{path} is not a regular file")
+    _check_private(st, path)
+    _check_private(os.stat(path.parent), path.parent)
+    return st
+
+
+def check_private_dir(path: Path) -> None:
+    """The ownership and mode check of `private_file_stat`, for a directory."""
+    _check_private(os.stat(path), Path(path))
+
+
+def same_file(a: os.stat_result, b: os.stat_result) -> bool:
+    return (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino)
+
+
+def inside_repo(path: Path, canon: str) -> bool:
+    """True if `path` (lexically or once its directory is resolved) lies in the repository
+    `canon`; a repository that holds DevGraph's own state cannot vouch for itself."""
+    path = Path(path)
+    repo = Path(canon)
+    candidates = (path, path.parent.resolve() / path.name)
+    return any(Path(unicodedata.normalize("NFC", str(c))).is_relative_to(repo) for c in candidates)
 
 
 def platform_supported(platform: str = sys.platform) -> bool:
