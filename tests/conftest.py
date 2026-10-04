@@ -38,6 +38,15 @@ def _isolate_project_trust_registry(tmp_path, monkeypatch):
     monkeypatch.setattr(project_trust, "_registry_db_path", lambda: tmp_path / "no-registry" / "registry.db")
 
 
+@pytest.fixture(autouse=True)
+def _isolate_sandbox_home(tmp_path, monkeypatch):
+    """Route the sandbox home (trust store, fixed-path registry, lock) to tmp,
+    never the user's real ~/.devgraph. Code reads it through `paths.sandbox_home`."""
+    from devgraph.sandbox import paths
+
+    monkeypatch.setattr(paths, "sandbox_home", lambda: tmp_path / "sandbox-home")
+
+
 @pytest.fixture
 def trusted_project_tools(monkeypatch):
     """Treat every project tools file as trusted. For tests of serving that predate
