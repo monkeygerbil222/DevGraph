@@ -758,6 +758,7 @@ def _project_schema_findings(repos: list[Any]) -> list[dict[str, Any]]:
                 "repo_id": None,
                 "status": "conflict",
                 "label": folded,
+                "repo_ids": sorted({repo_id for repo_id, _label, _key in entries}),
                 "detail": (
                     f"incompatible declarations of label {folded!r} in one shared "
                     f"database: {described}. Only the first provisioned constraint "
@@ -2050,7 +2051,12 @@ _GLOBAL_TOOLS_NOTE = (
 )
 
 
-def _tools_scope(ctx: typer.Context, repo: Optional[Path], global_: bool) -> Path | None:
+def _tools_scope(
+    ctx: typer.Context,
+    repo: Optional[Path],
+    global_: bool,
+    consequence: str = "MCP sessions won't serve its tools",
+) -> Path | None:
     """The repository root for a `config tools` command, or None for the global store.
 
     Without `--repo`: the registered repository containing the current directory, else
@@ -2066,7 +2072,7 @@ def _tools_scope(ctx: typer.Context, repo: Optional[Path], global_: bool) -> Pat
     if not registered:
         Console(stderr=True).print(
             f"[yellow]Warning:[/yellow] {escape(str(root))} is not a registered repository (nor inside one), "
-            "so MCP sessions won't serve its tools; register it with `devgraph add`.",
+            f"so {consequence}; register it with `devgraph add`.",
             soft_wrap=True,
         )
     return root
@@ -2107,7 +2113,7 @@ def _read_tool_source(source: str) -> dict:
     return _parse_tool_text(text, "stdin" if source == "-" else source)
 
 
-def _parse_tool_text(text: str, label: str) -> dict:
+def _parse_tool_text(text: str, label: str, what: str = "one tool") -> dict:
     import yaml
 
     from devgraph.config.project_tools import YAML_LOAD_ERRORS
@@ -2117,7 +2123,7 @@ def _parse_tool_text(text: str, label: str) -> dict:
     except YAML_LOAD_ERRORS as exc:
         raise _tools_fail(f"{label}: malformed YAML: {exc}")
     if not isinstance(tool, dict):
-        raise _tools_fail(f"{label}: expected one tool as a YAML mapping")
+        raise _tools_fail(f"{label}: expected {what} as a YAML mapping")
     return tool
 
 
@@ -2358,6 +2364,448 @@ def config_tools_reset(
         raise _tools_fail(str(exc))
     console.print(f"[green]Reset[/green] {escape(str(path))}", soft_wrap=True)
     console.print(escape(_tools_scope_note(root)), soft_wrap=True)
+
+
+schema_app = typer.Typer(
+    help="List, add, edit, delete or reset node types and relationships in a repository's devgraph.schema.yaml.",
+    no_args_is_help=True,
+)
+config_app.add_typer(schema_app, name="schema")
+
+_SCHEMA_SECTIONS = {
+    "node_types": ("label", "node type"),
+    "relationships": ("type", "relationship"),
+}
+
+
+def _schema_scope(ctx: typer.Context, repo: Optional[Path]) -> Path:
+    return _tools_scope(ctx, repo, False, "DevGraph does not index it")
+
+
+def _schema_record(root: Path):
+    """The registered, active repository record for `root`, else None."""
+    record = next((r for r in _registered_repos() if Path(r.path).expanduser().resolve() == root), None)
+    return record if record is not None and record.active else None
+
+
+def _schema_effect_note(root: Path) -> str:
+    """When a schema change takes effect for this repository."""
+    from devgraph.agent.schema_rescan import QUIET_PERIOD_S
+
+    record = _schema_record(root)
+    if record is None:
+        return f"{root} is not a registered repository, so DevGraph does not index it; register it with `devgraph add`."
+    if not record.project_config_enabled:
+        return (f"Not applied while the project config is disabled for {record.repo_id}; "
+                f"enable it with `devgraph config enable {record.repo_id}`.")
+    if record.watch_enabled:
+        minutes = round(QUIET_PERIOD_S / 60)
+        return (f"The change is applied about {minutes} minutes after the last edit while the DevGraph agent (tray or headless) "
+                f"is running, or now with `devgraph rescan {record.repo_id} --now`.")
+    return f"Not watched: run `devgraph rescan {record.repo_id} --now` to apply it."
+
+
+def _schema_text(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8") if path.exists() else ""
+    except (OSError, UnicodeDecodeError) as exc:
+        raise _tools_fail(f"{path}: cannot be read: {exc}")
+
+
+def _schema_declaration(text: str, path: Path):
+    """The parsed declaration, or None when the text is empty or invalid."""
+    from devgraph.config.project_schema import ProjectSchemaError, parse_project_schema
+
+    try:
+        return parse_project_schema(text, path)
+    except ProjectSchemaError:
+        return None
+
+
+def _read_schema_entry(source: str) -> dict:
+    if source == "-":
+        return _parse_tool_text(sys.stdin.read(), "stdin", "one schema entry")
+    try:
+        text = Path(source).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise _tools_fail(f"cannot read {source}: {exc}")
+    return _parse_tool_text(text, source, "one schema entry")
+
+
+def _entry_section(entry: dict) -> str:
+    """`node_types` or `relationships`, from whether the mapping has `label` or `type`."""
+    if ("label" in entry) == ("type" in entry):
+        raise _tools_fail("a schema entry needs exactly one of `label` (a node type) or `type` (a relationship)")
+    return "node_types" if "label" in entry else "relationships"
+
+
+def _locate_entry(text: str, name: str, node_type: bool, relationship: bool) -> str:
+    """The section (`node_types`/`relationships`) that `name` addresses."""
+    from devgraph.config.list_edit import ListEditError, entries
+    from devgraph.config.project_schema import SCHEMA_FILENAME
+    from devgraph.graph.schema import NODE_LABELS, RELATIONSHIP_TYPES
+
+    if node_type and relationship:
+        raise _tools_fail("use either --node-type or --relationship, not both")
+    try:
+        found = [
+            section for section, (ident, _) in _SCHEMA_SECTIONS.items()
+            if any(isinstance(e, dict) and e.get(ident) == name for e in entries(text, key=section))
+        ]
+    except ListEditError as exc:
+        raise _tools_fail(str(exc))
+    chosen = [s for s, flag in (("node_types", node_type), ("relationships", relationship)) if flag]
+    if chosen:
+        if chosen[0] not in found:
+            raise _tools_fail(f"no {_SCHEMA_SECTIONS[chosen[0]][1]} named {name!r} in {SCHEMA_FILENAME}")
+        return chosen[0]
+    if len(found) > 1:
+        raise _tools_fail(f"{name!r} is both a node type and a relationship type; pass --node-type or --relationship")
+    if not found:
+        hint = "; built-in schema entries cannot be changed" if name in NODE_LABELS + RELATIONSHIP_TYPES else ""
+        raise _tools_fail(f"no node type or relationship named {name!r} in {SCHEMA_FILENAME}{hint}")
+    return found[0]
+
+
+def _schema_edit(edit, path: Path, *, invalid_prefix: str = "", invalid_hint: str = "") -> None:
+    """Apply `edit(text) -> new text`, validate the whole result as the indexer would, then write it atomically."""
+    from devgraph.config.list_edit import ListEditError
+    from devgraph.config.project_schema import ProjectSchemaError, parse_project_schema, resolve_declaration
+
+    try:
+        new_text = edit(_schema_text(path))
+        try:
+            resolve_declaration(parse_project_schema(new_text, path), origin=str(path))
+        except ProjectSchemaError as exc:
+            raise _tools_fail(f"{invalid_prefix}{exc}{invalid_hint}")
+        _write_atomically(path, new_text)
+    except (ListEditError, OSError) as exc:
+        raise _tools_fail(str(exc))
+
+
+def _schema_done(verb: str, section: str, name: str, path: Path, root: Path) -> None:
+    noun = _SCHEMA_SECTIONS[section][1]
+    console.print(f"[green]{verb}[/green] {noun} {escape(repr(name))}: {escape(str(path))}", soft_wrap=True)
+    console.print(escape(_schema_effect_note(root)), soft_wrap=True)
+
+
+def _removed_types(before, after) -> tuple[list[str], list[str]]:
+    """Declared node labels and relationship types in `before` but not `after` (None counts as empty).
+
+    Built-in relationship types are never deleted by the indexer, so they are not reported.
+    """
+    from devgraph.graph.schema import RELATIONSHIP_TYPES
+
+    def names(declaration):
+        if declaration is None:
+            return set(), set()
+        return (
+            {n.label for n in declaration.node_types},
+            {r.type for r in declaration.relationships if r.type not in RELATIONSHIP_TYPES},
+        )
+
+    old_labels, old_types = names(before)
+    new_labels, new_types = names(after)
+    return sorted(old_labels - new_labels), sorted(old_types - new_types)
+
+
+def _pruned_types(before, after) -> list[str]:
+    """Labels kept in `after` whose filesystem-sourced nodes the next apply deletes: source dropped or kind changed."""
+    if before is None or after is None:
+        return []
+    now = {n.label: n for n in after.node_types}
+    pruned = []
+    for old in before.node_types:
+        new = now.get(old.label)
+        if new is None or old.source is None:
+            continue
+        if new.source is None:
+            pruned.append(f"{old.label} (source removed)")
+        elif new.source.kind != old.source.kind:
+            pruned.append(f"{old.label} (kind {old.source.kind} -> {new.source.kind})")
+    return sorted(pruned)
+
+
+def _changed_keys(before, after) -> list[tuple[str, tuple[str, ...]]]:
+    """(label, old key) for node types present in both whose key changed."""
+    if before is None or after is None:
+        return []
+    now = {n.label: n for n in after.node_types}
+    return [(o.label, tuple(o.key)) for o in before.node_types if o.label in now and tuple(now[o.label].key) != tuple(o.key)]
+
+
+def _warn_removed(labels: list[str], types: list[str], pruned: list[str] = (), *, root: Path) -> None:
+    when = "the next rescan" if _schema_record(root) and _schema_record(root).project_config_enabled else "applying this schema"
+    if labels:
+        console.print(
+            f"[yellow]Warning:[/yellow] {when} deletes the nodes of the removed node type(s): "
+            f"{escape(', '.join(labels))}.",
+            soft_wrap=True,
+        )
+    if pruned:
+        console.print(
+            f"[yellow]Warning:[/yellow] {when} deletes the nodes of node type(s) whose filesystem source "
+            f"changed: {escape(', '.join(pruned))}.",
+            soft_wrap=True,
+        )
+    if types:
+        console.print(
+            f"[yellow]Warning:[/yellow] {when} removes the relationships of the removed "
+            f"relationship type(s): {escape(', '.join(types))}.",
+            soft_wrap=True,
+        )
+
+
+def _schema_follow_up(root: Path, before, after, entry: dict | None = None) -> None:
+    """Warnings and notes after a successful write: lost nodes, unpopulated types, key changes, conflicts."""
+    _warn_removed(*_removed_types(before, after), _pruned_types(before, after), root=root)
+    for label, old_key in _changed_keys(before, after):
+        console.print(
+            f"[yellow]Warning:[/yellow] the existing uniqueness constraint on {escape(label)} keeps the old key "
+            f"({escape(', '.join(old_key))}) until constraints are dropped (dropping constraints/indexes for "
+            f"removed labels is still open; see PROJECT_STATUS.md).",
+            soft_wrap=True,
+        )
+    if entry is not None and "label" in entry and entry.get("source") is None:
+        console.print(
+            f"Note: no provider produces {escape(str(entry['label']))} nodes yet; only node types with "
+            f"`source: {{provider: filesystem}}` are populated.",
+            soft_wrap=True,
+        )
+    record = _schema_record(root)
+    if record is None or after is None:
+        return
+    for finding in _project_schema_findings(_registered_repos()):
+        if finding["status"] == "conflict" and record.repo_id in finding.get("repo_ids", ()):
+            console.print(f"[yellow]Warning:[/yellow] {escape(finding['detail'])}", soft_wrap=True)
+
+
+@schema_app.command("list")
+def config_schema_list(
+    ctx: typer.Context,
+    repo: Optional[Path] = typer.Option(None, "--repo", help="Repository root (default: current directory)."),
+    as_json: bool = typer.Option(False, "--json", help="Output as JSON."),
+) -> None:
+    """List the effective node types and relationships, marked built-in or project."""
+    from devgraph.config.project_schema import ProjectSchemaError, load_project_schema, resolve_declaration
+    from devgraph.config.project_switch import project_config_enabled
+    from devgraph.graph.schema import NODE_LABELS, RELATIONSHIP_TYPES
+
+    root = _schema_scope(ctx, repo)
+    try:
+        declaration = load_project_schema(root)
+        effective = resolve_declaration(declaration)
+    except ProjectSchemaError as exc:
+        raise _tools_fail(str(exc))
+
+    node_types: list[dict[str, Any]] = []
+    relationships: list[dict[str, Any]] = []
+    if declaration is None or declaration.extends == "default":
+        node_types += [{"label": n, "origin": "built-in", "key": None, "source": None} for n in NODE_LABELS]
+        relationships += [
+            {"type": t, "from": None, "to": None, "provider": "builtin", "origin": "built-in"}
+            for t in RELATIONSHIP_TYPES
+        ]
+    node_types += [
+        {
+            "label": n.label,
+            "origin": "project",
+            "key": list(n.key),
+            "source": {"provider": n.source.provider, "kind": n.source.kind} if n.source else None,
+        }
+        for n in effective.node_types
+    ]
+    relationships += [
+        {"type": r.type, "from": list(r.from_labels), "to": r.to, "provider": r.provider, "origin": "project"}
+        for r in effective.relationships
+    ]
+
+    if as_json:
+        typer.echo(json.dumps({"node_types": node_types, "relationships": relationships}, indent=2))
+        return
+    nodes = Table(title=escape(f"Node types for {root}"))
+    nodes.add_column("Label", style="cyan")
+    nodes.add_column("Origin")
+    nodes.add_column("Key")
+    nodes.add_column("Source")
+    for row in node_types:
+        source = row["source"]
+        nodes.add_row(
+            escape(row["label"]), row["origin"], escape(", ".join(row["key"] or ())),
+            f"{source['provider']} ({source['kind']})" if source else "\u2014",
+        )
+    console.print(nodes)
+    rels = Table(title="Relationships")
+    for column in ("Type", "Origin", "From", "To", "Provider"):
+        rels.add_column(column, style="cyan" if column == "Type" else None)
+    for row in relationships:
+        rels.add_row(
+            escape(row["type"]), row["origin"], escape(", ".join(row["from"] or ())), escape(row["to"] or ""), row["provider"]
+        )
+    console.print(rels)
+    if not project_config_enabled(root):
+        console.print("Project config is disabled: only the built-in schema is in effect.")
+
+
+def _duplicate_relationship(entry: dict, existing: list) -> bool:
+    """Whether `entry` equals an existing relationship once both are validated (`from: X` == `from: [X]`)."""
+    from pydantic import ValidationError
+
+    from devgraph.config.project_schema import RelationshipDecl
+
+    def normal(raw):
+        decl = RelationshipDecl.model_validate(raw)
+        return (decl.type, decl.from_labels, decl.to, decl.provider, decl.custom)
+
+    try:
+        new = normal(entry)
+    except ValidationError:
+        return False  # invalid entries are reported by the write's own validation
+    for other in existing:
+        try:
+            if normal(other) == new:
+                return True
+        except ValidationError:
+            continue
+    return False
+
+
+@schema_app.command("add")
+def config_schema_add(
+    ctx: typer.Context,
+    source: str = typer.Option(..., "--from", help="YAML or JSON file holding one node type (`label`) or relationship (`type`), or - for stdin."),
+    repo: Optional[Path] = typer.Option(None, "--repo", help="Repository root (default: current directory)."),
+) -> None:
+    """Add one node type or relationship. Fails if the label exists (use `edit`)."""
+    from devgraph.config.list_edit import ListEditError, add_entry_text, entries
+    from devgraph.config.project_schema import SCHEMA_VERSION, project_schema_path
+
+    root = _schema_scope(ctx, repo)
+    entry = _read_schema_entry(source)
+    section = _entry_section(entry)
+    ident, noun = _SCHEMA_SECTIONS[section]
+    path = project_schema_path(root)
+    try:
+        existing = entries(_schema_text(path), key=section)
+    except ListEditError as exc:
+        raise _tools_fail(str(exc))
+    name = entry[ident]
+    if section == "node_types" and any(isinstance(e, dict) and e.get(ident) == name for e in existing):
+        raise _tools_fail(f"a node type named {name!r} already exists; use `devgraph config schema edit {name}`")
+    if section == "relationships" and _duplicate_relationship(entry, existing):
+        raise _tools_fail(f"an identical relationship {name!r} already exists")
+    before = _schema_declaration(_schema_text(path), path)
+    # Relationships may share a type with different endpoints; only node type labels are unique.
+    _schema_edit(
+        lambda text: add_entry_text(
+            text, entry, key=section, ident=ident, version=SCHEMA_VERSION, noun=noun, unique=section == "node_types"
+        ),
+        path,
+        invalid_prefix="the new entry is invalid: ",
+    )
+    _schema_done("Added", section, str(name), path, root)
+    _schema_follow_up(root, before, _schema_declaration(_schema_text(path), path), entry)
+
+
+@schema_app.command("edit")
+def config_schema_edit(
+    ctx: typer.Context,
+    name: str = typer.Argument(..., help="Node type label or relationship type to replace."),
+    source: Optional[str] = typer.Option(None, "--from", help="YAML or JSON file holding the new entry, or - for stdin. Default: open $EDITOR."),
+    repo: Optional[Path] = typer.Option(None, "--repo", help="Repository root (default: current directory)."),
+    node_type: bool = typer.Option(False, "--node-type", help="NAME is a node type label."),
+    relationship: bool = typer.Option(False, "--relationship", help="NAME is a relationship type."),
+) -> None:
+    """Replace one entry, from a file or in $EDITOR. Nothing is written if the result is unchanged or invalid."""
+    from devgraph.config.list_edit import ListEditError, dump_entry, entries, replace_entry_text
+    from devgraph.config.project_schema import project_schema_path
+
+    root = _schema_scope(ctx, repo)
+    path = project_schema_path(root)
+    text = _schema_text(path)
+    section = _locate_entry(text, name, node_type, relationship)
+    ident, noun = _SCHEMA_SECTIONS[section]
+    try:
+        matches = [e for e in entries(text, key=section) if isinstance(e, dict) and e.get(ident) == name]
+    except ListEditError as exc:
+        raise _tools_fail(str(exc))
+    if len(matches) > 1:
+        raise _tools_fail(f"{noun} {name!r} is declared {len(matches)} times; edit the file by hand")
+    current = matches[0]
+    if source is not None:
+        entry = _read_schema_entry(source)
+    else:
+        original = dump_entry(current)
+        edited = click.edit(original, extension=".yaml")
+        if edited is None or edited == original:
+            console.print("No changes.")
+            return
+        entry = _parse_tool_text(edited, "edited entry", "one schema entry")
+        if entry == current:
+            console.print("No changes.")
+            return
+    if _entry_section(entry) != section:
+        raise _tools_fail(f"the new entry must be a {noun} (with `{ident}`)")
+    _schema_edit(
+        lambda current_text: replace_entry_text(current_text, name, entry, key=section, ident=ident, noun=noun),
+        path,
+        invalid_prefix="the new entry is invalid: ",
+    )
+    _schema_done("Updated", section, name, path, root)
+    _schema_follow_up(root, _schema_declaration(text, path), _schema_declaration(_schema_text(path), path), entry)
+
+
+@schema_app.command("delete")
+def config_schema_delete(
+    ctx: typer.Context,
+    name: str = typer.Argument(..., help="Node type label or relationship type to remove."),
+    repo: Optional[Path] = typer.Option(None, "--repo", help="Repository root (default: current directory)."),
+    node_type: bool = typer.Option(False, "--node-type", help="NAME is a node type label."),
+    relationship: bool = typer.Option(False, "--relationship", help="NAME is a relationship type."),
+) -> None:
+    """Remove one node type or relationship. Unknown names exit 1."""
+    from devgraph.config.list_edit import delete_entry_text
+    from devgraph.config.project_schema import project_schema_path
+
+    root = _schema_scope(ctx, repo)
+    path = project_schema_path(root)
+    text = _schema_text(path)
+    section = _locate_entry(text, name, node_type, relationship)
+    ident, noun = _SCHEMA_SECTIONS[section]
+    before = _schema_declaration(text, path)
+    _schema_edit(
+        lambda current: delete_entry_text(current, name, key=section, ident=ident, noun=noun),
+        path,
+        invalid_hint="; delete or edit the relationships that use it first" if section == "node_types" else "",
+    )
+    _schema_done("Deleted", section, name, path, root)
+    _schema_follow_up(root, before, _schema_declaration(_schema_text(path), path))
+
+
+@schema_app.command("reset")
+def config_schema_reset(
+    ctx: typer.Context,
+    repo: Optional[Path] = typer.Option(None, "--repo", help="Repository root (default: current directory)."),
+    yes: bool = typer.Option(False, "--yes", help="Do not ask for confirmation."),
+) -> None:
+    """Delete devgraph.schema.yaml, returning the repository to the built-in schema."""
+    from devgraph.config.project_schema import project_schema_path
+
+    root = _schema_scope(ctx, repo)
+    path = project_schema_path(root)
+    if not path.exists():
+        console.print(f"Nothing to reset: {escape(str(path))} does not exist.", soft_wrap=True)
+        return
+    if not yes:
+        typer.confirm(f"Delete {path} and return to the built-in schema?", abort=True)
+    before = _schema_declaration(_schema_text(path), path)
+    try:
+        path.unlink()
+    except OSError as exc:
+        raise _tools_fail(str(exc))
+    console.print(f"[green]Reset[/green] {escape(str(path))}", soft_wrap=True)
+    console.print(escape(_schema_effect_note(root)), soft_wrap=True)
+    _schema_follow_up(root, before, None)
 
 
 @app.command()
