@@ -1111,6 +1111,11 @@ def test_cli_doctor_reports_an_invalid_project_schema(runner, temp_registry_db, 
     assert "doctor found one or more failing checks above." in collapsed
 
 
+def test_rescan_accepts_now(runner):
+    result = runner.invoke(app, ["rescan", "--help"])
+    assert result.exit_code == 0 and "--now" in result.output
+
+
 def test_cli_dashboard_url_points_a_wildcard_bind_at_loopback(runner, temp_registry_db):
     """A wildcard bind address is refused by the dashboard's Host guard, so
     the printed URL must be the loopback address the server listens on."""
