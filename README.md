@@ -65,14 +65,40 @@ Run `devgraph --help` or `devgraph <command> --help` for the complete, current i
 - **Live updates.** Connecting an MCP client starts the tray app when needed. The watcher reindexes file and git-state changes; manual rescans remain safe and idempotent.
 - **Purpose-built queries.** MCP clients should use the registered tools and the live `devgraph://tool-catalog` resource rather than relying on a hand-maintained tool count.
 
-## Project schema constraints
+## Project schema
 
-A repository may declare extra node types in an optional `devgraph.schema.yaml` at its root. Registration and `devgraph rescan` resolve that file and provision a uniqueness constraint for each declared node type, keyed on `repo_id` plus the declared key. This is constraint provisioning only: nothing yet extracts or writes user-defined node types.
+A repository may declare extra node types in an optional `devgraph.schema.yaml` at its root. Registration and `devgraph rescan` resolve that file and provision a uniqueness constraint for each declared node type, keyed on `repo_id` plus the declared key (plus a `(repo_id, name)` lookup index for filesystem-sourced types, which the provider writes by `name`). Node types can be sourced from the repository's own files and folders with the filesystem provider:
+
+```yaml
+version: 1
+node_types:
+  - label: File
+    key: [path]
+    metadata: [{name: path}]
+    source: {provider: filesystem, kind: file}
+  - label: Folder
+    key: [path]
+    metadata: [{name: path}]
+    source: {provider: filesystem, kind: folder}
+relationships:
+  - type: IS_CHILD_OF
+    provider: filesystem
+    from: [File, Folder]
+    to: Folder
+```
+
+Every indexable file becomes a `File` node and every directory containing one a `Folder` node (`.` is the repository root), keyed by repo-relative path, with an `IS_CHILD_OF` edge to the parent folder. The watcher keeps them current; `search_component` finds them. While the DevGraph agent is running, saving `devgraph.schema.yaml` re-syncs the filesystem nodes immediately (constraints and indexes are provisioned, stale nodes pruned, the whole tree upserted; built-in extractors are not re-run); otherwise a new or changed schema applies on the next `devgraph rescan` or registration. Other user-declared node types are still constraint-only: nothing extracts them yet.
 
 - A repository without the file behaves exactly as before.
 - DevGraph's built-in constraints are always provisioned, including under `extends: none`, because every registered repository shares one Neo4j database.
 - An invalid file fails before any graph write: `devgraph rescan` exits non-zero, while registration keeps the repository and reports a warning, the same way it already does when Neo4j is unreachable.
 - `devgraph doctor` reports each repository's schema as absent, valid, or invalid, and flags two repositories that declare the same label with incompatible keys — a conflict that would otherwise leave one of them with no constraint at all.
+- An invalid file never removes filesystem nodes: indexing skips the provider and carries on with the built-in extractors.
+- Known limits of the filesystem provider:
+  - A folder moved or trashed out of the repository as a whole may leave stale nodes until `devgraph rescan`, because the watcher ignores directory events.
+  - `search_component` can return both a `Module` and a `File` for the same path; with `cross_repo=True` only the calling repository's declared labels are searched.
+  - On the dashboard, filesystem nodes share the unfiltered canvas with code nodes, and the `?label=` filter accepts built-in labels only.
+  - A symlinked file is represented at its target's path.
 
 ## Dashboard
 
