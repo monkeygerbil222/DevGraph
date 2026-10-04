@@ -1116,6 +1116,172 @@ def test_rescan_accepts_now(runner):
     assert result.exit_code == 0 and "--now" in result.output
 
 
+def _doctor_with_engine(runner, db_path, engine_cls):
+    from devgraph.cli import main as cli_main
+
+    config_module.get_settings.cache_clear()
+    with patch.object(config_module, "get_settings", return_value=_mock_settings(db_path)), \
+         patch.object(cli_main, "get_settings", return_value=_mock_settings(db_path)), \
+         patch.object(cli_main, "GraphEngine", engine_cls), \
+         patch.object(cli_main, "resolve_podman", return_value=None):
+        return runner.invoke(app, ["doctor"])
+
+
+def _stub_engine(applied):
+    class StubEngine:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def verify_connectivity(self):
+            pass
+
+        def init_schema(self):
+            pass
+
+        def read_applied_schema(self, repo_id):
+            return applied
+
+        def close(self):
+            pass
+
+    return StubEngine
+
+
+def test_cli_doctor_marks_a_disabled_repo_and_reports_drift(runner, temp_registry_db, tmp_path, monkeypatch):
+    from devgraph.config import project_switch
+
+    db_path, registry = temp_registry_db
+    monkeypatch.setattr(project_switch, "_registry_db_path", lambda: db_path)
+    repo_id = registry.add_repo(_repo_with_schema(tmp_path, "widgets", WIDGET_SCHEMA)).repo_id
+    registry.set_project_config_enabled(repo_id, False)
+    registry.close()
+
+    result = _doctor_with_engine(runner, db_path, _stub_engine({"hash": "sha256:old"}))
+    collapsed = _collapsed(result.stdout)
+    assert "project config disabled" in collapsed
+    # Disabled means the file hashes as absent, so a graph built with the file is pending.
+    assert "pending" in collapsed and f"devgraph rescan {repo_id} --now" in collapsed
+
+
+def test_cli_doctor_drift_states(runner, temp_registry_db, tmp_path, monkeypatch):
+    from devgraph.config import project_switch
+    from devgraph.config.project_schema import schema_file_hash
+
+    db_path, registry = temp_registry_db
+    monkeypatch.setattr(project_switch, "_registry_db_path", lambda: db_path)
+    root = _repo_with_schema(tmp_path, "widgets", WIDGET_SCHEMA)
+    repo_id = registry.add_repo(root).repo_id
+    registry.close()
+
+    pending = _collapsed(_doctor_with_engine(runner, db_path, _stub_engine({"hash": "sha256:old"})).stdout)
+    assert "pending" in pending and f"devgraph rescan {repo_id} --now" in pending
+
+    applied = _collapsed(
+        _doctor_with_engine(runner, db_path, _stub_engine({"hash": schema_file_hash(root)})).stdout
+    )
+    assert "applied" in applied and "pending" not in applied
+
+    never = _collapsed(_doctor_with_engine(runner, db_path, _stub_engine(None)).stdout)
+    assert "never applied" in never
+
+
+def test_cli_doctor_skips_drift_when_neo4j_is_unreachable(runner, temp_registry_db, tmp_path):
+    db_path, registry = temp_registry_db
+    registry.add_repo(_repo_with_schema(tmp_path, "widgets", WIDGET_SCHEMA))
+    registry.close()
+
+    stub = _stub_engine({"hash": "sha256:old"})
+
+    class Down(stub):
+        def verify_connectivity(self):
+            raise RuntimeError("connection refused")
+
+    collapsed = _collapsed(_doctor_with_engine(runner, db_path, Down).stdout)
+    assert "Schema drift" in collapsed and "skipped" in collapsed
+    assert "pending" not in collapsed
+
+
+def test_cli_list_shows_the_project_config_switch(runner, temp_registry_db, tmp_path):
+    db_path, registry = temp_registry_db
+    on = registry.add_repo(_repo_with_schema(tmp_path, "on")).repo_id
+    off = registry.add_repo(_repo_with_schema(tmp_path, "off")).repo_id
+    registry.set_project_config_enabled(off, False)
+    registry.close()
+
+    from devgraph.cli import main as cli_main
+
+    config_module.get_settings.cache_clear()
+    with patch.object(config_module, "get_settings", return_value=_mock_settings(db_path)), \
+         patch.object(cli_main, "get_settings", return_value=_mock_settings(db_path)):
+        result = runner.invoke(app, ["list"])
+    assert "Project config" in result.stdout
+    rows = {rid: line for rid in (on, off) for line in result.stdout.splitlines() if f"│ {rid} " in line}
+    # Cells are `| id | path | active | watch | project config | last indexed |`.
+    assert [rows[rid].split("│")[-3].strip() for rid in (on, off)] == ["on", "off"]
+
+
+def _doctor_repo(runner, temp_registry_db, tmp_path, monkeypatch, *, disabled, schema=WIDGET_SCHEMA, tools=None):
+    from devgraph.config import project_switch
+    from devgraph.config.project_tools import TOOLS_FILENAME
+
+    db_path, registry = temp_registry_db
+    monkeypatch.setattr(project_switch, "_registry_db_path", lambda: db_path)
+    root = _repo_with_schema(tmp_path, "widgets", schema)
+    if tools is not None:
+        (root / TOOLS_FILENAME).write_text(tools, encoding="utf-8")
+    repo_id = registry.add_repo(root).repo_id
+    if disabled:
+        registry.set_project_config_enabled(repo_id, False)
+    registry.close()
+    return db_path, root, repo_id
+
+
+LIST_FILES_TOOLS = """\
+version: 1
+tools:
+  - name: list_files
+    description: List files.
+    cypher: |
+      MATCH (f:File {repo_id: $repo_id}) RETURN f.path AS path
+"""
+
+
+def test_cli_doctor_reports_disabled_tools_as_not_served(runner, temp_registry_db, tmp_path, monkeypatch):
+    db_path, _root, repo_id = _doctor_repo(
+        runner, temp_registry_db, tmp_path, monkeypatch, disabled=True, tools=LIST_FILES_TOOLS
+    )
+    result = _doctor_with_engine(runner, db_path, _stub_engine({"hash": "absent"}))
+    collapsed = _collapsed(result.stdout)
+    assert f"[!] {repo_id}: tools: list_files (not served: project config disabled)" in collapsed
+    assert f"devgraph config enable {repo_id}" in collapsed and "<repo_id>" not in collapsed
+
+
+def test_cli_doctor_drift_wording_for_a_disabled_repo(runner, temp_registry_db, tmp_path, monkeypatch):
+    db_path, _root, repo_id = _doctor_repo(runner, temp_registry_db, tmp_path, monkeypatch, disabled=True)
+    in_sync = _collapsed(_doctor_with_engine(runner, db_path, _stub_engine({"hash": "absent"})).stdout)
+    assert "project config disabled; built-in schema applied)" in in_sync
+    assert "the schema changed" not in in_sync
+
+    pending = _collapsed(_doctor_with_engine(runner, db_path, _stub_engine({"hash": "sha256:old"})).stdout)
+    assert (
+        "project config disabled; built-in schema applied at the next rescan "
+        f"(devgraph rescan {repo_id} --now)"
+    ) in pending
+    assert "the schema changed" not in pending
+
+
+def test_cli_doctor_reports_an_unreadable_schema_file_not_pending(runner, temp_registry_db, tmp_path, monkeypatch):
+    from devgraph.config.project_schema import SCHEMA_FILENAME
+
+    db_path, root, _repo_id = _doctor_repo(
+        runner, temp_registry_db, tmp_path, monkeypatch, disabled=False, schema=None
+    )
+    (root / SCHEMA_FILENAME).mkdir()  # reading a directory fails with an OSError
+    collapsed = _collapsed(_doctor_with_engine(runner, db_path, _stub_engine({"hash": "sha256:old"})).stdout)
+    assert "schema file unreadable" in collapsed
+    assert "the schema changed" not in collapsed and "pending" not in collapsed
+
+
 def test_cli_dashboard_url_points_a_wildcard_bind_at_loopback(runner, temp_registry_db):
     """A wildcard bind address is refused by the dashboard's Host guard, so
     the printed URL must be the loopback address the server listens on."""

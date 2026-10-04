@@ -408,3 +408,143 @@ def test_tools_findings_cover_absent_valid_invalid_and_warning(tmp_path):
     assert {("a", "absent"), ("b", "valid"), ("c", "invalid"), ("d", "valid"), ("d", "warning")} == by_status
     assert [f["failed"] for f in findings if f["status"] == "invalid"] == [True]
     assert not any(f["failed"] for f in findings if f["status"] == "warning")
+
+
+# ── enable / disable ──────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def demo_repo(settings, tmp_path, monkeypatch):
+    """A registered repo `demo` with a valid schema; the switch lookup reads the same registry."""
+    from devgraph.config import project_switch
+
+    monkeypatch.setattr(project_switch, "_registry_db_path", lambda: settings.registry_db_path)
+    root = tmp_path / "demo"
+    root.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    write(root, WIDGET)
+    registry = RepoRegistry(settings.registry_db_path)
+    try:
+        registry.add_repo(root, repo_id="demo")
+    finally:
+        registry.close()
+    return root
+
+
+def _flag(settings) -> bool:
+    registry = RepoRegistry(settings.registry_db_path)
+    try:
+        return registry.get("demo").project_config_enabled
+    finally:
+        registry.close()
+
+
+def test_disable_then_enable(runner, settings, demo_repo):
+    result = runner.invoke(app, ["config", "disable", "demo"])
+    assert result.exit_code == 0, result.output
+    assert "disabled" in result.output
+    assert "devgraph rescan demo --now" in result.output and "2 s" in result.output
+    assert _flag(settings) is False
+
+    again = runner.invoke(app, ["config", "disable", "demo"])
+    assert again.exit_code == 0 and "already disabled" in again.output
+
+    result = runner.invoke(app, ["config", "enable", "demo"])
+    assert result.exit_code == 0, result.output
+    assert "enabled" in result.output and "devgraph rescan demo --now" in result.output
+    assert _flag(settings) is True
+
+    again = runner.invoke(app, ["config", "enable", "demo"])
+    assert again.exit_code == 0 and "already enabled" in again.output
+
+
+@pytest.mark.parametrize("verb", ["enable", "disable"])
+def test_enable_disable_unknown_repo(runner, settings, verb):
+    result = runner.invoke(app, ["config", verb, "nope"])
+    assert result.exit_code == 1 and "nope" in result.output
+
+
+def test_validate_reports_a_disabled_repo_but_still_checks_the_file(runner, settings, demo_repo):
+    runner.invoke(app, ["config", "disable", "demo"])
+    result = runner.invoke(app, ["config", "validate", "--repo", str(demo_repo)])
+    assert result.exit_code == 0, result.output
+    assert "valid" in result.output and "disabled" in result.output
+    write(demo_repo, "version: 2\n")
+    assert runner.invoke(app, ["config", "validate", "--repo", str(demo_repo)]).exit_code == 1
+
+
+def test_show_reports_a_disabled_repo_with_only_builtin_types(runner, settings, demo_repo):
+    runner.invoke(app, ["config", "disable", "demo"])
+    result = runner.invoke(app, ["config", "show", "--repo", str(demo_repo)])
+    assert result.exit_code == 0, result.output
+    assert "disabled" in result.output and "widget" not in result.output.lower()
+    data = json.loads(runner.invoke(app, ["config", "show", "--repo", str(demo_repo), "--json"]).stdout)
+    assert data["project_config"] == "disabled"
+    assert {n["origin"] for n in data["node_types"]} == {"built-in"}
+
+
+def test_show_json_enabled(runner, settings, demo_repo):
+    data = json.loads(runner.invoke(app, ["config", "show", "--repo", str(demo_repo), "--json"]).stdout)
+    assert data["project_config"] == "enabled"
+
+
+def test_tools_findings_flag_a_disabled_repo_as_not_served(runner, settings, demo_repo):
+    from types import SimpleNamespace
+
+    write_tools(demo_repo, TOOLS)
+    runner.invoke(app, ["config", "disable", "demo"])
+    findings = cli_main._project_tools_findings([SimpleNamespace(repo_id="demo", path=demo_repo)])
+    assert [(f["status"], f["failed"]) for f in findings] == [("disabled", False)]
+    assert findings[0]["detail"] == "tools: count_nodes (not served: project config disabled)"
+    # An invalid file in a disabled repo is still a failure.
+    write_tools(demo_repo, "version: 1\ntools: [oops\n")
+    findings = cli_main._project_tools_findings([SimpleNamespace(repo_id="demo", path=demo_repo)])
+    assert [f["failed"] for f in findings] == [True]
+
+
+def test_validate_reports_disabled_tools_as_not_served(runner, settings, demo_repo):
+    write_tools(demo_repo, TOOLS)
+    runner.invoke(app, ["config", "disable", "demo"])
+    for args in (["--repo", str(demo_repo)], ["--all"]):
+        result = runner.invoke(app, ["config", "validate", *args])
+        assert result.exit_code == 0, result.output
+        assert "tools: count_nodes (not served: project config disabled)" in " ".join(result.output.split())
+        assert "valid" not in [line.split()[0] for line in result.output.splitlines() if "tools:" in line]
+
+
+def test_validate_all_hint_names_the_registered_repo(runner, settings, demo_repo):
+    runner.invoke(app, ["config", "disable", "demo"])
+    result = runner.invoke(app, ["config", "validate", "--all"])
+    assert "devgraph config enable demo" in " ".join(result.output.split())
+    assert "<repo_id>" not in result.output
+
+
+def test_validate_and_show_by_path_look_up_the_registered_id(runner, settings, demo_repo):
+    runner.invoke(app, ["config", "disable", "demo"])
+    for cmd in ("validate", "show"):
+        result = runner.invoke(app, ["config", cmd, "--repo", str(demo_repo)])
+        assert "devgraph config enable demo" in " ".join(result.output.split()), result.output
+        assert "<repo_id>" not in result.output
+
+
+def test_validate_all_marks_a_disabled_repo_in_a_conflict(runner, settings, tmp_path, monkeypatch):
+    a, b = tmp_path / "a", tmp_path / "b"
+    for d in (a, b):
+        d.mkdir()
+        subprocess.run(["git", "init", "-q"], cwd=d, check=True)
+    write(a, WIDGET)
+    write(b, WIDGET.replace("key: [slug]", "key: [code]").replace("{name: slug}", "{name: code}"))
+    registry = RepoRegistry(settings.registry_db_path)
+    try:
+        registry.add_repo(a, repo_id="repo-a")
+        registry.add_repo(b, repo_id="repo-b")
+        registry.set_project_config_enabled("repo-b", False)
+    finally:
+        registry.close()
+    from devgraph.config import project_switch
+
+    monkeypatch.setattr(project_switch, "_registry_db_path", lambda: settings.registry_db_path)
+    result = runner.invoke(app, ["config", "validate", "--all"])
+    assert result.exit_code == 1, result.output
+    text = " ".join(result.output.split())
+    assert "repo-b (disabled) declares" in text and "repo-a (disabled)" not in text
