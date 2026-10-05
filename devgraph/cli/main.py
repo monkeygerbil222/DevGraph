@@ -2985,7 +2985,9 @@ def _script_provider_findings(repos: list[Any]) -> list[tuple[str, str, str]]:
     home = sandbox_paths.sandbox_home()
     store_path, registry_path = _sandbox_files()
     # The directory is followed, as the gates follow it; the files are not (a symlinked one is refused).
-    for path, look in ((home / ".devgraph", os.stat), (registry_path, os.lstat), (store_path, os.lstat)):
+    # Without `os.getuid` (Windows) the owner and mode checks cannot run; custom providers are unavailable there.
+    checks = ((home / ".devgraph", os.stat), (registry_path, os.lstat), (store_path, os.lstat))
+    for path, look in checks if hasattr(os, "getuid") else ():
         try:
             st = look(path)
         except OSError:
