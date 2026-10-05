@@ -9,7 +9,6 @@ through this module's attribute (`paths.sandbox_home()`), which tests patch.
 from __future__ import annotations
 
 import os
-import pwd
 import stat
 import sys
 import unicodedata
@@ -22,7 +21,30 @@ class SandboxPathError(Exception):
     """A repository path that cannot be canonicalised: every decision on it is off."""
 
 
+def _windows_profile_dir() -> Path:
+    """The user profile known folder (`FOLDERID_Profile`), not `USERPROFILE`."""
+    import ctypes
+    from ctypes import wintypes
+
+    class _Guid(ctypes.Structure):
+        _fields_ = [("a", wintypes.DWORD), ("b", wintypes.WORD), ("c", wintypes.WORD), ("d", ctypes.c_ubyte * 8)]
+
+    folder_id = _Guid(0x5E6C858F, 0x0E22, 0x4760, (ctypes.c_ubyte * 8)(0x9A, 0xFE, 0xEA, 0x33, 0x17, 0xB6, 0x71, 0x73))
+    out = ctypes.c_wchar_p()
+    shell32 = ctypes.windll.shell32  # type: ignore[attr-defined]
+    try:
+        if shell32.SHGetKnownFolderPath(ctypes.byref(folder_id), 0, None, ctypes.byref(out)) != 0 or not out.value:
+            raise SandboxPathError("cannot resolve the user profile folder")
+        return Path(out.value)
+    finally:
+        ctypes.windll.ole32.CoTaskMemFree(out)  # type: ignore[attr-defined]
+
+
 def sandbox_home() -> Path:
+    if sys.platform == "win32":
+        return _windows_profile_dir()
+    import pwd  # Unix-only: imported here so the module loads on Windows
+
     return Path(pwd.getpwuid(os.getuid()).pw_dir)
 
 
@@ -53,6 +75,8 @@ def canonical_repo_path(path: Path | str) -> str:
 
 
 def _check_private(st: os.stat_result, what: Path) -> None:
+    if not hasattr(os, "getuid"):
+        raise SandboxPathError(f"{what}: ownership cannot be checked on this platform")
     if st.st_uid != os.getuid():
         raise SandboxPathError(f"{what} is not owned by the current user")
     if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
