@@ -711,6 +711,15 @@ def test_doctor_off_linux(runner, repo, monkeypatch):
     assert "unavailable (platform)" in section
 
 
+def test_doctor_completes_without_getuid_on_windows(runner, repo, monkeypatch):
+    monkeypatch.setattr(consent, "current_platform", lambda: "win32")
+    monkeypatch.delattr(os, "getuid")
+    result, section = doctor(runner, monkeypatch)
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+    assert "unavailable (platform)" in section
+    assert "unavailable" in section and "not owned by you" not in section
+
+
 def test_doctor_reports_group_writable_devgraph_dir(runner, repo, home, monkeypatch):
     os.chmod(home / ".devgraph", 0o775)
     _, section = doctor(runner, monkeypatch)

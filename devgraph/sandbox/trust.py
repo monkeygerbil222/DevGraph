@@ -128,6 +128,8 @@ class TrustStore:
         path = Path(path)
         conn = None
         try:
+            if not (hasattr(os, "getuid") and hasattr(os, "O_NOFOLLOW")):
+                raise SandboxPathError("the trust store needs ownership and no-follow checks this platform lacks")
             path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
             check_private_dir(path.parent)
             fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
