@@ -6,6 +6,9 @@ file, the environment or the repository.
 
 from __future__ import annotations
 
+import errno
+from types import MappingProxyType
+
 # Reader and selection (§3.2, §6).
 SCRIPT_MAX_BYTES = 64 * 1024  # over: static_reject
 INPUT_MAX_FILE_BYTES = 1024 * 1024  # over: input_cap, file skipped
@@ -81,3 +84,91 @@ TRUST_SCHEMA_VERSION = 1
 # Runtime and platform (§4.3, §4.5).
 SANDBOX_RUNTIME = "podman"
 SUPPORTED_PLATFORMS = ("linux",)
+
+# Runner (§6, §4.4). A test may lower a timing value through `runner.RunConfig`,
+# never raise it; nothing overrides a security limit.
+CPU_PER_CALL_SECONDS = 2  # in-container timer per `derive` call (hygiene); over: timeout
+PER_FILE_DEADLINE_SECONDS = 5  # host, request write to result read; over: kill, timeout
+START_DEADLINE_SECONDS = 10  # host, report + ready; over: sandbox_unavailable
+RUN_WALL_BASE_SECONDS = 30  # per-run wall = base + per file, capped at the ceiling
+RUN_WALL_PER_FILE_SECONDS = 0.05
+RUN_WALL_CEILING_SECONDS = 300  # bounds a run's first container and its retry together
+CONMON_SLACK_SECONDS = 5  # conmon --timeout = the container's wall + this
+RETRY_MIN_BUDGET_SECONDS = 10  # under this much wall left: no retry, the rest aborted
+STDIN_WRITE_DEADLINE_SECONDS = 5  # per frame written to the container
+MEMORY_BYTES = 256 * 1024 * 1024  # memory and memory+swap alike: no swap; over: memory
+PIDS_LIMIT = 32  # over: crash
+OUTPUT_MAX_FILE_RECORDS = 1_000  # over: that file output_cap
+OUTPUT_MAX_FILE_BYTES = 1024 * 1024
+OUTPUT_MAX_RUN_RECORDS = 50_000  # over: the rest of the run output_cap
+OUTPUT_MAX_RUN_BYTES = 16 * 1024 * 1024
+STDERR_KEEP_BYTES = 8 * 1024  # the rest is drained and discarded
+LOCK_WAIT_SECONDS = 60  # then busy
+
+# Frame caps (§4.4): a declared length above the cap is `protocol` before allocation.
+REPORT_FRAME_MAX_BYTES = 64 * 1024  # the report and `ready`
+RESULT_FRAME_MAX_BYTES = 1024 * 1024
+RESULT_FRAME_ENVELOPE_BYTES = 4 * 1024  # `seq` and the frame keys around a result's records
+
+# Error codes (§8). Runner and tests import them from here only.
+RUN_ERROR_CODES = frozenset(
+    {
+        "disabled",
+        "pending",
+        "awaiting_approval",
+        "sandbox_unavailable",
+        "input_unavailable",
+        "static_reject",
+        "input_cap",
+        "input_decode",
+        "busy",
+        "timeout",
+        "memory",
+        "output_cap",
+        "protocol",
+        "schema_violation",
+        "crash",
+        "aborted",
+    }
+)
+
+# Seccomp expectation (§4.3). Every denied family fails with ENOSYS, so a filtered
+# call cannot be mistaken for a capability check's EPERM or a permitted call's
+# argument errno (EINVAL, EFAULT, EBADF). Keyed by family, then architecture; a
+# family absent on an architecture is listed as None.
+SECCOMP_ERRNO = errno.ENOSYS
+SECCOMP_DENIED = MappingProxyType(
+    {
+        family: MappingProxyType({"x86_64": SECCOMP_ERRNO, "aarch64": SECCOMP_ERRNO})
+        for family in (
+            "unshare",
+            "clone",  # with any CLONE_NEW* flag
+            "clone3",
+            "setns",
+            "io_uring_setup",
+            "io_uring_enter",
+            "io_uring_register",
+            "bpf",
+            "userfaultfd",
+            "keyctl",
+            "add_key",
+            "request_key",
+            "perf_event_open",
+            "ptrace",
+            "process_vm_readv",
+            "process_vm_writev",
+            "mount",
+            "umount2",
+            "pivot_root",
+            "fsopen",
+            "fsmount",
+            "open_tree",
+            "move_mount",
+            "socket",
+            "socketpair",
+        )
+    }
+)
+# The families Podman's stock profile plus --cap-drop=all lets reach the kernel:
+# the stock-profile control route for the denied-syscall probes.
+SECCOMP_STOCK_PERMITTED = frozenset({"socket", "socketpair"})

@@ -1,0 +1,142 @@
+# Script sandbox gate (spec §10.1, Q15).
+#
+# Required checks: making `sandbox-linux` and `sandbox-linux-arm64` required
+# status checks is an upstream repository setting (branch protection) that the
+# maintainer applies; this file cannot. Job ids are stable so the setting holds.
+#
+# There is no committed lockfile (uv.lock is never committed), so `uv` resolves
+# the dependencies fresh on every run.
+#
+# Podman comes from the runner image's own Ubuntu 26.04 archive package (5.7.0 on
+# image 20260927.*): no third-party repository, no static build. The labels are
+# pinned; `ubuntu-latest` still points at 24.04, which ships Podman 4.9.3.
+
+name: sandbox
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    # Windows is a filed follow-up, not a matrix entry: `import pwd`
+    # (devgraph/sandbox/paths.py) fails there today.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-26.04, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          python-version: "3.13"
+      - run: uv sync --extra dev
+      - run: uv run --extra dev pytest -q -m "not sandbox"
+
+  sandbox-linux:
+    runs-on: ubuntu-26.04
+    steps: &sandbox-steps
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Assert Podman >= 5.0
+        run: |
+          echo "runner image: ${ImageOS:-unknown} ${ImageVersion:-unknown}"
+          version="$(podman version --format '{{.Client.Version}}')"
+          echo "podman ${version}"
+          major="${version%%.*}"
+          if [ "${major}" -lt 5 ]; then
+            echo "::error::Podman ${version} is older than 5.0; the runner label changed"
+            exit 1
+          fi
+
+      - name: Ensure subuid/subgid ranges and newuidmap
+        run: |
+          if ! command -v newuidmap || ! command -v newgidmap; then
+            sudo apt-get update && sudo apt-get install -y uidmap
+          fi
+          ids() { awk -F: -v u="${USER}" '$1 == u { print $3 }' "$1" | head -n1; }
+          for file in /etc/subuid /etc/subgid; do
+            count="$(ids "${file}")"
+            if [ -z "${count}" ] || [ "${count}" -lt 65536 ]; then
+              sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 "${USER}"
+              break
+            fi
+          done
+          for file in /etc/subuid /etc/subgid; do
+            count="$(ids "${file}")"
+            if [ -z "${count}" ] || [ "${count}" -lt 65536 ]; then
+              echo "::error::${file} gives ${USER} fewer than 65536 IDs"
+              exit 1
+            fi
+          done
+
+      - name: Delegate cgroup controllers to the user session
+        run: |
+          sudo mkdir -p /etc/systemd/system/user@.service.d
+          printf '[Service]\nDelegate=cpu cpuset io memory pids\n' \
+            | sudo tee /etc/systemd/system/user@.service.d/delegate.conf
+          sudo systemctl daemon-reload
+
+      - name: Start the user session
+        run: |
+          sudo loginctl enable-linger "${USER}"
+          sudo systemctl start "user@$(id -u).service"
+          echo "XDG_RUNTIME_DIR=/run/user/$(id -u)" >> "${GITHUB_ENV}"
+          echo "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus" >> "${GITHUB_ENV}"
+
+      - name: Assert rootless, local, cgroup v2 with delegated controllers
+        run: |
+          podman system migrate
+          podman info --format json | python3 -c '
+          import json, sys
+          info = json.load(sys.stdin)
+          host = info["host"]
+          problems = []
+          if host["security"]["rootless"] is not True:
+              problems.append("not rootless")
+          if host["serviceIsRemote"] is not False:
+              problems.append("service is remote")
+          if host["cgroupVersion"] != "v2":
+              problems.append("cgroup " + host["cgroupVersion"])
+          missing = {"cpu", "memory", "pids"} - set(host["cgroupControllers"] or [])
+          if missing:
+              problems.append("controllers not delegated: " + ", ".join(sorted(missing)))
+          print("cgroupControllers:", host["cgroupControllers"])
+          sys.exit("; ".join(problems) or None)
+          '
+
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          python-version: "3.13"
+      - run: uv sync --extra dev
+
+      - name: Pre-pull the pinned image by manifest-list digest
+        run: |
+          ref="$(uv run --extra dev python -c '
+          import platform, sys
+          from devgraph.sandbox.invocation import IMAGE_PINS
+          pin = IMAGE_PINS.get(platform.machine())
+          if pin is None:
+              sys.exit("no image pin for " + platform.machine())
+          print(f"{pin.repo}@{pin.manifest_list_digest}")
+          ')"
+          podman pull "${ref}"
+
+      - name: Sandbox tests
+        env:
+          DEVGRAPH_TEST_REQUIRE_SANDBOX: "1"
+        run: uv run --extra dev pytest -q -m sandbox
+
+  # Required, with no continue-on-error: upstream is public, so hosted arm64
+  # runners are available (Ubuntu2604-Arm64 lists the same Podman 5.7.0). Runs the
+  # whole sandbox suite, which includes the per-architecture tests ([aarch64]
+  # seccomp and CPython start-up, image pin, mount allowlist).
+  sandbox-linux-arm64:
+    runs-on: ubuntu-26.04-arm
+    steps: *sandbox-steps

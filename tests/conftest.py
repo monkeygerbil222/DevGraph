@@ -1,6 +1,12 @@
 """Shared pytest configuration for environments without a desktop display."""
 
+import functools
+import json
 import os
+import shutil
+import subprocess
+import sys
+from dataclasses import dataclass
 
 import pytest
 
@@ -9,6 +15,79 @@ if not os.environ.get("DISPLAY"):
     # pystray otherwise selects its X11 backend during module import and aborts
     # collection before tests that do not need a tray icon can run.
     os.environ.setdefault("PYSTRAY_BACKEND", "dummy")
+
+
+REQUIRE_SANDBOX_ENV = "DEVGRAPH_TEST_REQUIRE_SANDBOX"
+
+
+@dataclass(frozen=True)
+class SandboxProbe:
+    available: bool
+    reason: str
+
+
+@functools.cache
+def sandbox_probe() -> SandboxProbe:
+    """Whether rootless, local Podman >= 5.0 is here (spec §4.3, §10.1). Runs
+    `podman info` once per session, only when a session needs the answer."""
+    if sys.platform != "linux":
+        return SandboxProbe(False, f"platform {sys.platform} is not linux")
+    import pwd
+
+    from devgraph.sandbox.limits import FIXED_PATH
+
+    podman = shutil.which("podman", path=FIXED_PATH)
+    if podman is None:
+        return SandboxProbe(False, "podman not found")
+    uid = os.getuid()
+    env = {
+        "PATH": FIXED_PATH,
+        "HOME": pwd.getpwuid(uid).pw_dir,
+        "XDG_RUNTIME_DIR": f"/run/user/{uid}",
+        "LANG": "C.UTF-8",
+    }
+    try:
+        proc = subprocess.run(
+            [podman, "info", "--format", "json"], env=env, capture_output=True, timeout=60, check=False
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return SandboxProbe(False, f"podman info failed: {type(exc).__name__}")
+    if proc.returncode != 0:
+        return SandboxProbe(False, f"podman info exited {proc.returncode}")
+    try:
+        info = json.loads(proc.stdout)
+        rootless = info["host"]["security"]["rootless"]
+        remote = info["host"]["serviceIsRemote"]
+        version = info["version"]["Version"]
+        major = int(version.split(".")[0])
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return SandboxProbe(False, "podman info output not understood")
+    if rootless is not True:
+        return SandboxProbe(False, "podman is not rootless")
+    if remote is not False:
+        return SandboxProbe(False, "podman service is remote")
+    if major < 5:
+        return SandboxProbe(False, f"podman {version} is older than 5.0")
+    return SandboxProbe(True, f"rootless podman {version}")
+
+
+def _sandbox_required() -> bool:
+    """The one read of the require-sandbox switch: a test-harness variable, never
+    read by DevGraph."""
+    return bool(os.environ.get(REQUIRE_SANDBOX_ENV))
+
+
+def require_sandbox_or_exit(probe_result: SandboxProbe, *, exit=pytest.exit) -> None:
+    """Fail the whole session when the sandbox is required but absent. A session
+    hook, not a fixture: a fixture's skip or failure would be swallowed by the
+    `xfail` markers and the gate would not bind."""
+    if _sandbox_required() and not probe_result.available:
+        exit(f"{REQUIRE_SANDBOX_ENV} is set but the sandbox is unavailable: {probe_result.reason}", returncode=1)
+
+
+def pytest_sessionstart(session):
+    if _sandbox_required():
+        require_sandbox_or_exit(sandbox_probe())
 
 
 @pytest.fixture(autouse=True)

@@ -47,3 +47,6 @@ include = ["devgraph*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "sandbox: launches a sandbox container; needs rootless Podman >= 5.0 (deselected when absent)",
+]
