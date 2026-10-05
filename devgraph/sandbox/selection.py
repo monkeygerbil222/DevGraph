@@ -102,6 +102,17 @@ def _check_git_version(
         )
 
 
+def check_git(git: str | None) -> None:
+    """Raise `InputError("input_unavailable")` unless `git` exists and is new enough for
+    selection, checked as selection checks it (for `doctor`)."""
+    if git is None:
+        raise InputError("input_unavailable", "git is not installed")
+    with tempfile.TemporaryDirectory(prefix="devgraph-git-home-") as home:
+        _check_git_version(
+            git, git_env(home, home), home, time.monotonic() + GIT_TIMEOUT_SECONDS
+        )
+
+
 def _kill(proc: subprocess.Popen) -> None:
     if proc.poll() is None:
         try:

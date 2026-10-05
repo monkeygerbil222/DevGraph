@@ -5,6 +5,7 @@ import importlib.metadata
 import json
 import logging
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -19,6 +20,7 @@ import typer
 from rich.console import Console
 from rich.markup import escape
 from rich.table import Table
+from rich.text import Text
 from typer.core import TyperGroup
 
 from devgraph.agent import lifecycle
@@ -38,6 +40,10 @@ from devgraph.indexer.docs.extractor import index_file as index_doc_file
 from devgraph.indexer.git_history.extractor import sync_git_history
 from devgraph.paths import is_within, read_bounded
 from devgraph.registry.store import RepoRegistry
+from devgraph.sandbox import consent, selection
+from devgraph.sandbox import paths as sandbox_paths
+from devgraph.sandbox.display import visible
+from devgraph.sandbox.selection import git_binary
 
 app = typer.Typer(help="DevGraph: local-first developer knowledge graph")
 
@@ -83,6 +89,7 @@ def add(
             console.print(
                 f"[green][OK][/green] Registered: {record.repo_id} at {record.path}"
             )
+            _scripts_notice(record.repo_id, Path(record.path))
 
             try:
                 settings = get_settings()
@@ -147,6 +154,7 @@ def remove(repo_id: str) -> None:
 
             registry.remove_repo(repo_id)
             console.print(f"[green][OK][/green] Removed: {repo_id} (registry entry and graph data)")
+            _forget_script_trust(repo_id)
         finally:
             registry.close()
     except ValueError as e:
@@ -1037,6 +1045,15 @@ def doctor() -> None:
                 )
             console.print(f"  [yellow][!] {subject}:[/yellow] {detail}", soft_wrap=True)
 
+    # 7e. Custom provider scripts (§5.7). Runs no script; the §4.3 Podman readiness checks arrive with the runner.
+    console.print("[bold]Script providers[/bold]")
+    for level, subject, detail in _script_provider_findings(registered_repos):
+        marker = {"ok": "[green][OK]", "warning": "[yellow][!]", "failed": "[red][X]"}[level]
+        closing = {"ok": "[/green]", "warning": "[/yellow]", "failed": "[/red]"}[level]
+        console.print(f"  {marker} {escape(subject)}:{closing} {escape(detail)}", soft_wrap=True, emoji=False,
+                      highlight=False)
+        any_failed = any_failed or level == "failed"
+
     # 8. Tray/watcher liveness
     console.print("[bold]Live Watcher[/bold]")
     liveness = _tray_liveness_text(settings)
@@ -1734,6 +1751,9 @@ def _set_project_config(repo_id: str, enabled: bool) -> None:
     console.print(f"[green][OK][/green] Project config {word} for {escape(repo_id)}.")
     for note in _project_config_notes(repo_id):
         console.print(f"  {escape(note)}")
+    if enabled:
+        for line in _resuming_providers(repo):
+            _plain(f"  {line}")
 
 
 @config_app.command("enable")
@@ -2388,6 +2408,563 @@ def config_tools_reset(
         reset_tools(root)
     console.print(f"[green]Reset[/green] {escape(str(path))}", soft_wrap=True)
     console.print(escape(_tools_scope_note(root)), soft_wrap=True)
+
+
+scripts_app = typer.Typer(
+    help="Custom provider scripts: list, show, approve, revoke, enable or disable. This version runs no scripts.",
+    no_args_is_help=True,
+)
+config_app.add_typer(scripts_app, name="scripts")
+
+# A message for whoever reads the output, possibly an agent: approval is the user's, at a terminal.
+_ASK_THE_USER = "ask the user to review and run `{command}` in a terminal"
+
+
+def _plain(text: str, prefix: str = "") -> None:
+    """Print `text` as plain text after DevGraph's own markup `prefix`: never Rich markup or
+    emoji, and wrapped onto further rows rather than cropped, so nothing hides off to the right.
+    Repository-sourced parts of `text` must already have gone through `display.visible`."""
+    line = Text.from_markup(prefix) + Text(text) if prefix else Text(text)
+    console.print(line, overflow="fold", no_wrap=False, highlight=False)
+
+
+def _scripts_fail(message: str) -> typer.Exit:
+    _plain(message, "[red][X] Error:[/red] ")
+    return typer.Exit(code=1)
+
+
+def _sandbox_files() -> tuple[Path, Path]:
+    """(trust store, fixed-path registry), under the sandbox home (never `Settings`)."""
+    home = sandbox_paths.sandbox_home()
+    return sandbox_paths.trust_store_path(home), sandbox_paths.fixed_registry_path(home)
+
+
+def _require_scripts_platform(action: str) -> None:
+    platform = consent.current_platform()
+    if not sandbox_paths.platform_supported(platform):
+        raise _scripts_fail(f"custom providers are unavailable (platform): {action} needs Linux, and this is {visible(platform)}")
+
+
+def _scripts_repo(repo_id: str) -> tuple[Any, str, Path]:
+    """The registered repository, its canonical path (the trust key) and its real path (for the reader)."""
+    record = next((r for r in _registered_repos() if r.repo_id == repo_id), None)
+    if record is None:
+        raise _scripts_fail(f"no such repo_id: {visible(repo_id)}")
+    try:
+        canon = sandbox_paths.canonical_repo_path(record.path)
+    except sandbox_paths.SandboxPathError as exc:
+        raise _scripts_fail(f"{visible(str(exc))}; custom providers are unavailable for {visible(repo_id)}")
+    return record, canon, Path(os.path.realpath(record.path))
+
+
+def _declared_providers(root: Path) -> list[str]:
+    """The custom provider names `root`'s schema declares; [] if none, or if it cannot be read."""
+    from devgraph.config.project_schema import parse_project_schema
+    from devgraph.sandbox.reader import SCHEMA_FILE, read_schema_file
+
+    try:
+        real = Path(os.path.realpath(root))
+        schema = parse_project_schema(read_schema_file(real).decode("utf-8"), Path(SCHEMA_FILE))
+    except Exception:
+        return []
+    return [provider.name for provider in schema.custom_providers]
+
+
+def _scripts_pending(repo_id: str, schema_hash: str) -> bool:
+    """Whether the schema is pending (§5.5): the graph's applied hash differs from the snapshot's.
+    Any error, an unreachable graph included, counts as pending."""
+    try:
+        settings = get_settings()
+        engine = GraphEngine(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password)
+        try:
+            applied = engine.read_applied_schema(repo_id)
+        finally:
+            engine.close()
+    except Exception:
+        return True
+    return applied is None or applied.get("hash") != schema_hash
+
+
+def _provider_states(record: Any) -> list[tuple[str, Any, str]]:
+    """(provider name, snapshot or InputError, state) for each provider `record` declares.
+    A schema that cannot be read gives one row named "-"."""
+    from devgraph.sandbox.reader import InputError
+    from devgraph.sandbox.snapshot import provider_state, repo_snapshots
+
+    store_path, registry_path = _sandbox_files()
+    platform = consent.current_platform()
+    try:
+        canon = sandbox_paths.canonical_repo_path(record.path)
+    except sandbox_paths.SandboxPathError as exc:
+        error = InputError("input_unavailable", str(exc))
+        return [(name, error, "unavailable") for name in _declared_providers(Path(record.path)) or ["-"]]
+    try:
+        snaps: dict[str, Any] = repo_snapshots(Path(os.path.realpath(record.path)), git=git_binary())
+    except InputError as exc:
+        snaps = {"-": exc}
+    hashes = {s.schema_hash for s in snaps.values() if not isinstance(s, InputError)}
+    pending = bool(hashes) and sandbox_paths.platform_supported(platform) and _scripts_pending(record.repo_id, hashes.pop())
+    return [
+        (name, snap, provider_state(record.repo_id, canon, snap, platform=platform, pending=pending,
+                                    registry_path=registry_path, store_path=store_path))
+        for name, snap in snaps.items()
+    ]
+
+
+def _open_store_read() -> Any:
+    from devgraph.sandbox.trust import TrustStore
+
+    return TrustStore.open_read(_sandbox_files()[0])
+
+
+def _approval_notes(snap: Any, history: list[Any]) -> tuple[str, str]:
+    """(approved-at, note) for a list row: the approval of the current digest, and whether
+    it is an older kept digest or the matched-file count has grown (§5.6)."""
+    active = [a for a in history if a.state == "active"]
+    current = next((a for a in active if a.digest == snap.digest), None)
+    reference = current or (active[-1] if active else (history[-1] if history else None))
+    notes = []
+    if current is not None and current is not active[-1]:
+        notes.append(f"kept older digest is active (approved {current.approved_at[:19]})")
+    if reference is not None and consent.grew(snap.matched_count, reference.matched_count):
+        notes.append(f"inputs grew: {snap.matched_count} matched, approved with {reference.matched_count}")
+    return (current.approved_at[:19] if current else "-"), "; ".join(notes)
+
+
+@scripts_app.command("list")
+def scripts_list(
+    repo: Optional[str] = typer.Option(None, "--repo", help="Only this registered repo id."),
+) -> None:
+    """Each custom provider's state, digest, approval date and matched-file count."""
+    from devgraph.sandbox.digest import short_digest
+    from devgraph.sandbox.reader import InputError
+
+    records = _registered_repos()
+    if repo is not None:
+        records = [r for r in records if r.repo_id == repo]
+        if not records:
+            raise _scripts_fail(f"no such repo_id: {visible(repo)}")
+    table = Table(title="Custom providers")
+    for column in ("Repository", "Provider", "State", "Digest", "Approved at", "Matched", "Note"):
+        table.add_column(column, overflow="fold")
+    store = _open_store_read()
+    try:
+        for record in records:
+            for name, snap, state in _provider_states(record):
+                if isinstance(snap, InputError):
+                    table.add_row(Text(visible(record.repo_id)), Text(visible(name)), state, "-", "-", "-",
+                                  Text(visible(snap.reason or snap.code)))
+                    continue
+                history = store.approvals(record.repo_id, sandbox_paths.canonical_repo_path(record.path), name) if store else []
+                approved_at, note = _approval_notes(snap, history)
+                table.add_row(Text(visible(record.repo_id)), Text(visible(name)), state, short_digest(snap.digest),
+                              approved_at, str(snap.matched_count), note)
+    finally:
+        if store is not None:
+            store.close()
+    if not table.rows:
+        console.print("No custom providers declared.")
+        return
+    console.print(table)
+
+
+@scripts_app.command("show")
+def scripts_show(
+    repo_id: str = typer.Argument(..., help="Registered repo id."),
+    name: str = typer.Argument(..., help="Custom provider name."),
+) -> None:
+    """One provider in full: state, script, inputs, findings, the digest (alone on its line) and approval history."""
+    from devgraph.sandbox.digest import short_digest
+    from devgraph.sandbox.reader import InputError
+
+    record, canon, _ = _scripts_repo(repo_id)
+    rows = {row_name: (snap, state) for row_name, snap, state in _provider_states(record)}
+    if name not in rows:
+        snap, state = rows.get("-", (None, "unavailable"))
+        reason = snap.reason if isinstance(snap, InputError) else f"no custom provider named {name!r} is declared"
+        raise _scripts_fail(f"{visible(name)}: {state}: {visible(reason)}")
+    snap, state = rows[name]
+    _plain(f"State: {state}")
+    _plain(f"Repository: {visible(record.repo_id)}")
+    _plain(f"Canonical path: {visible(canon)}")
+    if isinstance(snap, InputError):
+        _plain(f"Reason: {visible(snap.reason or snap.code)}")
+        raise typer.Exit(code=1)
+    _plain(f"Script: .devgraph/providers/{name}.py ({len(snap.script_text.encode('utf-8'))} bytes)")
+    _plain("Inputs: " + ", ".join(visible(g) for g in snap.declaration_set["provider"]["inputs"]))
+    _plain(f"  {snap.matched_count} matched file(s); {snap.denied} excluded by the secret-name denylist; "
+           f"{snap.total_bytes} input bytes")
+    _plain(f"  sample (first {len(snap.sample)}):")
+    for path in snap.sample:
+        _plain(f"    {visible(path)}")
+    for error in snap.errors:
+        _plain(f"  unreadable: {visible(error.reason or error.code)}")
+    if snap.findings:
+        _plain("Static scan findings:")
+        for finding in snap.findings:
+            _plain(f"  line {finding.line}: {finding.rule}: {visible(finding.message)}")
+    else:
+        _plain("Static scan: no findings")
+    _plain("Digest (sha256):")
+    _plain(snap.digest)
+    store = _open_store_read()
+    history = []
+    if store is not None:
+        with store:
+            history = store.approvals(record.repo_id, canon, name)
+    _plain("Approval history:" if history else "Approval history: none")
+    for approval in history:
+        _plain(f"  {short_digest(approval.digest)}  {approval.state}  approved {approval.approved_at}, "
+               f"{approval.matched_count} matched")
+    if state != "approved":
+        command = f"devgraph config scripts approve {visible(record.repo_id)} {name}"
+        _plain("To approve it, " + _ASK_THE_USER.format(command=command) + ".")
+
+
+def _approve_one(record: Any, canon: str, snap: Any, sha256: Optional[str], keep_previous: bool) -> None:
+    from devgraph.sandbox.digest import short_digest
+    from devgraph.sandbox.reader import InputError
+    from devgraph.sandbox.trust import TrustStore, TrustStoreError
+
+    repo_id = visible(record.repo_id)
+    if isinstance(snap, InputError):
+        state = "rejected" if snap.code == "static_reject" else "unavailable"
+        raise _scripts_fail(f"this provider is {state}: {visible(snap.reason or snap.code)}; nothing was approved")
+    name = snap.name
+    if snap.findings:
+        _plain(f"Static scan findings for {name}:")
+        for finding in snap.findings:
+            _plain(f"  line {finding.line}: {finding.rule}: {visible(finding.message)}")
+        raise _scripts_fail(f"{name} cannot be approved while the static scan reports findings; "
+                            "change the script, then approve it again. Nothing was approved.")
+    if snap.errors:
+        for error in snap.errors:
+            _plain(f"  unreadable input: {visible(error.reason or error.code)}")
+        raise _scripts_fail(f"{name} cannot be approved while some of its inputs cannot be read. Nothing was approved.")
+    store_path, _ = _sandbox_files()
+    store = TrustStore.open_read(store_path)
+    history = []
+    if store is not None:
+        with store:
+            history = store.approvals(record.repo_id, canon, name)
+    if sha256 is not None:
+        if not consent.digest_matches(sha256, snap.digest):
+            raise _scripts_fail(f"--sha256 does not match the current digest of {name}; run "
+                                f"`devgraph config scripts show {repo_id} {name}` to see it. Nothing was approved.")
+    else:
+        for line in consent.review_lines(record.repo_id, canon, snap, history[-1] if history else None,
+                                         width=console.width):
+            _plain(line)
+        typed = click.prompt(f"Type the provider name ({name}) to approve it", default="", show_default=False)
+        if typed.strip() != name:
+            console.print("Not approved.")
+            raise typer.Exit(code=1)
+    try:
+        with TrustStore.open_write(store_path) as writer:
+            writer.approve(record.repo_id, canon, name, snap.digest, declaration_json=snap.declaration_json,
+                           script_text=snap.script_text, matched_count=snap.matched_count,
+                           keep_previous=keep_previous)
+            enabled = writer.scripts_enabled(record.repo_id, canon)
+    except TrustStoreError as exc:
+        raise _scripts_fail(f"{visible(str(exc))}; nothing was approved")
+    _plain(f"Approved {name} for {repo_id} (digest {short_digest(snap.digest)}).", "[green][OK][/green] ")
+    if not enabled:
+        _plain(f"  Scripts are off for {repo_id}; enable them with `devgraph config scripts enable {repo_id}`.")
+    _plain("  This version does not run scripts yet.")
+
+
+@scripts_app.command("approve")
+def scripts_approve(
+    repo_id: str = typer.Argument(..., help="Registered repo id."),
+    name: Optional[str] = typer.Argument(None, help="Custom provider (default: each one awaiting approval, in turn)."),
+    sha256: Optional[str] = typer.Option(
+        None, "--sha256", help="For CI: approve without asking, only if this equals the provider's current digest."
+    ),
+    keep_previous: bool = typer.Option(
+        False, "--keep-previous", help="Keep earlier approved digests active (up to five) instead of retiring them."
+    ),
+) -> None:
+    """Approve a provider's script and declaration after reviewing them at a terminal: type its name to confirm."""
+    from devgraph.sandbox.reader import InputError
+    from devgraph.sandbox.snapshot import provider_snapshot, repo_snapshots
+
+    _require_scripts_platform("approving a script")
+    if sha256 is not None and name is None:
+        raise _scripts_fail("--sha256 approves one provider: name it")
+    if sha256 is None:
+        try:
+            consent.require_tty()
+        except consent.ConsentError:
+            command = f"devgraph config scripts approve {visible(repo_id)}" + (f" {visible(name)}" if name else "")
+            raise _scripts_fail("no terminal to confirm on: approving a script needs the user at a terminal; "
+                                + _ASK_THE_USER.format(command=command))
+    record, canon, real = _scripts_repo(repo_id)
+    git = git_binary()
+    if name is not None:
+        try:
+            snaps: list[Any] = [provider_snapshot(real, name, git=git)]
+        except InputError as exc:
+            snaps = [exc]
+    else:
+        try:
+            found = repo_snapshots(real, git=git)
+        except InputError as exc:
+            raise _scripts_fail(f"{visible(exc.reason or exc.code)}; nothing was approved")
+        store = _open_store_read()
+        try:
+            active = {n: {a.digest for a in store.active_digests(record.repo_id, canon, n)} if store else set()
+                      for n in found}
+        finally:
+            if store is not None:
+                store.close()
+        for skipped, snap in found.items():
+            if isinstance(snap, InputError):
+                state = "rejected" if snap.code == "static_reject" else "unavailable"
+                _plain(f"Skipping {skipped}: {state}: {visible(snap.reason or snap.code)}")
+        snaps = [s for s in found.values() if not isinstance(s, InputError) and s.digest not in active[s.name]]
+        if not snaps:
+            _plain(f"Nothing awaiting approval for {visible(record.repo_id)}.")
+            return
+    for snap in snaps:
+        _approve_one(record, canon, snap, sha256, keep_previous)
+
+
+@scripts_app.command("revoke")
+def scripts_revoke(
+    repo_id: str = typer.Argument(..., help="Registered repo id."),
+    name: str = typer.Argument(..., help="Custom provider name."),
+    digest: Optional[str] = typer.Option(None, "--digest", help="Revoke only this approved digest (or a unique prefix of 12+ hex characters)."),
+) -> None:
+    """Remove a provider's approvals (all, or one digest). Stops future runs; keeps graph data."""
+    from devgraph.sandbox.trust import TrustStore, TrustStoreError
+
+    record, canon, _ = _scripts_repo(repo_id)
+    store_path, _ = _sandbox_files()
+    if not os.path.lexists(store_path):
+        _plain(f"{name} has no approvals for {visible(record.repo_id)}; nothing to revoke.")
+        return
+    try:
+        with TrustStore.open_write(store_path) as store:
+            chosen = None
+            if digest is not None:
+                wanted = digest.lower()
+                matches = [a.digest for a in store.approvals(record.repo_id, canon, name) if a.digest.startswith(wanted)]
+                if not re.fullmatch(r"[0-9a-f]{12,64}", wanted) or len(matches) != 1:
+                    raise _scripts_fail(f"--digest names no single approval of {name}; "
+                                        f"see `devgraph config scripts show {visible(record.repo_id)} {name}`")
+                chosen = matches[0]
+            removed = store.revoke(record.repo_id, canon, name, chosen)
+    except TrustStoreError as exc:
+        raise _scripts_fail(f"{visible(str(exc))}; nothing was revoked")
+    if not removed:
+        _plain(f"{name} has no approvals for {visible(record.repo_id)}; nothing to revoke.")
+        return
+    _plain(f"Revoked {removed} approval(s) of {name} for {visible(record.repo_id)}; it no longer runs. "
+           "Graph data is kept.", "[green][OK][/green] ")
+
+
+@scripts_app.command("enable")
+def scripts_enable(repo_id: str = typer.Argument(..., help="Registered repo id.")) -> None:
+    """Allow a repository's approved custom provider scripts to run: type the repo id to confirm."""
+    from devgraph.sandbox.trust import TrustStore, TrustStoreError
+
+    _require_scripts_platform("enabling scripts")
+    try:
+        consent.require_tty()
+    except consent.ConsentError:
+        raise _scripts_fail("no terminal to confirm on: enabling scripts needs the user at a terminal; "
+                            + _ASK_THE_USER.format(command=f"devgraph config scripts enable {visible(repo_id)}"))
+    record, canon, real = _scripts_repo(repo_id)
+    shown = visible(record.repo_id)
+    store = _open_store_read()
+    if store is not None:
+        with store:
+            if store.scripts_enabled(record.repo_id, canon):
+                _plain(f"Scripts are already enabled for {shown}.")
+                return
+    names = _declared_providers(real)
+    _plain(f"Repository: {shown}")
+    _plain(f"Canonical path: {visible(canon)}")
+    _plain("Declared custom providers: " + (", ".join(visible(n) for n in names) or "none"))
+    _plain("Enabling scripts lets this repository's custom provider scripts run in the sandbox once each "
+           "provider is approved. Each provider still needs its own approval.")
+    typed = click.prompt(f"Type the repository id ({shown}) to enable scripts", default="", show_default=False)
+    if typed.strip() != record.repo_id:
+        console.print("Not enabled.")
+        raise typer.Exit(code=1)
+    try:
+        with TrustStore.open_write(_sandbox_files()[0]) as writer:
+            writer.set_scripts_enabled(record.repo_id, canon, True)
+    except TrustStoreError as exc:
+        raise _scripts_fail(f"{visible(str(exc))}; scripts were not enabled")
+    _plain(f"Scripts enabled for {shown}.", "[green][OK][/green] ")
+    if names:
+        _plain(f"  Approve providers with `devgraph config scripts approve {shown}`.")
+    if not record.project_config_enabled:
+        _plain(f"  Project config is off for {shown}, so nothing runs until `devgraph config enable {shown}`.")
+
+
+@scripts_app.command("disable")
+def scripts_disable(repo_id: str = typer.Argument(..., help="Registered repo id.")) -> None:
+    """Stop a repository's scripts. Approvals and graph data are kept."""
+    from devgraph.sandbox.trust import TrustStore, TrustStoreError
+
+    record, canon, _ = _scripts_repo(repo_id)
+    shown = visible(record.repo_id)
+    store = _open_store_read()
+    enabled = False
+    if store is not None:
+        with store:
+            enabled = store.scripts_enabled(record.repo_id, canon)
+    if not enabled and not os.path.lexists(_sandbox_files()[0]):
+        _plain(f"Scripts are already disabled for {shown}.")
+        return
+    try:
+        with TrustStore.open_write(_sandbox_files()[0]) as writer:
+            writer.set_scripts_enabled(record.repo_id, canon, False)
+    except TrustStoreError as exc:
+        raise _scripts_fail(f"{visible(str(exc))}; scripts were not disabled")
+    _plain(f"Scripts disabled for {shown}; approvals and graph data are kept.", "[green][OK][/green] ")
+
+
+def _scripts_notice(repo_id: str, root: Path) -> None:
+    """After `add`: a schema's custom providers do not run until enabled and approved (§5.7)."""
+    names = _declared_providers(root)
+    if not names:
+        return
+    shown = visible(repo_id)
+    _plain(f"This repository declares custom providers ({', '.join(visible(n) for n in names)}); they will not run "
+           "until scripts are enabled and each provider is approved. To use them, ask the user to review and run "
+           "these in a terminal:")
+    _plain(f"  devgraph config scripts enable {shown}")
+    _plain(f"  devgraph config scripts approve {shown}")
+
+
+def _forget_script_trust(repo_id: str) -> None:
+    """`remove`: delete the repository's trust rows under every path (NFC keys can collapse). Best effort:
+    a leftover row matches no registry row, so gate 1 keeps it off."""
+    from devgraph.sandbox.trust import TrustStore
+
+    store_path, _ = _sandbox_files()
+    if not os.path.lexists(store_path):
+        return
+    try:
+        with TrustStore.open_write(store_path) as store:
+            store.forget_repo(repo_id)
+    except Exception as exc:
+        _plain(f"could not delete {visible(repo_id)}'s script trust rows: {visible(str(exc))}. They match no "
+               "registered repository, so they grant nothing.", "[yellow]Warning:[/yellow] ")
+
+
+def _resuming_providers(record: Any) -> list[str]:
+    """After project config is switched on: the approved providers that resume without re-approval (§5.7)."""
+    from devgraph.sandbox.reader import InputError
+    from devgraph.sandbox.snapshot import repo_snapshots
+
+    if not sandbox_paths.platform_supported(consent.current_platform()) or not _declared_providers(Path(record.path)):
+        return []
+    try:
+        canon = sandbox_paths.canonical_repo_path(record.path)
+        snaps = repo_snapshots(Path(os.path.realpath(record.path)), git=git_binary())
+    except Exception:
+        return []
+    store = _open_store_read()
+    if store is None:
+        return []
+    with store:
+        if not store.scripts_enabled(record.repo_id, canon):
+            return []
+        lines = []
+        for name, snap in snaps.items():
+            if isinstance(snap, InputError):
+                continue
+            current = next((a for a in store.active_digests(record.repo_id, canon, name) if a.digest == snap.digest), None)
+            if current is not None:
+                lines.append(f"custom provider {visible(name)}: approved {current.approved_at[:19]}; "
+                             "resumes without re-approval")
+    return lines
+
+
+def _script_provider_findings(repos: list[Any]) -> list[tuple[str, str, str]]:
+    """doctor's "Script providers" section: (level, subject, detail), level ok/warning/failed.
+    Hints are interactive commands only, never one carrying a digest."""
+    from devgraph.sandbox import gates
+    from devgraph.sandbox.reader import InputError
+    from devgraph.sandbox.trust import TrustStore
+
+    findings: list[tuple[str, str, str]] = []
+    platform = consent.current_platform()
+    if sandbox_paths.platform_supported(platform):
+        findings.append(("ok", "platform", f"{visible(platform)}: custom providers are supported"))
+    else:
+        findings.append(("warning", "platform", f"{visible(platform)}: custom providers are unavailable (platform); "
+                                                "this version supports them on Linux only"))
+    try:
+        selection.check_git(git_binary())
+        findings.append(("ok", "git", "new enough for input selection"))
+    except InputError as exc:
+        findings.append(("warning", "git", f"{visible(exc.reason)}; custom provider inputs cannot be selected, "
+                                           "so every provider is unavailable"))
+
+    home = sandbox_paths.sandbox_home()
+    store_path, registry_path = _sandbox_files()
+    # The directory is followed, as the gates follow it; the files are not (a symlinked one is refused).
+    for path, look in ((home / ".devgraph", os.stat), (registry_path, os.lstat), (store_path, os.lstat)):
+        try:
+            st = look(path)
+        except OSError:
+            continue
+        if st.st_uid != os.getuid():
+            findings.append(("warning", visible(str(path)), "is not owned by you, so every script gate reads off; "
+                                                          "fix its ownership"))
+        elif st.st_mode & 0o022:
+            findings.append(("warning", visible(str(path)),
+                             "is writable by group or others, so every script gate reads off (scripts never run); "
+                             f"a umask such as 002 creates it so. Fix: chmod go-w {visible(str(path))}"))
+    if not os.path.lexists(store_path):
+        findings.append(("ok", "trust store", "none yet (no repository has scripts enabled)"))
+    else:
+        store = TrustStore.open_read(store_path)
+        if store is None:
+            findings.append(("failed", "trust store",
+                             f"{visible(str(store_path))} cannot be read (corrupt, another version, locked, or not "
+                             "private to you); every script reads as off and unapproved"))
+        else:
+            store.close()
+            findings.append(("ok", "trust store", visible(str(store_path))))
+
+    declaring = [r for r in repos if _declared_providers(Path(r.path))]
+    configured = Path(get_settings().registry_db_path).expanduser()
+    if declaring and configured.resolve() != registry_path.resolve():
+        findings.append(("warning", "registry",
+                         f"DevGraph uses the registry at {visible(str(configured))}, but custom providers read "
+                         f"project config only from the default registry location {visible(str(registry_path))}, "
+                         f"so scripts stay off for {', '.join(visible(r.repo_id) for r in declaring)}. "
+                         "Move the registry there (unset DEVGRAPH_REGISTRY_DB_PATH) to use them."))
+    for record in declaring:
+        repo_id = visible(record.repo_id)
+        for name, snap, state in _provider_states(record):
+            subject = f"{repo_id} {visible(name)}"
+            if state == "approved":
+                findings.append(("ok", subject, "approved"))
+            elif state == "awaiting_approval":
+                hint = _ASK_THE_USER.format(command=f"devgraph config scripts approve {repo_id} {visible(name)}")
+                findings.append(("warning", subject, f"awaiting_approval: {hint}"))
+            elif state == "disabled":
+                canon = sandbox_paths.canonical_repo_path(record.path)
+                if not gates.gate1_project_config(record.repo_id, canon, registry_path=registry_path):
+                    hint = f"project config is off (or unreadable): `devgraph config enable {repo_id}`"
+                else:
+                    hint = "scripts are off: " + _ASK_THE_USER.format(command=f"devgraph config scripts enable {repo_id}")
+                findings.append(("warning", subject, f"disabled: {hint}"))
+            elif state == "pending":
+                findings.append(("warning", subject, "pending: the schema is not applied yet, or the graph cannot be "
+                                                     f"read; `devgraph rescan {repo_id} --now` applies it"))
+            else:
+                reason = (snap.reason or snap.code) if isinstance(snap, InputError) else ""
+                detail = f"{state}: {visible(reason)}" if reason else state
+                findings.append(("warning", subject, detail))
+    return findings
 
 
 schema_app = typer.Typer(
