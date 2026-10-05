@@ -19,9 +19,10 @@ import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from git import Repo
+from git import GitCommandError, Repo
 
 from devgraph.config.settings import get_settings
+from devgraph.git_safe import open_repo
 from devgraph.indexer.git_history.blame import compute_function_recency
 
 logger = logging.getLogger(__name__)
@@ -77,7 +78,7 @@ class GitHistoryExtractor:
             preserves history order.
         """
         result = ExtractionResult()
-        repo = Repo(str(self.repo_path))
+        repo = open_repo(self.repo_path)
         try:
             commits = list(repo.iter_commits(max_count=max_count))
             commits.reverse()  # iter_commits is newest-first; we want oldest-first
@@ -132,7 +133,10 @@ class GitHistoryExtractor:
 def _changed_paths(commit) -> list[str]:
     """Return file paths touched by a commit (diff against its first parent, or full tree for a root commit)."""
     if commit.parents:
-        diffs = commit.parents[0].diff(commit)
+        # No rename detection: it reads blob content, which a partial clone
+        # may not have. A rename then shows as a delete plus an add, and both
+        # paths are collected below either way.
+        diffs = commit.parents[0].diff(commit, no_renames=True)
     else:
         # Root commit: diff against the empty tree isn't directly exposed;
         # fall back to a tree walk. A root commit with no tree (or a tree
@@ -282,6 +286,23 @@ def _reconcile_module_recency(engine, repo_id: str) -> None:
         )
 
 
+def _is_partial_clone(repo: Repo) -> bool:
+    """`extensions.partialClone`, or a promisor remote (what newer git
+    writes for a `--filter` clone instead). `--type=bool` counts a
+    valueless `promisor` key as true."""
+    try:
+        if repo.git.config("--get", "extensions.partialClone"):
+            return True
+    except GitCommandError:
+        pass  # exit 1: not set
+    try:
+        listing = repo.git.config("-z", "--type=bool", "--get-regexp", r"^remote\..*\.promisor$")
+    except GitCommandError:
+        return False  # exit 1: no promisor key
+    # -z: `<key>\n<value>\0` per entry.
+    return any(entry.rsplit("\n", 1)[-1] == "true" for entry in listing.split("\0") if entry)
+
+
 def _current_py_files(engine, repo_id: str) -> set[str]:
     """Every `.py` file currently backing at least one Function/Class node."""
     rows = engine.run_cypher(
@@ -393,7 +414,7 @@ def sync_git_history(engine, registry, repo_id: str, max_count: int | None = Non
     if repo_record is None:
         raise ValueError(f"no such repo_id: {repo_id}")
 
-    repo = Repo(str(repo_record.path))
+    repo = open_repo(repo_record.path)
     try:
         try:
             head_sha = repo.head.commit.hexsha
@@ -415,6 +436,14 @@ def sync_git_history(engine, registry, repo_id: str, max_count: int | None = Non
 
         extractor = GitHistoryExtractor(repo_id, repo_record.path)
 
+        # Blame reads older blobs, which a partial clone usually lacks and
+        # is never allowed to fetch; skip it once rather than fail per file.
+        blame_files = not _is_partial_clone(repo)
+        if not blame_files:
+            logger.info(
+                "%s is a partial clone; skipping blame-based Function/Class recency", repo_record.path
+            )
+
         if mode == "reconcile":
             # Full reachable-set walk, no cap — correctness matters more
             # than speed for what should be a rare event, and capping it
@@ -434,8 +463,9 @@ def sync_git_history(engine, registry, repo_id: str, max_count: int | None = Non
             engine.delete_commits(repo_id, orphans)
 
             _reconcile_module_recency(engine, repo_id)
-            for file_path in _current_py_files(engine, repo_id):
-                _apply_function_recency(engine, repo, repo_id, file_path, overwrite=True)
+            if blame_files:
+                for file_path in _current_py_files(engine, repo_id):
+                    _apply_function_recency(engine, repo, repo_id, file_path, overwrite=True)
 
             commits_indexed = len(result.commits)
             commits_deleted = len(orphans)
@@ -446,11 +476,12 @@ def sync_git_history(engine, registry, repo_id: str, max_count: int | None = Non
             _upsert_extraction_result(engine, repo_id, result)
             _stage_module_recency(engine, repo_id, result)
 
-            touched_py_files = {
-                rel.target_name for rel in result.relationships if rel.target_name.endswith(".py")
-            }
-            for file_path in touched_py_files:
-                _apply_function_recency(engine, repo, repo_id, file_path, overwrite=False)
+            if blame_files:
+                touched_py_files = {
+                    rel.target_name for rel in result.relationships if rel.target_name.endswith(".py")
+                }
+                for file_path in touched_py_files:
+                    _apply_function_recency(engine, repo, repo_id, file_path, overwrite=False)
 
             commits_indexed = len(result.commits)
             commits_deleted = 0
