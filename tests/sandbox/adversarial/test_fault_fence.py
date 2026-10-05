@@ -11,8 +11,10 @@ from __future__ import annotations
 
 import ast
 import dataclasses
+import io
 import math
 import re
+import tokenize
 from pathlib import Path
 
 import pytest
@@ -68,19 +70,24 @@ def _testing_uses(tree: ast.AST) -> list[str]:
     found = []
     allowed_names = set()
     for node in ast.walk(tree):
-        if isinstance(node, ast.Attribute) and node.attr == "enabled":
-            if isinstance(node.value, ast.Name) and node.value.id == "_testing":
-                allowed_names.add(id(node.value))
+        # `_testing.enabled` only as the function of a call, read not written.
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            func = node.func
+            if func.attr == "enabled" and isinstance(func.ctx, ast.Load):
+                if isinstance(func.value, ast.Name) and func.value.id == "_testing":
+                    allowed_names.add(id(func.value))
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom):
             module = node.module or ""
-            if module == "devgraph.sandbox":
-                for alias in node.names:
-                    if alias.name == "_testing" and alias.asname is not None:
-                        found.append(f"line {node.lineno}: _testing imported under another name")
-                    if alias.name == "*":
-                        found.append(f"line {node.lineno}: star import")
-            elif module == "devgraph.sandbox._testing":
+            absolute = node.level == 0
+            for alias in node.names:
+                if alias.name == "_testing" and not (
+                    absolute and module == "devgraph.sandbox" and alias.asname is None
+                ):
+                    found.append(f"line {node.lineno}: _testing imported other than as itself")
+                if alias.name == "*" and (not absolute or module == "devgraph.sandbox" or "_testing" in module):
+                    found.append(f"line {node.lineno}: star import")
+            if absolute and module == "devgraph.sandbox._testing":
                 if any(alias.name != "_TestFaults" or alias.asname is not None for alias in node.names):
                     found.append(f"line {node.lineno}: imports more than _TestFaults")
             elif "_testing" in module:
@@ -111,6 +118,9 @@ def _run_provider_uses(tree: ast.AST) -> list[str]:
     found = []
     called = set()
     for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            if any(alias.name == "run_provider" and alias.asname is not None for alias in node.names):
+                found.append(f"line {node.lineno}: run_provider imported under another name")
         if isinstance(node, ast.Call) and _call_name(node.func) == "run_provider":
             called.add(id(node.func))
             if any(kw.arg in ("config", "_faults", None) for kw in node.keywords):
@@ -136,21 +146,40 @@ def _dynamic_names(tree: ast.AST) -> list[str]:
     return found
 
 
+_SKIPPED_TOKENS = {
+    tokenize.COMMENT,
+    tokenize.NL,
+    tokenize.NEWLINE,
+    tokenize.INDENT,
+    tokenize.DEDENT,
+    tokenize.ENCODING,
+    tokenize.ENDMARKER,
+}
+
+
+def _code_text(source: str) -> str:
+    """The source's tokens without comments, space-joined: names, operators and
+    string literals (so an `importlib` string still counts), never a comment."""
+    tokens = tokenize.generate_tokens(io.StringIO(source).readline)
+    return " ".join(tok.string for tok in tokens if tok.type not in _SKIPPED_TOKENS)
+
+
 def fence_violations(rel: str, source: str) -> list[str]:
     """Every fence rule, for the module at `rel` (relative to `devgraph/`)."""
     tree = ast.parse(source)
+    code = _code_text(source)
     found = []
     if rel not in (RUNNER, INVOCATION, TESTING):
-        if FAULT_NAMES.search(source):
+        if FAULT_NAMES.search(code):
             found.append("names _TestFaults or DivergenceCase")
-        if TESTING_TOKEN.search(source):
+        if TESTING_TOKEN.search(code):
             found.append("names _testing")
     if rel in (RUNNER, INVOCATION):
         found += _testing_uses(tree)
     if rel != RUNNER:
-        if RUN_CONFIG_TOKEN.search(source):
+        if RUN_CONFIG_TOKEN.search(code):
             found.append("names RunConfig")
-        if PROBE_TOKEN.search(source):
+        if PROBE_TOKEN.search(code):
             found.append("names RunMode.PROBE")
     found += _run_provider_uses(tree)
     found += _dynamic_names(tree)
@@ -200,6 +229,15 @@ BYPASSES = [
     (INVOCATION, "cfg = RunConfig()\n"),
     (OTHER, "run_provider(s, r, c, mode=RunMode.PROBE)\n"),
     (INVOCATION, "mode = RunMode . PROBE\n"),
+    (OTHER, "from devgraph.sandbox.runner import run_provider as rp\nrp(s, r, c, config=cfg)\n"),
+    (OTHER, "from devgraph.sandbox.runner import run_provider as rp\n"),
+    (RUNNER, "from . import _testing as t\nt.enable()\n"),
+    (INVOCATION, "from . import _testing\n_testing.enable()\n"),
+    (RUNNER, "from ._testing import enable\nenable()\n"),
+    (RUNNER, "from . import *\n"),
+    (RUNNER, "from devgraph.sandbox import _testing\n_testing.enabled = lambda: True\n"),
+    (RUNNER, "from devgraph.sandbox import _testing\nis_on = _testing.enabled\n"),
+    (OTHER, "import importlib\nimportlib.import_module('devgraph.sandbox._testing')  # loads it\n"),
 ]
 
 
@@ -218,6 +256,8 @@ def test_fault_surface_scan_detects(rel, source):
         (INVOCATION, "from devgraph.sandbox._testing import _TestFaults\n"),
         (OTHER, "run_provider(snap, repo_id, canon, mode=RunMode.DRY_RUN)\n"),
         (OTHER, "getattr(settings, field_name)\n"),
+        (OTHER, "x = 1  # the _testing switch, RunConfig and RunMode.PROBE stay in runner.py\n"),
+        (OTHER, "from devgraph.sandbox.runner import run_provider\nrun_provider(s, r, c)\n"),
     ],
 )
 def test_fault_surface_scan_accepts(rel, source):

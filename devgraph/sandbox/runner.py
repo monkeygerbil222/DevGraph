@@ -93,9 +93,20 @@ class ProviderSnapshot(Protocol):
     @property
     def script_text(self) -> str: ...
 
+    @property
+    def matched(self) -> Sequence[str]:
+        """Every matched input path, sorted: `ctx.tree` (§3.2) and the run's file order."""
+        ...
+
+    @property
+    def skipped(self) -> Mapping[str, str]:
+        """Matched paths not sent: path -> `input_cap`, `input_unavailable` or `input_decode`."""
+        ...
+
     def iter_inputs(self) -> Iterator[tuple[str, str]]:
-        """(repo-relative POSIX path, UTF-8 text) per input file, from the
-        snapshot's single read."""
+        """(repo-relative POSIX path, UTF-8 text) for `matched` minus `skipped`, in
+        `matched` order, from the snapshot's single read. Its paths and the keys
+        of `skipped` are disjoint and together equal `set(matched)`."""
         ...
 
 

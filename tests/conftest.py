@@ -71,23 +71,29 @@ def sandbox_probe() -> SandboxProbe:
     return SandboxProbe(True, f"rootless podman {version}")
 
 
-def _sandbox_required() -> bool:
+def _require_sandbox_value() -> str:
     """The one read of the require-sandbox switch: a test-harness variable, never
-    read by DevGraph. Only the exact value "1" requires the sandbox; anything else,
-    or unset, leaves local absence to collection-time deselection."""
-    return os.environ.get(REQUIRE_SANDBOX_ENV) == "1"
+    read by DevGraph. Unset, empty or "0": off, and local absence is left to
+    collection-time deselection. "1": required. Anything else fails closed."""
+    return os.environ.get(REQUIRE_SANDBOX_ENV, "")
 
 
 def require_sandbox_or_exit(probe_result: SandboxProbe, *, exit=pytest.exit) -> None:
-    """Fail the whole session when the sandbox is required but absent. A session
-    hook, not a fixture: a fixture's skip or failure would be swallowed by the
-    `xfail` markers and the gate would not bind."""
-    if _sandbox_required() and not probe_result.available:
+    """Fail the whole session when the sandbox is required but absent, or when the
+    switch has a value other than "0" or "1". A session hook, not a fixture: a
+    fixture's skip or failure would be swallowed by the `xfail` markers and the
+    gate would not bind."""
+    value = _require_sandbox_value()
+    if value in ("", "0"):
+        return
+    if value != "1":
+        exit(f"{REQUIRE_SANDBOX_ENV} must be 0 or 1, not {value!r}", returncode=1)
+    elif not probe_result.available:
         exit(f"{REQUIRE_SANDBOX_ENV} is set but the sandbox is unavailable: {probe_result.reason}", returncode=1)
 
 
 def pytest_sessionstart(session):
-    if _sandbox_required():
+    if _require_sandbox_value() not in ("", "0"):
         require_sandbox_or_exit(sandbox_probe())
 
 

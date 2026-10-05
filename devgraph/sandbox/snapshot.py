@@ -12,9 +12,10 @@ from __future__ import annotations
 
 import hashlib
 import os
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 from devgraph.config.project_schema import (
@@ -60,10 +61,13 @@ class ProviderSnapshot:
     sample: tuple[str, ...]  # the first APPROVAL_SAMPLE_SIZE sorted matched paths
     denied: int  # glob matches the secret-name denylist excluded
     total_bytes: int  # bytes of the inputs that were read
-    # (path, UTF-8 text) of each input, from the single read; the runner sends these.
+    # (path, UTF-8 text) of each input, from the single read, in `matched` order;
+    # the runner sends these.
     inputs: tuple[tuple[str, str], ...]
-    # Inputs that are not UTF-8: skipped with `input_decode` at run time (§3.2).
-    undecodable: tuple[str, ...]
+    # Matched paths not sent: path -> `input_cap`, `input_unavailable` or
+    # `input_decode` (§3.2). Only the read refusals are also in `errors`, which
+    # block approval; a non-UTF-8 file does not.
+    skipped: Mapping[str, str]
     errors: tuple[
         InputError, ...
     ]  # per-file refusals (oversize, unreadable); those files are skipped
@@ -105,12 +109,13 @@ def _snapshot(
     scan = static_scan(text)
 
     selection = select_inputs(root, tuple(declaration["provider"]["inputs"]), git=git)
-    errors, inputs, undecodable, total = [], [], [], 0
+    errors, inputs, skipped, total = [], [], {}, 0
     for rel in selection.matched:
         try:
             data = read_repo_file(root, rel, cap=INPUT_MAX_FILE_BYTES)
         except InputError as exc:
             errors.append(exc)
+            skipped[rel] = exc.code
             continue
         total += len(data)
         if total > INPUT_MAX_RUN_BYTES:
@@ -118,7 +123,7 @@ def _snapshot(
         try:
             inputs.append((rel, data.decode("utf-8")))
         except UnicodeDecodeError:
-            undecodable.append(rel)
+            skipped[rel] = "input_decode"
 
     return ProviderSnapshot(
         name=name,
@@ -135,7 +140,7 @@ def _snapshot(
         denied=selection.denied,
         total_bytes=total,
         inputs=tuple(inputs),
-        undecodable=tuple(undecodable),
+        skipped=MappingProxyType(skipped),
         errors=tuple(errors),
     )
 

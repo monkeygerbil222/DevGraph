@@ -120,21 +120,28 @@ def test_snapshot_reads_each_file_once(repo, monkeypatch):
 
 def test_snapshot_keeps_the_input_text_it_read(repo, monkeypatch):
     """The runner gets the inputs from the snapshot (spec §10.3): the text of the
-    single read, never a second one. A file that is not UTF-8 is listed apart, to
-    be skipped with `input_decode` at run time (§3.2); it does not block approval."""
+    single read, never a second one. Every matched file is either sent or skipped
+    with its code (§3.2): a non-UTF-8 file `input_decode` (which does not block
+    approval), an oversize one `input_cap`."""
+    from devgraph.sandbox.limits import INPUT_MAX_FILE_BYTES
     from devgraph.sandbox.runner import ProviderSnapshot as SnapshotProtocol
 
     (repo / "docs" / "latin1.md").write_bytes(b"caf\xe9\n")
-    _git(repo, "add", "--", "docs/latin1.md")
-    _git(repo, "commit", "-q", "-m", "latin1")
+    (repo / "docs" / "huge.md").write_bytes(b"x" * (INPUT_MAX_FILE_BYTES + 1))
+    _git(repo, "add", "--", "docs/latin1.md", "docs/huge.md")
+    _git(repo, "commit", "-q", "-m", "latin1 and huge")
     calls = _counting(monkeypatch)
     snap = provider_snapshot(repo, "runbook_links", git=GIT)
     reads = sum(calls.values())
     assert isinstance(snap, SnapshotProtocol)
     assert dict(snap.iter_inputs()) == {rel: data.decode() for rel, data in DOCS.items()}
-    assert list(snap.iter_inputs()) == sorted(snap.iter_inputs())
-    assert snap.undecodable == ("docs/latin1.md",)
-    assert snap.errors == ()
+    assert dict(snap.skipped) == {"docs/latin1.md": "input_decode", "docs/huge.md": "input_cap"}
+    assert [code for code in (e.code for e in snap.errors)] == ["input_cap"]
+    sent = [rel for rel, _ in snap.iter_inputs()]
+    assert list(snap.matched) == sorted(snap.matched)
+    assert sent == [rel for rel in snap.matched if rel not in snap.skipped]
+    assert set(sent).isdisjoint(snap.skipped)
+    assert set(sent) | set(snap.skipped) == set(snap.matched)
     assert sum(calls.values()) == reads
 
 

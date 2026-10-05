@@ -49,13 +49,24 @@ def test_require_sandbox_exits_session(monkeypatch, probe):
         assert len(exit_.calls) == 1 and exit_.calls[0] != 0
 
 
-@pytest.mark.parametrize("value", ["", "0", "true", "yes", " 1"])
-def test_require_sandbox_only_on_exactly_one(monkeypatch, value):
-    """Only the value "1" requires the sandbox."""
+@pytest.mark.parametrize("value", ["", "0"])
+def test_require_sandbox_off_values(monkeypatch, value):
+    """Empty and "0" leave local absence to collection-time deselection."""
     exit_ = _Exit()
     monkeypatch.setenv(REQUIRE_SANDBOX_ENV, value)
     require_sandbox_or_exit(ABSENT, exit=exit_)
     assert exit_.calls == []
+
+
+@pytest.mark.parametrize("value", ["true", "yes", " 1", "2", "on"])
+@pytest.mark.parametrize("probe", [ABSENT, PRESENT], ids=["absent", "present"])
+def test_require_sandbox_fails_closed(monkeypatch, value, probe):
+    """Any other non-empty value ends the session, even with Podman present: a
+    typo in CI must not quietly turn the gate off."""
+    exit_ = _Exit()
+    monkeypatch.setenv(REQUIRE_SANDBOX_ENV, value)
+    require_sandbox_or_exit(probe, exit=exit_)
+    assert len(exit_.calls) == 1 and exit_.calls[0] != 0
 
 
 def _child(*args):

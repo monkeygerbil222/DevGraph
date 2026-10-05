@@ -112,15 +112,22 @@ def host_canary(tmp_path_factory) -> HostCanary:
 
 @dataclass(frozen=True)
 class FakeSnapshot:
-    """A duck-typed `runner.ProviderSnapshot`, shaped like E1's frozen snapshot."""
+    """A duck-typed `runner.ProviderSnapshot`, shaped like E1's frozen snapshot.
+    `matched` is derived, so the sent/skipped invariant holds by construction."""
 
     name: str
     declaration_set: Mapping[str, Any]
     script_text: str
-    inputs: tuple[tuple[str, str], ...] = field(default=())
+    inputs: tuple[tuple[str, str], ...] = ()
+    skipped: Mapping[str, str] = field(default_factory=dict)
+
+    @property
+    def matched(self) -> tuple[str, ...]:
+        return tuple(sorted({rel for rel, _ in self.inputs} | set(self.skipped)))
 
     def iter_inputs(self) -> Iterator[tuple[str, str]]:
-        return iter(self.inputs)
+        text = dict(self.inputs)
+        return iter([(rel, text[rel]) for rel in self.matched if rel not in self.skipped])
 
 
 @pytest.fixture

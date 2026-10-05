@@ -306,9 +306,11 @@ def test_provider_snapshot_protocol(trivial_snapshot):
         "name",
         "declaration_set",
         "script_text",
+        "matched",
+        "skipped",
         "iter_inputs",
     }
-    for member in ("name", "declaration_set", "script_text"):
+    for member in ("name", "declaration_set", "script_text", "matched", "skipped"):
         assert isinstance(getattr(ProviderSnapshot, member), property), member
     assert isinstance(trivial_snapshot, ProviderSnapshot)
     path, text = next(trivial_snapshot.iter_inputs())
@@ -318,8 +320,20 @@ def test_provider_snapshot_protocol(trivial_snapshot):
         name = "runbook_links"
         declaration_set: dict = {}
         script_text = ""
+        matched = ()
+        skipped: dict = {}
 
     assert not isinstance(MissingInputs(), ProviderSnapshot)
+
+    skipping = type(trivial_snapshot)(
+        name="runbook_links",
+        declaration_set={},
+        script_text="",
+        inputs=(("docs/b.md", "b"),),
+        skipped={"docs/a.md": "input_decode", "docs/c.md": "input_cap"},
+    )
+    assert skipping.matched == ("docs/a.md", "docs/b.md", "docs/c.md")
+    assert list(skipping.iter_inputs()) == [("docs/b.md", "b")]
 
 
 def test_e1_snapshot_satisfies_protocol():
@@ -364,6 +378,9 @@ def test_decode_result_return_shape():
         b'{"seq": 1}',
         b'{"seq": 1, "records": {}}',
         b'{"seq": 1, "records": [], "extra": 1}',
+        # A parse failure is a schema_violation whatever `seq` is.
+        b'{"records": [NaN]}',
+        b'{"seq": "1", "records": [NaN]}',
     ):
         assert isinstance(frames.decode_result(body), SchemaViolation), body
 
@@ -379,11 +396,15 @@ def test_decode_result_return_shape():
         b'{"seq": null, "records": []}',
         b'{"seq": -1, "records": []}',
         b'[1, []]',
+        # After a successful parse, `seq` is checked before content.
+        b'{"seq": "1", "records": {}}',
+        b'{"records": {}, "extra": 1}',
     ],
 )
 def test_decode_result_seq_fault_is_protocol(body):
     """A missing, non-integer, bool or negative `seq`, or a body that is not an
-    object, is a sequence fault: `ProtocolError`, not a `SchemaViolation`."""
+    object, is a sequence fault: `ProtocolError`, not a `SchemaViolation`. The body
+    must first parse; `seq` is then checked before any content rule."""
     with pytest.raises(runner.ProtocolError):
         frames.decode_result(body)
 
