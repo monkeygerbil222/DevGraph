@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -59,9 +60,17 @@ class ProviderSnapshot:
     sample: tuple[str, ...]  # the first APPROVAL_SAMPLE_SIZE sorted matched paths
     denied: int  # glob matches the secret-name denylist excluded
     total_bytes: int  # bytes of the inputs that were read
+    # (path, UTF-8 text) of each input, from the single read; the runner sends these.
+    inputs: tuple[tuple[str, str], ...]
+    # Inputs that are not UTF-8: skipped with `input_decode` at run time (§3.2).
+    undecodable: tuple[str, ...]
     errors: tuple[
         InputError, ...
     ]  # per-file refusals (oversize, unreadable); those files are skipped
+
+    def iter_inputs(self) -> Iterator[tuple[str, str]]:
+        """The runner's inputs (`runner.ProviderSnapshot`): never a second read."""
+        return iter(self.inputs)
 
 
 def _read_schema(root: Path) -> tuple[str, ProjectSchema]:
@@ -96,15 +105,20 @@ def _snapshot(
     scan = static_scan(text)
 
     selection = select_inputs(root, tuple(declaration["provider"]["inputs"]), git=git)
-    errors, total = [], 0
+    errors, inputs, undecodable, total = [], [], [], 0
     for rel in selection.matched:
         try:
-            total += len(read_repo_file(root, rel, cap=INPUT_MAX_FILE_BYTES))
+            data = read_repo_file(root, rel, cap=INPUT_MAX_FILE_BYTES)
         except InputError as exc:
             errors.append(exc)
             continue
+        total += len(data)
         if total > INPUT_MAX_RUN_BYTES:
             raise InputError("input_cap", f"inputs exceed {INPUT_MAX_RUN_BYTES} bytes")
+        try:
+            inputs.append((rel, data.decode("utf-8")))
+        except UnicodeDecodeError:
+            undecodable.append(rel)
 
     return ProviderSnapshot(
         name=name,
@@ -120,6 +134,8 @@ def _snapshot(
         sample=selection.matched[:APPROVAL_SAMPLE_SIZE],
         denied=selection.denied,
         total_bytes=total,
+        inputs=tuple(inputs),
+        undecodable=tuple(undecodable),
         errors=tuple(errors),
     )
 

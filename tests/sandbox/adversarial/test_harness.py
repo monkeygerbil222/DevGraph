@@ -49,6 +49,15 @@ def test_require_sandbox_exits_session(monkeypatch, probe):
         assert len(exit_.calls) == 1 and exit_.calls[0] != 0
 
 
+@pytest.mark.parametrize("value", ["", "0", "true", "yes", " 1"])
+def test_require_sandbox_only_on_exactly_one(monkeypatch, value):
+    """Only the value "1" requires the sandbox."""
+    exit_ = _Exit()
+    monkeypatch.setenv(REQUIRE_SANDBOX_ENV, value)
+    require_sandbox_or_exit(ABSENT, exit=exit_)
+    assert exit_.calls == []
+
+
 def _child(*args):
     return subprocess.run(
         [sys.executable, "-m", "tests.sandbox.adversarial._child", *args],

@@ -73,8 +73,9 @@ def sandbox_probe() -> SandboxProbe:
 
 def _sandbox_required() -> bool:
     """The one read of the require-sandbox switch: a test-harness variable, never
-    read by DevGraph."""
-    return bool(os.environ.get(REQUIRE_SANDBOX_ENV))
+    read by DevGraph. Only the exact value "1" requires the sandbox; anything else,
+    or unset, leaves local absence to collection-time deselection."""
+    return os.environ.get(REQUIRE_SANDBOX_ENV) == "1"
 
 
 def require_sandbox_or_exit(probe_result: SandboxProbe, *, exit=pytest.exit) -> None:

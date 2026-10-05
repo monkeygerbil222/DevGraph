@@ -85,8 +85,8 @@ TRUST_SCHEMA_VERSION = 1
 SANDBOX_RUNTIME = "podman"
 SUPPORTED_PLATFORMS = ("linux",)
 
-# Runner (§6, §4.4). A test may lower a timing value through `runner.RunConfig`,
-# never raise it; nothing overrides a security limit.
+# Runner (§6, §4.4). A test may lower a timing value through the runner's timing
+# overrides, never raise it; nothing overrides a security limit.
 CPU_PER_CALL_SECONDS = 2  # in-container timer per `derive` call (hygiene); over: timeout
 PER_FILE_DEADLINE_SECONDS = 5  # host, request write to result read; over: kill, timeout
 START_DEADLINE_SECONDS = 10  # host, report + ready; over: sandbox_unavailable

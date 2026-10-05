@@ -58,6 +58,13 @@ def pytest_collection_modifyitems(config, items):
         items[:] = keep
 
 
+@pytest.fixture(autouse=True)
+def _switch_left_off():
+    """The testing switch never outlives the test that turned it on."""
+    yield
+    assert not _testing.enabled(), "the testing switch was left on"
+
+
 @pytest.fixture
 def faults():
     """The `_TestFaults` constructor, with the testing switch on for this test only.
@@ -105,10 +112,10 @@ def host_canary(tmp_path_factory) -> HostCanary:
 
 @dataclass(frozen=True)
 class FakeSnapshot:
-    """A duck-typed `runner.ProviderSnapshot`."""
+    """A duck-typed `runner.ProviderSnapshot`, shaped like E1's frozen snapshot."""
 
-    provider_name: str
-    declaration: Mapping[str, Any]
+    name: str
+    declaration_set: Mapping[str, Any]
     script_text: str
     inputs: tuple[tuple[str, str], ...] = field(default=())
 
@@ -120,8 +127,8 @@ class FakeSnapshot:
 def trivial_snapshot() -> FakeSnapshot:
     """One input file and a `derive` that returns no records."""
     return FakeSnapshot(
-        provider_name="runbook_links",
-        declaration={
+        name="runbook_links",
+        declaration_set={
             "provider": {"name": "runbook_links", "inputs": ["docs/runbooks/**/*.md"], "params": {}},
             "node_types": [],
             "relationships": [],

@@ -8,6 +8,7 @@ test faults and probe runs while the testing switch is off.
 from __future__ import annotations
 
 import enum
+import math
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, fields
 from typing import Any, Protocol, runtime_checkable
@@ -80,12 +81,21 @@ FIELD_NAMES = INSPECT_FIELDS | REPORT_FIELDS | READINESS_FIELDS
 
 @runtime_checkable
 class ProviderSnapshot(Protocol):
-    provider_name: str
-    declaration: Mapping[str, Any]
-    script_text: str
+    """What the runner runs: E1's `snapshot.ProviderSnapshot`, whose digest the
+    gates checked (spec §10.3). Read-only, so a frozen dataclass satisfies it."""
+
+    @property
+    def name(self) -> str: ...
+
+    @property
+    def declaration_set(self) -> Mapping[str, Any]: ...
+
+    @property
+    def script_text(self) -> str: ...
 
     def iter_inputs(self) -> Iterator[tuple[str, str]]:
-        """(repo-relative POSIX path, UTF-8 text) per input file."""
+        """(repo-relative POSIX path, UTF-8 text) per input file, from the
+        snapshot's single read."""
         ...
 
 
@@ -101,8 +111,9 @@ _TIMING_LIMITS = {
 
 @dataclass(frozen=True)
 class RunConfig:
-    """Timing overrides for tests; `None` means the `limits` constant. An override
-    may only lower its limit. There is no field for any security limit."""
+    """Timing overrides for tests; `None` means the `limits` constant. A set value
+    is a finite number with `0 < value <= limit`: an override may only lower its
+    limit. There is no field for any security limit."""
 
     start_deadline_s: float | None = None
     per_file_deadline_s: float | None = None
@@ -113,8 +124,12 @@ class RunConfig:
     def __post_init__(self) -> None:
         for f in fields(self):
             value = getattr(self, f.name)
-            if value is not None and value > _TIMING_LIMITS[f.name]:
-                raise ValueError(f"{f.name} may only lower its limit")
+            if value is None:
+                continue
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+                raise ValueError(f"{f.name} must be a finite number")
+            if not 0 < value <= _TIMING_LIMITS[f.name]:
+                raise ValueError(f"{f.name} may only lower its limit, and must be positive")
 
 
 class RunMode(enum.Enum):
@@ -168,6 +183,10 @@ class SandboxUnavailable(Exception):
         self.field = field
 
 
+class FaultsRefused(RuntimeError):
+    """Test faults or a probe run while the testing switch is off."""
+
+
 class ProtocolError(Exception):
     """A length, framing or sequence fault (§4.4)."""
 
@@ -188,7 +207,7 @@ def run_provider(
     accepted only with `DRY_RUN_INTERACTIVE` and is the only route by which
     container stderr (the kept tail) leaves the runner."""
     if (_faults is not None or mode is RunMode.PROBE) and not _testing.enabled():
-        raise RuntimeError("test faults and probe runs need the testing switch")
+        raise FaultsRefused("test faults and probe runs need the testing switch")
     raise NotImplementedError("E2b")
 
 

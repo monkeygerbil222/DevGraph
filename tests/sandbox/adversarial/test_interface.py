@@ -8,11 +8,13 @@ from __future__ import annotations
 
 import dataclasses
 import inspect
+import json
+import typing
 from collections.abc import Callable
 
 import pytest
 
-from devgraph.sandbox import _testing, frames, invocation, limits, report, runner
+from devgraph.sandbox import _testing, frames, invocation, limits, report, runner, snapshot
 from devgraph.sandbox.runner import (
     FIELD_NAMES,
     INSPECT_FIELDS,
@@ -63,7 +65,7 @@ SIGNATURES: dict[Callable, str] = {
     ),
     frames.write_frame: "(buf: 'BinaryIO', obj: 'Any') -> 'None'",
     frames.read_frame: "(buf: 'BinaryIO', *, max_len: 'int') -> 'bytes'",
-    frames.decode_result: "(body: 'bytes') -> 'list[dict[str, Any]] | SchemaViolation'",
+    frames.decode_result: "(body: 'bytes') -> 'tuple[int, list[dict[str, Any]]] | SchemaViolation'",
     frames.step_frames: "(state: 'SessionState', frame: 'Frame', *, seq: 'int | None') -> 'SessionState'",
     frames.FrameSequence.__init__: "(self, files_total: 'int') -> 'None'",
     frames.FrameSequence.state.fget: "(self) -> 'SessionState'",
@@ -147,6 +149,7 @@ def test_interface_enums_and_errors():
     with pytest.raises(ValueError):
         runner.SandboxUnavailable("diverged", field="not-a-field")
     assert issubclass(runner.ProtocolError, Exception)
+    assert issubclass(runner.FaultsRefused, RuntimeError)
     assert runner.ProtocolError.code == "protocol"
     assert not hasattr(runner.RunResult, "stderr")
 
@@ -297,16 +300,34 @@ def test_field_vocabulary():
 
 
 def test_provider_snapshot_protocol(trivial_snapshot):
+    """E1's names (spec §10.3: the runner runs E1's snapshot), read-only, plus
+    `iter_inputs`."""
+    assert typing.get_protocol_members(ProviderSnapshot) == {
+        "name",
+        "declaration_set",
+        "script_text",
+        "iter_inputs",
+    }
+    for member in ("name", "declaration_set", "script_text"):
+        assert isinstance(getattr(ProviderSnapshot, member), property), member
     assert isinstance(trivial_snapshot, ProviderSnapshot)
     path, text = next(trivial_snapshot.iter_inputs())
     assert isinstance(path, str) and isinstance(text, str)
 
     class MissingInputs:
-        provider_name = "runbook_links"
-        declaration: dict = {}
+        name = "runbook_links"
+        declaration_set: dict = {}
         script_text = ""
 
     assert not isinstance(MissingInputs(), ProviderSnapshot)
+
+
+def test_e1_snapshot_satisfies_protocol():
+    """E1's frozen dataclass is the snapshot the runner receives."""
+    cls = snapshot.ProviderSnapshot
+    assert cls.__dataclass_params__.frozen
+    instance = cls(**{f.name: () for f in dataclasses.fields(cls)})
+    assert isinstance(instance, ProviderSnapshot)
 
 
 def test_divergence_case_covers_rows():
@@ -326,12 +347,45 @@ def test_divergence_case_covers_rows():
 
 @E2B
 def test_decode_result_return_shape():
-    records = frames.decode_result(b'{"seq": 1, "records": []}')
-    assert isinstance(records, list)
+    """A result body is `{"seq": int, "records": list}`, plus an ignored `path`. `decode_result`
+    parses it once and returns `(seq, records)`; content faults are returned as
+    a `SchemaViolation`, never raised."""
+    record = {"node": "Runbook", "props": {"slug": "restart"}}
+    assert frames.decode_result(b'{"seq": 3, "records": []}') == (3, [])
+    # A `path` in a result is ignored (spec §4.4): the host uses its own record of `seq`.
+    assert frames.decode_result(b'{"seq": 3, "records": [], "path": "elsewhere.md"}') == (3, [])
+    assert frames.decode_result(b'{"seq": 0, "records": [%s]}' % json.dumps(record).encode()) == (0, [record])
     bad_utf8 = frames.decode_result(b'{"seq": 1, "records": ["\xff"]}')
     assert isinstance(bad_utf8, SchemaViolation) and bad_utf8.record_index == -1
-    for body in (b"{", b'{"seq": 1, "records": [NaN]}', b"\x00"):
-        assert isinstance(frames.decode_result(body), SchemaViolation)
+    for body in (
+        b"{",
+        b"\x00",
+        b'{"seq": 1, "records": [NaN]}',
+        b'{"seq": 1}',
+        b'{"seq": 1, "records": {}}',
+        b'{"seq": 1, "records": [], "extra": 1}',
+    ):
+        assert isinstance(frames.decode_result(body), SchemaViolation), body
+
+
+@E2B
+@pytest.mark.parametrize(
+    "body",
+    [
+        b'{"records": []}',
+        b'{"seq": "1", "records": []}',
+        b'{"seq": 1.0, "records": []}',
+        b'{"seq": true, "records": []}',
+        b'{"seq": null, "records": []}',
+        b'{"seq": -1, "records": []}',
+        b'[1, []]',
+    ],
+)
+def test_decode_result_seq_fault_is_protocol(body):
+    """A missing, non-integer, bool or negative `seq`, or a body that is not an
+    object, is a sequence fault: `ProtocolError`, not a `SchemaViolation`."""
+    with pytest.raises(runner.ProtocolError):
+        frames.decode_result(body)
 
 
 @E2B

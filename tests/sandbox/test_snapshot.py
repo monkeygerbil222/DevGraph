@@ -118,6 +118,26 @@ def test_snapshot_reads_each_file_once(repo, monkeypatch):
     assert snap.total_bytes == sum(len(data) for data in DOCS.values())
 
 
+def test_snapshot_keeps_the_input_text_it_read(repo, monkeypatch):
+    """The runner gets the inputs from the snapshot (spec §10.3): the text of the
+    single read, never a second one. A file that is not UTF-8 is listed apart, to
+    be skipped with `input_decode` at run time (§3.2); it does not block approval."""
+    from devgraph.sandbox.runner import ProviderSnapshot as SnapshotProtocol
+
+    (repo / "docs" / "latin1.md").write_bytes(b"caf\xe9\n")
+    _git(repo, "add", "--", "docs/latin1.md")
+    _git(repo, "commit", "-q", "-m", "latin1")
+    calls = _counting(monkeypatch)
+    snap = provider_snapshot(repo, "runbook_links", git=GIT)
+    reads = sum(calls.values())
+    assert isinstance(snap, SnapshotProtocol)
+    assert dict(snap.iter_inputs()) == {rel: data.decode() for rel, data in DOCS.items()}
+    assert list(snap.iter_inputs()) == sorted(snap.iter_inputs())
+    assert snap.undecodable == ("docs/latin1.md",)
+    assert snap.errors == ()
+    assert sum(calls.values()) == reads
+
+
 def test_repo_snapshots_read_the_schema_once(repo, monkeypatch):
     calls = _counting(monkeypatch)
     snaps = repo_snapshots(repo, git=GIT)
