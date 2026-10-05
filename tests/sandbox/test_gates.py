@@ -185,8 +185,9 @@ def test_sandbox_decisions_ignore_env_and_dotenv(tmp_path, monkeypatch):
     fixture_home = tmp_path / "pw-home"
     fixture_home.mkdir()
     monkeypatch.setattr(paths, "sandbox_home", real_sandbox_home)
+    pwd = pytest.importorskip("pwd")  # Unix password database; Windows reads the profile folder
     monkeypatch.setattr(
-        paths.pwd, "getpwuid",
+        pwd, "getpwuid",
         lambda uid: types.SimpleNamespace(pw_dir=str(fixture_home), pw_uid=uid, pw_name="tester"),
     )
 
