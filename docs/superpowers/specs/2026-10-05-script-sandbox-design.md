@@ -491,11 +491,18 @@ parses untrusted source, so it runs in a **separate `python -I -S` subprocess**
 with a 5 s wall timeout, `RLIMIT_AS` 256 MiB and `RLIMIT_CPU` 5 s, and an
 environment of only `PATH` and `LC_ALL=C` (a named locale such as `C.UTF-8`
 makes glibc map its whole locale archive, 222 MiB on Fedora, and the
-interpreter then cannot start under that limit). Any non-zero
+interpreter then cannot start under that limit). The limits are set inside
+the worker before it reads the script, not by a `preexec_fn` (unsafe in a
+threaded parent). Any non-zero
 exit, timeout, signal or exception inside it, including `RecursionError`,
 `MemoryError` and `SyntaxError`, is a hard reject (`static_reject`), never a
 pass. It parses with `feature_version` set to the image's Python minor version
 so that the scan and the container agree on the grammar.
+Beyond the table, the scan also refuses dunder names in imports, `match`
+patterns and literal `getattr` strings, every `pathlib` submodule, and, by
+name alone, `from <allowed> import <name>` where `<name>` is a
+non-allowlisted standard-library module (`from typing import sys`). A module
+reached as an attribute (`typing.sys`) is not caught.
 
 The schema YAML is untrusted input of the same class: alias expansion is
 bounded (a document whose expansion exceeds 10,000 nodes is rejected), and
@@ -909,6 +916,7 @@ declaration", but the applied declaration exists only as graph state, which
 |-------|---------|-------|---------|
 | `disabled` | project config off, or scripts off | no | no |
 | `unavailable` | sandbox not ready, not Linux, no git work tree, or headless image | no | no |
+| `rejected` | the script or declaration is refused (`static_reject`: normalisation, scan crash or syntax error, unreadable script, invalid schema) | no | no |
 | `pending` | the schema file differs from the applied schema | no | no |
 | `awaiting_approval` | digest never approved, retired or revoked; new provider | no | no |
 | `approved` | digest active | yes | yes, only after a successful full run |

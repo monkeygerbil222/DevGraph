@@ -48,6 +48,36 @@ def _is_derive(node):
     )
 
 
+_NAME_MAX = 120
+_ATTR_BUILTINS = ("getattr", "setattr", "delattr", "hasattr")
+
+
+def _show(name):
+    """A name for a message: ASCII-escaped and bounded."""
+    shown = ascii(name)
+    return shown if len(shown) <= _NAME_MAX else shown[:_NAME_MAX] + "..."
+
+
+def _is_pathlib(module):
+    return module == "pathlib" or module.startswith("pathlib.")
+
+
+# Allowlisted packages' submodules whose names are also top-level module names.
+_SUBMODULES = frozenset({"collections.abc"})
+
+
+def _is_unlisted_module(name, module, allowed):
+    """`from <module> import <name>` where `name` is the name of a standard-library
+    module that is not allowlisted (`from os.path import os`, `from typing import
+    sys`). Decided by name alone, never by importing anything, so it is
+    conservative: any such name is refused unless it is a known submodule."""
+    return (
+        name in sys.stdlib_module_names
+        and not _module_allowed(name, allowed)
+        and f"{module}.{name}" not in _SUBMODULES
+    )
+
+
 def findings(tree, allowed, denied):
     found = []
 
@@ -56,42 +86,63 @@ def findings(tree, allowed, denied):
             {"rule": rule, "line": getattr(node, "lineno", 0), "message": message}
         )
 
+    def dunder(node, name, what):
+        if name and _dunder(name):
+            add("dunder", node, f"dunder {what} {_show(name)} is not allowed")
+
+    def refuse_import(node, name):
+        add("import", node, f"import of {_show(name)} is not allowed")
+
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
-                if alias.name == "pathlib" or not _module_allowed(alias.name, allowed):
-                    add("import", node, f"import of {ascii(alias.name)} is not allowed")
+                if _is_pathlib(alias.name) or not _module_allowed(alias.name, allowed):
+                    refuse_import(node, alias.name)
+                for part in alias.name.split("."):
+                    dunder(node, part, "name")
+                dunder(node, alias.asname, "name")
         elif isinstance(node, ast.ImportFrom):
             module = node.module or ""
             if node.level:
                 add("import", node, "relative imports are not allowed")
                 continue
             for alias in node.names:
-                if module == "pathlib":
-                    ok = alias.name.startswith("Pure")
-                else:
-                    ok = _module_allowed(module, allowed) or (
-                        alias.name != "*"
-                        and _module_allowed(f"{module}.{alias.name}", allowed)
-                    )
+                if _is_pathlib(module):
+                    ok = module == "pathlib" and alias.name.startswith("Pure")
+                elif alias.name == "*":
+                    ok = _module_allowed(module, allowed)
+                elif _module_allowed(module, allowed):
+                    ok = not _is_unlisted_module(alias.name, module, allowed)
+                else:  # `from os import path`
+                    ok = _module_allowed(f"{module}.{alias.name}", allowed)
                 if not ok:
-                    add(
-                        "import",
-                        node,
-                        f"import of {ascii(module + '.' + alias.name)} is not allowed",
-                    )
+                    refuse_import(node, f"{module}.{alias.name}")
+                dunder(node, alias.name, "name")
+                dunder(node, alias.asname, "name")
         elif isinstance(node, ast.Name):
             if node.id in denied:
-                add("denied_name", node, f"use of {ascii(node.id)} is not allowed")
-            if _dunder(node.id):
-                add("dunder", node, f"dunder name {ascii(node.id)} is not allowed")
+                add("denied_name", node, f"use of {_show(node.id)} is not allowed")
+            dunder(node, node.id, "name")
         elif isinstance(node, ast.Attribute):
-            if _dunder(node.attr):
-                add(
-                    "dunder",
-                    node,
-                    f"dunder attribute {ascii(node.attr)} is not allowed",
-                )
+            dunder(node, node.attr, "attribute")
+        elif isinstance(node, ast.Call):
+            # getattr(x, "__class__"): a literal dunder name. One built at run
+            # time is not caught (spec §4.1).
+            if (
+                isinstance(node.func, ast.Name)
+                and node.func.id in _ATTR_BUILTINS
+                and len(node.args) >= 2
+                and isinstance(node.args[1], ast.Constant)
+                and isinstance(node.args[1].value, str)
+            ):
+                dunder(node, node.args[1].value, "attribute")
+        elif isinstance(node, ast.MatchClass):
+            for attr in node.kwd_attrs:
+                dunder(node, attr, "attribute")
+        elif isinstance(node, (ast.MatchAs, ast.MatchStar)):
+            dunder(node, node.name, "name")
+        elif isinstance(node, ast.MatchMapping):
+            dunder(node, node.rest, "name")
         elif isinstance(node, ast.While):
             if isinstance(node.test, ast.Constant) and node.test.value is True:
                 add("while_true", node, "'while True:' is not allowed")

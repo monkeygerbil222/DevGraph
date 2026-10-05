@@ -165,12 +165,17 @@ def provider_state(
     registry_path: Path,
     store_path: Path,
 ) -> str:
-    """`unavailable`, `pending`, `disabled`, `awaiting_approval` or `approved` (§5.5).
+    """`unavailable`, `rejected`, `pending`, `disabled`, `awaiting_approval` or
+    `approved` (§5.5).
 
-    `failing` needs run records, which arrive in E3.
+    `rejected` is a `static_reject` snapshot (an invalid script or declaration),
+    which no approval can fix until the file changes; any other `InputError` is
+    `unavailable`. `failing` needs run records, which arrive in E3.
     """
-    if not platform_supported(platform) or isinstance(snap, InputError):
+    if not platform_supported(platform):
         return "unavailable"
+    if isinstance(snap, InputError):
+        return "rejected" if snap.code == "static_reject" else "unavailable"
     if pending:
         return "pending"
     gates = evaluate_gates(

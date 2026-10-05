@@ -348,6 +348,26 @@ def test_provider_state_table(repo, monkeypatch, gates_, pending, platform, expe
         )
 
 
+@pytest.mark.parametrize("platform", ["linux", "darwin"])
+def test_provider_state_of_a_static_reject_is_rejected(monkeypatch, platform):
+    monkeypatch.setattr(
+        snapshot, "evaluate_gates", lambda *a, **k: GateResult(True, True, True)
+    )
+    error = InputError("static_reject", "script line 2: syntax error")
+    expected = "rejected" if platform == "linux" else "unavailable"
+    for pending in (False, True):
+        state = provider_state(
+            "rid",
+            "/canon",
+            error,
+            platform=platform,
+            pending=pending,
+            registry_path=Path("/reg"),
+            store_path=Path("/store"),
+        )
+        assert state == expected
+
+
 def test_provider_state_of_an_input_error_is_unavailable(monkeypatch):
     monkeypatch.setattr(
         snapshot, "evaluate_gates", lambda *a, **k: GateResult(True, True, True)

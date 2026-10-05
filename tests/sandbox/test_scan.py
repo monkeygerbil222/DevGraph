@@ -16,6 +16,7 @@ from devgraph.sandbox.display import script_for_review
 from devgraph.sandbox.limits import (
     DENIED_NAMES,
     FIXED_PATH,
+    SCAN_OUTPUT_MAX_BYTES,
     SCAN_RLIMIT_AS_BYTES,
     SCAN_RLIMIT_CPU_SECONDS,
 )
@@ -134,6 +135,19 @@ def test_scanner_crash_is_reject():
             'print(\'{"findings": [], "literal_spans": [[true, 2]]}\')\n',
             id="bool-offset",
         ),
+        pytest.param(
+            'print(\'{"findings": [{"rule": "x", "line": 1, "message": "m", "y": 2}], "literal_spans": []}\')\n',
+            id="extra-finding-key",
+        ),
+        pytest.param(
+            'print(\'{"findings": [{"rule": "Bad Rule", "line": 1, "message": "m"}], "literal_spans": []}\')\n',
+            id="bad-rule-name",
+        ),
+        pytest.param(
+            'import json\nprint(json.dumps({"findings": [{"rule": "x", "line": 1, "message": "m" * 1001}],'
+            ' "literal_spans": []}))\n',
+            id="long-message",
+        ),
     ],
 )
 def test_bad_worker_output_is_reject(source):
@@ -153,7 +167,8 @@ def test_worker_runs_isolated_with_limits_and_a_constructed_environment(monkeypa
     expression = (
         '{"env": dict(os.environ), "flags": [sys.flags.isolated, sys.flags.no_site],'
         ' "as": resource.getrlimit(resource.RLIMIT_AS), "cpu": resource.getrlimit(resource.RLIMIT_CPU),'
-        ' "core": resource.getrlimit(resource.RLIMIT_CORE), "devgraph": "devgraph" in sys.modules,'
+        ' "core": resource.getrlimit(resource.RLIMIT_CORE), "fsize": resource.getrlimit(resource.RLIMIT_FSIZE),'
+        ' "devgraph": "devgraph" in sys.modules,'
         ' "path": [p for p in sys.path if "site-packages" in p],'
         ' "archive": "locale-archive" in open("/proc/self/maps").read()}'
     )
@@ -164,6 +179,7 @@ def test_worker_runs_isolated_with_limits_and_a_constructed_environment(monkeypa
     assert seen["as"] == [SCAN_RLIMIT_AS_BYTES, SCAN_RLIMIT_AS_BYTES]
     assert seen["cpu"] == [SCAN_RLIMIT_CPU_SECONDS, SCAN_RLIMIT_CPU_SECONDS]
     assert seen["core"] == [0, 0]
+    assert seen["fsize"] == [SCAN_OUTPUT_MAX_BYTES + 1, SCAN_OUTPUT_MAX_BYTES + 1]
     assert seen["devgraph"] is False and seen["path"] == []
     # The C locale maps no locale archive, so the 256 MiB budget is the parser's.
     assert seen["archive"] is False
@@ -174,12 +190,18 @@ def test_worker_command_line(monkeypatch):
     real_popen = subprocess.Popen
 
     def spy(args, **kwargs):
-        seen["args"] = args
+        seen["args"], seen["kwargs"] = args, kwargs
         return real_popen(args, **kwargs)
 
     monkeypatch.setattr(scan.subprocess, "Popen", spy)
     static_scan(DERIVE)
-    assert seen["args"] == [sys.executable, "-I", "-S", "-c", scan.WORKER_SOURCE]
+    assert seen["args"][:4] == [sys.executable, "-I", "-S", "-c"]
+    source = seen["args"][4]
+    assert source.endswith(scan.WORKER_SOURCE)
+    # The limits are set inside the worker, before it reads the script: no
+    # preexec_fn, so the scan is safe to start from a threaded parent.
+    assert source.startswith("import resource\n")
+    assert "preexec_fn" not in seen["kwargs"]
 
 
 def test_worker_source_imports_only_the_standard_library():
@@ -199,6 +221,8 @@ def test_worker_source_imports_only_the_standard_library():
 ESCAPE_TABLE = [
     ("().__class__.__base__.__subclasses__()", {"dunder"}),
     ('getattr(ctx, "__glo" + "bals__")', set()),
+    ('getattr(ctx, "__globals__")', {"dunder"}),  # a literal-string dunder is caught
+    ("import typing\ntyping.sys.modules", set()),  # a module reached as an attribute
     ('"{0.__globals__}".format(ctx)', set()),
     ("(x for x in ()).gi_frame.f_back.f_globals", set()),
     ("import socket", {"import"}),
@@ -242,6 +266,15 @@ def test_denied_names(name):
         "import collectionsx",
         "import jsonx.y",
         "from ctypes import CDLL",
+        "import pathlib._local",
+        "from pathlib._local import Path",
+        "from pathlib._local import PurePath",
+        "from os.path import os",
+        "from os.path import sys",
+        "from typing import sys",
+        "from fnmatch import posixpath",
+        "from collections import _collections_abc",
+        "from re import copyreg",
     ],
 )
 def test_imports_outside_the_allowlist(line):
@@ -260,6 +293,9 @@ def test_imports_outside_the_allowlist(line):
         "import json.decoder",
         "from pathlib import PurePath, PurePosixPath",
         "from fnmatch import *",
+        "from collections import abc",
+        "from json import decoder",
+        "from typing import Any",
     ],
 )
 def test_imports_inside_the_allowlist(line):
@@ -267,7 +303,22 @@ def test_imports_inside_the_allowlist(line):
 
 
 @pytest.mark.parametrize(
-    "snippet", ["x = __name__", "ctx.__dict__", "x = __builtins__", "a.b.__class__"]
+    "snippet",
+    [
+        "x = __name__",
+        "ctx.__dict__",
+        "x = __builtins__",
+        "a.b.__class__",
+        "match ctx:\n    case object(__class__=c):\n        pass",
+        "match ctx:\n    case object(__globals__=g):\n        pass",
+        "match ctx:\n    case __x__:\n        pass",
+        "match ctx:\n    case [*__x__]:\n        pass",
+        "match ctx:\n    case {**__x__}:\n        pass",
+        "from json import __builtins__ as b",
+        "from json import loads as __loads__",
+        "import json as __j__",
+        "hasattr(ctx, '__dict__')",
+    ],
 )
 def test_dunders(snippet):
     assert _rules(snippet + "\n" + DERIVE) == {"dunder"}
@@ -311,6 +362,18 @@ def test_findings_carry_line_and_message():
         Finding("import", 3, "import of 'socket' is not allowed"),
         Finding("denied_name", 4, "use of 'eval' is not allowed"),
     )
+
+
+def test_long_import_name_is_a_finding_with_a_truncated_message():
+    (finding,) = static_scan(DERIVE + "import " + "a" * 5000 + "\n").findings
+    assert finding.rule == "import"
+    assert len(finding.message) < 300
+
+
+def test_grammar_is_pinned_to_the_feature_version():
+    # PEP 695 `type` statements are 3.12 syntax; the scan parses as 3.11.
+    error = _reject("type X = int\n" + DERIVE)
+    assert "syntax error" in error.reason
 
 
 def test_finding_message_escapes_non_ascii():

@@ -4,7 +4,8 @@ The scan is hygiene, not a boundary: it gives readable findings at approval,
 and any finding blocks approval. It parses untrusted source, so it runs in a
 separate `python -I -S` worker (`scan_worker.py`, sent as `-c` text) with a
 constructed environment, `RLIMIT_AS`, `RLIMIT_CPU`, no core file and a wall
-timeout. Any crash, signal, timeout, non-zero exit, oversize or malformed
+timeout. The limits are set by a prologue inside the worker, before it reads
+the script. Any crash, signal, timeout, non-zero exit, oversize or malformed
 output, or exception the worker reports (SyntaxError, RecursionError,
 MemoryError included) is `static_reject`, never a pass.
 
@@ -16,7 +17,6 @@ from __future__ import annotations
 
 import json
 import re
-import resource
 import subprocess
 import sys
 import tempfile
@@ -69,20 +69,23 @@ def _reject(reason: str) -> InputError:
     return InputError("static_reject", reason)
 
 
-def _limits(memory_limit: int):
-    def apply() -> None:
-        resource.setrlimit(resource.RLIMIT_AS, (memory_limit, memory_limit))
-        resource.setrlimit(
-            resource.RLIMIT_CPU, (SCAN_RLIMIT_CPU_SECONDS, SCAN_RLIMIT_CPU_SECONDS)
-        )
-        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-        # Output goes to a file: a runaway writer is stopped at the cap, not the disk.
-        resource.setrlimit(
-            resource.RLIMIT_FSIZE,
-            (SCAN_OUTPUT_MAX_BYTES + 1, SCAN_OUTPUT_MAX_BYTES + 1),
-        )
-
-    return apply
+def _limits_prologue(memory_limit: int) -> str:
+    """Source run first in the worker, before it reads the script: sets the
+    limits (soft and hard) from inside the child. No `preexec_fn`, which is
+    unsafe to fork with from a threaded parent such as the dashboard. Output goes
+    to a file, so `RLIMIT_FSIZE` stops a runaway writer at the cap."""
+    limits = [
+        ("RLIMIT_AS", memory_limit),
+        ("RLIMIT_CPU", SCAN_RLIMIT_CPU_SECONDS),
+        ("RLIMIT_CORE", 0),
+        ("RLIMIT_FSIZE", SCAN_OUTPUT_MAX_BYTES + 1),
+    ]
+    lines = ["import resource"]
+    lines += [
+        f"resource.setrlimit(resource.{name}, ({int(value)}, {int(value)}))"
+        for name, value in limits
+    ]
+    return "\n".join(lines) + "\ndel resource\n"
 
 
 def _run_worker(
@@ -94,14 +97,19 @@ def _run_worker(
         stdin.seek(0)
         try:
             proc = subprocess.Popen(
-                [sys.executable, "-I", "-S", "-c", worker_source],
+                [
+                    sys.executable,
+                    "-I",
+                    "-S",
+                    "-c",
+                    _limits_prologue(memory_limit) + worker_source,
+                ],
                 stdin=stdin,
                 stdout=stdout,
                 stderr=subprocess.DEVNULL,
                 env=WORKER_ENV,
                 cwd="/",
                 close_fds=True,
-                preexec_fn=_limits(memory_limit),
             )
         except (OSError, subprocess.SubprocessError):
             raise _reject("the static scan could not start") from None
