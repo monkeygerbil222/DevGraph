@@ -31,6 +31,11 @@ REJECTS = [
     pytest.param("x = 'a‍b'\n".encode(), "U+200D", id="zero-width-joiner"),
     pytest.param("x = 1\n# a﻿b\n".encode(), "U+FEFF", id="zwnbsp-mid-file"),
     pytest.param("x = 'a\U000e0041b'\n".encode(), "U+E0041", id="astral-tag-char"),
+    pytest.param("x = 1\u2028y = 2\n".encode(), "U+2028", id="line-separator"),
+    pytest.param("x = 'a\u2029b'\n".encode(), "U+2029", id="paragraph-separator"),
+    pytest.param("x = 'a\ue000b'\n".encode(), "U+E000", id="private-use"),
+    pytest.param("# a\U000f0000b\n".encode(), "U+F0000", id="private-use-astral"),
+    pytest.param("x = 'a\u0378b'\n".encode(), "U+0378", id="unassigned"),
 ]
 
 
@@ -71,3 +76,8 @@ def test_reason_locates_invalid_utf8_by_byte():
 def test_cookie_beyond_line_two_is_not_a_cookie():
     raw = b"x = 1\ny = 2\n# coding: latin-1\n"
     assert normalise_script(raw) == raw.decode()
+
+
+def test_separators_as_escape_sequences_are_kept():
+    raw = b"x = '\\u2028\\u2029\\ue000'\n"
+    assert normalise_script(raw) == "x = '\\u2028\\u2029\\ue000'\n"

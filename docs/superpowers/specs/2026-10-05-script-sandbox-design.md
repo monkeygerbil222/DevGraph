@@ -843,9 +843,13 @@ re-read between the check and the run.
 The script is read once and must be strict UTF-8 without a BOM. It is
 rejected (`static_reject`) if it contains a PEP 263 coding cookie, NUL, a CR
 not followed by LF, a form feed, any other C0/C1 control except tab and LF,
-or any Unicode format character (category Cf, which includes the bidi
+any Unicode format character (category Cf, which includes the bidi
 overrides and isolates U+202A–U+202E and U+2066–U+2069, U+200E/U+200F and
-zero-width characters). CRLF is normalised to LF; that string is hashed,
+zero-width characters), a line or paragraph separator (U+2028/U+2029, Zl/Zp:
+some renderers break lines there while Python's tokenizer does not), or a
+private-use or unassigned code point (Co/Cn, as for the tools file and input
+globs). A script can still write any of these as escape sequences inside a
+string literal. CRLF is normalised to LF; that string is hashed,
 shown at approval, sent over stdin, and passed to `compile()` as a `str`,
 so no decoding step inside the container can reinterpret it.
 
@@ -855,12 +859,14 @@ something that is not quite `eval`. The static scan already sees the
 normalised name (§4.1). The approval display additionally renders every
 non-ASCII character **outside string literals and comments** as a `\u....`
 escape (located with `tokenize`; a tokenize failure is `static_reject`), so
-any non-ASCII identifier is visibly odd. Non-ASCII inside strings and comments
+any non-ASCII identifier is visibly odd. The scan reports the string and
+comment ranges, and everything else counts as code, so a missing range fails
+closed to an escape; malformed ranges are `static_reject`. Non-ASCII inside strings and comments
 is shown as text, subject to the control-character rule below.
 
 Every repository-sourced string DevGraph prints (script text, paths, params,
-labels, sample file names, diffs) is rendered with control and format
-characters made visible as `\x..`/`\u....` escapes, so terminal escape
+labels, sample file names, diffs) is rendered with control, format,
+separator, surrogate, private-use and unassigned characters made visible as `\x..`/`\u....` escapes, so terminal escape
 sequences cannot repaint the prompt.
 
 ### 5.4 Approval and enablement

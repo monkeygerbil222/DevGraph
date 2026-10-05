@@ -12,6 +12,19 @@ import unicodedata
 
 from devgraph.sandbox.reader import InputError
 
+# Refused character categories, beyond tab and LF (which are Cc but allowed).
+# Zl/Zp: some renderers break lines at U+2028/U+2029 while Python's tokenizer
+# does not. Co/Cn: as the tools-file and glob refusal sets. Cs cannot survive a
+# strict UTF-8 decode.
+_REFUSED_CATEGORIES = {
+    "Cc": "control character",
+    "Cf": "format character",
+    "Zl": "line separator",
+    "Zp": "paragraph separator",
+    "Co": "private-use character",
+    "Cn": "unassigned character",
+}
+
 # PEP 263's cookie pattern, on line 1 or 2. Matched whatever line 1 holds,
 # which is stricter than the interpreter and never weaker.
 _CODING_COOKIE = re.compile(r"^[ \t\f]*#.*?coding[:=]")
@@ -26,8 +39,10 @@ def normalise_script(raw: bytes) -> str:
     """Return `raw` as strict UTF-8 text with CRLF turned into LF.
 
     Raises `InputError("static_reject")` for a BOM, invalid UTF-8, a coding
-    cookie, a CR not followed by LF, or any control (Cc) or format (Cf)
-    character other than tab and LF. The reason gives the rule, the line and
+    cookie, a CR not followed by LF, or any control (Cc), format (Cf), line or
+    paragraph separator (Zl, Zp), private-use (Co) or unassigned (Cn)
+    character other than tab and LF. Such characters can still be written as
+    escape sequences inside string literals. The reason gives the rule, the line and
     the column, and names a character only by its code point.
     """
     if raw.startswith(b"\xef\xbb\xbf"):
@@ -51,11 +66,9 @@ def normalise_script(raw: bytes) -> str:
             if text.startswith("\n", index + 1):
                 continue
             raise _reject("CR not followed by LF (U+000D)", line, column)
-        category = unicodedata.category(char)
-        if category == "Cc":
-            raise _reject(f"control character U+{ord(char):04X}", line, column)
-        if category == "Cf":
-            raise _reject(f"format character U+{ord(char):04X}", line, column)
+        kind = _REFUSED_CATEGORIES.get(unicodedata.category(char))
+        if kind is not None:
+            raise _reject(f"{kind} U+{ord(char):04X}", line, column)
 
     text = text.replace("\r\n", "\n")
     for number, first_lines in enumerate(text.split("\n", 2)[:2], start=1):
