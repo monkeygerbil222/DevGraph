@@ -93,6 +93,31 @@ class TrustStore:
             return None
         return cls(path, conn)
 
+    @staticmethod
+    def read_problem(path: Path) -> str | None:
+        """Why `open_read` would refuse the store at `path`, for `doctor`; None if nothing is found."""
+        path = Path(path)
+        try:
+            private_file_stat(path)
+        except SandboxPathError as exc:
+            return str(exc)
+        except OSError as exc:
+            return f"{path} cannot be examined: {exc.strerror or exc}"
+        conn = None
+        try:
+            conn = sqlite3.connect(f"{path.parent.resolve().joinpath(path.name).as_uri()}?mode=ro", uri=True,
+                                   timeout=_READ_TIMEOUT, isolation_level=None)
+            version = conn.execute("PRAGMA user_version").fetchone()[0]
+            conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchall()
+        except sqlite3.Error as exc:
+            return f"{path} is not a readable SQLite database ({exc})"
+        finally:
+            if conn is not None:
+                conn.close()
+        if version != TRUST_SCHEMA_VERSION:
+            return f"{path} has trust schema version {version}, expected {TRUST_SCHEMA_VERSION}"
+        return None
+
     @classmethod
     def open_write(cls, path: Path) -> TrustStore:
         """The store for writing, created (directory 0700, file 0600) if absent.

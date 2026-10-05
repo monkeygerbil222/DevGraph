@@ -25,6 +25,7 @@ from devgraph.sandbox.snapshot import provider_snapshot
 from devgraph.sandbox.trust import TrustStore
 
 GIT = git_binary()
+REAL_SCHEMA_STATUS = getattr(cli_main, "_applied_schema_status", None)  # bound before the autouse patch
 pytestmark = pytest.mark.skipif(GIT is None, reason="git is not installed")
 
 _SETUP_ENV = {
@@ -53,7 +54,9 @@ node_types:
 """
 SCRIPT = "import re\n\n\ndef derive(ctx):\n    return []\n"
 DOCS = {f"docs/r{i:02d}.md": "# runbook\n" for i in range(3)}
-APPROVE_DIGEST = re.compile(r"approve.*\b[0-9a-f]{64}\b")
+APPROVE_DIGEST = re.compile(r"approve.*\b[0-9a-fA-F]{64}\b", re.IGNORECASE)
+SHA256_DIGEST = re.compile(r"--sha256\s+[0-9a-fA-F]{64}")
+BARE_DIGEST = re.compile(r"\b[0-9a-fA-F]{64}\b")
 
 
 def _git(repo: Path, *args: str) -> None:
@@ -97,7 +100,7 @@ def settings(monkeypatch, home):
 
 @pytest.fixture(autouse=True)
 def not_pending(monkeypatch):
-    monkeypatch.setattr(cli_main, "_scripts_pending", lambda repo_id, schema_hash: False)
+    monkeypatch.setattr(cli_main, "_applied_schema_status", lambda repo_id, schema_hash: "applied")
 
 
 @pytest.fixture(autouse=True)
@@ -158,13 +161,19 @@ def state(runner) -> str:
     result = runner.invoke(app, ["config", "scripts", "list"])
     assert result.exit_code == 0, result.output
     row = next(line for line in result.output.splitlines() if PROVIDER in line)
-    return next(s for s in ("awaiting_approval", "approved", "disabled", "unavailable", "rejected", "pending")
-                if s in row)
+    return row.split("│")[3].strip()  # the State cell
 
 
 def no_approve_digest(output: str) -> None:
-    for line in output.splitlines():
+    """No approve command carrying a digest: not on one line, not as `--sha256 <hex>` even
+    across a line break, and no bare digest on a line next to one that says approve."""
+    lines = output.splitlines()
+    assert not SHA256_DIGEST.search(output), output
+    for index, line in enumerate(lines):
         assert not APPROVE_DIGEST.search(line), line
+        if BARE_DIGEST.search(line):
+            for near in lines[max(index - 1, 0):index + 2]:
+                assert "approve" not in near.lower(), (line, near)
 
 
 # --- consent helpers --------------------------------------------------------------
@@ -244,11 +253,15 @@ def test_sha256_exact_match_approves_without_a_tty(runner, repo, home):
 
 
 @pytest.mark.parametrize("given", ["0" * 64, "ab" * 31, "ab" * 33, "zz" * 32])
-def test_sha256_mismatch_refuses_and_points_at_show(runner, repo, home, given):
+def test_sha256_mismatch_steers_an_agent_to_the_user(runner, repo, home, given):
     result = runner.invoke(app, ["config", "scripts", "approve", "demo", PROVIDER, "--sha256", given])
     assert result.exit_code == 1
     out = " ".join(result.output.split())
-    assert "does not match" in out and "devgraph config scripts show demo runbook_links" in out
+    assert "does not match" in out
+    ci = out.index("--sha256 is for CI with a digest kept in a protected secret")
+    ask = out.index("ask the user to run `devgraph config scripts approve demo runbook_links` in a terminal")
+    assert ci < ask
+    assert "config scripts show" not in out[:ci]
     assert given not in result.output
     assert not store_path(home).exists()
     no_approve_digest(result.output)
@@ -344,6 +357,38 @@ def test_approve_without_a_name_walks_providers_awaiting_approval(tmp_path, sett
     assert again.exit_code == 0 and "nothing awaiting approval" in again.output.lower()
 
 
+def test_approve_walk_skips_a_provider_with_findings_and_exits_1(tmp_path, settings, home, tty, runner):
+    schema = SCHEMA.replace("node_types:", "  - name: bad\n    inputs: [\"docs/*.md\"]\nnode_types:")
+    root = make_repo(tmp_path / "walk", files(schema=schema, **{".devgraph/providers/bad.py": "import socket\n"}))
+    register(settings, root)
+    result = runner.invoke(app, ["config", "scripts", "approve", "demo"], input=f"{PROVIDER}\n")
+    assert result.exit_code == 1, result.output
+    out = " ".join(result.output.split())
+    assert "Skipping bad" in out and "socket" in out
+    store = TrustStore.open_read(store_path(home))
+    with store:
+        canon = paths.canonical_repo_path(root)
+        assert store.active_digests("demo", canon, PROVIDER) and not store.active_digests("demo", canon, "bad")
+    rest = runner.invoke(app, ["config", "scripts", "approve", "demo"])
+    assert rest.exit_code == 1 and "nothing awaiting approval" in rest.output.lower()
+
+
+def test_unreadable_inputs_cannot_be_approved(tmp_path, settings, home, tty, runner):
+    outside = tmp_path / "outside.md"
+    outside.write_text("secret\n")
+    root = make_repo(tmp_path / "links", files())
+    (root / "docs" / "link.md").symlink_to(outside)
+    _git(root, "add", "docs/link.md")
+    _git(root, "commit", "-q", "-m", "link")
+    register(settings, root)
+    for result in (approve(runner, PROVIDER),
+                   runner.invoke(app, ["config", "scripts", "approve", "demo", PROVIDER, "--sha256",
+                                       provider_snapshot(root, PROVIDER, git=GIT).digest])):
+        assert result.exit_code == 1, result.output
+        assert "inputs cannot be read" in result.output and "link.md" in result.output
+    assert not store_path(home).exists()
+
+
 # --- §5.6 multiple digests -------------------------------------------------------------
 
 
@@ -391,7 +436,7 @@ def test_kept_older_digest_is_marked_with_its_date(runner, repo, home, tty):
     out = runner.invoke(app, ["config", "scripts", "list"]).output
     first = next(a for a in approvals(home, repo) if a.digest == digest(repo))
     row = next(line for line in out.splitlines() if PROVIDER in line)
-    assert "approved" in row and "kept" in row and first.approved_at[:10] in row
+    assert "approved" in row and "kept" in row and first.approved_at[:10] in row and "UTC" in row
 
 
 def test_revoke_stops_active_digest(runner, repo, home, tty):
@@ -400,6 +445,7 @@ def test_revoke_stops_active_digest(runner, repo, home, tty):
     assert state(runner) == "approved"
     result = runner.invoke(app, ["config", "scripts", "revoke", "demo", PROVIDER])
     assert result.exit_code == 0, result.output
+    assert "no longer runs" in " ".join(result.output.split())
     assert approvals(home, repo) == []
     assert state(runner) == "awaiting_approval"
 
@@ -414,6 +460,11 @@ def test_revoke_one_digest(runner, repo, home):
     result = runner.invoke(app, ["config", "scripts", "revoke", "demo", PROVIDER, "--digest", first[:12]])
     assert result.exit_code == 0, result.output
     assert [a.digest for a in approvals(home, repo)] == [second]
+    out = " ".join(result.output.split())
+    assert "no longer runs" not in out
+    assert first[:12] in out and "current digest" in out and second[:12] in out and "still approved" in out
+    last = runner.invoke(app, ["config", "scripts", "revoke", "demo", PROVIDER, "--digest", second])
+    assert "no longer runs" in " ".join(last.output.split())
     unknown = runner.invoke(app, ["config", "scripts", "revoke", "demo", PROVIDER, "--digest", "f" * 64])
     assert unknown.exit_code == 1
 
@@ -481,9 +532,24 @@ def test_show_prints_the_digest_alone_on_its_line(runner, repo, home, tty):
     for line in lines:
         assert digest(repo) not in line or line == digest(repo)
     for expected in ("state: disabled", paths.canonical_repo_path(repo), f".devgraph/providers/{PROVIDER}.py",
-                     "3 matched", "docs/r00.md", "denylist", "Approval history"):
+                     "3 matched", "docs/r00.md", "denylist", "Approval history", "UTC"):
         assert expected.lower() in result.output.lower(), expected
+    at = lines.index(digest(repo))
+    assert lines[at - 1] == "Digest (for review):"
+    assert "not to be passed to --sha256 by an automated agent" in " ".join(lines[at + 1:at + 3])
     no_approve_digest(result.output)
+
+
+@pytest.mark.parametrize("script, expected", [
+    ("def derive(ctx):\n  return (\n", "rejected"),
+    ("import socket\n\ndef derive(ctx):\n    return []\n", "disabled"),
+])
+def test_show_offers_no_approve_hint_when_approval_would_be_refused(tmp_path, settings, runner, script, expected):
+    root = make_repo(tmp_path / "nohint", files(script=script))
+    register(settings, root)
+    result = runner.invoke(app, ["config", "scripts", "show", "demo", PROVIDER])
+    assert f"State: {expected}" in result.output
+    assert "config scripts approve" not in result.output
 
 
 def test_hostile_characters_are_shown_escaped(tmp_path, settings, runner, tty):
@@ -570,7 +636,31 @@ def test_remove_warns_when_the_trust_store_cannot_be_written(runner, repo, home,
     monkeypatch.setattr(cli_main, "GraphEngine", _StubGraph)
     result = runner.invoke(app, ["remove", "demo"])
     assert result.exit_code == 0, result.output
-    assert "Warning" in result.output and "trust" in result.output
+    out = " ".join(result.output.split())
+    assert "Warning" in out and "trust" in out
+    assert "grant nothing" not in out and "cleared when" in out
+
+
+def test_re_adding_a_repository_never_inherits_old_trust_rows(runner, tmp_path, settings, home, tty, monkeypatch):
+    monkeypatch.setattr(cli_main, "GraphEngine", _NoGraph)
+    root = make_repo(tmp_path / "again", files())
+    first = runner.invoke(app, ["add", str(root)])
+    repo_id = re.search(r"Registered: (\S+)", " ".join(first.output.split()))[1]
+    assert runner.invoke(app, ["config", "scripts", "enable", repo_id], input=f"{repo_id}\n").exit_code == 0
+    assert runner.invoke(app, ["config", "scripts", "approve", repo_id, PROVIDER], input=f"{PROVIDER}\n").exit_code == 0
+    registry = RepoRegistry(settings.registry_db_path)  # a remove whose trust cleanup failed
+    try:
+        registry.remove_repo(repo_id)
+    finally:
+        registry.close()
+    again = runner.invoke(app, ["add", str(root)])
+    assert again.exit_code == 0, again.output
+    assert re.search(r"Registered: (\S+)", " ".join(again.output.split()))[1] == repo_id
+    store = TrustStore.open_read(store_path(home))
+    with store:
+        canon = paths.canonical_repo_path(root)
+        assert not store.scripts_enabled(repo_id, canon)
+        assert store.approvals(repo_id, canon, PROVIDER) == []
 
 
 def doctor(runner, monkeypatch):
@@ -624,8 +714,27 @@ def test_doctor_reports_a_corrupt_trust_store(runner, repo, home, monkeypatch):
     store_path(home).write_bytes(b"not a database")
     os.chmod(store_path(home), 0o600)
     result, section = doctor(runner, monkeypatch)
-    assert "trust store" in section and "cannot be read" in section
+    assert "trust store" in section and "not a readable SQLite database" in section
     assert "doctor found one or more failing checks" in result.output
+
+
+def test_doctor_names_a_permission_problem_on_the_trust_store(runner, repo, home, tty, monkeypatch):
+    assert approve(runner, PROVIDER).exit_code == 0
+    os.chmod(store_path(home), 0o666)
+    _, section = doctor(runner, monkeypatch)
+    assert "writable by group or others" in section and "chmod 600" in section
+    assert "corrupt" not in section
+
+
+def test_doctor_tells_project_config_off_from_a_gate_read_off(runner, repo, home, monkeypatch):
+    assert runner.invoke(app, ["config", "disable", "demo"]).exit_code == 0
+    _, off = doctor(runner, monkeypatch)
+    assert "project config is off" in off and "`devgraph config enable demo`" in off
+    assert runner.invoke(app, ["config", "enable", "demo"]).exit_code == 0
+    os.chmod(paths.fixed_registry_path(home), 0o664)
+    _, gate = doctor(runner, monkeypatch)
+    assert "project config is on, but the script gate reads it as off" in gate
+    assert "`devgraph config enable demo`" not in gate
 
 
 def test_doctor_reports_registry_location_mismatch(runner, tmp_path, monkeypatch):
@@ -644,3 +753,74 @@ def test_doctor_follows_a_symlinked_devgraph_dir_as_the_gates_do(runner, repo, h
     (home / ".devgraph").symlink_to(real)
     _, section = doctor(runner, monkeypatch)
     assert "writable by group or others" not in section
+
+
+# --- an unreachable graph, and gate log lines -------------------------------------------------
+
+
+@pytest.fixture
+def unreachable(monkeypatch):
+    monkeypatch.setattr(cli_main, "_applied_schema_status", lambda repo_id, schema_hash: "unreachable")
+
+
+def test_unreachable_graph_is_pending_and_says_so(runner, repo, home, tty, monkeypatch):
+    assert enable(runner).exit_code == 0
+    assert approve(runner, PROVIDER).exit_code == 0
+    monkeypatch.setattr(cli_main, "_applied_schema_status", lambda repo_id, schema_hash: "unreachable")
+    assert state(runner) == "pending"
+    row = next(line for line in runner.invoke(app, ["config", "scripts", "list"]).output.splitlines()
+               if PROVIDER in line)
+    note = row.split("│")[7]
+    assert "graph unreachable" in note and "start Neo4j" in note and "approved" in note
+    result, section = doctor(runner, monkeypatch)
+    assert "pending" in section and "graph unreachable" in section and "start Neo4j" in section
+    no_approve_digest(result.output)
+
+
+def test_pending_with_a_reachable_graph_says_rescan(runner, repo, monkeypatch):
+    monkeypatch.setattr(cli_main, "_applied_schema_status", lambda repo_id, schema_hash: "pending")
+    assert state(runner) == "pending"
+    _, section = doctor(runner, monkeypatch)
+    assert "devgraph rescan demo --now" in section and "graph unreachable" not in section
+
+
+def test_applied_schema_status_reports_an_unreachable_graph(monkeypatch):
+    real = REAL_SCHEMA_STATUS
+    monkeypatch.setattr(cli_main, "GraphEngine", _NoGraph)
+    assert real("demo", "sha256:x") == "unreachable"
+
+    class Applied(_StubGraph):
+        def read_applied_schema(self, repo_id):
+            return {"hash": "sha256:x"}
+
+    monkeypatch.setattr(cli_main, "GraphEngine", Applied)
+    assert real("demo", "sha256:x") == "applied"
+    assert real("demo", "sha256:y") == "pending"
+
+
+def test_gate_warnings_are_not_repeated(tmp_path, settings, home, runner, monkeypatch, caplog):
+    schema = SCHEMA.replace("node_types:", "  - name: other\n    inputs: [\"docs/*.md\"]\nnode_types:")
+    root = make_repo(tmp_path / "logs", files(schema=schema, **{".devgraph/providers/other.py": SCRIPT}))
+    register(settings, root)
+    os.chmod(paths.fixed_registry_path(home), 0o664)  # gate 1 logs a warning on every read
+
+    def gate1_records():
+        return [r for r in caplog.records if "script gate 1" in r.getMessage()]
+
+    result = runner.invoke(app, ["config", "scripts", "list"])
+    assert result.exit_code == 0, result.output
+    assert len(gate1_records()) == 1  # two providers, one line
+    caplog.clear()
+    doctor(runner, monkeypatch)
+    assert len(gate1_records()) == 1
+
+
+@pytest.mark.parametrize("output", [
+    "devgraph config scripts approve demo x --sha256 " + "ab" * 32,
+    "Approve with:\n" + "AB" * 32,
+    "ab" * 32 + "\nthen approve it",
+    "run it with --sha256\n" + "ab" * 32,
+])
+def test_digest_scanner_catches_split_and_adjacent_forms(output):
+    with pytest.raises(AssertionError):
+        no_approve_digest(output)

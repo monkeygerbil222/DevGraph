@@ -1,7 +1,9 @@
 """No DevGraph output prints an approve command carrying a digest (spec §5.4).
 
-Every line of every CLI, doctor, `add` and dashboard output in these scenarios is
-scanned for `approve` followed anywhere on the line by 64 hex characters.
+Every CLI, doctor, `add`, `remove` and dashboard output in these scenarios is scanned
+(`no_approve_digest`) for `approve` followed anywhere on the line by 64 hex characters,
+for `--sha256` followed by 64 hex characters (across line breaks too), and for a bare
+64-hex string on a line next to one that says approve.
 """
 
 from __future__ import annotations
@@ -18,8 +20,10 @@ from devgraph.sandbox.snapshot import provider_snapshot
 from tests.cli.test_scripts_cli import (  # noqa: F401
     GIT,
     PROVIDER,
+    SCRIPT,
     _DownGraph,
     _NoGraph,
+    _StubGraph,
     files,
     home,
     linux,
@@ -64,6 +68,55 @@ def test_no_output_contains_approve_command_with_digest(runner, tmp_path, settin
     monkeypatch.setattr(main_module, "resolve_podman", lambda: None)
     monkeypatch.setattr(main_module, "GraphEngine", _DownGraph)
     outputs.append(runner.invoke(app, ["doctor"]).output)
+
+    # Approved again, then project config off and on: the resume lines.
+    monkeypatch.setattr(consent, "require_tty", lambda *a, **k: None)
+    outputs.append(runner.invoke(app, [*scripts, "enable", repo_id], input=f"{repo_id}\n").output)
+    outputs.append(runner.invoke(app, [*scripts, "approve", repo_id], input=f"{PROVIDER}\n").output)
+    outputs.append(runner.invoke(app, ["config", "disable", repo_id]).output)
+    resumed = runner.invoke(app, ["config", "enable", repo_id]).output
+    assert "resumes without re-approval" in " ".join(resumed.split())
+    outputs.append(resumed)
+    outputs.append(runner.invoke(app, ["doctor"]).output)  # approved
+    for status in ("pending", "unreachable"):
+        monkeypatch.setattr(main_module, "_applied_schema_status", lambda repo_id, schema_hash, s=status: s)
+        outputs.append(runner.invoke(app, ["doctor"]).output)
+        outputs.append(runner.invoke(app, [*scripts, "list"]).output)
+        outputs.append(runner.invoke(app, [*scripts, "show", repo_id, PROVIDER]).output)
+    monkeypatch.setattr(main_module, "_applied_schema_status", lambda repo_id, schema_hash: "applied")
+    (fresh / ".devgraph" / "providers" / f"{PROVIDER}.py").write_text(SCRIPT + "# changed\n")
+    awaiting = runner.invoke(app, ["doctor"]).output
+    assert "awaiting_approval" in awaiting
+    outputs.append(awaiting)
+
+    # A repository whose walk skips a provider with findings and a rejected one.
+    schema = files()["devgraph.schema.yaml"].replace(
+        "node_types:", '  - name: bad\n    inputs: ["docs/*.md"]\n  - name: broken\n    inputs: ["docs/*.md"]\nnode_types:')
+    mixed = make_repo(tmp_path / "mixed", files(schema=schema, **{
+        ".devgraph/providers/bad.py": "import socket\n",
+        ".devgraph/providers/broken.py": "def derive(ctx):\n  return (\n",
+    }))
+    monkeypatch.setattr(main_module, "GraphEngine", _NoGraph)
+    added = runner.invoke(app, ["add", str(mixed)]).output
+    outputs.append(added)
+    mixed_id = re.search(r"Registered: (\S+)", " ".join(added.split()))[1]
+    for args, typed in [
+        (["enable", mixed_id], mixed_id),
+        (["approve", mixed_id], PROVIDER),  # walk: approves one, skips two
+        (["approve", mixed_id], ""),  # nothing awaiting, still skips
+        (["approve", mixed_id, "bad"], "bad"),  # findings
+        (["approve", mixed_id, "broken"], "broken"),  # rejected
+        (["approve", mixed_id, "bad", "--sha256", current], ""),
+        (["revoke", mixed_id, PROVIDER, "--digest", "zz"], ""),
+        (["revoke", mixed_id, PROVIDER, "--digest", current], ""),
+        (["revoke", mixed_id, PROVIDER, "--digest", "0" * 12], ""),
+        (["show", mixed_id, "bad"], ""),
+        (["show", mixed_id, "broken"], ""),
+        (["list"], ""),
+    ]:
+        outputs.append(runner.invoke(app, [*scripts, *args], input=f"{typed}\n").output)
+    monkeypatch.setattr(main_module, "GraphEngine", _StubGraph)
+    outputs.append(runner.invoke(app, ["remove", mixed_id]).output)
 
     from fastapi import FastAPI
     from fastapi.testclient import TestClient

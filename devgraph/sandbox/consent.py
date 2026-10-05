@@ -22,6 +22,7 @@ import hmac
 import json
 import re
 import sys
+from datetime import datetime, timezone
 from typing import TextIO
 
 from rich.cells import cell_len
@@ -64,6 +65,17 @@ def digest_matches(given: str, current: str) -> bool:
     if not isinstance(given, str) or not _HEX_DIGEST.fullmatch(given):
         return False
     return hmac.compare_digest(given.lower().encode("ascii"), current.lower().encode("ascii"))
+
+
+def utc_time(iso: str) -> str:
+    """A stored ISO-8601 timestamp as `YYYY-MM-DD HH:MM:SS UTC` (as given, escaped, if unparsable)."""
+    try:
+        moment = datetime.fromisoformat(iso)
+    except (TypeError, ValueError):
+        return visible(str(iso))
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
 def pretty_declaration(declaration_json: str) -> str:
@@ -122,7 +134,7 @@ def review_lines(
         body = declaration.splitlines()
     else:
         old = pretty_declaration(previous.declaration_json)
-        lines.append(f"Declaration changes since the approval at {visible(previous.approved_at)}:")
+        lines.append(f"Declaration changes since the approval at {utc_time(previous.approved_at)}:")
         body = _diff(old, declaration) or ["(unchanged)"]
     lines += _flag([visible(line) for line in body], width)
 
@@ -139,7 +151,7 @@ def review_lines(
             shown.pop()
         numbered = [f"{n:>4} | {line}" for n, line in enumerate(shown, 1)]
     else:
-        lines.append(f"Script changes since the approval at {visible(previous.approved_at)}:")
+        lines.append(f"Script changes since the approval at {utc_time(previous.approved_at)}:")
         # Diff lines carry no literal spans, so every non-ASCII character in them is escaped.
         numbered = [script_for_review(line, []) for line in _diff(previous.script_text, snap.script_text)]
         numbered = numbered or ["(unchanged)"]
