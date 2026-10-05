@@ -63,3 +63,13 @@ def real_project_trust():
     from devgraph.config import project_trust
 
     return project_trust
+
+
+@pytest.fixture(autouse=True)
+def _wide_cli_console(monkeypatch):
+    """Keep Rich output from wrapping at the terminal width (e.g. long tmp paths)."""
+    monkeypatch.setenv("COLUMNS", "1000")
+    from devgraph.cli import main
+
+    # The CLI console is created at import time, so it has already read COLUMNS.
+    monkeypatch.setattr(main.console, "_width", 1000)
