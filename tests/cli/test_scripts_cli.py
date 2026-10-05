@@ -55,7 +55,7 @@ node_types:
 SCRIPT = "import re\n\n\ndef derive(ctx):\n    return []\n"
 DOCS = {f"docs/r{i:02d}.md": "# runbook\n" for i in range(3)}
 APPROVE_DIGEST = re.compile(r"approve.*\b[0-9a-fA-F]{64}\b", re.IGNORECASE)
-SHA256_DIGEST = re.compile(r"--sha256\s+[0-9a-fA-F]{64}")
+SHA256_DIGEST = re.compile(r"--sha256[\s=]+[0-9a-fA-F]{64}")
 BARE_DIGEST = re.compile(r"\b[0-9a-fA-F]{64}\b")
 
 
@@ -820,6 +820,7 @@ def test_gate_warnings_are_not_repeated(tmp_path, settings, home, runner, monkey
     "Approve with:\n" + "AB" * 32,
     "ab" * 32 + "\nthen approve it",
     "run it with --sha256\n" + "ab" * 32,
+    "pass --sha256=" + "ab" * 32,
 ])
 def test_digest_scanner_catches_split_and_adjacent_forms(output):
     with pytest.raises(AssertionError):
