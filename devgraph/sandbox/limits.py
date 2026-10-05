@@ -11,6 +11,11 @@ SCRIPT_MAX_BYTES = 64 * 1024  # over: static_reject
 INPUT_MAX_FILE_BYTES = 1024 * 1024  # over: input_cap, file skipped
 INPUT_MAX_RUN_BYTES = 32 * 1024 * 1024  # over: input_cap, run refused
 INPUT_MAX_FILES = 5_000  # over: input_cap
+INDEX_MAX_ENTRIES = 50 * INPUT_MAX_FILES  # git index entries read for selection; over: input_cap
+
+# The only PATH a sandbox subprocess (selection's `git`, the static-scan worker) sees.
+FIXED_PATH = "/usr/bin:/bin"
+GIT_TIMEOUT_SECONDS = 30
 
 # Approval display (§3.2, §5.4).
 APPROVAL_SAMPLE_SIZE = 20  # first N sorted matched paths
@@ -26,6 +31,7 @@ MAX_ACTIVE_DIGESTS = 5
 SCAN_WALL_SECONDS = 5
 SCAN_RLIMIT_AS_BYTES = 256 * 1024 * 1024
 SCAN_RLIMIT_CPU_SECONDS = 5
+SCAN_OUTPUT_MAX_BYTES = 1024 * 1024  # worker stdout; over: static_reject
 SCAN_FEATURE_VERSION = (3, 11)  # the image's Python minor version
 
 # Secret-name denylist (§3.2): always applies, matched on the NFC-normalised,

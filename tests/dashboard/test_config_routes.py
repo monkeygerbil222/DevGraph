@@ -464,7 +464,7 @@ def test_schema_add_replace_and_delete_with_dry_run_warnings(client, registry, t
     assert any("no provider produces Gadget" in n for n in added.json()["notes"])
     assert [n["label"] for n in added.json()["scope"]["schema"]["node_types"]] == ["Widget", "Gadget"]
 
-    rel = "type: FEEDS\nprovider: custom\ncustom: {name: gadget_feeds}\nfrom: Widget\nto: Gadget\n"
+    rel = "type: MENTIONS\nfrom: Widget\nto: Gadget\n"  # not custom: the dashboard refuses those (Q13)
     rel_added = _send(client, "POST", "/api/config/repo-a/schema/relationships", _fp(client, "repo-a", "schema"),
                       {"yaml": rel})
     assert rel_added.status_code == 201, rel_added.text
@@ -477,14 +477,14 @@ def test_schema_add_replace_and_delete_with_dry_run_warnings(client, registry, t
     assert dry.json()["written"] is False and any("keeps the old key" in w for w in dry.json()["warnings"])
 
     before = schema.read_bytes()
-    dry_delete = _send(client, "DELETE", "/api/config/repo-a/schema/relationships/FEEDS?dry_run=1",
+    dry_delete = _send(client, "DELETE", "/api/config/repo-a/schema/relationships/HAS_PART?dry_run=1",
                        _fp(client, "repo-a", "schema"))
     assert dry_delete.status_code == 200 and dry_delete.json()["written"] is False
-    assert any("FEEDS" in w for w in dry_delete.json()["warnings"])
+    assert any("HAS_PART" in w for w in dry_delete.json()["warnings"])
     assert schema.read_bytes() == before
 
-    deleted = _send(client, "DELETE", "/api/config/repo-a/schema/relationships/FEEDS", _fp(client, "repo-a", "schema"))
-    assert deleted.status_code == 200 and "FEEDS" not in schema.read_text()
+    deleted = _send(client, "DELETE", "/api/config/repo-a/schema/relationships/HAS_PART", _fp(client, "repo-a", "schema"))
+    assert deleted.status_code == 200 and "HAS_PART" not in schema.read_text()
 
 
 def test_schema_entry_in_the_wrong_section_is_refused(client, registry, tmp_path):
@@ -1571,11 +1571,11 @@ def test_relationship_copy_with_a_missing_endpoint_is_422(client, registry, tmp_
     _repo(tmp_path, registry, "repo-a")
     b = _repo(tmp_path, registry, "repo-b")
     _write(b.path, SCHEMA_FILENAME, "version: 1\nnode_types: []\n")
-    rel = "type: FEEDS\nprovider: custom\ncustom: {name: f}\nfrom: Widget\nto: Widget\n"
+    rel = "type: MENTIONS\nfrom: Widget\nto: Widget\n"
     res = _send(client, "POST", "/api/config/repo-b/schema/relationships", _fp(client, "repo-b", "schema"),
                 {"yaml": rel, "dry_run": True})
     assert res.status_code == 422
-    assert res.json()["detail"]["code"] == "invalid"
+    assert res.json()["detail"]["code"] == "invalid" and "Widget" in res.json()["detail"]["message"]
 
 
 def test_copy_to_a_stale_destination_is_412_and_leaves_bytes_alone(client, registry, tmp_path):
@@ -1804,3 +1804,150 @@ def test_alias_bomb_in_schema_file_is_refused_quickly(client, registry, tmp_path
     block = project["schema"]
     assert block["state"] == "invalid" and block["node_types"] == []
     assert "more than 10000" in block["error"]
+
+
+# --- Q13: the dashboard refuses creating or editing custom provider declarations ------------------
+
+CUSTOM_SCHEMA = """
+    version: 1
+    custom_providers:
+      - {name: runbook_links, inputs: ["docs/*.md"]}
+    node_types:
+      - label: Doc
+        key: [path]
+        metadata: [{name: path, required: true}]
+        source: {provider: filesystem, kind: file}
+      - label: Runbook
+        key: [slug]
+        metadata: [{name: slug, required: true}]
+        source: {provider: custom, name: runbook_links}
+    relationships:
+      - type: DOCUMENTS
+        provider: custom
+        custom: {name: runbook_links, params: {}}
+        from: Runbook
+        to: Service
+      - type: MENTIONS
+        from: Doc
+        to: Service
+"""
+DOC_AS_CUSTOM = "label: Doc\nkey: [path]\nmetadata: [{name: path, required: true}]\nsource: {provider: custom, name: runbook_links}\n"
+RUNBOOK_PLAIN = "label: Runbook\nkey: [slug]\nmetadata: [{name: slug, required: true}]\n"
+DOCUMENTS_NEW_PARAMS = "type: DOCUMENTS\nprovider: custom\ncustom: {name: runbook_links, params: {mode: strict}}\nfrom: Runbook\nto: Service\n"
+DOCUMENTS_BUILTIN = "type: DOCUMENTED_BY\nfrom: Runbook\nto: Service\n"
+MENTIONS_AS_CUSTOM = "type: MENTIONS\nprovider: custom\ncustom: {name: runbook_links}\nfrom: Doc\nto: Service\n"
+
+
+def _custom_repo(tmp_path, registry, name: str = "repo-a"):
+    record = _repo(tmp_path, registry, name)
+    _write(record.path, SCHEMA_FILENAME, CUSTOM_SCHEMA)
+    return record
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+@pytest.mark.parametrize("method,url,body", [
+    pytest.param("POST", "/api/config/repo-a/schema/node_types", CUSTOM_NODE.replace("Runbook", "Playbook"), id="add-custom-node"),
+    pytest.param("POST", "/api/config/repo-a/schema/relationships", CUSTOM_REL.replace("DOCUMENTS", "LINKS"), id="add-custom-rel"),
+    pytest.param("PUT", "/api/config/repo-a/schema/node_types/Doc", DOC_AS_CUSTOM, id="node-to-custom"),
+    pytest.param("PUT", "/api/config/repo-a/schema/relationships/MENTIONS", MENTIONS_AS_CUSTOM, id="rel-to-custom"),
+    pytest.param("PUT", "/api/config/repo-a/schema/relationships/DOCUMENTS", DOCUMENTS_NEW_PARAMS, id="edit-custom-rel-params"),
+    pytest.param("PUT", "/api/config/repo-a/schema/node_types/Runbook", RUNBOOK_PLAIN, id="custom-node-to-plain"),
+    pytest.param("PUT", "/api/config/repo-a/schema/relationships/DOCUMENTS", DOCUMENTS_BUILTIN, id="custom-rel-to-plain"),
+])
+def test_dashboard_routes_refuse_custom(client, registry, tmp_path, method, url, body, dry_run):
+    """Spec Q13: creating or editing a custom declaration is CLI or hand-edit only. Each refusal is a
+    422 naming the YAML and the CLI, with nothing written and the fingerprint unchanged."""
+    _custom_repo(tmp_path, registry)
+    fp = _fp(client, "repo-a", "schema")
+    before = _snapshot(tmp_path)
+
+    response = _send(client, method, url, fp, {"yaml": body, "dry_run": dry_run})
+
+    assert response.status_code == 422, response.text
+    detail = response.json()["detail"]
+    assert detail["code"] == "invalid"
+    assert "custom" in detail["message"] and SCHEMA_FILENAME in detail["message"]
+    assert "devgraph config schema" in detail["message"]
+    assert _snapshot(tmp_path) == before
+    assert _fp(client, "repo-a", "schema") == fp
+
+
+def test_copy_of_a_custom_entry_to_another_repo_is_refused(client, registry, tmp_path):
+    """Copy to… is a POST of the entry's YAML to the destination: a custom entry is refused there too."""
+    source = _custom_repo(tmp_path, registry, "repo-a")
+    _custom_repo(tmp_path, registry, "repo-b")
+    entries = client.get("/api/config/repo-a").json()["schema"]
+    yamls = [n["yaml"] for n in entries["node_types"] if n["label"] == "Runbook"]
+    yamls += [r["yaml"] for r in entries["relationships"] if r["type"] == "DOCUMENTS"]
+    assert len(yamls) == 2 and source
+    before = _snapshot(tmp_path)
+    for text, section in zip(yamls, ["node_types", "relationships"]):
+        for dry_run in (True, False):
+            res = _send(client, "POST", f"/api/config/repo-b/schema/{section}", _fp(client, "repo-b", "schema"),
+                        {"yaml": text, "dry_run": dry_run})
+            assert res.status_code == 422, res.text
+            assert "custom" in res.json()["detail"]["message"]
+    assert _snapshot(tmp_path) == before
+
+
+def test_form_edit_of_a_custom_relationship_is_refused(client, registry, tmp_path):
+    """The form writes a relationship as YAML in model order (configEntryYaml): an edit made there that
+    keeps the custom provider is refused like any other."""
+    _custom_repo(tmp_path, registry)
+    before = _snapshot(tmp_path)
+    form_yaml = "type: DOCUMENTS\nfrom: Runbook\nto: Service\nprovider: custom\ncustom:\n  name: runbook_links\n  params: {}\ncolor: \"#1f77b4\"\n"
+    res = _send(client, "PUT", "/api/config/repo-a/schema/relationships/DOCUMENTS", _fp(client, "repo-a", "schema"),
+                {"yaml": form_yaml})
+    assert res.status_code == 422 and "custom" in res.json()["detail"]["message"]
+    assert _snapshot(tmp_path) == before
+
+
+@pytest.mark.parametrize("url", [
+    "/api/config/repo-a/schema/node_types/Runbook", "/api/config/repo-a/schema/relationships/DOCUMENTS",
+])
+def test_deleting_a_custom_entry_is_still_allowed(client, registry, tmp_path, url):
+    record = _custom_repo(tmp_path, registry)
+    path = record.path / SCHEMA_FILENAME
+    if url.endswith("Runbook"):  # the custom relationship uses Runbook: delete it first
+        assert _send(client, "DELETE", "/api/config/repo-a/schema/relationships/DOCUMENTS",
+                     _fp(client, "repo-a", "schema")).status_code == 200
+    before = path.read_bytes()
+
+    dry = _send(client, "DELETE", url + "?dry_run=1", _fp(client, "repo-a", "schema"))
+    assert dry.status_code == 200, dry.text
+    assert dry.json()["written"] is False and path.read_bytes() == before
+
+    real = _send(client, "DELETE", url, _fp(client, "repo-a", "schema"))
+    assert real.status_code == 200, real.text
+    declared = load_project_schema(record.path, respect_switch=False)
+    assert url.rsplit("/", 1)[1] not in [n.label for n in declared.node_types] + [r.type for r in declared.relationships]
+
+
+def test_reset_schema_with_custom_providers_is_still_allowed(client, registry, tmp_path):
+    record = _custom_repo(tmp_path, registry)
+    path = record.path / SCHEMA_FILENAME
+    dry = _send(client, "POST", "/api/config/repo-a/reset/schema", _fp(client, "repo-a", "schema"), {"dry_run": True})
+    assert dry.status_code == 200, dry.text
+    assert path.exists()
+    res = _send(client, "POST", "/api/config/repo-a/reset/schema", dry.json()["fingerprint"], {})
+    assert res.status_code == 200, res.text
+    assert not path.exists()
+
+
+def test_custom_providers_is_not_a_schema_section(client, registry, tmp_path):
+    _custom_repo(tmp_path, registry)
+    before = _snapshot(tmp_path)
+    fp = _fp(client, "repo-a", "schema")
+    body = {"yaml": "name: runbook_links\ninputs: [\"docs/*.md\"]\n"}
+    assert _send(client, "POST", "/api/config/repo-a/schema/custom_providers", fp, body).status_code == 404
+    assert _send(client, "PUT", "/api/config/repo-a/schema/custom_providers/runbook_links", fp, body).status_code == 404
+    assert _send(client, "DELETE", "/api/config/repo-a/schema/custom_providers/runbook_links", fp).status_code == 404
+    assert _snapshot(tmp_path) == before
+
+
+def test_editing_a_plain_entry_in_a_file_with_custom_providers_still_works(client, registry, tmp_path):
+    record = _custom_repo(tmp_path, registry)
+    res = _send(client, "PUT", "/api/config/repo-a/schema/relationships/MENTIONS", _fp(client, "repo-a", "schema"),
+                {"yaml": "type: MENTIONS\nfrom: Doc\nto: Runbook\n"})
+    assert res.status_code == 200, res.text
+    assert "to: Runbook" in (record.path / SCHEMA_FILENAME).read_text()

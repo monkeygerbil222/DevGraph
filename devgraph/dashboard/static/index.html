@@ -3868,6 +3868,11 @@ const CONFIG_FORM_REASONS = {
   value: "This entry contains a value the page can't carry exactly (for example a date or a very large number). Edit it as YAML.",
   fromList: "This entry's `from` can't be shown as comma-separated labels exactly (a label with a comma, surrounding spaces or a non-text value). Edit it as YAML.",
   customProvider: "This entry has a `custom` block but its provider isn't custom; the form can't show that. Edit it as YAML.",
+  /* Q13: saving a custom declaration is refused by the server; the reason says where to edit it */
+  customSource: "This node type comes from a custom provider, which the dashboard can't create or edit. " +
+    "Edit devgraph.schema.yaml by hand or run `devgraph config schema edit` in a terminal; deleting it here is allowed.",
+  customRelationship: "This relationship comes from a custom provider, which the dashboard can't create or edit. " +
+    "Edit devgraph.schema.yaml by hand or run `devgraph config schema edit` in a terminal; deleting it here is allowed.",
   handEdit: "The YAML was edited by hand, and the form can only show text it produced. Keep editing as YAML, or discard the hand edits to return to the form.",
 };
 const configIsMap = v => v !== null && typeof v === "object" && !Array.isArray(v);
@@ -3936,10 +3941,11 @@ function configFormFromEntry(section, entry) {
         (k === "custom" && configIsMap(entry.custom) ? configFormBadField(entry.custom, "custom", "custom.") : null);
       if (bad) return { ok: false, reason: bad === "from" ? CONFIG_FORM_REASONS.fromList : CONFIG_FORM_REASONS.field(bad) };
     }
-    if (configIsMap(entry.custom) && entry.provider !== "custom") return { ok: false, reason: CONFIG_FORM_REASONS.customProvider };
+    if (entry.provider === "custom") return { ok: false, reason: CONFIG_FORM_REASONS.customRelationship };
+    if (configIsMap(entry.custom)) return { ok: false, reason: CONFIG_FORM_REASONS.customProvider };
     return { ok: true, form: {
       type: t(entry.type), from: "from" in entry ? configFormFromText(entry.from) : "", to: t(entry.to),
-      provider: entry.provider || "builtin", custom: t(configIsMap(entry.custom) ? entry.custom.name : null), color: t(entry.color),
+      provider: entry.provider || "builtin", color: t(entry.color),
       open: entry } };
   }
   if (section === "tools") {
@@ -3952,6 +3958,7 @@ function configFormFromEntry(section, entry) {
         required: "required" in p ? p.required : true, default: t(p.default), description: t(p.description), open: p })),
       open: entry } };
   }
+  if (configIsMap(entry.source) && entry.source.provider === "custom") return { ok: false, reason: CONFIG_FORM_REASONS.customSource };
   const metadata = entry.metadata || [];
   let bad = configFormBadField(entry, "node_type", "") || configFormBadRows(metadata, "metadata", "metadata.");
   if (!bad && configIsMap(entry.source)) {
@@ -4030,18 +4037,9 @@ function configEntryFromForm(section, form, order) {
     }
     configFormPut(vals, open, "to", form.to, id);
     configFormPutChoice(vals, open, "provider", form.provider, "builtin");
-    /* the custom name is only written for the custom provider, so switching
-       away and back keeps it; an opened `custom: null` stays unless the form
-       ends with a name under the custom provider */
-    const block = configIsMap(open.custom) ? open.custom : null;
-    const named = form.provider === "custom" && form.custom !== "";
-    if ("custom" in open && open.custom === null && !named) vals.custom = null;
-    else if (form.provider === "custom" && (block || named)) {
-      const c = {};
-      configFormPut(c, block || {}, "name", form.custom, id);
-      if (block && "params" in block) c.params = block.params;
-      vals.custom = configFormOrdered(c, Object.keys(block || {}), CONFIG_FORM_FIELDS.custom);
-    }
+    /* the form never edits a custom relationship (it opens as YAML), so the
+       only `custom` it carries is an opened `custom: null` */
+    if ("custom" in open && open.custom === null) vals.custom = null;
     configFormPut(vals, open, "color", form.color, id);
     return configFormOrdered(vals, order, CONFIG_FORM_FIELDS.relationship);
   }
@@ -4181,10 +4179,9 @@ function configFormHints(section, form, ctx) {
     if (ctx && typeOk) {
       const builtin = ctx.relationship_types.includes(form.type);
       if (form.provider === "builtin" && !builtin) {
-        hint("provider", "The builtin provider reuses one of DevGraph's relationship types; pick Custom or Filesystem to declare a new one.");
+        hint("provider", "The builtin provider reuses one of DevGraph's relationship types; pick Filesystem, or declare a custom provider in devgraph.schema.yaml, for a new one.");
       } else if (form.provider !== "builtin" && builtin) hint("provider", "`" + form.type + "` is built in: use the builtin provider to reuse it.");
     }
-    if (form.provider === "custom") nameHint("custom", form.custom, L.PROPERTY_NAME_PATTERN, "A custom provider name");
     const known = (field, label) => {
       if (ctx && !ctx.labels.includes(label)) {
         hint(field, "`" + label + "` isn't a node type this repository has (built-in, or declared in this file as last loaded).");
@@ -4511,27 +4508,12 @@ function renderConfigForm(edit) {
       (edit.op === "replace" ? " Changing it renames the relationship." : ""));
     text(box, "from", "From", "from", f, "One or more node labels, separated by commas. Each must be a node type declared in this file (or a built-in one when the file uses `extends: default`).");
     text(box, "to", "To", "to", f, "One node label: a node type declared in this file (or a built-in one when the file uses `extends: default`).");
-    const names = { builtin: "Built-in type", custom: "Custom provider", filesystem: "Filesystem (file → parent folder)" };
-    /* Provider changes only the custom name field, in place: the select keeps
-       focus while arrow keys step through the providers */
-    const holder = configEl("div", "");
-    let custom = null;
-    const fillCustom = () => {
-      if (custom) configFormEls.all.splice(configFormEls.all.indexOf(custom), 1);
-      delete configFormEls.controls.custom;
-      delete configFormEls.hints.custom;
-      holder.replaceChildren();
-      custom = null;
-      /* empty, the holder would still take a flex gap */
-      holder.style.display = f.provider === "custom" ? "" : "none";
-      if (f.provider !== "custom") return;
-      custom = configFormText_("input", f.custom, v => { f.custom = v; });
-      configFormField(holder, "custom", "Custom provider name", custom, "Recorded as data; DevGraph does not run it.");
-    };
-    configFormField(box, "provider", "Provider", configFormSelect(CONFIG_FORM_FIELDS.relationship_providers.map(p => [p, names[p]]), f.provider, [],
-      v => { f.provider = v; fillCustom(); configFormChanged(); }));
-    box.appendChild(holder);
-    fillCustom();
+    const names = { builtin: "Built-in type", filesystem: "Filesystem (file → parent folder)" };
+    /* custom is never offered: the dashboard can't create or edit a custom
+       relationship, and an existing one opens as YAML */
+    configFormField(box, "provider", "Provider",
+      configFormSelect(CONFIG_FORM_FIELDS.relationship_providers.filter(p => p !== "custom").map(p => [p, names[p]]), f.provider, [],
+        v => { f.provider = v; configFormChanged(); }));
     configFormColour(box, f);
     configFormRefresh(edit);
     return;

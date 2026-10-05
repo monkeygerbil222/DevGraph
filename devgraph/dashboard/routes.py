@@ -60,6 +60,7 @@ from devgraph.graph.schema import NODE_LABELS, RELATIONSHIP_TYPES
 from devgraph.indexer.dispatch import full_scan
 from devgraph.mcp import tools as devgraph_tools
 from devgraph.registry.store import RepoRegistry
+from devgraph.sandbox.trust import forget_repo_trust
 
 logger = logging.getLogger(__name__)
 
@@ -356,6 +357,8 @@ def build_router(
             logger.exception("repo registration failed for %s", path)
             raise HTTPException(status_code=500, detail="registration failed") from exc
 
+        # As `devgraph add` does: a re-registered id never inherits old approvals.
+        trust_warning = forget_repo_trust(record.repo_id, registering=True)
         indexed = False
         files_indexed: int | None = None
         warning: str | None = None
@@ -385,6 +388,8 @@ def build_router(
         # slugifies the id and can suffix it on collision, and mark_indexed
         # just wrote last_indexed.
         persisted = registry.get(record.repo_id)
+        if trust_warning is not None:
+            warning = f"{warning} {trust_warning}" if warning else trust_warning
         return {
             "repo_id": persisted.repo_id,
             "path": str(persisted.path),
@@ -964,6 +969,7 @@ def build_router(
         def op(root: Path) -> edits.EditResult:
             if edits.entry_section(entry) != section:
                 raise edits.ConfigEditError(f"the new entry must be a {edits.SCHEMA_SECTIONS[section][1]}", "invalid")
+            edits.refuse_custom(entry, None)  # Q13: custom declarations are CLI or hand-edit only
             return edits.add_schema_entry(root, entry, record=record, expected_fingerprint=expected, dry_run=dry_run)
 
         return await run_in_threadpool(_apply_edit, scope, record, "schema", op, True)
@@ -980,6 +986,8 @@ def build_router(
             lambda root: edits.replace_schema_entry(
                 root, name, entry, node_type=section == "node_types", relationship=section == "relationships",
                 record=record, expected_fingerprint=expected, dry_run=dry_run,
+                # Q13, under the edit's lock: neither the new entry nor the one it replaces may be custom
+                check=lambda existing: edits.refuse_custom(entry, existing),
             ),
             False,
         )

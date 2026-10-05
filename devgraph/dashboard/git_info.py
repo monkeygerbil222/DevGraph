@@ -6,7 +6,7 @@ mirror `indexer/git_history/extractor.py` (`hexsha`, `message.strip()`,
 `author.name`, `authored_datetime`) since that's the existing convention for
 reading commits in this codebase.
 
-Every function opens its own `Repo` in a `with` block -- GitPython holds
+Every function opens its own `Repo` (via `devgraph.git_safe.open_repo`) in a `with` block -- GitPython holds
 open file handles into `.git/` for the life of a `Repo` object, and leaving
 one open blocks its directory from being removed/renamed on Windows.
 """
@@ -16,7 +16,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from git import Repo
+from devgraph.git_safe import open_repo
 
 
 def get_git_log(repo_path: Path, limit: int) -> list[dict[str, Any]]:
@@ -29,7 +29,7 @@ def get_git_log(repo_path: Path, limit: int) -> list[dict[str, Any]]:
     (`len(parents) > 1`) and lane layout are derived client-side from this
     real parent graph.
     """
-    with Repo(str(repo_path)) as repo:
+    with open_repo(repo_path) as repo:
         try:
             commits = list(repo.iter_commits(max_count=limit))
         except ValueError:
@@ -56,8 +56,12 @@ def get_git_status(repo_path: Path) -> dict[str, Any]:
     other `git_repo.git.<cmd>()` calls) rather than GitPython's diff/index
     APIs, which is simpler to get right for the modified/untracked/staged
     distinction the porcelain format already encodes per-line.
+
+    `--ignore-submodules=all` keeps status out of submodules: it would
+    otherwise run a nested `git status` under each submodule's own config,
+    whose filter drivers `open_repo` never saw.
     """
-    with Repo(str(repo_path)) as repo:
+    with open_repo(repo_path) as repo:
         try:
             branch = repo.active_branch.name
         except TypeError:
@@ -66,7 +70,7 @@ def get_git_status(repo_path: Path) -> dict[str, Any]:
             except (ValueError, TypeError):
                 branch = "no commits yet"
 
-        porcelain = repo.git.status("--porcelain")
+        porcelain = repo.git.status("--porcelain", "--ignore-submodules=all")
         entries: list[dict[str, str]] = []
         for line in porcelain.splitlines():
             if not line.strip():

@@ -11,12 +11,12 @@ query strings.
 from pathlib import Path
 from typing import Any
 
-import git
 import json
 import os
 import subprocess
 
 from devgraph.config.project_schema import LABEL_PATTERN, ProjectSchemaError, resolve_effective_schema
+from devgraph.git_safe import open_repo
 from devgraph.graph.engine import GraphEngine
 from devgraph.graph import schema
 from devgraph.paths import is_within
@@ -64,17 +64,22 @@ def _sanitize_row(row: dict) -> dict:
     return {k: _sanitize_value(v) for k, v in row.items()}
 
 
+# `owner/name` as GitHub allows them; the slug comes from repo config and is
+# passed to `gh --repo`.
+_GH_SLUG_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9._-]+")
+
+
 def _resolve_gh_repo(repo_path: str) -> str | None:
     """Resolve a local repo path to its 'owner/name' GitHub slug via git remote.
     Returns None if no 'origin' remote exists or parsing fails."""
     try:
-        repo = git.Repo(repo_path)
+        repo = open_repo(repo_path)
         remote_url = repo.remote("origin").url
         repo.close()
         if "github.com" not in remote_url:
             return None
-        slug = remote_url.rstrip(".git").split("github.com")[-1].lstrip(":/")
-        return slug if "/" in slug else None
+        slug = remote_url.removesuffix(".git").split("github.com")[-1].lstrip(":/")
+        return slug if _GH_SLUG_RE.fullmatch(slug) else None
     except Exception:
         return None
 
@@ -824,10 +829,12 @@ def impact_analysis_for_diff(
 
     git_repo = None
     try:
-        git_repo = git.Repo(str(repo.path))
+        git_repo = open_repo(repo.path)
         git_repo.commit(base_ref)
         git_repo.commit(head_ref)
-        diff_output = git_repo.git.diff("--name-only", f"{base_ref}..{head_ref}")
+        # Without rename detection the diff needs only trees, never blob
+        # content, so it also works in a partial clone.
+        diff_output = git_repo.git.diff("--name-only", "--no-renames", f"{base_ref}..{head_ref}")
     except Exception as exc:
         return {**empty, "error": f"could not diff {base_ref}..{head_ref}: {exc}"}
     finally:

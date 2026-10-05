@@ -215,15 +215,15 @@ a plain `git ls-files -z` runs the program named by a repository-local
 invocation is therefore fixed:
 
 ```
-git --no-pager -C <canonical root>
+git --no-pager -C <real root path>
     -c core.fsmonitor=false -c core.untrackedCache=false
-    ls-files -z --cached
+    ls-files -z --cached --sparse -t --stage
 ```
 
 run with a constructed environment, not a filtered copy of the caller's:
 `PATH` fixed, `HOME` set to an empty temporary directory, `GIT_CONFIG_NOSYSTEM=1`,
 `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CEILING_DIRECTORIES=<parent of root>`,
-`GIT_PAGER=cat`, `LC_ALL=C`, and nothing else (no `GIT_DIR`, `GIT_WORK_TREE`,
+`GIT_NO_LAZY_FETCH=1`, `GIT_PAGER=cat`, `LC_ALL=C`, and nothing else (no `GIT_DIR`, `GIT_WORK_TREE`,
 `GIT_INDEX_FILE`, `GIT_EXEC_PATH`, `GIT_CONFIG_*`, `GIT_TRACE*`). The git binary
 is resolved once to an absolute path from the fixed `PATH`.
 
@@ -237,6 +237,41 @@ resolving to an enclosing repository (verified). `ls-files` runs no hooks, so
 `core.hooksPath` is irrelevant. A repository owned by another user now fails
 `safe.directory`: `input_unavailable`, fail closed.
 
+`--cached` is not enough on its own (found in E1 review, verified on git
+2.55). In a partial clone (`extensions.partialClone` naming a promisor
+remote) with a sparse index, a plain `ls-files` expands the index, reads the
+collapsed directories' tree objects, finds them missing and lazily fetches
+them from the promisor remote. That fetch runs whatever the repository
+configures: `core.sshCommand` for an ssh URL, `remote.<name>.uploadpack` for a
+local one, or an `ext::<program>` URL when repository-local
+`protocol.ext.allow=always` (which also overrides a command-line
+`protocol.allow=never`). `GIT_NO_LAZY_FETCH=1` is the guard: git refuses
+any lazy fetch. `--sparse` is defence in depth for cone mode only: it keeps a
+cone-mode sparse index collapsed (no tree objects are read), but with
+non-cone patterns (`core.sparseCheckoutCone=false`) git expands the index
+anyway and, without the environment guard, the fetch runs (verified; E1's
+test covers both layouts).
+`GIT_NO_LAZY_FETCH` exists from git 2.45, so an older git (checked with
+`git --version` under the same environment) is `input_unavailable`, and
+`doctor` reports it. Partial clones are allowed, not refused: blobless and
+treeless clones are common, and with both guards no fetch is attempted
+(E1's test covers all three transports with marker programs).
+
+`-t --stage` gives each entry's tag and mode. Selection keeps only regular
+files and symlinks (modes 100644, 100755, 120000) that are not skip-worktree
+(`S`): out-of-cone files of a sparse checkout, collapsed sparse directories
+(mode 040000) and gitlinks (submodules, 160000) are dropped the same way
+whether or not the index is sparse. Repeated paths (an unmerged entry's
+stages) count once.
+
+The real resolved path, not the NFC trust-key form, goes to `-C`, so a
+repository directory with an NFD name still resolves. Output is streamed and
+filtered as it is read; once the matches exceed the per-run file cap, or the
+index exceeds `INDEX_MAX_ENTRIES` (50 × the file cap) entries, git's process
+group is killed and the run is `input_cap`, so a huge index is never
+buffered whole. One 30 s deadline covers the version check, the read and the
+final wait.
+
 Any non-zero exit, or no git binary, means `input_unavailable` and the
 provider does not run. Reading the index directly was considered and rejected:
 index versions 2–4, split and sparse indexes are more parser surface than four
@@ -246,21 +281,26 @@ Candidates are then filtered by the declared globs, `IGNORED_DIR_NAMES`, and a
 **secret-name denylist** that always applies and cannot be overridden in E
 (`.env*`, `*.pem`, `*.key`, `*.p12`, `*.pfx`, `id_rsa*`, `id_ed25519*`,
 `id_ecdsa*`, `.netrc`, `.npmrc`, `.pypirc`, `.git-credentials`, `*.kdbx`,
-`*.tfstate*`, `*credential*`, `*secret*`). Matching is on the NFC-normalised,
-case-folded path for the denylist and on the NFC-normalised path for globs.
+`*.tfstate*`, `*credential*`, `*secret*`). The denylist matches each path
+component after NFKC normalisation and case folding (so fullwidth `ｓｅｃｒｅｔ`
+is caught); globs match the NFC-normalised path, case-sensitively.
 
 **Reading.** A new module, `devgraph/sandbox/reader.py`, is the only code that
 reads a sandbox input, a provider script, or the schema file whose declaration
 feeds a digest. For each path:
 
-1. Containment is decided on path components with `Path.is_relative_to`
-   against the canonical repository root; never by string prefix.
+1. The root must already be its own real path (`os.path.realpath`), absolute
+   and not `/`, and is opened `O_NOFOLLOW | O_DIRECTORY`. Containment is
+   decided on path components with `Path.is_relative_to` against it; never by
+   string prefix.
 2. `lstat` every component from the repository root down. Any symlink or any
    non-directory intermediate is refused.
 3. Open without following: `openat2` with
    `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS` relative to
-   a directory descriptor of the root; on kernels without `openat2` (before
-   5.6), component-by-component `openat(dir_fd, part, O_NOFOLLOW |
+   a directory descriptor of the root, called as syscall 437 on Linux machines
+   that use the unified syscall table (x86_64, aarch64, arm, riscv64, ppc64,
+   s390x, loongarch64); elsewhere, and on kernels without `openat2` (before
+   5.6, or `EPERM` from a seccomp filter), component-by-component `openat(dir_fd, part, O_NOFOLLOW |
    O_DIRECTORY)` and `O_NOFOLLOW | O_RDONLY` for the leaf.
 4. `fstat` the open descriptor: must be `S_ISREG`, size within the per-file
    cap. Read at most cap + 1 bytes from the descriptor; more is `input_cap`.
@@ -268,7 +308,23 @@ feeds a digest. For each path:
 Steps 3–4 close the race between check and use: no component is followed by
 name after the check, and the type and size decision is made on the
 descriptor that is read. (A Windows reader is part of the platform follow-up,
-§4.5; it cannot make the same claim.)
+§4.5; it cannot make the same claim. Where the no-follow flags or `dir_fd`
+are missing, every read is refused.)
+
+Residuals, stated plainly:
+- **Hardlinks are read.** A hardlink inside the repository to a file elsewhere
+  on the same filesystem is a regular file and passes every check. Kernel
+  `protected_hardlinks` stops links to files the user does not own, not to the
+  user's own files; a declared input that is a hardlink to a secret is read.
+- **Mount points are crossed.** `RESOLVE_BENEATH` does not stop at a bind
+  mount inside the repository (`RESOLVE_NO_XDEV` is not set), so a bind mount
+  placed in the work tree is read through.
+- **The fallback has a rename race.** The component-wise fallback opens one
+  directory at a time. A concurrent rename can move an already-opened
+  directory out of the repository; the file then read was beneath the root,
+  with no symlink followed, when its parent was opened, but may not be by the
+  time it is read. `openat2` resolves the whole path in one call and does not
+  have this gap.
 
 **Shown at approval:** the matched-file count, a sample (first 20 sorted
 paths), how many tracked files the denylist excluded, and the total input
@@ -432,11 +488,21 @@ its internals for an AST scan to close:
 The scan (import allowlist, denied names, dunder attributes, the table above)
 gives early, readable findings at approval; it is hygiene, not a boundary. It
 parses untrusted source, so it runs in a **separate `python -I -S` subprocess**
-with a 5 s wall timeout, `RLIMIT_AS` 256 MiB and `RLIMIT_CPU` 5 s. Any non-zero
+with a 5 s wall timeout, `RLIMIT_AS` 256 MiB and `RLIMIT_CPU` 5 s, and an
+environment of only `PATH` and `LC_ALL=C` (a named locale such as `C.UTF-8`
+makes glibc map its whole locale archive, 222 MiB on Fedora, and the
+interpreter then cannot start under that limit). The limits are set inside
+the worker before it reads the script, not by a `preexec_fn` (unsafe in a
+threaded parent). Any non-zero
 exit, timeout, signal or exception inside it, including `RecursionError`,
 `MemoryError` and `SyntaxError`, is a hard reject (`static_reject`), never a
 pass. It parses with `feature_version` set to the image's Python minor version
 so that the scan and the container agree on the grammar.
+Beyond the table, the scan also refuses dunder names in imports, `match`
+patterns and literal `getattr` strings, every `pathlib` submodule, and, by
+name alone, `from <allowed> import <name>` where `<name>` is a
+non-allowlisted standard-library module (`from typing import sys`). A module
+reached as an attribute (`typing.sys`) is not caught.
 
 The schema YAML is untrusted input of the same class: alias expansion is
 bounded (a document whose expansion exceeds 10,000 nodes is rejected), and
@@ -787,9 +853,15 @@ re-read between the check and the run.
 The script is read once and must be strict UTF-8 without a BOM. It is
 rejected (`static_reject`) if it contains a PEP 263 coding cookie, NUL, a CR
 not followed by LF, a form feed, any other C0/C1 control except tab and LF,
-or any Unicode format character (category Cf, which includes the bidi
+any Unicode format character (category Cf, which includes the bidi
 overrides and isolates U+202A–U+202E and U+2066–U+2069, U+200E/U+200F and
-zero-width characters). CRLF is normalised to LF; that string is hashed,
+zero-width characters), a line or paragraph separator (U+2028/U+2029, Zl/Zp:
+some renderers break lines there while Python's tokenizer does not), or a
+private-use or unassigned code point (Co/Cn, as for the tools file and input
+globs). Categories come from the host Python's Unicode tables, so a code
+point a newer Unicode version assigns can be refused as Cn on an older host.
+A script can still write any of these as escape sequences inside a
+string literal. CRLF is normalised to LF; that string is hashed,
 shown at approval, sent over stdin, and passed to `compile()` as a `str`,
 so no decoding step inside the container can reinterpret it.
 
@@ -799,12 +871,14 @@ something that is not quite `eval`. The static scan already sees the
 normalised name (§4.1). The approval display additionally renders every
 non-ASCII character **outside string literals and comments** as a `\u....`
 escape (located with `tokenize`; a tokenize failure is `static_reject`), so
-any non-ASCII identifier is visibly odd. Non-ASCII inside strings and comments
+any non-ASCII identifier is visibly odd. The scan reports the string and
+comment ranges, and everything else counts as code, so a missing range fails
+closed to an escape; malformed ranges are `static_reject`. Non-ASCII inside strings and comments
 is shown as text, subject to the control-character rule below.
 
 Every repository-sourced string DevGraph prints (script text, paths, params,
-labels, sample file names, diffs) is rendered with control and format
-characters made visible as `\x..`/`\u....` escapes, so terminal escape
+labels, sample file names, diffs) is rendered with control, format,
+separator, surrogate, private-use and unassigned characters made visible as `\x..`/`\u....` escapes, so terminal escape
 sequences cannot repaint the prompt.
 
 ### 5.4 Approval and enablement
@@ -838,10 +912,16 @@ Revision 2 said the provider would run "under the applied schema's
 declaration", but the applied declaration exists only as graph state, which
 §5.4 forbids as a source. Not running is simpler and needs no stored copy.
 
+States are decided in the order of this table, so a provider that is off
+shows as `disabled`, never as `pending` (a rescan would not run it).
+Static-scan findings are not a state: they block approval, and `list`,
+`show` and `doctor` say so.
+
 | State | Meaning | Runs? | Prunes? |
 |-------|---------|-------|---------|
-| `disabled` | project config off, or scripts off | no | no |
 | `unavailable` | sandbox not ready, not Linux, no git work tree, or headless image | no | no |
+| `rejected` | the script or declaration is refused (`static_reject`: normalisation, scan crash or syntax error, unreadable script, invalid schema) | no | no |
+| `disabled` | project config off, or scripts off | no | no |
 | `pending` | the schema file differs from the applied schema | no | no |
 | `awaiting_approval` | digest never approved, retired or revoked; new provider | no | no |
 | `approved` | digest active | yes | yes, only after a successful full run |
@@ -1091,6 +1171,7 @@ starts before this document is signed off.
 | `test_selection_excludes_untracked_and_ignored_files` | Untracked, ignored and denylisted files never match, whatever the globs. |
 | `test_no_git_work_tree_is_input_unavailable` | A non-repository directory nested inside another repository is not resolved to the outer one; no git binary; non-zero exit. |
 | `test_ls_files_runs_no_repository_program` | Repository config sets `core.fsmonitor`, `pager.ls-files`, `filter.x.clean`/`smudge`, `diff.x.textconv` with `.gitattributes`, and an `include.path` to a file setting `core.fsmonitor`; a marker file is never created. |
+| `test_lazy_fetch_runs_no_repository_program` | A partial clone with a sparse index whose collapsed trees are missing, its promisor remote reached through `core.sshCommand`, `remote.origin.uploadpack`, or `ext::` with repository-local `protocol.ext.allow=always`, each with cone and with non-cone sparse patterns; a marker file is never created, and a control run without the guards creates it. |
 | `test_reader_refusals` | Symlinked leaf and intermediate, `..`, FIFO, oversize, swapped-in symlink between check and open. |
 | `test_normalisation_rejection_table`, `test_digest_stability_and_sensitivity` | §5.2–5.3. |
 | `test_approval_display_escapes_non_ascii_identifiers` | Full-width `eval` is shown escaped; non-ASCII in strings and comments is shown as text; control characters escaped everywhere. |
@@ -1135,3 +1216,26 @@ snapshot.
 (the dry run lists resuming providers and enabling resumes them without
 re-approval); `test_sandbox_surfaces_use_textcontent`; the epic's acceptance
 line end to end.
+
+### 10.3 Notes for E2b from the E1 review
+
+- **One decision point.** A run starts only when `provider_state(...)` is
+  `approved`. `pending` is fail-closed, as is any state E2b does not know.
+- **One store connection for gates 2 and 3.** E1's `evaluate_gates` opens the
+  trust store once per gate. E2b reads both gates from a single read
+  connection, so a write between them cannot pair one gate's old answer with
+  the other's new one.
+- **Run the snapshot, never re-read.** The runner sends `snap.script_text` and
+  builds the context from `snap.declaration_set`, the same snapshot whose
+  digest the gates checked. It does not read the script or the schema file
+  again.
+- **New findings on an approved digest.** If a later DevGraph adds scan rules,
+  an approved digest can gain findings. E2b decides whether that blocks a run
+  or only shows as a note. Approval already refuses while findings exist.
+- **Applied-schema check.** `devgraph/sandbox/schema_status.py`
+  (`applied_schema_status`) is the shared check the CLI uses; the tray and the
+  runner use it too rather than writing their own.
+- **`import os.path` binds `os`.** The static scan refuses a dotted `import`
+  without `as` unless its first component is allowlisted. The in-container
+  import hook has the same issue: `__import__("os.path")` returns `os`, so the
+  hook must check the name that is bound, not only the name requested.

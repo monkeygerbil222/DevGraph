@@ -38,17 +38,28 @@ def read_bounded(path: Path, max_bytes: int | None = None) -> bytes:
     cap = MAX_CONFIG_BYTES if max_bytes is None else max_bytes
     fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
     try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
-            raise NotRegularFile(f"{path}: not a regular file")
-        chunks, size = [], 0
-        while size <= cap:
-            chunk = os.read(fd, cap + 1 - size)
-            if not chunk:
-                break
-            chunks.append(chunk)
-            size += len(chunk)
+        return read_fd_bounded(fd, cap, str(path))
     finally:
         os.close(fd)
+
+
+def read_fd_bounded(fd: int, cap: int, name: str) -> bytes:
+    """The bytes behind an open descriptor, which must be a regular file of at most
+    `cap` bytes. Type and size are decided on the descriptor itself, and at most
+    `cap + 1` bytes are read. Raises `NotRegularFile` or `FileTooLarge` (naming
+    `name`, never quoting content); the caller closes `fd`."""
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode):
+        raise NotRegularFile(f"{name}: not a regular file")
+    if st.st_size > cap:
+        raise FileTooLarge(f"{name}: larger than {cap} bytes")
+    chunks, size = [], 0
+    while size <= cap:
+        chunk = os.read(fd, cap + 1 - size)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        size += len(chunk)
     if size > cap:
-        raise FileTooLarge(f"{path}: larger than {cap} bytes")
+        raise FileTooLarge(f"{name}: larger than {cap} bytes")
     return b"".join(chunks)

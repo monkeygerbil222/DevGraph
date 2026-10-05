@@ -28,6 +28,9 @@ class FunctionRecency:
 def compute_function_recency(repo: Repo, file_path: str) -> list[FunctionRecency]:
     """Blame `file_path` at HEAD and return one `FunctionRecency` per contiguous hunk.
 
+    `repo` comes from `devgraph.git_safe.open_repo`, whose `blame` always
+    passes `--no-textconv`.
+
     `Repo.blame("HEAD", file_path)` returns `[(Commit, [line, line, ...]), ...]`
     covering the whole file in order, each tuple's line list a contiguous
     run — a running line counter turns that directly into 1-indexed
