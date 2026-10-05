@@ -165,19 +165,19 @@ def provider_state(
     registry_path: Path,
     store_path: Path,
 ) -> str:
-    """`unavailable`, `rejected`, `pending`, `disabled`, `awaiting_approval` or
-    `approved` (§5.5).
+    """`unavailable`, `rejected`, `disabled`, `pending`, `awaiting_approval` or
+    `approved` (§5.5), decided in that order.
 
     `rejected` is a `static_reject` snapshot (an invalid script or declaration),
     which no approval can fix until the file changes; any other `InputError` is
-    `unavailable`. `failing` needs run records, which arrive in E3.
+    `unavailable`. Gates 1 and 2 come before `pending`, so a provider that would
+    not run after a rescan shows as `disabled`. `failing` needs run records,
+    which arrive in E3.
     """
     if not platform_supported(platform):
         return "unavailable"
     if isinstance(snap, InputError):
         return "rejected" if snap.code == "static_reject" else "unavailable"
-    if pending:
-        return "pending"
     gates = evaluate_gates(
         repo_id,
         canon,
@@ -188,6 +188,8 @@ def provider_state(
     )
     if not (gates.project_config and gates.scripts_enabled):
         return "disabled"
+    if pending:
+        return "pending"
     if not gates.digest_active:
         return "awaiting_approval"
     return "approved"

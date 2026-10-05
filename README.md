@@ -194,7 +194,13 @@ relationships:
   - `enable <repo_id>` lets a repository's approved providers run once running exists, after you type the repo id;
   - `disable <repo_id>` stops them and keeps approvals.
 
-  Provider states are `approved`, `awaiting_approval`, `disabled`, `pending` (the schema file has changed since the last rescan), `rejected` (the script fails the checks: strict UTF-8, no control or invisible characters, a static scan) and `unavailable`.
+  Provider states, in the order they are decided:
+  - `unavailable`: not Linux, or the inputs cannot be selected or read within the limits;
+  - `rejected`: the schema or script cannot be checked, so no approval can fix it until the file changes. That covers a script or declaration that fails normalisation (strict UTF-8, no control or invisible characters), a script with a syntax error or that crashes the static scan, and a script that is missing, a symlink or too large. Static-scan findings do not reject a script: they block approval, and `list`, `show` and `doctor` say so;
+  - `disabled`: project config or scripts are off for the repository;
+  - `pending`: project config and scripts are on, but the schema file has changed since the last rescan (`devgraph rescan <repo_id> --now` applies it);
+  - `awaiting_approval`: the current digest is not approved;
+  - `approved`.
 - **What an approval covers.** It covers a SHA-256 digest of the script text together with the provider's full declaration set (its `custom_providers` entry, its node types and its relationships, `params` included). Changing either one puts the provider back to `awaiting_approval`. A new approval retires the earlier digests unless you pass `--keep-previous` (at most five are kept active).
 - **Consent at a terminal.** `approve` and `enable` refuse unless both stdin and stdout are a TTY, and there is no `--yes`. For CI, `approve --sha256 <hex>` approves without asking, only when `<hex>` equals the current digest. Take the digest from `show`, after reviewing the script, and keep it in a protected CI secret. DevGraph never prints an `approve` command that contains a digest: `show` prints the digest on its own line, and the `add` notice and `doctor` hints give only the interactive commands.
 - **Where trust lives.** The trust store is a fixed file, `~/.devgraph/script_trust.sqlite3`, where `~` is your account's home directory from the system user database. It is never taken from `HOME`, a setting, `.env` or an environment variable, so a repository cannot point DevGraph at a store of its own. Approvals are keyed by repo id and canonical path, so a moved or re-registered repository starts unapproved. `devgraph remove` deletes the repository's approvals. A store that is missing, unreadable, corrupt, or in a directory that is not owned by you or is group- or world-writable counts as "off" (with umask 002, run `chmod go-w ~/.devgraph`).

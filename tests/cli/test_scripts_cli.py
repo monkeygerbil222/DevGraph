@@ -298,7 +298,8 @@ def test_approval_prompt_shows_what_is_approved(runner, repo, tty):
     assert out.index("def derive(ctx):") < out.index("Type the provider name")
 
 
-def test_approval_prompt_wraps_long_lines_and_flags_them(tmp_path, settings, tty):
+def test_approval_prompt_wraps_long_lines_and_flags_them(tmp_path, settings, tty, monkeypatch):
+    monkeypatch.setattr(cli_main.console, "_width", 80)  # the autouse wide console is 1000
     long_line = "    x = '" + "a" * 300 + "'  # HIDDEN_TAIL\n"
     root = make_repo(tmp_path / "wide", files(script="def derive(ctx):\n" + long_line + "    return []\n"))
     register(settings, root)
@@ -777,11 +778,30 @@ def test_unreachable_graph_is_pending_and_says_so(runner, repo, home, tty, monke
     no_approve_digest(result.output)
 
 
-def test_pending_with_a_reachable_graph_says_rescan(runner, repo, monkeypatch):
+def test_pending_with_a_reachable_graph_says_rescan(runner, repo, tty, monkeypatch):
+    assert enable(runner).exit_code == 0
     monkeypatch.setattr(cli_main, "_applied_schema_status", lambda repo_id, schema_hash: "pending")
     assert state(runner) == "pending"
     _, section = doctor(runner, monkeypatch)
     assert "devgraph rescan demo --now" in section and "graph unreachable" not in section
+
+
+def test_pending_schema_with_scripts_off_is_disabled(runner, repo, monkeypatch):
+    monkeypatch.setattr(cli_main, "_applied_schema_status", lambda repo_id, schema_hash: "pending")
+    assert state(runner) == "disabled"
+    _, section = doctor(runner, monkeypatch)
+    assert "devgraph config scripts enable demo" in section and "rescan" not in section
+
+
+def test_config_disable_then_rescan_is_disabled_not_pending(runner, repo, tty, monkeypatch):
+    assert enable(runner).exit_code == 0
+    assert approve(runner, PROVIDER).exit_code == 0
+    assert runner.invoke(app, ["config", "disable", "demo"]).exit_code == 0
+    # A rescan with project config off leaves the custom schema unapplied.
+    monkeypatch.setattr(cli_main, "_applied_schema_status", lambda repo_id, schema_hash: "pending")
+    assert state(runner) == "disabled"
+    _, section = doctor(runner, monkeypatch)
+    assert "project config is off" in section and "rescan" not in section
 
 
 def test_applied_schema_status_reports_an_unreachable_graph(monkeypatch):

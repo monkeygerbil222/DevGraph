@@ -3052,9 +3052,12 @@ def _script_provider_findings(repos: list[Any]) -> list[tuple[str, str, str]]:
             elif state == "pending" and would_be is not None:
                 findings.append(("warning", subject, f"pending: {_GRAPH_UNREACHABLE}, so the applied schema cannot "
                                                      f"be checked; otherwise {would_be}"))
-            elif state == "pending":
+            elif state == "pending" and record.project_config_enabled:
                 findings.append(("warning", subject, "pending: the schema is not applied yet; "
                                                      f"`devgraph rescan {repo_id} --now` applies it"))
+            elif state == "pending":
+                findings.append(("warning", subject, "pending: the schema is not applied yet, and project config "
+                                                     f"is off: `devgraph config enable {repo_id}`"))
             else:
                 reason = (snap.reason or snap.code) if isinstance(snap, InputError) else ""
                 detail = f"{state}: {visible(reason)}" if reason else state

@@ -306,7 +306,12 @@ def test_snapshot_is_frozen(repo):
         ((True, False, True), False, "linux", "disabled"),
         ((False, False, False), False, "linux", "disabled"),
         ((True, True, True), True, "linux", "pending"),
-        ((False, False, False), True, "linux", "pending"),
+        ((True, True, False), True, "linux", "pending"),
+        # Gates 1 and 2 are decided before pending: a disabled provider is not
+        # shown as waiting on a rescan that would not run it.
+        ((False, False, False), True, "linux", "disabled"),
+        ((False, True, True), True, "linux", "disabled"),
+        ((True, False, True), True, "linux", "disabled"),
         ((True, True, True), False, "darwin", "unavailable"),
         ((True, True, True), True, "win32", "unavailable"),
     ],
@@ -337,7 +342,7 @@ def test_provider_state_table(repo, monkeypatch, gates_, pending, platform, expe
         store_path=Path("/store"),
     )
     assert state == expected
-    if expected in ("approved", "awaiting_approval", "disabled"):
+    if expected != "unavailable":
         assert seen == dict(
             repo_id="rid",
             canon="/canon",
