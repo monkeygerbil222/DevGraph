@@ -56,6 +56,10 @@ def get_git_status(repo_path: Path) -> dict[str, Any]:
     other `git_repo.git.<cmd>()` calls) rather than GitPython's diff/index
     APIs, which is simpler to get right for the modified/untracked/staged
     distinction the porcelain format already encodes per-line.
+
+    `--ignore-submodules=all` keeps status out of submodules: it would
+    otherwise run a nested `git status` under each submodule's own config,
+    whose filter drivers `open_repo` never saw.
     """
     with open_repo(repo_path) as repo:
         try:
@@ -66,7 +70,7 @@ def get_git_status(repo_path: Path) -> dict[str, Any]:
             except (ValueError, TypeError):
                 branch = "no commits yet"
 
-        porcelain = repo.git.status("--porcelain")
+        porcelain = repo.git.status("--porcelain", "--ignore-submodules=all")
         entries: list[dict[str, str]] = []
         for line in porcelain.splitlines():
             if not line.strip():

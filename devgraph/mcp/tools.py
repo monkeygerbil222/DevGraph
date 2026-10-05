@@ -75,7 +75,7 @@ def _resolve_gh_repo(repo_path: str) -> str | None:
         repo.close()
         if "github.com" not in remote_url:
             return None
-        slug = remote_url.rstrip(".git").split("github.com")[-1].lstrip(":/")
+        slug = remote_url.removesuffix(".git").split("github.com")[-1].lstrip(":/")
         return slug if _GH_SLUG_RE.fullmatch(slug) else None
     except Exception:
         return None
@@ -800,7 +800,9 @@ def impact_analysis_for_diff(
         git_repo = open_repo(repo.path)
         git_repo.commit(base_ref)
         git_repo.commit(head_ref)
-        diff_output = git_repo.git.diff("--name-only", f"{base_ref}..{head_ref}")
+        # Without rename detection the diff needs only trees, never blob
+        # content, so it also works in a partial clone.
+        diff_output = git_repo.git.diff("--name-only", "--no-renames", f"{base_ref}..{head_ref}")
     except Exception as exc:
         return {**empty, "error": f"could not diff {base_ref}..{head_ref}: {exc}"}
     finally:

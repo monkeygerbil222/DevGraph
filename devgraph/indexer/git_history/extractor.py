@@ -19,7 +19,7 @@ import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from git import Repo
+from git import GitCommandError, Repo
 
 from devgraph.config.settings import get_settings
 from devgraph.git_safe import open_repo
@@ -133,7 +133,10 @@ class GitHistoryExtractor:
 def _changed_paths(commit) -> list[str]:
     """Return file paths touched by a commit (diff against its first parent, or full tree for a root commit)."""
     if commit.parents:
-        diffs = commit.parents[0].diff(commit)
+        # No rename detection: it reads blob content, which a partial clone
+        # may not have. A rename then shows as a delete plus an add, and both
+        # paths are collected below either way.
+        diffs = commit.parents[0].diff(commit, no_renames=True)
     else:
         # Root commit: diff against the empty tree isn't directly exposed;
         # fall back to a tree walk. A root commit with no tree (or a tree
@@ -283,6 +286,20 @@ def _reconcile_module_recency(engine, repo_id: str) -> None:
         )
 
 
+def _is_partial_clone(repo: Repo) -> bool:
+    """`extensions.partialClone`, or a promisor remote (what newer git
+    writes for a `--filter` clone instead)."""
+    try:
+        listing = repo.git.config("--get-regexp", r"^(extensions\.partialclone|remote\..*\.promisor)$")
+    except GitCommandError:
+        return False  # exit 1: neither key is set
+    for line in listing.splitlines():
+        key, _, value = line.partition(" ")
+        if key == "extensions.partialclone" or value.lower() in ("true", "yes", "on", "1"):
+            return True
+    return False
+
+
 def _current_py_files(engine, repo_id: str) -> set[str]:
     """Every `.py` file currently backing at least one Function/Class node."""
     rows = engine.run_cypher(
@@ -416,6 +433,14 @@ def sync_git_history(engine, registry, repo_id: str, max_count: int | None = Non
 
         extractor = GitHistoryExtractor(repo_id, repo_record.path)
 
+        # Blame reads older blobs, which a partial clone usually lacks and
+        # is never allowed to fetch; skip it once rather than fail per file.
+        blame_files = not _is_partial_clone(repo)
+        if not blame_files:
+            logger.info(
+                "%s is a partial clone; skipping blame-based Function/Class recency", repo_record.path
+            )
+
         if mode == "reconcile":
             # Full reachable-set walk, no cap — correctness matters more
             # than speed for what should be a rare event, and capping it
@@ -435,8 +460,9 @@ def sync_git_history(engine, registry, repo_id: str, max_count: int | None = Non
             engine.delete_commits(repo_id, orphans)
 
             _reconcile_module_recency(engine, repo_id)
-            for file_path in _current_py_files(engine, repo_id):
-                _apply_function_recency(engine, repo, repo_id, file_path, overwrite=True)
+            if blame_files:
+                for file_path in _current_py_files(engine, repo_id):
+                    _apply_function_recency(engine, repo, repo_id, file_path, overwrite=True)
 
             commits_indexed = len(result.commits)
             commits_deleted = len(orphans)
@@ -447,11 +473,12 @@ def sync_git_history(engine, registry, repo_id: str, max_count: int | None = Non
             _upsert_extraction_result(engine, repo_id, result)
             _stage_module_recency(engine, repo_id, result)
 
-            touched_py_files = {
-                rel.target_name for rel in result.relationships if rel.target_name.endswith(".py")
-            }
-            for file_path in touched_py_files:
-                _apply_function_recency(engine, repo, repo_id, file_path, overwrite=False)
+            if blame_files:
+                touched_py_files = {
+                    rel.target_name for rel in result.relationships if rel.target_name.endswith(".py")
+                }
+                for file_path in touched_py_files:
+                    _apply_function_recency(engine, repo, repo_id, file_path, overwrite=False)
 
             commits_indexed = len(result.commits)
             commits_deleted = 0

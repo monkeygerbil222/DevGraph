@@ -12,15 +12,20 @@ Neo4j test instance and skip without it.
 from __future__ import annotations
 
 import logging
+import os
 import subprocess
+import time
 import uuid
 from pathlib import Path
 
 import pytest
+from git import GitCommandError, Repo
 
 from devgraph import git_safe
 from devgraph.dashboard.git_info import get_git_log, get_git_status
+from devgraph.indexer.git_history.blame import compute_function_recency
 from devgraph.indexer.git_history.extractor import GitHistoryExtractor, sync_git_history
+from devgraph.mcp import tools
 from devgraph.mcp.tools import _resolve_gh_repo, impact_analysis_for_diff
 from devgraph.registry.store import RepoRegistry
 
@@ -199,6 +204,17 @@ def test_blame_textconv_not_run(tmp_path, request):
     assert not marker.fired()
 
 
+def _blame_through_open_repo(clone: Path) -> None:
+    """History resync skips blame in a partial clone, so blame directly."""
+    repo = git_safe.open_repo(clone)
+    try:
+        compute_function_recency(repo, "a.py")
+    except GitCommandError:
+        pass  # the older blob is missing and may not be fetched
+    finally:
+        repo.close()
+
+
 def _ext_remote(clone: Path, marker: Marker) -> None:
     _git_ok(clone, "config", "remote.origin.url", f"ext::{marker.script} %S")
     _git_ok(clone, "config", "protocol.ext.allow", "always")
@@ -216,7 +232,7 @@ def test_partial_clone_lazy_fetch_not_run(configure, tmp_path, request):
     configure(clone, marker)
     marker.assert_live(clone, "blame", "HEAD", "--", "a.py")
 
-    _run_site("history_resync", clone, request)
+    _blame_through_open_repo(clone)
     assert not marker.fired()
 
 
@@ -231,7 +247,7 @@ def test_lazy_fetch_blocked_by_config_alone(configure, tmp_path, request, monkey
     configure(clone, marker)
     marker.assert_live(clone, "blame", "HEAD", "--", "a.py")
 
-    _run_site("history_resync", clone, request)
+    _blame_through_open_repo(clone)
     assert not marker.fired()
 
 
@@ -248,11 +264,12 @@ def test_lazy_fetch_blocked_by_one_env_var_alone(configure, dropped, tmp_path, r
     configure(clone, marker)
     marker.assert_live(clone, "blame", "HEAD", "--", "a.py")
 
-    _run_site("history_resync", clone, request)
+    _blame_through_open_repo(clone)
     assert not marker.fired()
 
 
 def test_inherited_index_file_is_ignored(tmp_path, monkeypatch):
+    monkeypatch.setattr(git_safe, "_env_scrubbed", False)
     repo = _make_repo(tmp_path / "repo")
     other = _make_repo(tmp_path / "other")
     (other / "only-in-other.txt").write_text("x")
@@ -309,6 +326,8 @@ def test_normal_repo_behaviour_unchanged(tmp_path, graph_repo, registry):
     [
         ("git@github.com:octo-org/sample.repo.git", "octo-org/sample.repo"),
         ("https://github.com/octo-org/sample", "octo-org/sample"),
+        ("https://github.com/owner/widget", "owner/widget"),
+        ("git@github.com:owner/widget.git", "owner/widget"),
         ("https://github.com/octo-org/sample/../../other", None),
         ("https://github.com/octo org/sample", None),
         ("https://github.com/-R/sample", None),
@@ -319,3 +338,167 @@ def test_gh_repo_slug_is_sanitised(url, expected, tmp_path):
     repo = _make_repo(tmp_path / "repo")
     _git_ok(repo, "remote", "add", "origin", url)
     assert _resolve_gh_repo(str(repo)) == expected
+
+
+def _attributes_in_tree(repo: Path, line: str) -> None:
+    (repo / ".gitattributes").write_text(line)
+
+
+def _attributes_in_info(repo: Path, line: str) -> None:
+    info = repo / ".git" / "info"
+    info.mkdir(exist_ok=True)
+    (info / "attributes").write_text(line)
+
+
+def _attributes_file(repo: Path, line: str) -> None:
+    attributes = repo.parent / "attributes"
+    attributes.write_text(line)
+    _git_ok(repo, "config", "core.attributesFile", str(attributes))
+
+
+@pytest.mark.parametrize(
+    "assign", [_attributes_in_tree, _attributes_in_info, _attributes_file], ids=["gitattributes", "info", "attributesFile"]
+)
+@pytest.mark.parametrize("key", ["clean", "process"])
+def test_repo_filter_driver_not_run(key, assign, tmp_path):
+    repo = _make_repo(tmp_path / "repo")
+    marker = Marker(tmp_path, "filter")
+    _git_ok(repo, "config", f"filter.x.{key}", str(marker.script))
+    assign(repo, "*.py filter=x\n")
+    (repo / "a.py").write_text(V1)  # stat-dirty tracked file, so status filters it
+    marker.assert_live(repo, "status")
+    (repo / "a.py").write_text(V2 + "\n")
+
+    assert "branch" in get_git_status(repo)
+    assert not marker.fired()
+
+
+def test_required_repo_filter_does_not_break_status(tmp_path):
+    repo = _make_repo(tmp_path / "repo")
+    marker = Marker(tmp_path, "filter")
+    _git_ok(repo, "config", "filter.x.clean", str(marker.script))
+    _git_ok(repo, "config", "filter.x.required", "true")
+    _attributes_in_tree(repo, "*.py filter=x\n")
+    (repo / "a.py").write_text(V1)
+
+    assert ("a.py", "modified") in {(e["path"], e["state"]) for e in get_git_status(repo)["uncommitted"]}
+    assert not marker.fired()
+
+
+def test_submodule_filter_driver_not_run(tmp_path):
+    sub = _make_repo(tmp_path / "sub")
+    repo = _make_repo(tmp_path / "repo")
+    _git_ok(repo, "-c", "protocol.file.allow=always", "submodule", "add", "-q", str(sub), "sub")
+    _git_ok(repo, "commit", "-qm", "add submodule")
+    marker = Marker(tmp_path, "subfilter")
+    _git_ok(repo / "sub", "config", "filter.x.clean", str(marker.script))  # .git/modules/sub/config
+    (repo / ".git" / "modules" / "sub" / "info" / "attributes").write_text("*.py filter=x\n")
+    (repo / "sub" / "a.py").write_text(V1)
+    marker.assert_live(repo, "status")
+    (repo / "sub" / "a.py").write_text(V2 + "\n")
+
+    get_git_status(repo)
+    assert not marker.fired()
+
+
+def test_slow_command_times_out(tmp_path, monkeypatch):
+    repo = _make_repo(tmp_path / "repo")
+    slow = tmp_path / "slow.sh"
+    slow.write_text("#!/bin/sh\nexec sleep 20\n")
+    slow.chmod(0o755)
+    _git_ok(repo, "config", "core.fsmonitor", str(slow))
+    overrides = tuple(o for o in git_safe.CONFIG_OVERRIDES if not o.startswith("core.fsmonitor"))
+    monkeypatch.setattr(git_safe, "CONFIG_OVERRIDES", overrides)
+    monkeypatch.setattr(git_safe, "GIT_TIMEOUT_SECONDS", 1.0)
+
+    started = time.monotonic()
+    with pytest.raises(GitCommandError, match="did not complete in 1 secs"):
+        get_git_status(repo)
+    assert time.monotonic() - started < 10
+
+
+def test_global_excludes_file_is_honoured(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "ignore").write_text("*.log\n")
+    (home / ".gitconfig").write_text(f"[core]\n\texcludesFile = {home / 'ignore'}\n")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("GIT_CONFIG_GLOBAL", raising=False)
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    repo = _make_repo(tmp_path / "repo")
+    (repo / "debug.log").write_text("x")
+    (repo / "new.txt").write_text("n")
+
+    assert get_git_status(repo)["uncommitted"] == [{"path": "new.txt", "state": "untracked"}]
+
+
+def _make_renaming_partial_clone(tmp_path: Path) -> Path:
+    """A blob:none clone whose last commit renames a file and edits it; the
+    pre-rename blob is absent, so rename detection would need a fetch."""
+    src = tmp_path / "src"
+    src.mkdir()
+    _commit_history(src)
+    body = "".join(f"line {i}\n" for i in range(40))
+    (src / "notes.txt").write_text(body)
+    _git_ok(src, "add", "notes.txt")
+    _git_ok(src, "commit", "-qm", "add notes")
+    _git_ok(src, "mv", "notes.txt", "renamed.txt")
+    (src / "renamed.txt").write_text(body + "edited\n")
+    _git_ok(src, "commit", "-qam", "rename notes")
+    _git_ok(src, "config", "uploadpack.allowFilter", "true")
+    clone = tmp_path / "clone"
+    _git_ok(tmp_path, "clone", "-q", "--filter=blob:none", f"file://{src}", str(clone))
+    no_fetch = subprocess.run(
+        ["git", "diff", "--name-only", "-M", "HEAD~1", "HEAD"],
+        cwd=str(clone),
+        capture_output=True,
+        env={**os.environ, "GIT_NO_LAZY_FETCH": "1"},
+    )
+    assert no_fetch.returncode != 0, "setup check: rename detection should need a missing blob"
+    return clone
+
+
+def test_partial_clone_history_resync_and_impact_diff(tmp_path, graph_repo, registry, caplog):
+    clone = _make_renaming_partial_clone(tmp_path)
+
+    extracted = GitHistoryExtractor("_hgit_partial", clone).extract_new_commits()
+    last = extracted.commits[-1].sha
+    assert {r.target_name for r in extracted.relationships if r.source_name == last} == {"notes.txt", "renamed.txt"}
+
+    engine, register = graph_repo
+    repo_id = register(clone)
+    with caplog.at_level(logging.INFO, logger="devgraph.indexer.git_history.extractor"):
+        assert sync_git_history(engine, registry, repo_id)["commits_indexed"] == 4
+    assert caplog.text.count("partial clone") == 1
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+    outcome = impact_analysis_for_diff(engine, registry, repo_id, "HEAD~1", "HEAD")
+    assert "error" not in outcome
+    assert sorted(outcome["changed_files"]) == ["notes.txt", "renamed.txt"]
+
+
+def test_impact_diff_opens_repo_through_open_repo(tmp_path, graph_repo, registry, monkeypatch):
+    repo = _make_repo(tmp_path / "repo")
+    engine, register = graph_repo
+    repo_id = register(repo)
+
+    opened: list[type] = []
+    real_init = Repo.__init__
+
+    def spy_init(self, *args, **kwargs):
+        opened.append(type(self))
+        real_init(self, *args, **kwargs)
+
+    via_open_repo: list[str] = []
+    real_open_repo = tools.open_repo
+
+    def spy_open_repo(path):
+        via_open_repo.append(str(path))
+        return real_open_repo(path)
+
+    monkeypatch.setattr(Repo, "__init__", spy_init)
+    monkeypatch.setattr(tools, "open_repo", spy_open_repo)
+
+    assert impact_analysis_for_diff(engine, registry, repo_id, "HEAD~1", "HEAD")["changed_files"] == ["a.py"]
+    assert via_open_repo == [str(repo)]
+    assert opened == [git_safe.HardenedRepo]

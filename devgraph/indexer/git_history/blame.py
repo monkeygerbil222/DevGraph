@@ -28,8 +28,8 @@ class FunctionRecency:
 def compute_function_recency(repo: Repo, file_path: str) -> list[FunctionRecency]:
     """Blame `file_path` at HEAD and return one `FunctionRecency` per contiguous hunk.
 
-    Blames with `--no-textconv`: a `.gitattributes` diff driver would
-    otherwise run its textconv program on every blob read.
+    `repo` comes from `devgraph.git_safe.open_repo`, whose `blame` always
+    passes `--no-textconv`.
 
     `Repo.blame("HEAD", file_path)` returns `[(Commit, [line, line, ...]), ...]`
     covering the whole file in order, each tuple's line list a contiguous
@@ -37,7 +37,7 @@ def compute_function_recency(repo: Repo, file_path: str) -> list[FunctionRecency
     start/end ranges matching how Function/Class nodes store
     `start_line`/`end_line` (see `indexer/python/extractor.py`).
     """
-    hunks = repo.blame("HEAD", file_path, no_textconv=True)
+    hunks = repo.blame("HEAD", file_path)
     recency: list[FunctionRecency] = []
     line_no = 1
     for commit, lines in (hunks or []):  # type: ignore[assignment]
