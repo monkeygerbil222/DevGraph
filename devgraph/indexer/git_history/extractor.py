@@ -288,16 +288,19 @@ def _reconcile_module_recency(engine, repo_id: str) -> None:
 
 def _is_partial_clone(repo: Repo) -> bool:
     """`extensions.partialClone`, or a promisor remote (what newer git
-    writes for a `--filter` clone instead)."""
+    writes for a `--filter` clone instead). `--type=bool` counts a
+    valueless `promisor` key as true."""
     try:
-        listing = repo.git.config("--get-regexp", r"^(extensions\.partialclone|remote\..*\.promisor)$")
-    except GitCommandError:
-        return False  # exit 1: neither key is set
-    for line in listing.splitlines():
-        key, _, value = line.partition(" ")
-        if key == "extensions.partialclone" or value.lower() in ("true", "yes", "on", "1"):
+        if repo.git.config("--get", "extensions.partialClone"):
             return True
-    return False
+    except GitCommandError:
+        pass  # exit 1: not set
+    try:
+        listing = repo.git.config("-z", "--type=bool", "--get-regexp", r"^remote\..*\.promisor$")
+    except GitCommandError:
+        return False  # exit 1: no promisor key
+    # -z: `<key>\n<value>\0` per entry.
+    return any(entry.rsplit("\n", 1)[-1] == "true" for entry in listing.split("\0") if entry)
 
 
 def _current_py_files(engine, repo_id: str) -> set[str]:

@@ -24,7 +24,7 @@ from git import GitCommandError, Repo
 from devgraph import git_safe
 from devgraph.dashboard.git_info import get_git_log, get_git_status
 from devgraph.indexer.git_history.blame import compute_function_recency
-from devgraph.indexer.git_history.extractor import GitHistoryExtractor, sync_git_history
+from devgraph.indexer.git_history.extractor import GitHistoryExtractor, _is_partial_clone, sync_git_history
 from devgraph.mcp import tools
 from devgraph.mcp.tools import _resolve_gh_repo, impact_analysis_for_diff
 from devgraph.registry.store import RepoRegistry
@@ -401,20 +401,139 @@ def test_submodule_filter_driver_not_run(tmp_path):
     assert not marker.fired()
 
 
-def test_slow_command_times_out(tmp_path, monkeypatch):
-    repo = _make_repo(tmp_path / "repo")
-    slow = tmp_path / "slow.sh"
-    slow.write_text("#!/bin/sh\nexec sleep 20\n")
-    slow.chmod(0o755)
-    _git_ok(repo, "config", "core.fsmonitor", str(slow))
+def _sleeper(tmp_path: Path, name: str, output: str = "") -> tuple[Path, Path]:
+    """A helper that writes `output`, then starts a child `sleep` (no exec)
+    and waits for it; the child's PID is recorded in the returned file."""
+    pid_file = tmp_path / f"pid-{name}"
+    script = tmp_path / f"{name}.sh"
+    script.write_text(f"#!/bin/sh\n{output}sleep 20 &\necho $! > '{pid_file}'\nwait\n")
+    script.chmod(0o755)
+    return script, pid_file
+
+
+def _assert_process_gone(pid_file: Path) -> None:
+    pid = int(pid_file.read_text())
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        try:
+            state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+        except (FileNotFoundError, ProcessLookupError):
+            return  # the process exited while being looked up
+        if state == "Z":
+            return
+        time.sleep(0.1)
+    raise AssertionError(f"sleep child {pid} survived the timeout")
+
+
+def _without_fsmonitor_override(monkeypatch) -> None:
     overrides = tuple(o for o in git_safe.CONFIG_OVERRIDES if not o.startswith("core.fsmonitor"))
     monkeypatch.setattr(git_safe, "CONFIG_OVERRIDES", overrides)
+
+
+def test_slow_command_times_out_and_kills_process_group(tmp_path, monkeypatch):
+    repo = _make_repo(tmp_path / "repo")
+    script, pid_file = _sleeper(tmp_path, "fsmonitor")
+    _git_ok(repo, "config", "core.fsmonitor", str(script))
+    _without_fsmonitor_override(monkeypatch)
     monkeypatch.setattr(git_safe, "GIT_TIMEOUT_SECONDS", 1.0)
 
     started = time.monotonic()
     with pytest.raises(GitCommandError, match="did not complete in 1 secs"):
         get_git_status(repo)
-    assert time.monotonic() - started < 10
+    assert time.monotonic() - started < 4
+    _assert_process_gone(pid_file)
+
+
+def _alias(repo: Path, script: Path) -> None:
+    _git_ok(repo, "config", "alias.stream", f"!{script}")
+
+
+def _read_lines(proc) -> list[bytes]:
+    lines = []
+    while line := proc.stdout.readline():
+        lines.append(line)
+    return lines
+
+
+def test_streamed_command_that_keeps_producing_is_not_killed(tmp_path, monkeypatch):
+    repo = _make_repo(tmp_path / "repo")
+    script = tmp_path / "producer.sh"
+    script.write_text("#!/bin/sh\nfor i in 1 2 3 4 5 6; do echo line$i; sleep 0.4; done\n")
+    script.chmod(0o755)
+    _alias(repo, script)
+    monkeypatch.setattr(git_safe, "GIT_TIMEOUT_SECONDS", 1.0)
+    monkeypatch.setattr(git_safe, "GIT_STREAM_IDLE_TIMEOUT_SECONDS", 1.0)
+
+    git_repo = git_safe.open_repo(repo)
+    try:
+        proc = git_repo.git.stream(as_process=True)
+        assert len(_read_lines(proc)) == 6
+        proc.wait()
+    finally:
+        git_repo.close()
+
+
+def test_stalled_streamed_command_is_killed(tmp_path, monkeypatch):
+    repo = _make_repo(tmp_path / "repo")
+    script, pid_file = _sleeper(tmp_path, "stall", output="echo first\n")
+    _alias(repo, script)
+    monkeypatch.setattr(git_safe, "GIT_STREAM_IDLE_TIMEOUT_SECONDS", 1.0)
+
+    git_repo = git_safe.open_repo(repo)
+    try:
+        proc = git_repo.git.stream(as_process=True)
+        started = time.monotonic()
+        assert _read_lines(proc) == [b"first\n"]
+        assert time.monotonic() - started < 4
+    finally:
+        git_repo.close()
+    _assert_process_gone(pid_file)
+
+
+def test_filter_name_containing_equals_not_run(tmp_path):
+    repo = _make_repo(tmp_path / "repo")
+    marker = Marker(tmp_path, "filter")
+    _git_ok(repo, "config", "filter.a=b.clean", str(marker.script))
+    _attributes_in_tree(repo, "*.py filter=a=b\n")
+    (repo / "a.py").write_text(V1)
+    marker.assert_live(repo, "status")
+    (repo / "a.py").write_text(V2 + "\n")
+
+    assert "branch" in get_git_status(repo)
+    assert not marker.fired()
+
+
+def test_filter_added_after_open_not_run(tmp_path):
+    repo = _make_repo(tmp_path / "repo")
+    git_repo = git_safe.open_repo(repo)
+    try:
+        marker = Marker(tmp_path, "filter")
+        _git_ok(repo, "config", "filter.x.clean", str(marker.script))
+        _attributes_in_tree(repo, "*.py filter=x\n")
+        (repo / "a.py").write_text(V1)
+        marker.assert_live(repo, "status")
+        (repo / "a.py").write_text(V2 + "\n")
+
+        git_repo.git.status("--porcelain")
+        assert not marker.fired()
+    finally:
+        git_repo.close()
+
+
+@pytest.mark.parametrize(
+    "remote_config, expected",
+    [("", False), ("\tpromisor\n", True), ("\tpromisor = yes\n", True), ("\tpromisor = false\n", False)],
+    ids=["none", "valueless", "yes", "false"],
+)
+def test_partial_clone_detected_from_promisor_remote(remote_config, expected, tmp_path):
+    repo = _make_repo(tmp_path / "repo")
+    with (repo / ".git" / "config").open("a") as config:
+        config.write(f'[remote "origin"]\n\turl = /nowhere\n{remote_config}')
+    git_repo = git_safe.open_repo(repo)
+    try:
+        assert _is_partial_clone(git_repo) is expected
+    finally:
+        git_repo.close()
 
 
 def test_global_excludes_file_is_honoured(tmp_path, monkeypatch):
