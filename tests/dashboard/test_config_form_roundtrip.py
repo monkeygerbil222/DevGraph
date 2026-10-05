@@ -113,16 +113,9 @@ VALID_NODE_TYPES = [
 
 VALID_RELATIONSHIPS = [
     {"type": "CALLS", "from": "Function", "to": "Function"},
-    {
-        "type": "DOCUMENTS",
-        "from": "Runbook",
-        "to": "Service",
-        "provider": "custom",
-        "custom": {"name": "runbook_links", "params": {}},
-        "color": "#1f77b4",
-    },
+    {"type": "DOCUMENTED_BY", "from": "Service", "to": "Runbook", "color": "#1f77b4"},
     {"type": "IS_CHILD_OF", "from": ["File", "Folder"], "to": "Folder", "provider": "filesystem"},
-    {"type": "OWNS", "from": ["Team"], "to": "Service", "provider": "custom", "custom": {"name": "owners"}},
+    {"type": "DEPENDS_ON", "from": ["Service"], "to": "Service", "provider": "builtin"},
     {"to": "Function", "provider": "builtin", "from": ["Function", "Service"], "type": "USES", "custom": None, "color": None},
 ]
 
@@ -176,6 +169,10 @@ _TEXTAREA = {"tools": ["description", "cypher"], "node_types": ["description"]}
 # what JavaScript's String.prototype.trim() strips (not Python's str.strip())
 _JS_SPACE = "\t\n\v\f\r \xa0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff"
 _FIELD = "This entry has a field the form doesn't edit: `{}`. Edit it as YAML."
+_CUSTOM_RELATIONSHIP = (
+    "This relationship comes from a custom provider, which the dashboard can't create or edit. "
+    "Edit devgraph.schema.yaml by hand or run `devgraph config schema edit` in a terminal; deleting it here is allowed."
+)
 _FROM_LIST = (
     "This entry's `from` can't be shown as comma-separated labels exactly (a label with a comma, "
     "surrounding spaces or a non-text value). Edit it as YAML."
@@ -207,6 +204,9 @@ def _relationship_refusal(mapping: dict) -> str | None:
             return _FIELD.format("custom.name")
         if key in ("type", "to", "color") and _broken(value):
             return _FIELD.format(key)
+    # the dashboard never edits a custom relationship (spec Q13): it opens as YAML
+    if mapping.get("provider") == "custom":
+        return _CUSTOM_RELATIONSHIP
     return None
 
 
@@ -280,7 +280,7 @@ def test_every_fixture_survives_a_trip_through_the_form(dumped):
         assert result["form_yaml"] is not None, (fixture, result["reason"])
         text = result["form_yaml"]
         assert _ordered(yaml.safe_load(text)) == _ordered(fixture["mapping"]), text
-    for reason in (_FROM_LIST, _FIELD.format("type"), _FIELD.format("custom.name")):
+    for reason in (_FROM_LIST, _FIELD.format("type"), _FIELD.format("custom.name"), _CUSTOM_RELATIONSHIP):
         assert reason in refused, f"no fixture exercised the refusal {reason!r}"
 
 

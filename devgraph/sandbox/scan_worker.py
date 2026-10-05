@@ -78,6 +78,14 @@ def _is_unlisted_module(name, module, allowed):
     )
 
 
+def _binds_message(module, head):
+    parent, _, last = module.rpartition(".")
+    message = f"import of {_show(module)} binds {_show(head)}, which is not allowed"
+    if module.isascii() and len(module) <= _NAME_MAX:
+        message += f"; use `import {module} as <name>` or `from {parent} import {last}`"
+    return message
+
+
 def findings(tree, allowed, denied):
     found = []
 
@@ -96,8 +104,12 @@ def findings(tree, allowed, denied):
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
+                head = alias.name.split(".")[0]
                 if _is_pathlib(alias.name) or not _module_allowed(alias.name, allowed):
                     refuse_import(node, alias.name)
+                elif alias.asname is None and not _module_allowed(head, allowed):
+                    # `import os.path` binds `os`, not `os.path`.
+                    add("import", node, _binds_message(alias.name, head))
                 for part in alias.name.split("."):
                     dunder(node, part, "name")
                 dunder(node, alias.asname, "name")

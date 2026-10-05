@@ -1678,6 +1678,6 @@ def test_json_schema_describes_custom_providers():
 def test_starter_example_declares_its_custom_provider(tmp_path):
     lines = project_schema.starter_schema_text().splitlines()
     start = lines.index("extends: default") + 1
-    text = "\n".join(lines[:start] + [l[2:] if l.startswith("# ") else l for l in lines[start:]]) + "\n"
+    text = "\n".join(lines[:start] + [line[2:] if line.startswith("# ") else line for line in lines[start:]]) + "\n"
     declaration = load_project_schema(write_schema(tmp_path, text))
     assert [p.name for p in declaration.custom_providers] == ["runbook_links"]

@@ -912,11 +912,16 @@ Revision 2 said the provider would run "under the applied schema's
 declaration", but the applied declaration exists only as graph state, which
 §5.4 forbids as a source. Not running is simpler and needs no stored copy.
 
+States are decided in the order of this table, so a provider that is off
+shows as `disabled`, never as `pending` (a rescan would not run it).
+Static-scan findings are not a state: they block approval, and `list`,
+`show` and `doctor` say so.
+
 | State | Meaning | Runs? | Prunes? |
 |-------|---------|-------|---------|
-| `disabled` | project config off, or scripts off | no | no |
 | `unavailable` | sandbox not ready, not Linux, no git work tree, or headless image | no | no |
 | `rejected` | the script or declaration is refused (`static_reject`: normalisation, scan crash or syntax error, unreadable script, invalid schema) | no | no |
+| `disabled` | project config off, or scripts off | no | no |
 | `pending` | the schema file differs from the applied schema | no | no |
 | `awaiting_approval` | digest never approved, retired or revoked; new provider | no | no |
 | `approved` | digest active | yes | yes, only after a successful full run |
@@ -1211,3 +1216,26 @@ snapshot.
 (the dry run lists resuming providers and enabling resumes them without
 re-approval); `test_sandbox_surfaces_use_textcontent`; the epic's acceptance
 line end to end.
+
+### 10.3 Notes for E2b from the E1 review
+
+- **One decision point.** A run starts only when `provider_state(...)` is
+  `approved`. `pending` is fail-closed, as is any state E2b does not know.
+- **One store connection for gates 2 and 3.** E1's `evaluate_gates` opens the
+  trust store once per gate. E2b reads both gates from a single read
+  connection, so a write between them cannot pair one gate's old answer with
+  the other's new one.
+- **Run the snapshot, never re-read.** The runner sends `snap.script_text` and
+  builds the context from `snap.declaration_set`, the same snapshot whose
+  digest the gates checked. It does not read the script or the schema file
+  again.
+- **New findings on an approved digest.** If a later DevGraph adds scan rules,
+  an approved digest can gain findings. E2b decides whether that blocks a run
+  or only shows as a note. Approval already refuses while findings exist.
+- **Applied-schema check.** `devgraph/sandbox/schema_status.py`
+  (`applied_schema_status`) is the shared check the CLI uses; the tray and the
+  runner use it too rather than writing their own.
+- **`import os.path` binds `os`.** The static scan refuses a dotted `import`
+  without `as` unless its first component is allowlisted. The in-container
+  import hook has the same issue: `__import__("os.path")` returns `os`, so the
+  hook must check the name that is bound, not only the name requested.

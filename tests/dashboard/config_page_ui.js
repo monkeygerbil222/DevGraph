@@ -1723,14 +1723,13 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
   // 39b. relationships: which entries the form shows, form <-> mapping, YAML, hints, context
   const FROM_LIST = "This entry's `from` can't be shown as comma-separated labels exactly (a label with a comma, surrounding spaces or a non-text value). Edit it as YAML.";
   const CUSTOM_PROVIDER = "This entry has a `custom` block but its provider isn't custom; the form can't show that. Edit it as YAML.";
+  const CUSTOM_RELATIONSHIP = "This relationship comes from a custom provider, which the dashboard can't create or edit. " +
+    "Edit devgraph.schema.yaml by hand or run `devgraph config schema edit` in a terminal; deleting it here is allowed.";
   const REL_OK = [
     { type: "CALLS", from: "Function", to: "Function" },
-    { type: "DOCUMENTS", from: ["Runbook", "Service"], to: "Service", provider: "custom", custom: { name: "runbook_links" }, color: "#1f77b4" },
-    { type: "DOCUMENTS", from: "Runbook", to: "Service", provider: "custom", custom: { name: "runbook_links", params: {} } },
-    { type: "DOCUMENTS", from: "Runbook", to: "Service", provider: "custom", custom: { params: {}, name: "x" } },
+    { type: "DOCUMENTS", from: ["Runbook", "Service"], to: "Service", color: "#1f77b4" },
     { type: "IS_CHILD_OF", from: ["File", "Folder"], to: "Folder", provider: "filesystem" },
     { type: "OWNS", from: ["Team"], to: "Service", provider: "builtin", color: null, custom: null },
-    { to: "B", type: "T", from: "A", provider: "custom", custom: null },
     { type: "T", from: "", to: "" },
     api.CONFIG_SECTIONS.relationships.entry,
   ];
@@ -1738,17 +1737,24 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
     const rep = api.configFormFromEntry("relationships", e);
     check("the form can show representable relationship #" + i, rep.ok && rep.form, j(rep));
   });
+  [{ type: "DOCUMENTS", from: ["Runbook", "Service"], to: "Service", provider: "custom", custom: { name: "runbook_links" }, color: "#1f77b4" },
+    { type: "DOCUMENTS", from: "Runbook", to: "Service", provider: "custom", custom: { name: "runbook_links", params: {} } },
+    { to: "B", type: "T", from: "A", provider: "custom", custom: null },
+    { type: "T", from: "A", to: "B", provider: "custom" }].forEach((e, i) => {
+    const rep = api.configFormFromEntry("relationships", e);
+    check("a custom relationship opens in YAML with the custom-provider notice #" + i, !rep.ok && rep.reason === CUSTOM_RELATIONSHIP, j(rep));
+  });
   check("the Add relationship template carries the entry its text parses to",
     j(api.CONFIG_SECTIONS.relationships.entry) === j({ type: "DOCUMENTED_BY", from: "Service", to: "Runbook" }),
     j(api.CONFIG_SECTIONS.relationships.entry));
   const relForm = e => api.configFormFromEntry("relationships", e).form;
   let rf = relForm(REL_OK[1]);
-  check("relationship form state: from joined with commas, provider and custom name as text",
-    rf.type === "DOCUMENTS" && rf.from === "Runbook, Service" && rf.to === "Service" && rf.provider === "custom" &&
-    rf.custom === "runbook_links" && rf.color === "#1f77b4" && rf.open === REL_OK[1], j(rf));
+  check("relationship form state: from joined with commas, the provider and colour as text",
+    rf.type === "DOCUMENTS" && rf.from === "Runbook, Service" && rf.to === "Service" && rf.provider === "builtin" &&
+    !("custom" in rf) && rf.color === "#1f77b4" && rf.open === REL_OK[1], j(rf));
   rf = relForm(REL_OK[0]);
   check("a missing provider shows as builtin; missing fields as empty text",
-    rf.provider === "builtin" && rf.custom === "" && rf.color === "" && rf.from === "Function", j(rf));
+    rf.provider === "builtin" && rf.color === "" && rf.from === "Function", j(rf));
   const REL = { type: "T", from: "A", to: "B" };
   [["an unknown relationship key", { ...REL, extra: 1 }, FIELD("extra")],
     ["an unknown custom key", { ...REL, provider: "custom", custom: { name: "x", module: "m" } }, FIELD("custom.module")],
@@ -1787,7 +1793,7 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
   });
   const relBack = (e, edit) => { const f = relForm(e); edit(f); return api.configEntryFromForm("relationships", f, Object.keys(e)); };
   const fromOf = (e, text) => relBack(e, f => { f.from = text; }).from;
-  check("an untouched one-item from list stays a list", j(back("relationships", REL_OK[5]).from) === j(["Team"]), j(back("relationships", REL_OK[5])));
+  check("an untouched one-item from list stays a list", j(back("relationships", REL_OK[3]).from) === j(["Team"]), j(back("relationships", REL_OK[3])));
   check("editing a from string to two labels writes a list", j(fromOf(REL, "A, B")) === j(["A", "B"]), j(fromOf(REL, "A, B")));
   check("editing a from list down to one label keeps a list", j(fromOf(REL_OK[1], "Runbook")) === j(["Runbook"]), j(fromOf(REL_OK[1], "Runbook")));
   check("editing a from string to another label keeps a string", fromOf(REL, " C ") === "C", j(fromOf(REL, " C ")));
@@ -1799,37 +1805,17 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
   rm = fresh(f => { f.from = "Runbook"; f.type = "CALLS"; f.to = "Service"; });
   check("a new entry writes one from label as a string, in model order, without the default provider",
     j(rm) === j({ type: "CALLS", from: "Runbook", to: "Service" }), j(rm));
-  rm = fresh(f => { f.type = "DOCUMENTS"; f.from = "Runbook, Service"; f.to = "Service"; f.provider = "custom"; f.custom = "runbook_links"; });
-  check("a new entry writes several from labels as a list, and a custom block for the custom provider",
-    j(rm) === j({ type: "DOCUMENTS", from: ["Runbook", "Service"], to: "Service", provider: "custom", custom: { name: "runbook_links" } }), j(rm));
+  rm = fresh(f => { f.type = "DOCUMENTS"; f.from = "Runbook, Service"; f.to = "Service"; f.provider = "filesystem"; });
+  check("a new entry writes several from labels as a list, and a provider other than the default",
+    j(rm) === j({ type: "DOCUMENTS", from: ["Runbook", "Service"], to: "Service", provider: "filesystem" }), j(rm));
   check("the Add relationship template declares no custom provider (custom ones need a custom_providers entry)",
     !/custom/.test(api.CONFIG_SECTIONS.relationships.template) && !("provider" in api.CONFIG_SECTIONS.relationships.entry), api.CONFIG_SECTIONS.relationships.template);
   rm = relBack({ type: "CALLS", provider: "builtin", from: "A", to: "B" }, f => { f.type = "USES"; });
   check("a provider the entry spelled out at its default is kept", j(rm) === j({ type: "USES", provider: "builtin", from: "A", to: "B" }), j(rm));
   rm = relBack(REL, f => { f.provider = "filesystem"; });
   check("a provider changed from the default is written in model order", j(rm) === j({ type: "T", from: "A", to: "B", provider: "filesystem" }), j(rm));
-  rm = relBack(REL, f => { f.provider = "custom"; });
-  check("switching to custom with no name writes no custom block", j(rm) === j({ type: "T", from: "A", to: "B", provider: "custom" }), j(rm));
-  rm = relBack(REL, f => { f.provider = "custom"; f.custom = "my_links"; });
-  check("a custom name is written as a nested block", j(rm) === j({ type: "T", from: "A", to: "B", provider: "custom", custom: { name: "my_links" } }), j(rm));
-  rf = relForm(REL_OK[2]);
-  rf.provider = "builtin";
-  rm = api.configEntryFromForm("relationships", rf, Object.keys(REL_OK[2]));
-  check("switching away from custom keeps the name in the form state but doesn't write it",
-    rf.custom === "runbook_links" && j(rm) === j({ type: "DOCUMENTS", from: "Runbook", to: "Service", provider: "builtin" }), j([rf.custom, rm]));
-  rf.provider = "custom";
-  rm = api.configEntryFromForm("relationships", rf, Object.keys(REL_OK[2]));
-  check("...and switching back restores it, params included", j(rm) === j(REL_OK[2]), j(rm));
-  rf.custom = "";
-  rm = api.configEntryFromForm("relationships", rf, Object.keys(REL_OK[2]));
-  check("an emptied name in an opened custom block drops only the name", j(rm.custom) === j({ params: {} }), j(rm));
-  rm = relBack(REL_OK[6], f => { f.type = "U"; });
-  check("an opened custom: null is kept while the name stays empty", "custom" in rm && rm.custom === null, j(rm));
-  rm = relBack(REL_OK[6], f => { f.custom = "named"; });
-  check("...and becomes a block once a name is typed", j(rm.custom) === j({ name: "named" }), j(rm));
-  rm = relBack(REL_OK[6], f => { f.custom = "named"; f.provider = "builtin"; });
-  check("...but stays custom: null when the provider is then switched away (only a name under custom replaces it)",
-    "custom" in rm && rm.custom === null && rm.provider === "builtin", j(rm));
+  rm = relBack(REL_OK[3], f => { f.type = "USES"; f.provider = "filesystem"; });
+  check("an opened custom: null is kept under another provider", "custom" in rm && rm.custom === null && rm.provider === "filesystem", j(rm));
   rm = relBack(REL_OK[1], f => { f.color = ""; f.to = "Doc"; });
   check("a cleared colour is omitted; an edited to is written", !("color" in rm) && rm.to === "Doc", j(rm));
   check("relationship YAML: from as a flow list, custom as a nested block, keys in model order",
@@ -1868,20 +1854,17 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
     j(ctxB.filesystem) === j({ file: null, folder: null }) && j(ctxB.labels) === j(["Function", "Service", "Runbook"]), j(ctxB));
   const relHints = (e, edit, c = ctx) => { const f = relForm(e); if (edit) edit(f); return c === "none" ? api.configFormHints("relationships", f) : api.configFormHints("relationships", f, c); };
   [{ type: "CALLS", from: "Function", to: "Function" },
-    { type: "DOCUMENTS", from: ["Runbook", "Service"], to: "Service", provider: "custom", custom: { name: "runbook_links" }, color: "#1f77b4" },
+    { type: "CALLS", from: ["Function", "Runbook"], to: "Service", color: "#1f77b4" },
     { type: "IS_CHILD_OF", from: ["File", "Folder"], to: "Folder", provider: "filesystem" }].forEach((e, i) => {
     check("no hints for valid relationship #" + i, j(relHints(e)) === "[]", j(relHints(e)));
   });
-  const R_OK = { type: "DOCUMENTS", from: "Runbook", to: "Service", provider: "custom", custom: { name: "runbook_links" } };
+  const R_OK = { type: "CALLS", from: "Runbook", to: "Service" };
   const FS_OK = { type: "IS_CHILD_OF", from: ["File", "Folder"], to: "Folder", provider: "filesystem" };
   [["an empty type", R_OK, f => { f.type = ""; }, "type", /^A relationship type is uppercase letters, digits and underscores, starting with a letter \(at most 64 characters\)\.$/],
     ["a lowercase type", R_OK, f => { f.type = "documents"; }, "type", /uppercase letters/],
-    ["a builtin provider with a new type", R_OK, f => { f.provider = "builtin"; }, "provider",
-      /^The builtin provider reuses one of DevGraph's relationship types; pick Custom or Filesystem to declare a new one\.$/],
-    ["a custom provider with a built-in type", R_OK, f => { f.type = "USES"; }, "provider", /^`USES` is built in: use the builtin provider to reuse it\.$/],
+    ["a builtin provider with a new type", R_OK, f => { f.type = "DOCUMENTS"; }, "provider",
+      /^The builtin provider reuses one of DevGraph's relationship types; pick Filesystem, or declare a custom provider in devgraph\.schema\.yaml, for a new one\.$/],
     ["a filesystem provider with a built-in type", FS_OK, f => { f.type = "CALLS"; }, "provider", /^`CALLS` is built in/],
-    ["an empty custom name", R_OK, f => { f.custom = ""; }, "custom", /required/],
-    ["a custom name off the pattern", R_OK, f => { f.custom = "Links"; }, "custom", /lowercase/],
     ["no from labels", R_OK, f => { f.from = " , "; }, "from", /at least one/],
     ["a from label off the pattern", R_OK, f => { f.from = "Runbook, 9x"; }, "from", /`9x`/],
     ["a from label listed twice", R_OK, f => { f.from = "Runbook, Service, Runbook"; }, "from", /`Runbook` is listed more than once/],
@@ -1911,8 +1894,6 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
   check("built-in labels are unknown under extends: none", got.some(h => h.field === "from" && /`Function` isn't a node type/.test(h.text)), j(got));
   got = relHints(R_OK, f => { f.from = "Runbok"; f.to = "Servic"; f.type = "USES"; }, "none");
   check("no label, provider-type or filesystem hints without a context", j(got) === "[]", j(got));
-  got = relHints(R_OK, f => { f.provider = "builtin"; f.custom = ""; });
-  check("the custom name is only hinted for the custom provider", !got.some(h => h.field === "custom"), j(got));
   check("tools and node types ignore the context",
     j(api.configFormHints("tools", api.configFormFromEntry("tools", VALID_TOOL).form, ctx)) === "[]" &&
     j(api.configFormHints("node_types", api.configFormFromEntry("node_types", VALID_NODE).form, ctx)) === "[]", "");
@@ -1936,9 +1917,9 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
     parameters: [{ name: "limit", type: "integer", required: false, default: 10 }, { name: "flag", type: "boolean", required: false, default: "yes" }] };
   /* what the server dumped: deliberately not what the form's emitter would write */
   const TOOL_YAML = "name: hot_paths\ndescription: 'Hot paths.'\ncypher: |\n  MATCH (f:Function {repo_id: $repo_id})\n  RETURN f.name AS name\nparameters:\n- {name: limit, type: integer, required: false, default: 10}\n- {name: flag, type: boolean, required: false, default: 'yes'}\n";
-  const REL_ENTRY = { type: "OWNS", from: ["Team"], to: "Service", provider: "custom", custom: { name: "owners", params: {} }, color: "#1f77b4" };
+  const REL_ENTRY = { type: "OWNS", from: ["Team"], to: "Service", provider: "filesystem", color: "#1f77b4" };
   /* what the server dumped: again not the emitter's text */
-  const REL_YAML = "type: OWNS\nfrom:\n- Team\nto: Service\nprovider: custom\ncustom:\n  name: owners\n  params: {}\ncolor: '#1f77b4'\n";
+  const REL_YAML = "type: OWNS\nfrom:\n- Team\nto: Service\nprovider: filesystem\ncolor: '#1f77b4'\n";
   const RUNBOOK = { label: "Runbook", key: ["slug"], metadata: [{ name: "slug", type: "string", required: true }, { name: "owner", type: "string" }] };
   const FM = () => {
     const m = MODEL();
@@ -1956,7 +1937,9 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
       { type: "OWNS", yaml: REL_YAML, entry: REL_ENTRY, editable: true, badges: [] },
       { type: "PARAMS", yaml: "type: PARAMS\n", entry: { type: "PARAMS", from: "A", to: "B", provider: "custom", custom: { name: "x", params: { a: 1 } } },
         editable: true, badges: [] },
-      { type: "HOSTILE_REL", yaml: "type: HOSTILE_REL\n", entry: { type: HOSTILE, from: HOSTILE, to: HOSTILE, provider: "custom", custom: { name: HOSTILE }, color: HOSTILE },
+      { type: "HOSTILE_REL", yaml: "type: HOSTILE_REL\n", entry: { type: HOSTILE, from: HOSTILE, to: HOSTILE, color: HOSTILE },
+        editable: true, badges: [] },
+      { type: "DOCUMENTS", yaml: "type: DOCUMENTS\n", entry: { type: "DOCUMENTS", from: "Runbook", to: "Service", provider: "custom", custom: { name: "runbook_links" } },
         editable: true, badges: [] }];
     return m;
   };
@@ -2089,6 +2072,9 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
     els.configFormNoticeText.textContent);
   await editRow("repo-b", "PARAMS");
   check("a relationship with non-empty custom.params opens in YAML, naming the field", formOff(FIELD("custom.params")),
+    els.configFormNoticeText.textContent);
+  await editRow("repo-b", "DOCUMENTS");
+  check("a custom relationship opens in YAML with the custom-provider notice", formOff(CUSTOM_RELATIONSHIP),
     els.configFormNoticeText.textContent);
   els.configModalCancel.fire("click");
 
@@ -2311,7 +2297,7 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
     JSON.stringify(allEls.filter(e => e._html.includes("<img")).map(e => e._html)));
   els.configModalCancel.fire("click");
 
-  // 41n. relationships in the form: provider and custom name, from as labels, the shared colour control
+  // 41n. relationships in the form: provider, from as labels, the shared colour control
   api.renderConfigPage(FM());
   fetchCalls = [];
   respond = quiet;
@@ -2319,24 +2305,24 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
   check("a relationship with an entry opens in the form, legended Relationship", shown(els.configForm) && !shown(els.configYaml) &&
     shown(els.configEditorSwitch) && els.configModeForm.getAttribute("aria-pressed") === "true" && els.configForm.children[0].tagName === "LEGEND" &&
     els.configForm.children[0].textContent === "Relationship", els.configForm.style.display);
-  check("...showing the entry: from as comma-separated labels, the provider, the custom name, the colour",
+  check("...showing the entry: from as comma-separated labels, the provider, the colour",
     formCtl("Type").value === "OWNS" && formCtl("From").value === "Team" && formCtl("To").value === "Service" &&
-    formCtl("Provider").value === "custom" && formCtl("Custom provider name").value === "owners" && formCtl("Colour").value === "#1f77b4",
+    formCtl("Provider").value === "filesystem" && formCtl("Colour").value === "#1f77b4",
     JSON.stringify([formCtl("Type").value, formCtl("From").value, formCtl("Provider").value]));
-  check("...the fields in model order, the custom name right after Provider",
+  check("...the fields in model order, with no custom provider name",
     JSON.stringify(find(els.configForm, e => e.tagName === "LABEL").map(l => l.textContent)) ===
-      JSON.stringify(["Type", "From", "To", "Provider", "Custom provider name", "Colour"]),
+      JSON.stringify(["Type", "From", "To", "Provider", "Colour"]),
     JSON.stringify(find(els.configForm, e => e.tagName === "LABEL").map(l => l.textContent)));
   check("...Type's help says an edit renames it", /Changing it renames the relationship\./.test(
     find(els.configForm, e => e.id === formCtl("Type").getAttribute("aria-describedby").split(" ")[0])[0].textContent), "");
-  check("...the provider options name what each does", JSON.stringify(formCtl("Provider").children.map(o => [o.value, o.textContent])) ===
-    JSON.stringify([["builtin", "Built-in type"], ["custom", "Custom provider"], ["filesystem", "Filesystem (file → parent folder)"]]),
+  check("...the provider options name what each does, and custom is not one of them", JSON.stringify(formCtl("Provider").children.map(o => [o.value, o.textContent])) ===
+    JSON.stringify([["builtin", "Built-in type"], ["filesystem", "Filesystem (file → parent folder)"]]),
     JSON.stringify(formCtl("Provider").children.map(o => [o.value, o.textContent])));
   check("...the textarea keeps the server's text, focus on the first control", els.configYaml.value === REL_YAML && focused === formCtl("Type"),
     focused && focused.tagName);
   check("every relationship form control has a label", labelled(els.configForm).length === 0, JSON.stringify(labelled(els.configForm).map(c => c.id)));
   check("...and every text field and select has its hint box linked by aria-describedby",
-    ["Type", "From", "To", "Provider", "Custom provider name", "Colour"].every(l => {
+    ["Type", "From", "To", "Provider", "Colour"].every(l => {
       const ids = (formCtl(l).getAttribute("aria-describedby") || "").split(" ");
       return ids.some(id => find(els.configForm, e => e.id === id && e.classList.contains("cfg-hint")).length === 1);
     }), "");
@@ -2345,7 +2331,7 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
     writes().length === 2 && body(writes()[0]).dry_run === true && body(writes()[1]).dry_run === false &&
     writes().every(c => body(c).yaml === REL_YAML && c.url === "/api/config/repo-b/schema/relationships/OWNS" && c.init.method === "PUT" &&
       ifMatch(c) === '"sha256:repo-b-schema"'), JSON.stringify(writes()));
-  // provider switching: the custom name shows and hides in place, the select keeps focus, the YAML follows
+  // provider switching: the select keeps focus, the YAML follows
   api.renderConfigPage(FM());
   fetchCalls = [];
   await editRow("repo-b", "OWNS");
@@ -2353,27 +2339,9 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
   prov.focus();
   prov.value = "builtin";
   await prov.fire("change");
-  const nameGone = api.formEls.all.filter(c => c.tagName === "INPUT" && c.type === "text").length === 4;
-  check("switching the provider away from custom hides the custom name, keeping the same select focused",
-    nameGone &&
-    formCtl("Provider") === prov && focused === prov && !formCtl("Custom provider name") &&
-    !find(els.configForm, e => e.tagName === "LABEL" && e.textContent === "Custom provider name").length, focused && focused.tagName);
-  const emptyHolders = els.configForm.children.filter(e => e.tagName === "DIV" && !e.children.length && e.style.display !== "none");
-  check("...and the empty holder is out of the layout (no doubled flex gap)", !emptyHolders.length, String(emptyHolders.length));
-  check("...and the YAML drops the custom block", /^provider: builtin$/m.test(els.configYaml.value) && !/custom:|owners/.test(els.configYaml.value),
-    els.configYaml.value);
-  prov.value = "custom";
-  await prov.fire("change");
-  check("...the holder is shown again for the custom name", !els.configForm.children.some(e => e.tagName === "DIV" && e.style.display === "none" && !e.children.length), "");
-  check("switching back shows the custom name again with its value, focus still on the select",
-    formCtl("Custom provider name") && formCtl("Custom provider name").value === "owners" && focused === prov &&
-    /custom:\n  name: owners\n  params: \{\}/.test(els.configYaml.value), els.configYaml.value);
-  await typeIn(formCtl("Custom provider name"), "Owners");
-  const cnHint = find(els.configForm, e => e.id === formCtl("Custom provider name").getAttribute("aria-describedby").split(" ").pop())[0];
-  check("...a bad custom name shows its hint", shown(cnHint) && /lowercase/.test(cnHint.textContent), cnHint.textContent);
-  check("the custom name control is among the form's controls only while shown",
-    api.formEls.all.includes(formCtl("Custom provider name")) && api.formEls.all.filter(c => c.tagName === "INPUT" && c.type === "text").length === 5,
-    String(api.formEls.all.length));
+  check("switching the provider keeps the same select focused and the YAML follows",
+    formCtl("Provider") === prov && focused === prov && /^provider: builtin$/m.test(els.configYaml.value) &&
+    !/custom/.test(els.configYaml.value), els.configYaml.value);
   els.configModalCancel.fire("click");
   // a form edit is a textarea edit: crossName cleared, a confirm dropped, Save sends the textarea's text
   api.renderConfigPage(FM());
@@ -2407,8 +2375,8 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
   const provBusy = formCtl("Provider");
   provBusy.value = "builtin";
   await provBusy.fire("change");
-  check("...a provider change that lands anyway changes nothing", els.configYaml.value === relBusy && api.edit.formState.provider === "custom" &&
-    !!formCtl("Custom provider name"), els.configYaml.value);
+  check("...a provider change that lands anyway changes nothing", els.configYaml.value === relBusy && api.edit.formState.provider === "filesystem",
+    els.configYaml.value);
   gate = null; release(); await pending;
   els.configModalCancel.fire("click");
   // the shared colour control
@@ -2422,7 +2390,7 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
   els.configModalCancel.fire("click");
   // hostile values
   await editRow("repo-b", "HOSTILE_REL");
-  check("hostile relationship values are control values", ["Type", "From", "To", "Custom provider name", "Colour"].every(l => formCtl(l).value === HOSTILE),
+  check("hostile relationship values are control values", ["Type", "From", "To", "Colour"].every(l => formCtl(l).value === HOSTILE),
     formCtl("Type").value);
   await typeIn(formCtl("From"), HOSTILE + ", " + HOSTILE);
   check("...their hints are text, and nothing reaches innerHTML", allEls.every(e => !e._html.includes("<img") && !e._html.includes("onerror")),

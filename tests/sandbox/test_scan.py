@@ -16,6 +16,7 @@ from devgraph.sandbox.display import script_for_review
 from devgraph.sandbox.limits import (
     DENIED_NAMES,
     FIXED_PATH,
+    INPUT_ALLOWLIST_MODULES,
     SCAN_OUTPUT_MAX_BYTES,
     SCAN_RLIMIT_AS_BYTES,
     SCAN_RLIMIT_CPU_SECONDS,
@@ -53,7 +54,7 @@ def _probe(expression: str) -> str:
 
 def test_clean_script_has_no_findings():
     text = (
-        "import re\nimport json\nimport os.path\nfrom os import path\nfrom os.path import join\n"
+        "import re\nimport json\nimport os.path as osp\nfrom os import path\nfrom os.path import join\n"
         "from collections.abc import Mapping\nfrom pathlib import PurePosixPath, PureWindowsPath\n"
         "import typing as t\n\n"
         "def derive(ctx):\n    while 1:\n        break\n    return [{'path': ctx.path}]\n"
@@ -275,6 +276,9 @@ def test_denied_names(name):
         "from fnmatch import posixpath",
         "from collections import _collections_abc",
         "from re import copyreg",
+        # `import a.b` binds `a`, so `a` itself must be allowlisted.
+        "import os.path",
+        "import os.path, re",
     ],
 )
 def test_imports_outside_the_allowlist(line):
@@ -285,8 +289,8 @@ def test_imports_outside_the_allowlist(line):
     "line",
     [
         "import re",
-        "import os.path",
         "import os.path as p",
+        "import collections.abc",
         "from os import path",
         "from os.path import join, splitext",
         "from collections.abc import Mapping",
@@ -374,6 +378,31 @@ def test_grammar_is_pinned_to_the_feature_version():
     # PEP 695 `type` statements are 3.12 syntax; the scan parses as 3.11.
     error = _reject("type X = int\n" + DERIVE)
     assert "syntax error" in error.reason
+
+
+def test_dotted_import_names_the_module_it_binds_and_the_fix():
+    (finding,) = static_scan(DERIVE + "import os.path\n").findings
+    assert finding == Finding(
+        "import",
+        3,
+        "import of 'os.path' binds 'os', which is not allowed; "
+        "use `import os.path as <name>` or `from os import path`",
+    )
+
+
+def test_every_allowlisted_dotted_module_is_checked_by_its_first_name():
+    for module in INPUT_ALLOWLIST_MODULES:
+        head = module.split(".")[0]
+        rules = _rules(f"import {module}\n" + DERIVE)
+        if module == "pathlib":
+            assert rules == {"import"}  # only `from pathlib import Pure...`
+        elif head in INPUT_ALLOWLIST_MODULES:
+            assert rules == set(), module
+        else:
+            assert rules == {"import"}, module
+        assert _rules(f"import {module} as m\n" + DERIVE) == (
+            {"import"} if module == "pathlib" else set()
+        ), module
 
 
 def test_finding_message_escapes_non_ascii():
