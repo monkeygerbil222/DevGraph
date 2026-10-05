@@ -33,6 +33,7 @@ from dataclasses import dataclass
 from fnmatch import fnmatchcase
 from pathlib import Path, PurePosixPath
 
+from devgraph.git_safe import LAZY_FETCH_GUARD_MIN_VERSION
 from devgraph.indexer.dispatch import is_ignored_path
 from devgraph.sandbox.limits import (
     DENYLIST,
@@ -46,7 +47,7 @@ from devgraph.sandbox.reader import InputError
 logger = logging.getLogger(__name__)
 
 #: `GIT_NO_LAZY_FETCH` first appears in git 2.45.
-GIT_MIN_VERSION = (2, 45)
+GIT_MIN_VERSION = LAZY_FETCH_GUARD_MIN_VERSION
 #: A pending, unterminated name longer than this ends the read (PATH_MAX is 4 KiB).
 _MAX_NAME_BYTES = 64 * 1024
 

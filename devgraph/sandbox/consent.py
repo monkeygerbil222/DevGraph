@@ -29,6 +29,7 @@ from rich.cells import cell_len
 
 from devgraph.sandbox.display import script_for_review, visible
 from devgraph.sandbox.limits import GROWTH_FACTOR
+from devgraph.sandbox.reader import provider_script_path
 from devgraph.sandbox.snapshot import ProviderSnapshot
 from devgraph.sandbox.trust import Approval
 
@@ -107,7 +108,7 @@ def review_lines(
     """The approval prompt (§5.4), as plain-text lines with every repository-sourced
     string escaped. `previous` is the provider's most recent approval, if any: the
     declaration and the script are then shown as unified diffs against it."""
-    script_path = f".devgraph/providers/{snap.name}.py"
+    script_path = provider_script_path(snap.name)
     globs = ", ".join(visible(g) for g in snap.declaration_set["provider"]["inputs"])
     lines = [
         f"Repository: {visible(repo_id)}",

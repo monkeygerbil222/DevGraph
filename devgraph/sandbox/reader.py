@@ -28,11 +28,10 @@ import sys
 from collections.abc import Callable
 from pathlib import Path
 
-from devgraph.config.project_schema import PROPERTY_NAME_PATTERN
-from devgraph.paths import FileTooLarge, NotRegularFile, read_fd_bounded
-from devgraph.sandbox.limits import INPUT_MAX_FILE_BYTES, SCRIPT_MAX_BYTES
+from devgraph.config.project_schema import PROPERTY_NAME_PATTERN, SCHEMA_FILENAME
+from devgraph.paths import MAX_CONFIG_BYTES, FileTooLarge, NotRegularFile, read_fd_bounded
+from devgraph.sandbox.limits import SCRIPT_MAX_BYTES
 
-SCHEMA_FILE = "devgraph.schema.yaml"
 
 # 437 in the unified syscall table, which these Linux machines use. Others (alpha,
 # ia64, mips) number it differently and take the fallback.
@@ -228,6 +227,11 @@ def read_repo_file(
         os.close(root_fd)
 
 
+def provider_script_path(name: str) -> str:
+    """The fixed repo-relative path of provider `name`'s script."""
+    return f".devgraph/providers/{name}.py"
+
+
 def read_provider_script(
     root: Path, name: str, *, use_openat2: bool | None = None
 ) -> bytes:
@@ -237,7 +241,7 @@ def read_provider_script(
     try:
         return read_repo_file(
             root,
-            f".devgraph/providers/{name}.py",
+            provider_script_path(name),
             cap=SCRIPT_MAX_BYTES,
             use_openat2=use_openat2,
         )
@@ -251,7 +255,7 @@ def read_provider_script(
 
 
 def read_schema_file(root: Path, *, use_openat2: bool | None = None) -> bytes:
-    """`devgraph.schema.yaml`, at most `INPUT_MAX_FILE_BYTES`."""
+    """`devgraph.schema.yaml`, at most `MAX_CONFIG_BYTES` (the cap every config read uses)."""
     return read_repo_file(
-        root, SCHEMA_FILE, cap=INPUT_MAX_FILE_BYTES, use_openat2=use_openat2
+        root, SCHEMA_FILENAME, cap=MAX_CONFIG_BYTES, use_openat2=use_openat2
     )

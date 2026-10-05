@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from devgraph.config.project_schema import (
+    SCHEMA_FILENAME,
     ProjectSchema,
     ProjectSchemaError,
     parse_project_schema,
@@ -31,7 +32,6 @@ from devgraph.sandbox.limits import (
 )
 from devgraph.sandbox.paths import platform_supported
 from devgraph.sandbox.reader import (
-    SCHEMA_FILE,
     InputError,
     read_provider_script,
     read_repo_file,
@@ -67,11 +67,11 @@ class ProviderSnapshot:
 def _read_schema(root: Path) -> tuple[str, ProjectSchema]:
     raw = read_schema_file(root)
     try:
-        schema = parse_project_schema(raw.decode("utf-8"), Path(SCHEMA_FILE))
+        schema = parse_project_schema(raw.decode("utf-8"), Path(SCHEMA_FILENAME))
         resolve_declaration(schema)
     except (UnicodeDecodeError, ProjectSchemaError):
         raise InputError(
-            "static_reject", f"{SCHEMA_FILE} is not a valid schema"
+            "static_reject", f"{SCHEMA_FILENAME} is not a valid schema"
         ) from None
     return "sha256:" + hashlib.sha256(raw).hexdigest(), schema
 
@@ -141,7 +141,7 @@ def repo_snapshots(
     a schema that cannot be read or is invalid raises `InputError`.
     """
     real = Path(os.path.realpath(root))
-    if not os.path.lexists(real / SCHEMA_FILE):
+    if not os.path.lexists(real / SCHEMA_FILENAME):
         return {}
     schema_hash, schema = _read_schema(real)
     result: dict[str, ProviderSnapshot | InputError] = {}

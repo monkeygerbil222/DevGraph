@@ -75,7 +75,7 @@ def test_no_output_contains_approve_command_with_digest(runner, tmp_path, settin
     outputs.append(runner.invoke(app, [*scripts, "approve", repo_id], input=f"{PROVIDER}\n").output)
     outputs.append(runner.invoke(app, ["config", "disable", repo_id]).output)
     resumed = runner.invoke(app, ["config", "enable", repo_id]).output
-    assert "resumes without re-approval" in " ".join(resumed.split())
+    assert "remains approved" in " ".join(resumed.split())
     outputs.append(resumed)
     outputs.append(runner.invoke(app, ["doctor"]).output)  # approved
     for status in ("pending", "unreachable"):

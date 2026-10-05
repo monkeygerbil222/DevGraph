@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from devgraph.sandbox import paths
 from devgraph.sandbox.limits import MAX_ACTIVE_DIGESTS, TRUST_SCHEMA_VERSION
 from devgraph.sandbox.paths import SandboxPathError, check_private_dir, private_file_stat, same_file
 
@@ -277,3 +278,29 @@ class TrustStore:
             ("DELETE FROM approvals WHERE repo_id = ?", (repo_id,)),
             ("DELETE FROM repo_scripts WHERE repo_id = ?", (repo_id,)),
         ])
+
+
+def forget_repo_trust(repo_id: str, *, registering: bool) -> str | None:
+    """Delete every trust row for `repo_id`, under any path (NFC keys can collapse).
+
+    Called on `remove`, and on registration from the CLI or the dashboard, so a
+    re-registered id never inherits approvals a failed cleanup left behind.
+    Returns None, or a plain-text warning when the store exists but cannot be
+    written; the caller escapes it for its surface.
+    """
+    store_path = paths.trust_store_path(paths.sandbox_home())
+    if not os.path.lexists(store_path):
+        return None
+    try:
+        with TrustStore.open_write(store_path) as store:
+            store.forget_repo(repo_id)
+    except Exception as exc:
+        if registering:
+            consequence = (f"old approvals for {repo_id} may still apply; run "
+                           f"`devgraph config scripts disable {repo_id}` and revoke them once the trust "
+                           "store can be written")
+        else:
+            consequence = ("while no repository is registered under this id they match nothing; they are cleared "
+                           "when the id is registered again")
+        return f"Could not delete {repo_id}'s script trust rows: {exc}. {consequence}."
+    return None

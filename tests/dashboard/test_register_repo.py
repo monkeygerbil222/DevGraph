@@ -452,3 +452,45 @@ def test_register_repo_with_an_invalid_schema_stays_registered_and_warns(
         assert reopened.get("sample-repo") is not None
     finally:
         reopened.close()
+
+
+def _stale_trust(repo: Path) -> Path:
+    """A trust store holding rows for `sample-repo` left behind by an earlier registration."""
+    from devgraph.sandbox import paths
+    from devgraph.sandbox.trust import TrustStore
+
+    home = paths.sandbox_home()
+    (home / ".devgraph").mkdir(parents=True, mode=0o700)
+    store_path = paths.trust_store_path(home)
+    with TrustStore.open_write(store_path) as store:
+        store.set_scripts_enabled("sample-repo", str(repo.resolve()), True)
+    return store_path
+
+
+def test_register_repo_clears_stale_script_trust_like_the_cli(client, tmp_path):
+    from devgraph.sandbox.trust import TrustStore
+
+    repo = _make_git_repo(tmp_path)
+    store_path = _stale_trust(repo)
+
+    res = client.post("/api/repos", json={"path": str(repo)})
+
+    assert res.status_code == 201, res.text
+    assert res.json()["warning"] is None
+    store = TrustStore.open_read(store_path)
+    with store:
+        assert not store.scripts_enabled("sample-repo", str(repo.resolve()))
+
+
+def test_register_repo_warns_when_stale_script_trust_cannot_be_cleared(client, tmp_path):
+    import os
+
+    repo = _make_git_repo(tmp_path)
+    store_path = _stale_trust(repo)
+    os.chmod(store_path, 0o666)
+
+    res = client.post("/api/repos", json={"path": str(repo)})
+
+    assert res.status_code == 201, res.text
+    warning = res.json()["warning"]
+    assert "script trust" in warning and "config scripts disable sample-repo" in warning

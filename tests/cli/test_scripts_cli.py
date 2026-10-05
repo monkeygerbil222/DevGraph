@@ -333,6 +333,20 @@ def test_script_with_findings_cannot_be_approved(tmp_path, settings, home, tty, 
     assert not store_path(home).exists()
 
 
+def test_findings_block_approval_in_list_and_doctor(tmp_path, settings, home, tty, runner, monkeypatch):
+    root = make_repo(tmp_path / "bad", files(script="import socket\n\ndef derive(ctx):\n    return []\n"))
+    register(settings, root)
+    assert enable(runner).exit_code == 0
+    assert state(runner) == "awaiting_approval"
+    row = next(line for line in runner.invoke(app, ["config", "scripts", "list"]).output.splitlines() if PROVIDER in line)
+    assert "findings block approval" in row.split("│")[7]
+    _, section = doctor(runner, monkeypatch)
+    assert "findings block approval" in section and "devgraph config scripts show demo runbook_links" in section
+    assert "scripts approve" not in section
+    shown = runner.invoke(app, ["config", "scripts", "show", "demo", PROVIDER]).output
+    assert "Static scan findings (findings block approval):" in shown
+
+
 def test_rejected_script_cannot_be_approved(tmp_path, settings, home, tty, runner):
     root = make_repo(tmp_path / "rej", files(script="def derive(ctx):\n  return (\n"))
     register(settings, root)
@@ -463,7 +477,8 @@ def test_revoke_one_digest(runner, repo, home):
     assert [a.digest for a in approvals(home, repo)] == [second]
     out = " ".join(result.output.split())
     assert "no longer runs" not in out
-    assert first[:12] in out and "current digest" in out and second[:12] in out and "still approved" in out
+    assert first[:12] in out and "current digest" in out and second[:12] in out and "remains approved" in out
+    assert "still runs" not in out
     last = runner.invoke(app, ["config", "scripts", "revoke", "demo", PROVIDER, "--digest", second])
     assert "no longer runs" in " ".join(last.output.split())
     unknown = runner.invoke(app, ["config", "scripts", "revoke", "demo", PROVIDER, "--digest", "f" * 64])
@@ -487,6 +502,7 @@ def test_list_shows_growth_marker(runner, repo, home, tty):
 def test_enable_requires_typing_the_repo_id(runner, repo, home, tty):
     wrong = enable(runner, typed="yes")
     assert wrong.exit_code == 1 and not store_path(home).exists()
+    assert "This version does not run scripts yet." in " ".join(wrong.output.split())  # shown before the answer
     right = enable(runner)
     assert right.exit_code == 0, right.output
     assert paths.canonical_repo_path(repo) in right.output and PROVIDER in right.output
@@ -516,7 +532,8 @@ def test_project_config_resume_cli(runner, repo, home, tty):
     result = runner.invoke(app, ["config", "enable", "demo"])
     assert result.exit_code == 0, result.output
     out = " ".join(result.output.split())
-    assert PROVIDER in out and "resume" in out and "without re-approval" in out
+    assert PROVIDER in out and "remains approved" in out and "without re-approval" in out
+    assert "resumes" not in out
     assert state(runner) == "approved"
     assert approvals(home, repo) == before
 
@@ -804,18 +821,21 @@ def test_config_disable_then_rescan_is_disabled_not_pending(runner, repo, tty, m
     assert "project config is off" in section and "rescan" not in section
 
 
-def test_applied_schema_status_reports_an_unreachable_graph(monkeypatch):
-    real = REAL_SCHEMA_STATUS
-    monkeypatch.setattr(cli_main, "GraphEngine", _NoGraph)
-    assert real("demo", "sha256:x") == "unreachable"
+def test_applied_schema_status_reports_an_unreachable_graph(monkeypatch, settings):
+    from devgraph.sandbox import schema_status
+
+    real = schema_status.applied_schema_status
+    monkeypatch.setattr(schema_status, "GraphEngine", _NoGraph)
+    assert real("demo", "sha256:x", settings) == "unreachable"
 
     class Applied(_StubGraph):
         def read_applied_schema(self, repo_id):
             return {"hash": "sha256:x"}
 
-    monkeypatch.setattr(cli_main, "GraphEngine", Applied)
-    assert real("demo", "sha256:x") == "applied"
-    assert real("demo", "sha256:y") == "pending"
+    monkeypatch.setattr(schema_status, "GraphEngine", Applied)
+    assert real("demo", "sha256:x", settings) == "applied"
+    assert real("demo", "sha256:y", settings) == "pending"
+    assert REAL_SCHEMA_STATUS("demo", "sha256:y") == "pending"  # the CLI passes its settings
 
 
 def test_gate_warnings_are_not_repeated(tmp_path, settings, home, runner, monkeypatch, caplog):
