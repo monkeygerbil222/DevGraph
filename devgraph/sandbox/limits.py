@@ -31,6 +31,7 @@ MAX_ACTIVE_DIGESTS = 5
 SCAN_WALL_SECONDS = 5
 SCAN_RLIMIT_AS_BYTES = 256 * 1024 * 1024
 SCAN_RLIMIT_CPU_SECONDS = 5
+SCAN_OUTPUT_MAX_BYTES = 1024 * 1024  # worker stdout; over: static_reject
 SCAN_FEATURE_VERSION = (3, 11)  # the image's Python minor version
 
 # Secret-name denylist (§3.2): always applies, matched on the NFC-normalised,

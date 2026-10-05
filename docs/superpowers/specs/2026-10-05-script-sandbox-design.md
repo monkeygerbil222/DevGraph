@@ -488,7 +488,10 @@ its internals for an AST scan to close:
 The scan (import allowlist, denied names, dunder attributes, the table above)
 gives early, readable findings at approval; it is hygiene, not a boundary. It
 parses untrusted source, so it runs in a **separate `python -I -S` subprocess**
-with a 5 s wall timeout, `RLIMIT_AS` 256 MiB and `RLIMIT_CPU` 5 s. Any non-zero
+with a 5 s wall timeout, `RLIMIT_AS` 256 MiB and `RLIMIT_CPU` 5 s, and an
+environment of only `PATH` and `LC_ALL=C` (a named locale such as `C.UTF-8`
+makes glibc map its whole locale archive, 222 MiB on Fedora, and the
+interpreter then cannot start under that limit). Any non-zero
 exit, timeout, signal or exception inside it, including `RecursionError`,
 `MemoryError` and `SyntaxError`, is a hard reject (`static_reject`), never a
 pass. It parses with `feature_version` set to the image's Python minor version
@@ -848,7 +851,9 @@ overrides and isolates U+202A–U+202E and U+2066–U+2069, U+200E/U+200F and
 zero-width characters), a line or paragraph separator (U+2028/U+2029, Zl/Zp:
 some renderers break lines there while Python's tokenizer does not), or a
 private-use or unassigned code point (Co/Cn, as for the tools file and input
-globs). A script can still write any of these as escape sequences inside a
+globs). Categories come from the host Python's Unicode tables, so a code
+point a newer Unicode version assigns can be refused as Cn on an older host.
+A script can still write any of these as escape sequences inside a
 string literal. CRLF is normalised to LF; that string is hashed,
 shown at approval, sent over stdin, and passed to `compile()` as a `str`,
 so no decoding step inside the container can reinterpret it.
