@@ -621,3 +621,59 @@ def test_impact_diff_opens_repo_through_open_repo(tmp_path, graph_repo, registry
     assert impact_analysis_for_diff(engine, registry, repo_id, "HEAD~1", "HEAD")["changed_files"] == ["a.py"]
     assert via_open_repo == [str(repo)]
     assert opened == [git_safe.HardenedRepo]
+
+
+def _no_untracked(entries: list[dict]) -> bool:
+    return not [e for e in entries if e["state"] == "untracked"]
+
+
+def test_inherited_config_parameters_cannot_override_pins(tmp_path, monkeypatch):
+    repo = _make_repo(tmp_path / "repo")
+    marker = Marker(tmp_path, "fsmonitor")
+    (repo / "new.txt").write_text("n")
+    monkeypatch.setenv(
+        "GIT_CONFIG_PARAMETERS", f"'core.fsmonitor'='{marker.script}' 'status.showUntrackedFiles'='no'"
+    )
+    marker.assert_live(repo, "status")
+
+    assert _no_untracked(get_git_status(repo)["uncommitted"])  # harmless setting still applies
+    assert not marker.fired()
+
+
+def test_inherited_config_count_pairs_are_kept_below_pins(tmp_path, monkeypatch):
+    repo = _make_repo(tmp_path / "repo")
+    marker = Marker(tmp_path, "fsmonitor")
+    (repo / "new.txt").write_text("n")
+    for name, value in {
+        "GIT_CONFIG_COUNT": "2",
+        "GIT_CONFIG_KEY_0": "core.fsmonitor",
+        "GIT_CONFIG_VALUE_0": str(marker.script),
+        "GIT_CONFIG_KEY_1": "status.showUntrackedFiles",
+        "GIT_CONFIG_VALUE_1": "no",
+    }.items():
+        monkeypatch.setenv(name, value)
+    marker.assert_live(repo, "status")
+
+    assert _no_untracked(get_git_status(repo)["uncommitted"])
+    assert not marker.fired()
+
+
+@pytest.mark.parametrize(
+    "args",
+    [("cat-file", "--filters", "HEAD:a.py"), ("cat-file", "--textconv", "HEAD:a.py"), ("diff-tree", "-p", "--textconv", "HEAD")],
+    ids=["cat-file-filters", "cat-file-textconv", "diff-tree-textconv"],
+)
+def test_object_command_with_conversion_flag_runs_no_repo_program(args, tmp_path):
+    repo = _make_repo(tmp_path / "repo")
+    marker = Marker(tmp_path, "convert")
+    _git_ok(repo, "config", "filter.x.smudge", str(marker.script))
+    _git_ok(repo, "config", "diff.conv.textconv", str(marker.script))
+    _attributes_in_info(repo, "*.py filter=x diff=conv\n")
+    marker.assert_live(repo, *args)
+
+    git_repo = git_safe.open_repo(repo)
+    try:
+        git_repo.git.execute(["git", *args], with_exceptions=False)
+    finally:
+        git_repo.close()
+    assert not marker.fired()

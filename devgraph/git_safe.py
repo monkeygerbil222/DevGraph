@@ -8,17 +8,21 @@ diff driver, a clean/smudge/process filter driver, or a transport helper
 reached through a partial-clone lazy fetch. `open_repo` returns a GitPython
 `Repo` whose every git invocation runs with those mechanisms switched off:
 
-- Config overrides on every command, passed as `GIT_CONFIG_COUNT` /
-  `GIT_CONFIG_KEY_<n>` / `GIT_CONFIG_VALUE_<n>` environment pairs. These have
-  the same precedence as `-c` and beat every config file, including files
-  reached through `include.path`, so a repository cannot re-enable anything
-  pinned here. Unlike `-c`, a pair keeps its key intact even when it
-  contains `=`.
-- Filter drivers defined in the repository's own config (`local` and
-  `worktree` scope) are listed again before each command that may read the
-  working tree, and blanked with further pairs. Filters from the user's
-  global/system config (e.g. Git LFS) are left alone; the user's global and
-  system config apply as usual.
+- Config overrides on every command, appended to `GIT_CONFIG_PARAMETERS` in
+  git's quoted `'key'='value'` form (the form `-c` itself uses, and which
+  keeps a key intact even when it contains `=`). Command-scope config beats
+  every config file, including files reached through `include.path`, and git
+  reads `GIT_CONFIG_PARAMETERS` after any `GIT_CONFIG_COUNT` pairs, left to
+  right, so these pins come last and win over everything. Inherited
+  `GIT_CONFIG_PARAMETERS` entries and `GIT_CONFIG_COUNT` pairs (e.g. from a
+  user's `git -c ...` wrapper) are kept; they still apply to everything not
+  pinned here.
+- Filter drivers and diff `textconv` drivers defined in the repository's own
+  config (`local` and `worktree` scope) are listed again before each command
+  that may read the working tree or convert content, and blanked with further
+  pins (a blanked textconv makes git fail rather than run anything). Drivers
+  from the user's global/system config (e.g. Git LFS) are left alone; the
+  user's global and system config apply as usual.
 - A fixed environment: no lazy fetching of missing objects, no transport
   protocols at all, no prompts.
 - Timeouts, so a hung git never blocks the dashboard or the indexer. A
@@ -87,12 +91,14 @@ GIT_TIMEOUT_SECONDS: float = 30.0
 # How long a read of a streamed command's output may wait with no data.
 GIT_STREAM_IDLE_TIMEOUT_SECONDS: float = 30.0
 
-_FILTER_DRIVER_KEYS = r"^filter\..*\.(clean|smudge|process)$"
+_DRIVER_KEYS = r"^(filter\..*\.(clean|smudge|process)|diff\..*\.textconv)$"
 _REPO_SCOPES = ("local", "worktree")
 
-# Subcommands that only read objects and refs, never the working tree, so
-# no filter driver can run; they skip the per-command filter listing.
+# Subcommands that only read objects and refs, never the working tree, so no
+# driver can run; they skip the per-command driver listing unless they are
+# asked to convert content.
 _OBJECT_ONLY_COMMANDS = frozenset({"cat-file", "config", "diff-tree", "rev-list", "rev-parse"})
+_CONVERSION_FLAGS = ("--filters", "--textconv")
 
 # GitPython's `Repo()` also reads these from `os.environ` to locate the
 # repository, so they are removed from the process environment rather than
@@ -102,12 +108,14 @@ _INHERITED_LOCATION_VARS = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_C
 LAZY_FETCH_GUARD_MIN_VERSION = (2, 45)
 
 
+def _sq(text: str) -> str:
+    return "'" + text.replace("'", "'\\''") + "'"
+
+
 def _config_env(pairs: list[tuple[str, str]]) -> dict[str, str]:
-    env = {"GIT_CONFIG_COUNT": str(len(pairs))}
-    for i, (key, value) in enumerate(pairs):
-        env[f"GIT_CONFIG_KEY_{i}"] = key
-        env[f"GIT_CONFIG_VALUE_{i}"] = value
-    return env
+    pins = " ".join(f"{_sq(key)}={_sq(value)}" for key, value in pairs)
+    inherited = os.environ.get("GIT_CONFIG_PARAMETERS", "").strip()
+    return {"GIT_CONFIG_PARAMETERS": f"{inherited} {pins}" if inherited else pins}
 
 
 def _fixed_pairs() -> list[tuple[str, str]]:
@@ -211,37 +219,40 @@ class _HardenedGit(Git):
         super().__init__(working_dir)
         self.update_environment(**GIT_ENV)
 
-    def _repo_filter_drivers(self) -> list[str]:
-        """Names of filter drivers defined in the repository's own config."""
+    def _repo_driver_pins(self) -> list[tuple[str, str]]:
+        """Pins blanking the filter and textconv drivers defined in the
+        repository's own config."""
         status, listing, stderr = self.config(
-            "-z", "--show-scope", "--get-regexp", _FILTER_DRIVER_KEYS, with_extended_output=True, with_exceptions=False
+            "-z", "--show-scope", "--get-regexp", _DRIVER_KEYS, with_extended_output=True, with_exceptions=False
         )
         if status == 1:
             return []  # no matching keys
         if status != 0:
-            raise GitCommandError(["git", "config", "--get-regexp", _FILTER_DRIVER_KEYS], status, stderr)
+            raise GitCommandError(["git", "config", "--get-regexp", _DRIVER_KEYS], status, stderr)
         # -z: `<scope>\0<key>\n<value>\0` per entry.
         fields = listing.split("\0")
-        names: list[str] = []
+        pins: list[tuple[str, str]] = []
         for scope, entry in zip(fields[0::2], fields[1::2]):
             if scope not in _REPO_SCOPES:
                 continue
-            key = entry.split("\n", 1)[0]
-            name = key[len("filter.") :].rsplit(".", 1)[0]
-            if name not in names:
-                names.append(name)
-        return names
+            section, rest = entry.split("\n", 1)[0].split(".", 1)
+            name = rest.rsplit(".", 1)[0]
+            if section == "diff":
+                driver_pins = [(f"diff.{name}.textconv", "")]
+            else:
+                driver_pins = [(f"filter.{name}.{key}", "") for key in ("clean", "smudge", "process")]
+                # A required filter with no command makes git abort instead
+                # of reading the file unfiltered.
+                driver_pins.append((f"filter.{name}.required", "false"))
+            pins += [pin for pin in driver_pins if pin not in pins]
+        return pins
 
     def _config_pairs(self, command: list[str]) -> list[tuple[str, str]]:
         pairs = _fixed_pairs()
-        if _subcommand(command) in _OBJECT_ONLY_COMMANDS:
+        converts = any(str(arg).startswith(_CONVERSION_FLAGS) for arg in command[1:])
+        if _subcommand(command) in _OBJECT_ONLY_COMMANDS and not converts:
             return pairs
-        for name in self._repo_filter_drivers():
-            pairs += [(f"filter.{name}.{key}", "") for key in ("clean", "smudge", "process")]
-            # A required filter with no command makes git abort instead of
-            # reading the file unfiltered.
-            pairs.append((f"filter.{name}.required", "false"))
-        return pairs
+        return pairs + self._repo_driver_pins()
 
     def execute(self, command, **kwargs):  # type: ignore[override]
         kwargs.pop("kill_after_timeout", None)
