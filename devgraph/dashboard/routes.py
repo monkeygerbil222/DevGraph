@@ -964,6 +964,7 @@ def build_router(
         def op(root: Path) -> edits.EditResult:
             if edits.entry_section(entry) != section:
                 raise edits.ConfigEditError(f"the new entry must be a {edits.SCHEMA_SECTIONS[section][1]}", "invalid")
+            edits.refuse_custom(entry, None)  # Q13: custom declarations are CLI or hand-edit only
             return edits.add_schema_entry(root, entry, record=record, expected_fingerprint=expected, dry_run=dry_run)
 
         return await run_in_threadpool(_apply_edit, scope, record, "schema", op, True)
@@ -980,6 +981,8 @@ def build_router(
             lambda root: edits.replace_schema_entry(
                 root, name, entry, node_type=section == "node_types", relationship=section == "relationships",
                 record=record, expected_fingerprint=expected, dry_run=dry_run,
+                # Q13, under the edit's lock: neither the new entry nor the one it replaces may be custom
+                check=lambda existing: edits.refuse_custom(entry, existing),
             ),
             False,
         )

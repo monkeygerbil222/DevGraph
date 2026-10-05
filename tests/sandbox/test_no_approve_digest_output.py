@@ -140,6 +140,17 @@ def test_no_output_contains_approve_command_with_digest(runner, tmp_path, settin
         body = {"yaml": "label: Widget\nkey: [slug]\nmetadata: [{name: slug, required: true}]\n", "dry_run": True}
         outputs.append(client.post(f"/api/config/{repo_id}/schema/node_types", json=body,
                                    headers={"if-match": f'"{fingerprint}"'}).text)
+        # The Q13 refusals: adding a custom node type, and editing the existing one (dry run and real).
+        headers = {"if-match": f'"{fingerprint}"'}
+        custom = "label: Playbook\nkey: [slug]\nmetadata: [{name: slug, required: true}]\nsource: {provider: custom, name: runbook_links}\n"
+        for dry_run in (True, False):
+            refused = [
+                client.post(f"/api/config/{repo_id}/schema/node_types", json={"yaml": custom, "dry_run": dry_run}, headers=headers),
+                client.put(f"/api/config/{repo_id}/schema/node_types/Runbook",
+                           json={"yaml": custom.replace("Playbook", "Runbook"), "dry_run": dry_run}, headers=headers),
+            ]
+            assert all(r.status_code == 422 for r in refused), [r.text for r in refused]
+            outputs.extend(r.text for r in refused)
     finally:
         registry.close()
 

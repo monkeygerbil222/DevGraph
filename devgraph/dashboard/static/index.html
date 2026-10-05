@@ -3868,6 +3868,9 @@ const CONFIG_FORM_REASONS = {
   value: "This entry contains a value the page can't carry exactly (for example a date or a very large number). Edit it as YAML.",
   fromList: "This entry's `from` can't be shown as comma-separated labels exactly (a label with a comma, surrounding spaces or a non-text value). Edit it as YAML.",
   customProvider: "This entry has a `custom` block but its provider isn't custom; the form can't show that. Edit it as YAML.",
+  /* Q13: saving a custom declaration is refused by the server; the reason says where to edit it */
+  customSource: "This node type comes from a custom provider, which the dashboard can't create or edit. " +
+    "Edit devgraph.schema.yaml by hand or run `devgraph config schema edit` in a terminal; deleting it here is allowed.",
   handEdit: "The YAML was edited by hand, and the form can only show text it produced. Keep editing as YAML, or discard the hand edits to return to the form.",
 };
 const configIsMap = v => v !== null && typeof v === "object" && !Array.isArray(v);
@@ -3952,6 +3955,7 @@ function configFormFromEntry(section, entry) {
         required: "required" in p ? p.required : true, default: t(p.default), description: t(p.description), open: p })),
       open: entry } };
   }
+  if (configIsMap(entry.source) && entry.source.provider === "custom") return { ok: false, reason: CONFIG_FORM_REASONS.customSource };
   const metadata = entry.metadata || [];
   let bad = configFormBadField(entry, "node_type", "") || configFormBadRows(metadata, "metadata", "metadata.");
   if (!bad && configIsMap(entry.source)) {

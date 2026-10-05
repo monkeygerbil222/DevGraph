@@ -311,3 +311,15 @@ def test_each_template_entry_is_its_template_parsed(dumped):
     for section, template in dumped["templates"].items():
         assert template["entry"] is not None, section
         assert _ordered(yaml.safe_load(template["template"])) == _ordered(template["entry"]), section
+
+
+def test_schema_templates_validate_and_are_not_custom(dumped):
+    """The dashboard refuses custom declarations (spec Q13), so no Add template may offer one."""
+    from devgraph.config.edits import refuse_custom
+
+    templates = dumped["templates"]
+    NodeTypeDecl.model_validate(templates["node_types"]["entry"])
+    RelationshipDecl.model_validate(templates["relationships"]["entry"])
+    for section in ("node_types", "relationships"):
+        refuse_custom(templates[section]["entry"], None)
+        assert "custom" not in templates[section]["template"], section

@@ -359,6 +359,30 @@ def schema_effect_note(root: Path, record: Any) -> str:
     return f"Not watched: run `devgraph rescan {record.repo_id} --now` to apply it."
 
 
+CUSTOM_REFUSED = (
+    "custom provider declarations (`custom_providers`, a node type's `source: {provider: custom}`, "
+    "a relationship's `provider: custom`) can't be created or edited from the dashboard; edit "
+    "devgraph.schema.yaml by hand or with `devgraph config schema add` / `devgraph config schema edit` "
+    "in a terminal. Deleting them here is still allowed."
+)
+
+
+def _is_custom(entry: dict | None) -> bool:
+    if not isinstance(entry, dict):
+        return False
+    source = entry.get("source")
+    return (
+        isinstance(source, dict) and source.get("provider") == "custom"
+    ) or entry.get("provider") == "custom" or isinstance(entry.get("custom"), dict)
+
+
+def refuse_custom(entry: dict | None, existing: dict | None) -> None:
+    """Refuse a dashboard write that creates or edits a custom declaration (spec Q13): `entry` (the
+    new one) or `existing` (the one it replaces) uses a custom provider. Deletes never call this."""
+    if _is_custom(entry) or _is_custom(existing):
+        raise ConfigEditError(CUSTOM_REFUSED, "invalid")
+
+
 def schema_declaration(text: str, path: Path):
     """The parsed declaration, or None when the text is empty or invalid."""
     from devgraph.config.project_schema import ProjectSchemaError, parse_project_schema
@@ -636,8 +660,10 @@ def replace_schema_entry(
     record: Any = None,
     expected_fingerprint: str | None = None,
     dry_run: bool = False,
+    check: Callable[[dict], None] | None = None,
 ) -> EditResult:
-    """Replace one entry; the new entry must stay in the same section."""
+    """Replace one entry; the new entry must stay in the same section. `check(existing)`, when given,
+    runs on the entry being replaced under the edit's own lock and may refuse the edit."""
     from devgraph.config.list_edit import replace_entry_text
     from devgraph.config.project_schema import project_schema_path
 
@@ -645,7 +671,9 @@ def replace_schema_entry(
     with _guard(path, expected_fingerprint):
         section = locate_entry(read_text(path), name, node_type, relationship)
         ident, noun = SCHEMA_SECTIONS[section]
-        find_schema_entry(read_text(path), name, section)
+        existing = find_schema_entry(read_text(path), name, section)
+        if check is not None:
+            check(existing)
         if entry_section(entry) != section:
             raise ConfigEditError(f"the new entry must be a {noun} (with `{ident}`)", "invalid")
         new_name = entry.get(ident)

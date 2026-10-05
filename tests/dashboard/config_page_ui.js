@@ -1521,6 +1521,8 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
     check("the form can show representable " + section + " entry #" + i, rep.ok && rep.form, j(rep));
   });
   const FIELD = p => "This entry has a field the form doesn't edit: `" + p + "`. Edit it as YAML.";
+  const CUSTOM_SOURCE = "This node type comes from a custom provider, which the dashboard can't create or edit. " +
+    "Edit devgraph.schema.yaml by hand or run `devgraph config schema edit` in a terminal; deleting it here is allowed.";
   const ORDER = "This entry's key order differs from its metadata order; the form can't show that. Edit it as YAML.";
   const VALUE = "This entry contains a value the page can't carry exactly (for example a date or a very large number). Edit it as YAML.";
   const refusals = [
@@ -1543,7 +1545,7 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
     ["a source with an extra key", "node_types", { ...NODE_OK(), source: { provider: "filesystem", kind: "file", glob: "*" } }, FIELD("source.glob")],
     ["a source with another provider", "node_types", { ...NODE_OK(), source: { provider: "git", kind: "file" } }, FIELD("source.provider")],
     ["a source with no kind", "node_types", { ...NODE_OK(), source: { provider: "filesystem" } }, FIELD("source.kind")],
-    ["a custom source", "node_types", { ...NODE_OK(), source: { provider: "custom", name: "runbook_links" } }, FIELD("source.provider")],
+    ["a custom source", "node_types", { ...NODE_OK(), source: { provider: "custom", name: "runbook_links" } }, CUSTOM_SOURCE],
     ["a filesystem source with a name", "node_types", { ...NODE_OK(), source: { provider: "filesystem", kind: "file", name: "x" } }, FIELD("source.name")],
     ["an unknown metadata key", "node_types", { ...NODE_OK(), metadata: [{ name: "slug", unique: true }] }, FIELD("metadata.0.unique")],
     ["a metadata type outside the enum", "node_types", { ...NODE_OK(), metadata: [{ name: "slug", type: "date" }] }, FIELD("metadata.0.type")],
@@ -2088,6 +2090,43 @@ const ok = scopeBlock => ({ status: 200, body: { ok: true, written: true, warnin
   await editRow("repo-b", "PARAMS");
   check("a relationship with non-empty custom.params opens in YAML, naming the field", formOff(FIELD("custom.params")),
     els.configFormNoticeText.textContent);
+  els.configModalCancel.fire("click");
+
+  // 41e2. Q13: a custom node type opens in YAML with its own reason, and the server's refusal of a save
+  // or a copy shows in the editor as text, with nothing but the dry run sent
+  const REFUSED = "custom provider declarations (`custom_providers`, a node type's `source: {provider: custom}`, a relationship's " +
+    "`provider: custom`) can't be created or edited from the dashboard; edit devgraph.schema.yaml by hand or with " +
+    "`devgraph config schema add` / `devgraph config schema edit` in a terminal. Deleting them here is still allowed.";
+  const PLAYBOOK_YAML = "label: Playbook\nkey: [slug]\nmetadata:\n- {name: slug, required: true}\nsource: {provider: custom, name: runbook_links}\n";
+  const FMCustom = () => {
+    const m = FM();
+    m.projects[1].schema.node_types.push({ label: "Playbook", yaml: PLAYBOOK_YAML, editable: true, badges: [],
+      entry: { label: "Playbook", key: ["slug"], metadata: [{ name: "slug", required: true }], source: { provider: "custom", name: "runbook_links" } } });
+    return m;
+  };
+  configPayload = FMCustom();
+  api.renderConfigPage(FMCustom());
+  fetchCalls = [];
+  respond = () => ({ status: 422, body: { detail: { code: "invalid", message: REFUSED } } });
+  await editRow("repo-b", "Playbook");
+  check("a custom node type opens in YAML, saying the dashboard can't edit it and where to", formOff(CUSTOM_SOURCE),
+    els.configFormNoticeText.textContent);
+  els.configYaml.value = PLAYBOOK_YAML.replace("slug, required: true}", "slug, required: true}\n- {name: owner}");
+  await els.configYaml.fire("input");
+  await press(els.configModalSave);
+  const refusedShown = () => els.configModalError.textContent === REFUSED && shown(els.configModalError) && !shown(els.configModalReload) &&
+    els.configModal.classList.contains("open");
+  check("saving its YAML is refused by the server: the message shows as text, only the dry run was sent, the dialog stays open",
+    writes().length === 1 && body(writes()[0]).dry_run === true && writes()[0].init.method === "PUT" &&
+    writes()[0].url === "/api/config/repo-b/schema/node_types/Playbook" && refusedShown(),
+    JSON.stringify([writes(), els.configModalError.textContent]));
+  els.configModalCancel.fire("click");
+  fetchCalls = [];
+  await copyBtn("repo-b", "Playbook")[0].fire("click");
+  await press(els.configModalSave);
+  check("Copy to… of a custom node type is refused the same way at the destination",
+    writes().length === 1 && body(writes()[0]).dry_run === true && writes()[0].init.method === "POST" &&
+    writes()[0].url === "/api/config/repo-a/schema/node_types" && refusedShown(), JSON.stringify([writes(), els.configModalError.textContent]));
   els.configModalCancel.fire("click");
 
   // 41f. delete and copy never show the form: the read-only YAML, no switch, no notice
