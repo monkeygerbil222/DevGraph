@@ -1209,7 +1209,9 @@ class GraphEngine:
         (`source_file`/`file`, a `Module` named by its path, or a schema
         provider's node, which its `path` owns) is one of `files`. `file` is
         that provenance: the Module's name, else `file`, `source_file` or
-        `path`, in that order.
+        `path`, in that order. A shared node one of `files` claims (in its
+        `sources`: a `Container`, `Datastore`, `Endpoint` or handler stub) is
+        returned with `file` "", besides any row for its own provenance.
 
         index_paths snapshots this before re-indexing a batch so it can tell
         which nodes the batch *adds* -- only those can be the missing
@@ -1220,16 +1222,20 @@ class GraphEngine:
             result = _retry_transient(
                 session.run,
                 "MATCH (n {repo_id: $repo_id}) "
-                "WHERE n.source_file IN $files OR n.file IN $files "
+                "WITH n, (n.source_file IN $files OR n.file IN $files "
                 "   OR (n:Module AND n.name IN $files) "
-                "   OR (n.extractor IS NOT NULL AND n.path IN $files) "
-                "RETURN DISTINCT labels(n)[0] AS label, n.name AS name, "
+                "   OR (n.extractor IS NOT NULL AND n.path IN $files)) AS owned, "
+                "   any(s IN coalesce(n.sources, []) WHERE s IN $files) AS claimed "
+                "WHERE owned OR claimed "
+                "RETURN DISTINCT labels(n)[0] AS label, n.name AS name, owned, claimed, "
                 "CASE WHEN n:Module THEN n.name ELSE coalesce(n.file, n.source_file, n.path) END AS file",
                 repo_id=repo_id,
                 files=files,
             )
-            records = result or []
-            return {(record["label"], record["name"], record["file"]) for record in records}
+            records = list(result or [])
+            return {(r["label"], r["name"], r["file"]) for r in records if r["owned"]} | {
+                (r["label"], r["name"], "") for r in records if r["claimed"]
+            }
 
     def find_name_refs(self, repo_id: str, names: list[str], skip: list[str]) -> list[tuple[str, list[str]]]:
         """(Module name, entries) for every Module outside `skip` whose
@@ -1258,8 +1264,9 @@ class GraphEngine:
         self, repo_id: str, pairs: list[tuple[str, str]], batch_keys: list[str]
     ) -> dict[tuple[str, str], set[str]]:
         """For each (label, name) in `pairs` that some node outside the batch
-        (provenance not in `batch_keys`) already has, the Documents that
-        MENTION a node of that label and name.
+        (provenance not in `batch_keys`; for a shared node, a claim from
+        outside the batch) already has, the Documents that MENTION a node of
+        that label and name.
 
         Mention edges resolve by name, so a Document that mentions an
         existing `get` is exactly the set that should also link a newly added
@@ -1272,6 +1279,8 @@ class GraphEngine:
                 "WHERE n.name IN $names "
                 "  AND NOT coalesce(n.file, n.source_file, '') IN $batch_keys "
                 "  AND NOT (n:Module AND n.name IN $batch_keys) "
+                "  AND (coalesce(n.file, n.source_file) IS NOT NULL OR n.sources IS NULL "
+                "       OR any(s IN n.sources WHERE NOT s IN $batch_keys)) "
                 "WITH DISTINCT labels(n)[0] AS label, n.name AS name "
                 "WHERE [label, name] IN $pairs "
                 "OPTIONAL MATCH (d:Document {repo_id: $repo_id})-[:MENTIONS]->(m {repo_id: $repo_id, name: name}) "

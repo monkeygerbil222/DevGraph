@@ -631,7 +631,9 @@ def index_paths(
     # node in the batch exists (see the docs/mentions passes below).
     docs_files: list[Path] = []
     mention_files: list[Path] = []
-    # (label, name, compose file) of the Service nodes the batch's compose files wrote.
+    # (label, name, compose file) of the Service nodes the batch's compose
+    # files and Containerfiles wrote, and (label, name, "") of the Containers
+    # they claim.
     batch_services: set[tuple[str, str, str]] = set()
 
     # Process files in a fixed order, not set order, so a batch never
@@ -1081,10 +1083,12 @@ def _index_single_path(
     if "containerfile" in routes:
         result = _index_containerfile(engine, repo_id, resolved, rel_path)
         batch_services |= {("Service", service.name, rel_path) for service in result.services}
+        batch_services |= {("Container", container.name, "") for container in result.containers}
         indexed += 1
     elif "compose" in routes:
         result = _index_compose_file(engine, repo_id, resolved, rel_path)
         batch_services |= {("Service", service.name, rel_path) for service in result.services}
+        batch_services |= {("Container", container.name, "") for container in result.containers}
         indexed += 1
     return indexed
 
@@ -1147,16 +1151,26 @@ def _batch_nodes(
     """(label, name, file) of every file-provenance node this batch wrote:
     code symbols and Modules, docs notes, Markdown Document nodes, compose
     Services and schema-provider nodes -- the same provenance, with the same
-    `file`, that list_file_nodes snapshots. File-less nodes (a C++ out-of-class
-    method's Class stub, API handler stubs, other `source`-keyed nodes) are
-    left out: they have no provenance to compare against, so they would
-    look newly added on every save."""
+    `file`, that list_file_nodes snapshots. A shared node a batch file claims
+    (a `Datastore`, `Endpoint` or handler stub, or a compose/Containerfile
+    `Container`) has `file` "", as list_file_nodes gives it, so one whose
+    last claim went and came back is added. Other file-less nodes (a C++
+    out-of-class method's Class stub) are left out: they have no
+    provenance to compare against, so they would look newly added on every
+    save."""
     nodes = {
         (node["label"], node["name"], rel_path if node["label"] == "Module" else node["properties"]["file"])
         for extractions in code_extractions
         for rel_path, (file_nodes, _rels) in extractions.items()
         for node in file_nodes
         if node["label"] == "Module" or node["properties"].get("file")
+    }
+    nodes |= {
+        (node["label"], node["name"], "")
+        for extractions in code_extractions
+        for rel_path, (file_nodes, _rels) in extractions.items()
+        for node in file_nodes
+        if not node["properties"].get("file") and node["properties"].get("source") == rel_path
     }
     for path in docs_files:
         # The extraction is keyed by the file name, but index_doc_file

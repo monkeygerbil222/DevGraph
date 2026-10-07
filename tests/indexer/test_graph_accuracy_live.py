@@ -493,6 +493,22 @@ def test_container_mentions_survive_dockerfile_reindex(engine, repo_id, tmp_path
     incremental_equals_fresh(engine, repo_id, tmp_path, mentions_enabled=True)
 
 
+def test_container_regains_mentions_when_re_added(engine, repo_id, tmp_path):
+    # The last claim going deletes the Container; its next claimant adds it
+    # back, and the Markdown that mentions it links again.
+    dockerfile = write(tmp_path, "Dockerfile", "FROM postgres:16\n")
+    write(tmp_path, "notes.md", "Runs on `postgres`.\n")
+    scan(engine, repo_id, tmp_path, mentions_enabled=True)
+
+    write(tmp_path, "Dockerfile", "# No stages.\n")
+    index_paths(engine, repo_id, tmp_path, {dockerfile}, mentions_enabled=True)
+    assert node(engine, repo_id, "Container", "postgres") == []
+    write(tmp_path, "Dockerfile", "FROM postgres:16\n")
+    index_paths(engine, repo_id, tmp_path, {dockerfile}, mentions_enabled=True)
+    assert len(_mentions_of(engine, repo_id, "postgres")) == 1
+    incremental_equals_fresh(engine, repo_id, tmp_path, mentions_enabled=True)
+
+
 REDIS_APP = """\
     import redis
 
