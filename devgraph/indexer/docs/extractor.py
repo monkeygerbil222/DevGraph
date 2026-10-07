@@ -32,6 +32,9 @@ _TYPE_TO_LABEL = {
     "architecture_note": "ArchitectureNote",
 }
 
+#: Every label a docs note is written with.
+DOC_NOTE_LABELS = tuple(_TYPE_TO_LABEL.values())
+
 _FRONTMATTER_RE = re.compile(r"\A---\s*\n(.*?)\n---\s*\n?(.*)", re.DOTALL)
 
 

@@ -164,6 +164,45 @@ def test_same_named_classes_keep_their_own_bases(engine, repo_id, tmp_path):
     incremental_equals_fresh(engine, repo_id, tmp_path)
 
 
+# Spec G1 row 1 in every language: a same-named function in another file
+# never takes the caller's edge, on a full scan or a re-index of either file.
+STEALING = {
+    "python": ("a.py", "def helper():\n    return 1\n\n\ndef main():\n    return helper()\n",
+               "b.py", "def main():\n    return {}\n"),
+    "typescript": ("a.ts", "function helper() {\n  return 1;\n}\n\nfunction main() {\n  return helper();\n}\n",
+                   "b.ts", "function main() {{\n  return {};\n}}\n"),
+    "csharp": ("A.cs", "class A {\n  static int Helper() { return 1; }\n  static int Main() { return Helper(); }\n}\n",
+               "B.cs", "class B {{\n  static int Main() {{ return {}; }}\n}}\n"),
+    "cpp": ("a.cpp", "int helper() { return 1; }\n\nint main() { return helper(); }\n",
+            "b.cpp", "int main() {{ return {}; }}\n"),
+    "java": ("A.java", "class A {\n  static int helper() { return 1; }\n  static int main() { return helper(); }\n}\n",
+             "B.java", "class B {{\n  static int main() {{ return {}; }}\n}}\n"),
+    "rust": ("a.rs", "fn helper() -> i32 {\n    1\n}\n\nfn main() -> i32 {\n    helper()\n}\n",
+             "b.rs", "fn main() -> i32 {{\n    {}\n}}\n"),
+    "go": ("a.go", "package a\n\nfunc helper() int {\n\treturn 1\n}\n\nfunc main() int {\n\treturn helper()\n}\n",
+           "b.go", "package a\n\nfunc main() int {{\n\treturn {}\n}}\n"),
+    "kotlin": ("a.kt", "fun helper(): Int = 1\n\nfun main(): Int = helper()\n",
+               "b.kt", "fun main(): Int = {}\n"),
+}
+
+
+@pytest.mark.parametrize("language", sorted(STEALING))
+def test_no_cross_file_stealing(engine, repo_id, tmp_path, language):
+    a, a_text, b, b_text = STEALING[language]
+    (tmp_path / a).write_text(a_text)
+    (tmp_path / b).write_text(b_text.format(2))
+    scan(engine, repo_id, tmp_path)
+    (only,) = edges(engine, repo_id, "CALLS")  # main@a -> helper@a, and nothing from b's main
+    assert (only[0], only[2], only[4], only[6], only[7]) == ("Function", a, "Function", a, (a,))
+    assert only[1].lower() == "main" and only[5].lower() == "helper"
+
+    (tmp_path / b).write_text(b_text.format(3))
+    index_paths(engine, repo_id, tmp_path, {tmp_path / b})
+    index_paths(engine, repo_id, tmp_path, {tmp_path / a})
+    assert edges(engine, repo_id, "CALLS") == [only]
+    incremental_equals_fresh(engine, repo_id, tmp_path)
+
+
 M_BEFORE = """\
     import pkg.util
 
@@ -670,6 +709,28 @@ def test_removed_mention_is_retracted(engine, repo_id, tmp_path):
     incremental_equals_fresh(engine, repo_id, tmp_path, mentions_enabled=True)
 
 
+def test_mentions_replace_is_document_and_repo_scoped(engine, repo_id, tmp_path):
+    other = f"{repo_id}-other"
+    roots = {repo_id: tmp_path / "one", other: tmp_path / "two"}
+    for repo, root in roots.items():
+        write(root, "app.py", MENTIONED)
+        write(root, "notes.md", "Uses `helper` and `other`.\n")
+        write(root, "more.md", "Uses `helper` and `other`.\n")
+        scan(engine, repo, root, mentions_enabled=True)
+    others_before = edges(engine, other, "MENTIONS")
+    more_before = [e for e in edges(engine, repo_id, "MENTIONS") if e[1] == "more.md"]
+    assert len(others_before) == 4 and len(more_before) == 2
+
+    notes = write(roots[repo_id], "notes.md", "Uses `other`.\n")
+    index_paths(engine, repo_id, roots[repo_id], {notes}, mentions_enabled=True)
+    mentions = edges(engine, repo_id, "MENTIONS")
+    assert sorted(e[5] for e in mentions if e[1] == "notes.md") == ["other"]
+    assert [e for e in mentions if e[1] == "more.md"] == more_before
+    assert edges(engine, other, "MENTIONS") == others_before
+    for repo, root in roots.items():
+        incremental_equals_fresh(engine, repo, root, mentions_enabled=True)
+
+
 def test_full_scan_drops_a_removed_mention(engine, repo_id, tmp_path):
     write(tmp_path, "app.py", MENTIONED)
     write(tmp_path, "notes.md", "Uses `helper` and `other`.\n")
@@ -972,7 +1033,9 @@ def test_name_ref_relink_benchmark(engine, repo_id):
     (row,) = engine.run_cypher(
         "MATCH (:Function {repo_id: $r, name: 'caller'})-[c:CALLS]->() RETURN count(c) AS n", {"r": repo_id}
     )
-    assert row["n"] > 0
+    # Each caller links to exactly the added names among its module's targets.
+    expected = sum(len(set(m["properties"]["name_ref_targets"]) & set(added_names)) for m in modules)
+    assert expected > 0 and row["n"] == expected
     assert elapsed < 2.0
 
 
@@ -983,5 +1046,18 @@ def test_full_scan_stamps_index_format(engine, repo_id, tmp_path):
     assert not dispatch.index_outdated(engine, repo_id)
 
     engine.run_cypher("MATCH (r:Repository {repo_id: $r}) REMOVE r.index_format", {"r": repo_id})
+    assert engine.index_format(repo_id) is None
+    assert dispatch.index_outdated(engine, repo_id)
+
+
+def test_failed_full_scan_leaves_the_index_unstamped(engine, repo_id, tmp_path, monkeypatch):
+    app_and_worker(tmp_path)
+
+    def broken(*args, **kwargs):
+        raise RuntimeError("scan interrupted")
+
+    monkeypatch.setattr(dispatch, "index_paths", broken)
+    with pytest.raises(RuntimeError, match="scan interrupted"):
+        scan(engine, repo_id, tmp_path)
     assert engine.index_format(repo_id) is None
     assert dispatch.index_outdated(engine, repo_id)

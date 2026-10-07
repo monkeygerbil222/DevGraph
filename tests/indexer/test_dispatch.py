@@ -1456,20 +1456,27 @@ def test_prune_skips_walked_paths_outside_the_repository(tmp_path, monkeypatch):
 def test_name_refs_are_compact():
     """A Module's name_refs hold each by-name edge once, as a short string, in
     a fixed order: no keys, no repo id, far smaller than the edge dicts."""
+    import json
     import random
 
     from devgraph.indexer.common import name_ref_properties
     from devgraph.indexer.python.extractor import extract_python_file
 
-    path = Path(__file__).resolve().parents[2] / "devgraph" / "cli" / "main.py"
+    # A fixed module: 40 functions, each with four by-name calls.
+    source = "import os\nfrom pkg import util\n\n\nclass Child(Base):\n    pass\n\n" + "".join(
+        f"\ndef f{i}():\n    helper{i % 7}()\n    util.run{i % 3}()\n    f{(i + 1) % 40}()\n"
+        f"    return os.path.join('a')\n\n"
+        for i in range(40)
+    )
     repo_id = "zz-compact-repo"
-    rels = [r.to_dict() for r in extract_python_file(path.read_text(), "devgraph/cli/main.py", repo_id).relationships]
+    rels = [r.to_dict() for r in extract_python_file(source, "pkg/fixture.py", repo_id).relationships]
     props = name_ref_properties(rels)
     refs = props["name_refs"]
-    assert refs and refs == sorted(set(refs))
+    assert len(refs) > 150 and refs == sorted(set(refs))
     assert not any("{" in entry or repo_id in entry for entry in refs)
     # The stored size: each string's UTF-8 bytes (JSON would escape every separator as \u001f).
-    assert sum(len(entry.encode()) for values in props.values() for entry in values) < 90_000
+    stored = sum(len(entry.encode()) for values in props.values() for entry in values)
+    assert stored < 10_000 and stored * 5 < len(json.dumps(rels))
     shuffled = list(rels)
     random.Random(7).shuffle(shuffled)
     assert name_ref_properties(shuffled) == props

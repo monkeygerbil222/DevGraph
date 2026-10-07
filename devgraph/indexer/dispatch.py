@@ -983,6 +983,8 @@ def _index_single_path(
         # this file's nodes as gone-but-not-yet-rebuilt. The Datastore/
         # Endpoint/handler claims go through the same call, so the ones
         # the file still makes are re-claimed in place, not recreated.
+        # _group_nodes_by_label keeps first-seen order, so the extractor's
+        # file-scoped Function MERGE runs before the handler stub's claim.
         engine.replace_file_nodes(repo_id, rel_path, _with_name_refs(nodes, rels, rel_path), rels, service_api=True)
         indexed += 1
         py_files.append((rel_path, content))

@@ -20,6 +20,7 @@ from neo4j.graph import Node, Relationship
 
 from devgraph.graph.schema import RELATIONSHIP_TYPES, RESERVED_NODE_PROPERTIES, constraint_statements
 from devgraph.indexer.common import NAME_REF_SEP
+from devgraph.indexer.docs.extractor import DOC_NOTE_LABELS
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     # Imported for annotations only: `devgraph.config.project_schema` imports
@@ -222,9 +223,10 @@ _REPLACE_OWNED_NODES_CYPHER = (
 
 # G2 set (d): every edge a docs note writes touches one of the note's own
 # nodes, so unclaiming the note file from the edges into and out of them
-# (and nothing else) retracts the links it dropped.
+# (and nothing else) retracts the links it dropped. Anchored on the note
+# labels so it scans only notes, not every node in the graph.
 _UNCLAIM_DOC_NOTE_EDGES_CYPHER = (
-    "MATCH (n {repo_id: $repo_id, source_file: $f}) "
+    "MATCH (n:" + "|".join(DOC_NOTE_LABELS) + " {repo_id: $repo_id, source_file: $f}) "
     "CALL (n) { MATCH (n)<-[r:DOCUMENTED_BY|SATISFIES]-() " + _UNCLAIM_EDGE + " } "
     "CALL (n) { MATCH (n)-[r:SUPERSEDES|DECIDED_BY]->() " + _UNCLAIM_EDGE + " }"
 )

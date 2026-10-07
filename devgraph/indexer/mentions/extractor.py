@@ -328,8 +328,9 @@ def upsert_document_node(engine, repo_id: str, file_path: str | Path, repo_root:
 
     Lets a batch create every Document node before any file's mentions are
     resolved, so a file mentioning a Document (or anything else) indexed
-    later in the same batch still gets its edge. index_file then adds the
-    edges (and re-upserts the same node idempotently).
+    later in the same batch still gets its edge. index_file then replaces
+    the Document's MENTIONS edges with the current ones (and re-upserts the
+    same node idempotently).
     """
     file_path = Path(file_path)
     content = file_path.read_text(encoding="utf-8")
