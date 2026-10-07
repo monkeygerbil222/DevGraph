@@ -710,15 +710,17 @@ def _print_graph_index(engine: GraphEngine) -> None:
             repos = [r for r in registry.list_repos() if r.active]
         finally:
             registry.close()
-        pending = [r.repo_id for r in repos if index_outdated(engine, r.repo_id)]
+        pending = [r for r in repos if index_outdated(engine, r.repo_id)]
     except Exception as e:
         console.print(f"  [red]Error:[/red] {escape(str(e))}")
         return
-    for repo_id in pending:
-        console.print(
-            f"  [yellow]{escape(repo_id)}: rescan pending[/yellow] "
-            "(the agent rescans it automatically, or run 'devgraph rescan')"
-        )
+    for repo in pending:
+        console.print(f"  [yellow]{escape(repo.repo_id)}: rescan pending[/yellow] ", end="")
+        # The agent's automatic upgrade skips repositories it does not watch.
+        if repo.watch_enabled:
+            console.print("(the agent rescans it automatically, or run 'devgraph rescan')")
+        else:
+            console.print("(not watched: run 'devgraph rescan')")
     if not pending:
         console.print("  up to date")
 

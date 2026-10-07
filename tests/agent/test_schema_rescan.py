@@ -252,3 +252,42 @@ def test_outdated_index_rescans_without_quiet_period(monkeypatch, tmp_path):
     assert registry.marked == ["old"]
     assert sched.run_once() == []           # now current: untouched
     assert state["scans"] == ["old"]
+
+
+def test_a_failing_upgrade_backs_off_and_resets_on_success(monkeypatch, tmp_path, caplog):
+    state = setup(monkeypatch, tmp_path)
+    state["pending"] = False
+    state["outdated"] = {"old"}
+    attempts, broken = [], {"v": True}
+
+    def scan(engine, repo_id, root, docs_path=None, mentions_enabled=False):
+        attempts.append(clock.now)
+        if broken["v"]:
+            raise RuntimeError("neo4j down")
+        state["outdated"].discard(repo_id)
+        return 7
+
+    monkeypatch.setattr(schema_rescan, "full_scan", scan)
+    clock = Clock()
+    sched = SchemaRescanScheduler(None, Registry([Repo("old", tmp_path)]), clock=clock, interval_s=30)
+    with caplog.at_level("DEBUG", logger="devgraph.agent.schema_rescan"):
+        for _ in range(400):                 # passes every 30 s for 200 minutes
+            sched.run_once()
+            clock.now += 30
+    gaps = [b - a for a, b in zip(attempts, attempts[1:])]
+    assert gaps[:6] == [30, 60, 120, 240, 480, 960]
+    assert set(gaps[6:]) == {1800}           # capped at 30 minutes
+    warnings = [r for r in caplog.records if r.levelname == "WARNING" and "check failed" in r.getMessage()]
+    assert len(warnings) == 1                # one warning per failure streak
+
+    broken["v"] = False
+    while sched.run_once() != ["old"]:
+        clock.now += 30
+    # Success resets the back-off: the next failure retries after one interval.
+    state["outdated"].add("old")
+    broken["v"] = True
+    count = len(attempts)
+    sched.run_once()
+    clock.now += 30
+    sched.run_once()
+    assert len(attempts) == count + 2

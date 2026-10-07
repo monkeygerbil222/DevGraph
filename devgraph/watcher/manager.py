@@ -428,7 +428,10 @@ class WatcherManager:
                 return  # paused while waiting for the lock
             since = snapshot if snapshot is not None else self._last_indexed(repo_id)
             if since is None:
-                logger.info('DevGraph hasn\'t indexed %s yet; run "devgraph rescan %s"', repo_id, repo_id)
+                logger.info(
+                    "DevGraph hasn't indexed %s yet; the agent indexes it automatically shortly, "
+                    'or run "devgraph rescan %s" to index it now', repo_id, repo_id,
+                )
                 return
             self._catch_up_then_sync(repo_id, since, "start")
 
