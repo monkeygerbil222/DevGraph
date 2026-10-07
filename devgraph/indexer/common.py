@@ -110,3 +110,35 @@ def own_edges(result: ExtractionResult, file_path: str) -> ExtractionResult:
         if rel.from_file is None and (rel.from_label, rel.from_name) in owned:
             rel.from_file = file_path
     return result
+
+
+#: Joins the fields of one `name_refs` entry (see name_ref_properties).
+NAME_REF_SEP = "\x1f"
+
+
+def name_ref_properties(rels: list[dict]) -> dict:
+    """The Module properties that record a file's by-name edges, so a batch
+    that later adds one of their endpoints can relink them from the graph.
+
+    An edge is by-name when its target has no `to_file`, or its source is
+    unpinned and not a Module. `name_refs` holds each one once, sorted, as
+    `rel_type, from_label, from_name, from_file, to_label, to_name,
+    caller_class` joined by NAME_REF_SEP (an unset field is empty).
+    `name_ref_targets` is their sorted distinct `to_name`s and
+    `name_ref_sources` the sorted distinct `from_name`s of their unpinned
+    non-Module sources. All three are lists, empty when there is nothing.
+    """
+    refs, targets, sources = set(), set(), set()
+    for rel in rels:
+        unpinned_source = not rel.get("from_file") and rel["from_label"] != "Module"
+        if rel.get("to_file") and not unpinned_source:
+            continue
+        caller_class = (rel.get("properties") or {}).get("caller_class") or ""
+        refs.add(NAME_REF_SEP.join((
+            rel["rel_type"], rel["from_label"], rel["from_name"], rel.get("from_file") or "",
+            rel["to_label"], rel["to_name"], caller_class,
+        )))
+        targets.add(rel["to_name"])
+        if unpinned_source:
+            sources.add(rel["from_name"])
+    return {"name_refs": sorted(refs), "name_ref_targets": sorted(targets), "name_ref_sources": sorted(sources)}

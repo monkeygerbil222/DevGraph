@@ -1343,7 +1343,7 @@ class TestFieldKeyedDocsApply:
         spec, files = _keyed_docs(temp_repo)
         engine = _RecordingEngine()
         engine.extracted_entries = lambda repo_id, extractor, labels: {("Adr", "ADR-1", "decisions/adr-1.md")}
-        engine.list_file_nodes = lambda repo_id, files: {("Adr", "ADR-1")}
+        engine.list_file_nodes = lambda repo_id, files: {("Adr", "ADR-1", "decisions/adr-1.md")}
         copy = "decisions/adr-1 copy.md"
         batch = dispatch._read_docs_batch(engine, "demo", temp_repo, spec, {copy: files[copy]}, set())
         assert sorted(batch.selected) == ["decisions/adr-1 copy.md", "decisions/adr-1.md"]
@@ -1451,3 +1451,25 @@ def test_prune_skips_walked_paths_outside_the_repository(tmp_path, monkeypatch):
 
     assert dispatch.prune_stale_files(FakeEngine(), "r", repo) == 1
     assert removed == [{repo / "gone.py"}]
+
+
+def test_name_refs_are_compact():
+    """A Module's name_refs hold each by-name edge once, as a short string, in
+    a fixed order: no keys, no repo id, far smaller than the edge dicts."""
+    import random
+
+    from devgraph.indexer.common import name_ref_properties
+    from devgraph.indexer.python.extractor import extract_python_file
+
+    path = Path(__file__).resolve().parents[2] / "devgraph" / "cli" / "main.py"
+    repo_id = "zz-compact-repo"
+    rels = [r.to_dict() for r in extract_python_file(path.read_text(), "devgraph/cli/main.py", repo_id).relationships]
+    props = name_ref_properties(rels)
+    refs = props["name_refs"]
+    assert refs and refs == sorted(set(refs))
+    assert not any("{" in entry or repo_id in entry for entry in refs)
+    # The stored size: each string's UTF-8 bytes (JSON would escape every separator as \u001f).
+    assert sum(len(entry.encode()) for values in props.values() for entry in values) < 90_000
+    shuffled = list(rels)
+    random.Random(7).shuffle(shuffled)
+    assert name_ref_properties(shuffled) == props

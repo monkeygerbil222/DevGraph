@@ -246,6 +246,27 @@ def test_edits_made_while_off_are_caught_up_on_start(engine, repo, live_agent):
     assert states[:2] == ["running", "done"], second.events
 
 
+def test_an_import_target_deleted_and_restored(engine, repo, live_agent):
+    root, repo_id = repo
+    (root / "tools" / "use.py").write_text("from pkg.sub.util import helper\n\n\ndef go():\n    return helper()\n")
+    git(root, "add", "-A")
+    git(root, "commit", "-q", "-m", "Use the helper")
+    start(live_agent, repo_id)
+
+    (root / "pkg" / "sub" / "util.py").unlink()
+    converges(engine, repo_id, root)
+    git(root, "checkout", "--", "pkg/sub/util.py")
+    converges(engine, repo_id, root)
+
+    # The same, through a branch switch.
+    git(root, "checkout", "-q", "-b", "without-util")
+    git(root, "rm", "-q", "pkg/sub/util.py")
+    git(root, "commit", "-q", "-m", "Drop the helper")
+    converges(engine, repo_id, root)
+    git(root, "checkout", "-q", "main")
+    converges(engine, repo_id, root)
+
+
 def git_synced(agent, repo_id, count):
     """Wait until the agent has synced git history `count` times for the repo:
     the sync runs after the post-git catch-up, in the same job."""

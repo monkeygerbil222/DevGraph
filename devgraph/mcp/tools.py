@@ -267,7 +267,9 @@ _DESCRIBE_MAX_LIST_ITEMS = 20
 _DESCRIBE_ECHO = 100
 _DESCRIBE_DIRECTIONS = ("both", "out", "in")
 # Shown elsewhere in the response, or extractor/insight bookkeeping that other tools serve.
-_DESCRIBE_HIDDEN = frozenset({"repo_id", "name", "claims", "extractor"})
+_DESCRIBE_HIDDEN = frozenset(
+    {"repo_id", "name", "claims", "extractor", "name_refs", "name_ref_targets", "name_ref_sources"}
+)
 _DESCRIBE_BUILTIN_LABELS = tuple(label for label in schema.NODE_LABELS if label != "Repository")
 _DESCRIBE_HINT = (
     "search_component searches by partial name; a file, folder or docs node is named by its "

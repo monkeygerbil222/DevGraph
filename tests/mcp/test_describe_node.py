@@ -98,6 +98,13 @@ def test_properties_hide_only_bookkeeping():
     assert node["properties_truncated"] is True
 
 
+def test_name_refs_hidden_from_describe_node():
+    props = {"name_refs": ["CALLS\x1fFunction\x1fmain"], "name_ref_targets": ["helper"], "name_ref_sources": [],
+             "source_file": "a.py"}
+    engine = StubEngine(([{**LOOKUP_ROW, "properties": props}], False), ([], False))
+    assert set(_found(engine)["node"]["properties"]) == {"source_file"}
+
+
 def test_refs_are_raw():
     odd = "n\t" + "z" * 600
     groups = [{"dir": "out", "rel": "CALLS", "total": 1, "refs": [{"label": "Function", "name": odd, "file": "a.py"}]}]

@@ -8,10 +8,12 @@ equals the expected graph".
 
 import textwrap
 import uuid
+from pathlib import Path
 
 import pytest
 
 from devgraph.graph.engine import _UNCLAIM_EDGE, GraphEngine, provision_repository_schema
+from devgraph.indexer import dispatch
 from devgraph.indexer.dispatch import full_scan, index_paths, remove_paths
 from tests.watcher.live_helpers import fresh_snapshot, graph_snapshot, snapshot_diff
 
@@ -686,3 +688,273 @@ def test_mentions_replace_keeps_the_docs_note(engine, repo_id, tmp_path):
     assert node(engine, repo_id, "DesignDecision", "ADR-1")
     assert _mentioned_names(engine, repo_id) == []
     incremental_equals_fresh(engine, repo_id, tmp_path, mentions_enabled=True, docs_path="docs")
+
+
+# --- relinking by-name edges (G5) ----------------------------------------------
+
+
+A_IMPORTS_B = """\
+    from pkg.b import helper
+
+
+    def main():
+        return helper()
+"""
+
+
+def test_import_target_deleted_and_restored(engine, repo_id, tmp_path):
+    write(tmp_path, "pkg/a.py", A_IMPORTS_B)
+    b = write(tmp_path, "pkg/b.py", "def helper():\n    return 1\n")
+    scan(engine, repo_id, tmp_path)
+
+    b.unlink()
+    remove_paths(engine, repo_id, tmp_path, {b})
+    write(tmp_path, "pkg/b.py", "def helper():\n    return 1\n")
+    index_paths(engine, repo_id, tmp_path, {b})
+
+    incremental_equals_fresh(engine, repo_id, tmp_path)
+    assert ("Module", "pkg/a.py", "pkg/a.py", "IMPORTS", "Module", "pkg/b.py", "pkg/b.py", ("pkg/a.py",)) in edges(
+        engine, repo_id, "IMPORTS"
+    )
+    assert edges(engine, repo_id, "CALLS") == [
+        ("Function", "main", "pkg/a.py", "CALLS", "Function", "helper", "pkg/b.py", ("pkg/a.py",)),
+    ]
+
+
+def test_module_added_after_its_importer(engine, repo_id, tmp_path):
+    write(tmp_path, "pkg/a.py", "import lib.b\n")
+    scan(engine, repo_id, tmp_path)
+
+    added = write(tmp_path, "lib/b.py", "X = 1\n")
+    index_paths(engine, repo_id, tmp_path, {added})
+    assert [e for e in edges(engine, repo_id, "IMPORTS") if e[5] == "lib/b.py"]
+    incremental_equals_fresh(engine, repo_id, tmp_path)
+
+
+@pytest.mark.parametrize("files", [
+    {
+        "app/k.py": "from base.b import Base\n\n\nclass K(Base):\n    pass\n",
+        "base/b.py": "class Base:\n    pass\n",
+    },
+    {
+        "app/K.java": "package app;\n\nimport base.Base;\n\npublic class K extends Base {}\n",
+        "base/Base.java": "package base;\n\npublic class Base {}\n",
+    },
+], ids=["python", "java"])
+def test_supertype_added_in_another_directory(engine, repo_id, tmp_path, files):
+    (sub_rel, sub_text), (base_rel, base_text) = files.items()
+    write(tmp_path, sub_rel, sub_text)
+    scan(engine, repo_id, tmp_path)
+
+    base = write(tmp_path, base_rel, base_text)
+    index_paths(engine, repo_id, tmp_path, {base})
+    assert [e for e in edges(engine, repo_id, "EXTENDS") if (e[1], e[6]) == ("K", base_rel)]
+    incremental_equals_fresh(engine, repo_id, tmp_path)
+
+
+def test_second_same_named_function_links_outside_callers(engine, repo_id, tmp_path):
+    write(tmp_path, "a.py", "def main():\n    return helper()\n")
+    write(tmp_path, "b.py", "def helper():\n    return 1\n")
+    scan(engine, repo_id, tmp_path)
+
+    c = write(tmp_path, "c.py", "def helper():\n    return 2\n")
+    index_paths(engine, repo_id, tmp_path, {c})
+    assert ("Function", "main", "a.py", "CALLS", "Function", "helper", "c.py", ("a.py",)) in edges(
+        engine, repo_id, "CALLS"
+    )
+    incremental_equals_fresh(engine, repo_id, tmp_path)
+
+
+def rust_trio(root):
+    write(root, "foo.rs", "pub struct Foo;\n")
+    write(root, "display.rs", "pub trait Display {}\n")
+    write(root, "conv.rs", "impl Display for Foo {}\n")
+
+
+IMPL_EDGE = ("Class", "Foo", "foo.rs", "EXTENDS", "Class", "Display", "display.rs", ("conv.rs",))
+
+
+def test_restored_type_regains_foreign_impl(engine, repo_id, tmp_path):
+    rust_trio(tmp_path)
+    scan(engine, repo_id, tmp_path)
+    foo = tmp_path / "foo.rs"
+
+    foo.unlink()
+    remove_paths(engine, repo_id, tmp_path, {foo})
+    assert edges(engine, repo_id, "EXTENDS") == []
+    write(tmp_path, "foo.rs", "pub struct Foo;\n")
+    index_paths(engine, repo_id, tmp_path, {foo})
+    assert edges(engine, repo_id, "EXTENDS") == [IMPL_EDGE]
+    incremental_equals_fresh(engine, repo_id, tmp_path)
+
+
+def test_removed_foreign_impl_is_retracted(engine, repo_id, tmp_path):
+    rust_trio(tmp_path)
+    scan(engine, repo_id, tmp_path)
+    assert edges(engine, repo_id, "EXTENDS") == [IMPL_EDGE]
+
+    conv = write(tmp_path, "conv.rs", "// No impls left.\n")
+    index_paths(engine, repo_id, tmp_path, {conv})
+    assert edges(engine, repo_id, "EXTENDS") == []
+    incremental_equals_fresh(engine, repo_id, tmp_path)
+
+    # The same edit, healed by a full_scan alone.
+    write(tmp_path, "conv.rs", "impl Display for Foo {}\n")
+    scan(engine, repo_id, tmp_path)
+    assert edges(engine, repo_id, "EXTENDS") == [IMPL_EDGE]
+    write(tmp_path, "conv.rs", "// No impls left.\n")
+    scan(engine, repo_id, tmp_path)
+    assert edges(engine, repo_id, "EXTENDS") == []
+    incremental_equals_fresh(engine, repo_id, tmp_path)
+
+    # And with conv.rs deleted.
+    write(tmp_path, "conv.rs", "impl Display for Foo {}\n")
+    scan(engine, repo_id, tmp_path)
+    assert edges(engine, repo_id, "EXTENDS") == [IMPL_EDGE]
+    conv.unlink()
+    remove_paths(engine, repo_id, tmp_path, {conv})
+    assert edges(engine, repo_id, "EXTENDS") == []
+
+
+def test_symbol_moved_between_files_in_one_batch(engine, repo_id, tmp_path):
+    write(tmp_path, "a.py", "def main():\n    return helper()\n")
+    b = write(tmp_path, "b.py", "def helper():\n    return 1\n")
+    write(tmp_path, "notes.md", "Uses `helper`.\n")
+    scan(engine, repo_id, tmp_path, mentions_enabled=True)
+
+    write(tmp_path, "b.py", "X = 1\n")
+    c = write(tmp_path, "c.py", "def helper():\n    return 1\n")
+    index_paths(engine, repo_id, tmp_path, {b, c}, mentions_enabled=True)
+    assert edges(engine, repo_id, "CALLS") == [
+        ("Function", "main", "a.py", "CALLS", "Function", "helper", "c.py", ("a.py",)),
+    ]
+    assert [e[6] for e in edges(engine, repo_id, "MENTIONS") if e[5] == "helper"] == ["c.py"]
+    incremental_equals_fresh(engine, repo_id, tmp_path, mentions_enabled=True)
+
+
+def test_relink_reads_no_files(engine, repo_id, tmp_path, monkeypatch):
+    write(tmp_path, "a.py", "def main():\n    return helper()\n")
+    write(tmp_path, "other.py", "def unrelated():\n    return 0\n")
+    scan(engine, repo_id, tmp_path)
+
+    b = write(tmp_path, "b.py", "def helper():\n    return 1\n")
+    reads = []
+    real_read_text, real_dispatch_read = Path.read_text, dispatch._read_text
+
+    def read_text(self, *args, **kwargs):
+        reads.append(Path(self))
+        return real_read_text(self, *args, **kwargs)
+
+    def dispatch_read(path):
+        reads.append(Path(path))
+        return real_dispatch_read(path)
+
+    monkeypatch.setattr(Path, "read_text", read_text)
+    monkeypatch.setattr(dispatch, "_read_text", dispatch_read)
+    index_paths(engine, repo_id, tmp_path, {b})
+    monkeypatch.undo()
+
+    root = tmp_path.resolve()
+    outside = [p for p in reads if p.resolve().is_relative_to(root) and p.resolve() != b.resolve()]
+    assert outside == []
+    assert ("Function", "main", "a.py", "CALLS", "Function", "helper", "b.py", ("a.py",)) in edges(
+        engine, repo_id, "CALLS"
+    )
+
+
+def _spy(monkeypatch, cls, name):
+    calls = []
+    real = getattr(cls, name)
+
+    def spy(self, *args, **kwargs):
+        calls.append(args)
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(cls, name, spy)
+    return calls
+
+
+def test_full_scan_skips_relink(engine, repo_id, tmp_path, monkeypatch):
+    write(tmp_path, "a.py", "def main():\n    return helper()\n")
+    calls = _spy(monkeypatch, GraphEngine, "find_name_refs")
+    scan(engine, repo_id, tmp_path)
+    assert calls == []
+
+    b = write(tmp_path, "b.py", "def helper():\n    return 1\n")
+    index_paths(engine, repo_id, tmp_path, {b})
+    assert len(calls) == 1
+
+
+def _module_name_refs(engine, repo_id, name):
+    (row,) = engine.run_cypher(
+        "MATCH (m:Module {repo_id: $r, name: $n}) "
+        "RETURN m.name_refs AS refs, m.name_ref_targets AS targets, m.name_ref_sources AS sources",
+        {"r": repo_id, "n": name},
+    )
+    return row["refs"], row["targets"], row["sources"]
+
+
+def test_pass_two_omits_name_refs(engine, repo_id, tmp_path, monkeypatch):
+    scan(engine, repo_id, tmp_path)
+    a = write(tmp_path, "a.py", "def main():\n    return helper()\n")
+    calls = _spy(monkeypatch, GraphEngine, "upsert_nodes")
+    index_paths(engine, repo_id, tmp_path, {a})
+    modules = [n for (nodes,) in calls for n in nodes if n["label"] == "Module"]
+    assert modules and not any("name_refs" in n["properties"] for n in modules)
+    assert _module_name_refs(engine, repo_id, "a.py")[0] == ["CALLS\x1fFunction\x1fmain\x1fa.py\x1fFunction\x1fhelper\x1f"]
+
+
+def test_name_refs_written_empty(engine, repo_id, tmp_path):
+    write(tmp_path, "plain.py", "X = 1\n")
+    caller = write(tmp_path, "caller.py", "def main():\n    return helper()\n")
+    scan(engine, repo_id, tmp_path)
+    assert _module_name_refs(engine, repo_id, "plain.py") == ([], [], [])
+    assert _module_name_refs(engine, repo_id, "caller.py")[1] == ["helper"]
+
+    write(tmp_path, "caller.py", "def main():\n    return 1\n")
+    index_paths(engine, repo_id, tmp_path, {caller})
+    assert _module_name_refs(engine, repo_id, "caller.py") == ([], [], [])
+
+
+def test_name_ref_relink_benchmark(engine, repo_id):
+    """The relink read over 5,000 Modules, each with 60 by-name edges drawn
+    from 2,000 names, then the parse and the upsert of what it found."""
+    import logging
+    import random
+    import time
+
+    rng = random.Random(4)
+    names = [f"fn{i}" for i in range(2000)]
+    modules = []
+    callers = []
+    for i in range(5000):
+        path = f"m{i}.py"
+        targets = sorted(rng.sample(names, 60))
+        modules.append({
+            "label": "Module", "repo_id": repo_id, "name": path, "properties": {
+                "source_file": path,
+                "name_refs": [f"CALLS\x1fFunction\x1fcaller\x1f{path}\x1fFunction\x1f{t}\x1f" for t in targets],
+                "name_ref_targets": targets,
+                "name_ref_sources": [],
+            },
+        })
+        callers.append({"label": "Function", "repo_id": repo_id, "name": "caller", "properties": {"file": path}})
+    for chunk in range(0, len(modules), 500):
+        engine.upsert_nodes(modules[chunk:chunk + 500] + callers[chunk:chunk + 500])
+    added_names = rng.sample(names, 20)
+    engine.upsert_nodes([
+        {"label": "Function", "repo_id": repo_id, "name": n, "properties": {"file": "new.py"}} for n in added_names
+    ])
+    added = {("Function", n, "new.py") for n in added_names}
+
+    started = time.perf_counter()
+    dispatch._relink_name_refs(engine, repo_id, added, set())
+    elapsed = time.perf_counter() - started
+
+    logging.getLogger(__name__).warning("name_ref relink over 5,000 Modules: %.3f s", elapsed)
+    print(f"name_ref relink over 5,000 Modules: {elapsed:.3f} s")
+    (row,) = engine.run_cypher(
+        "MATCH (:Function {repo_id: $r, name: 'caller'})-[c:CALLS]->() RETURN count(c) AS n", {"r": repo_id}
+    )
+    assert row["n"] > 0
+    assert elapsed < 2.0

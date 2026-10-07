@@ -37,8 +37,9 @@ from devgraph.config.project_schema import (
     schema_file_hash,
 )
 from devgraph.graph.engine import GraphEngine, provision_repository_schema
-from devgraph.graph.schema import NODE_LABELS, RELATIONSHIP_TYPES
+from devgraph.graph.schema import FILE_SCOPED_LABELS, NODE_LABELS, RELATIONSHIP_TYPES
 from devgraph.indexer.apis.extractor import APIExtractor
+from devgraph.indexer.common import NAME_REF_SEP, name_ref_properties
 from devgraph.indexer.containers.extractor import ContainerExtractor, ExtractionResult
 from devgraph.indexer.datastores.extractor import DatastoreExtractor
 from devgraph.indexer.docs.extractor import DocsExtractor
@@ -404,7 +405,7 @@ def _read_docs_batch(
             # type's, say); those already there are not added either.
             pulled_in = sorted(set(selected) - batch)
             if pulled_in:
-                existing |= engine.list_file_nodes(repo_id, pulled_in)
+                existing |= {node[:2] for node in engine.list_file_nodes(repo_id, pulled_in)}
         nodes, problems = docs.build_nodes(spec, repo_id, selected, owners)
     except Exception:
         logger.warning("docs node pass failed for %s; skipping it for this batch", repo_id, exc_info=True)
@@ -551,7 +552,10 @@ def _sync_docs_edges(engine: GraphEngine, repo_id: str, repo_root: Path, applied
         logger.warning("docs edge pass failed for %s; the next rescan retries it", repo_id, exc_info=True)
 
 
-def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[Path], docs_path: str | None = None, mentions_enabled: bool = False, sync_provider: bool = True) -> int:
+def index_paths(
+    engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[Path], docs_path: str | None = None,
+    mentions_enabled: bool = False, sync_provider: bool = True, relink_outside: bool = True,
+) -> int:
     """Index a set of changed files, routing each to its extractor by name/extension.
 
     Args:
@@ -563,14 +567,19 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
             skipped. Besides these, the batch also re-indexes files that
             refer to what these files contain: direct importers (see
             _expand_with_reverse_dependents) and files whose by-name edges
-            target a node the batch adds (see _find_referrers), and relinks
-            Markdown mentioning an added name (see _mention_referrers).
+            target a node the batch adds (see _find_referrers), relinks
+            Markdown mentioning an added name (see _mention_referrers), and
+            relinks the by-name edges other code files recorded to an added
+            node (see _relink_name_refs).
         docs_path: The repo's configured docs folder (repo-relative), if any.
         mentions_enabled: Whether to index mentions in Markdown files.
         sync_provider: Write schema-provider nodes and edges for `paths`
             and relink docs edges to added nodes (skipped while the schema
             is pending or invalid). False when the caller has just applied
             the schema.
+        relink_outside: Relink other code files' by-name edges to the
+            nodes the batch adds. False for a full scan, which has no file
+            outside the batch.
 
     Returns:
         Number of files actually indexed, including those referrers
@@ -612,8 +621,8 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
     # node in the batch exists (see the docs/mentions passes below).
     docs_files: list[Path] = []
     mention_files: list[Path] = []
-    # (label, name) of the Service nodes the batch's compose files wrote.
-    batch_services: set[tuple[str, str]] = set()
+    # (label, name, compose file) of the Service nodes the batch's compose files wrote.
+    batch_services: set[tuple[str, str, str]] = set()
 
     # Process files in a fixed order, not set order, so a batch never
     # depends on PYTHONHASHSEED. Shared nodes (Datastore/Endpoint) no longer
@@ -679,18 +688,17 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
     if providers_ok and docs_spec is not None:
         docs_batch = _read_docs_batch(
             engine, repo_id, repo_root, docs_spec,
-            {rel: p for rel, p in by_rel_path.items() if _is_provider_file(repo_root, p)}, previous_nodes,
+            {rel: p for rel, p in by_rel_path.items() if _is_provider_file(repo_root, p)},
+            {node[:2] for node in previous_nodes},
         )
-    if docs_batch:
-        # A field-keyed entry the batch writes that was already in the graph
-        # (moving between files) is not added.
-        previous_nodes |= docs_batch.existing
     # Provider nodes the batch writes that a docs edge can target: docs nodes
     # and filesystem files. Folders are left out: a folder isn't one of the
     # batch's files, so the snapshot above can't tell a new one from an old one.
-    provider_nodes = {(node["label"], node["name"]) for node in (docs_batch.nodes if docs_batch else [])}
+    provider_nodes = {
+        (node["label"], node["name"], node["properties"]["path"]) for node in (docs_batch.nodes if docs_batch else [])
+    }
     if fs_spec is not None and fs_spec.file_label:
-        provider_nodes |= {(fs_spec.file_label, rel) for rel in present}
+        provider_nodes |= {(fs_spec.file_label, rel, rel) for rel in present}
 
     for rel_path in sorted(by_rel_path):
         index_one(rel_path, by_rel_path[rel_path])
@@ -703,9 +711,17 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
         py_extractions, js_extractions, cs_extractions, cpp_extractions,
         java_extractions, rs_extractions, kt_extractions, go_extractions,
     ]
-    added_nodes = _batch_nodes(
+    batch_nodes = _batch_nodes(
         repo_id, root_resolved, code_extractions, docs_files, mention_files, batch_services, provider_nodes,
-    ) - previous_nodes
+    )
+    # A node is added when no node of its label and name was at its file
+    # before, so one moving between two of the batch's files is added too.
+    # A field-keyed docs entry already in the graph (moving between files)
+    # is not: its edges move with it.
+    added = batch_nodes - previous_nodes
+    if docs_batch:
+        added -= {node for node in batch_nodes if node[:2] in docs_batch.existing}
+    added_nodes = {node[:2] for node in added}
     referrers = _find_referrers(
         engine, repo_id, root_resolved, docs_root, added_nodes, set(by_rel_path),
         {**java_extractions, **kt_extractions},
@@ -785,6 +801,13 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
     for rel_path, (nodes, rels) in go_extractions.items():
         engine.upsert_nodes(nodes)
         engine.upsert_relationships(rels)
+
+    # Code files outside the batch whose by-name edges meet an added node
+    # were indexed before it existed. Their Modules' name_refs re-write those
+    # edges straight from the graph, with no file read. A full scan has no
+    # file outside the batch.
+    if relink_outside:
+        _relink_name_refs(engine, repo_id, added, set(by_rel_path) | referrers)
 
     # Service cross-linking runs as a final pass, after every file in this
     # batch (including any compose file) has been indexed — Service nodes'
@@ -873,6 +896,18 @@ def _routes(resolved: Path, docs_root: Path | None, mentions_enabled: bool) -> l
     return routes
 
 
+def _with_name_refs(nodes: list[dict], rels: list[dict], rel_path: str) -> list[dict]:
+    """A copy of a code file's `nodes` whose Module carries the file's
+    by-name edges (see name_ref_properties), for its pass-1 replace only:
+    pass 2 re-upserts the plain `nodes`, so it never writes them again."""
+    refs = name_ref_properties(rels)
+    return [
+        {**node, "properties": {**node["properties"], **refs}}
+        if node["label"] == "Module" and node["name"] == rel_path else node
+        for node in nodes
+    ]
+
+
 def _index_single_path(
     engine: GraphEngine,
     repo_id: str,
@@ -899,7 +934,7 @@ def _index_single_path(
     go_extractions: dict[str, tuple[list[dict], list[dict]]],
     docs_files: list[Path],
     mention_files: list[Path],
-    batch_services: set[tuple[str, str]],
+    batch_services: set[tuple[str, str, str]],
 ) -> int:
     """Extract and upsert one file's graph output, routing by name/extension.
 
@@ -936,7 +971,7 @@ def _index_single_path(
         # this file's nodes as gone-but-not-yet-rebuilt. The Datastore/
         # Endpoint/handler claims go through the same call, so the ones
         # the file still makes are re-claimed in place, not recreated.
-        engine.replace_file_nodes(repo_id, rel_path, nodes, rels, service_api=True)
+        engine.replace_file_nodes(repo_id, rel_path, _with_name_refs(nodes, rels, rel_path), rels, service_api=True)
         indexed += 1
         py_files.append((rel_path, content))
         # API edges ride along in the re-upsert pass: an Endpoint's
@@ -951,7 +986,7 @@ def _index_single_path(
         # Same replace-then-reupsert rationale as the .py branch above:
         # prune this file's previously-indexed nodes/edges and write the
         # freshly-extracted ones in one transaction.
-        engine.replace_file_nodes(repo_id, rel_path, nodes, rels)
+        engine.replace_file_nodes(repo_id, rel_path, _with_name_refs(nodes, rels, rel_path), rels)
         indexed += 1
         js_files.append(rel_path)
         js_extractions[rel_path] = (nodes, rels)
@@ -963,7 +998,7 @@ def _index_single_path(
         # Same replace-then-re-upsert rationale as the .py branch above:
         # prune this file's stale nodes/edges in one transaction, then
         # re-upsert in pass 2 once every file in the batch has a node.
-        engine.replace_file_nodes(repo_id, rel_path, nodes, rels)
+        engine.replace_file_nodes(repo_id, rel_path, _with_name_refs(nodes, rels, rel_path), rels)
         indexed += 1
         cs_files.append(rel_path)
         cs_extractions[rel_path] = (nodes, rels)
@@ -972,7 +1007,7 @@ def _index_single_path(
         result = extract_cpp_file(content, rel_path, repo_id)
         nodes = [n.to_dict() for n in result.nodes]
         rels = [r.to_dict() for r in result.relationships]
-        engine.replace_file_nodes(repo_id, rel_path, nodes, rels)
+        engine.replace_file_nodes(repo_id, rel_path, _with_name_refs(nodes, rels, rel_path), rels)
         indexed += 1
         cpp_files.append(rel_path)
         cpp_extractions[rel_path] = (nodes, rels)
@@ -984,7 +1019,7 @@ def _index_single_path(
         # Same replace-then-cross-link-reupsert pattern as the .py
         # branch above (see its comment for why replace_file_nodes runs
         # first, in one transaction, rather than plain upsert).
-        engine.replace_file_nodes(repo_id, rel_path, nodes, rels)
+        engine.replace_file_nodes(repo_id, rel_path, _with_name_refs(nodes, rels, rel_path), rels)
         indexed += 1
         java_files.append((rel_path, content))
         java_extractions[rel_path] = (nodes, rels)
@@ -996,7 +1031,7 @@ def _index_single_path(
         # Same replace-not-merely-upsert reasoning as the .py branch
         # above: a removed Function/Class must not survive in the graph
         # forever just because MERGE never deletes.
-        engine.replace_file_nodes(repo_id, rel_path, nodes, rels)
+        engine.replace_file_nodes(repo_id, rel_path, _with_name_refs(nodes, rels, rel_path), rels)
         indexed += 1
         rs_files.append(rel_path)
         rs_extractions[rel_path] = (nodes, rels)
@@ -1008,7 +1043,7 @@ def _index_single_path(
         # Same replace-then-re-upsert rationale as the .py branch above: a
         # class/function removed from the file must not survive in the graph
         # as a stale node.
-        engine.replace_file_nodes(repo_id, rel_path, nodes, rels)
+        engine.replace_file_nodes(repo_id, rel_path, _with_name_refs(nodes, rels, rel_path), rels)
         indexed += 1
         kt_files.append(rel_path)
         kt_extractions[rel_path] = (nodes, rels)
@@ -1020,7 +1055,7 @@ def _index_single_path(
         # Same replace-then-re-upsert rationale as the .py branch above:
         # a struct/func/method removed from the file must not survive in
         # the graph as a stale node.
-        engine.replace_file_nodes(repo_id, rel_path, nodes, rels)
+        engine.replace_file_nodes(repo_id, rel_path, _with_name_refs(nodes, rels, rel_path), rels)
         indexed += 1
         go_extractions[rel_path] = (nodes, rels)
     elif "docs" in routes:
@@ -1035,11 +1070,11 @@ def _index_single_path(
         mention_files.append(resolved)
     if "containerfile" in routes:
         result = _index_containerfile(engine, repo_id, resolved, rel_path)
-        batch_services |= {("Service", service.name) for service in result.services}
+        batch_services |= {("Service", service.name, rel_path) for service in result.services}
         indexed += 1
     elif "compose" in routes:
         result = _index_compose_file(engine, repo_id, resolved, rel_path)
-        batch_services |= {("Service", service.name) for service in result.services}
+        batch_services |= {("Service", service.name, rel_path) for service in result.services}
         indexed += 1
     return indexed
 
@@ -1096,30 +1131,76 @@ def _batch_nodes(
     code_extractions: list[dict[str, tuple[list[dict], list[dict]]]],
     docs_files: list[Path],
     mention_files: list[Path],
-    services: set[tuple[str, str]],
-    provider_nodes: set[tuple[str, str]],
-) -> set[tuple[str, str]]:
-    """(label, name) of every file-provenance node this batch wrote: code
-    symbols and Modules, docs notes, Markdown Document nodes, compose
-    Services and schema-provider nodes -- the same provenance list_file_nodes
-    snapshots. File-less nodes (a C++ out-of-class
+    services: set[tuple[str, str, str]],
+    provider_nodes: set[tuple[str, str, str]],
+) -> set[tuple[str, str, str]]:
+    """(label, name, file) of every file-provenance node this batch wrote:
+    code symbols and Modules, docs notes, Markdown Document nodes, compose
+    Services and schema-provider nodes -- the same provenance, with the same
+    `file`, that list_file_nodes snapshots. File-less nodes (a C++ out-of-class
     method's Class stub, API handler stubs, other `source`-keyed nodes) are
     left out: they have no provenance to compare against, so they would
     look newly added on every save."""
     nodes = {
-        (node["label"], node["name"])
+        (node["label"], node["name"], rel_path if node["label"] == "Module" else node["properties"]["file"])
         for extractions in code_extractions
-        for file_nodes, _rels in extractions.values()
+        for rel_path, (file_nodes, _rels) in extractions.items()
         for node in file_nodes
         if node["label"] == "Module" or node["properties"].get("file")
     }
     for path in docs_files:
+        # The extraction is keyed by the file name, but index_doc_file
+        # writes the repo-relative path as the note's `source_file`.
         result = DocsExtractor(repo_id).extract_from_source(_read_text(path), path.name)
-        nodes |= {(doc.label, doc.name) for doc in result.docs}
-    nodes |= {("Document", path.relative_to(root).as_posix()) for path in mention_files}
+        rel = path.relative_to(root).as_posix()
+        nodes |= {(doc.label, doc.name, rel) for doc in result.docs}
+    nodes |= {("Document", rel, rel) for rel in (path.relative_to(root).as_posix() for path in mention_files)}
     nodes |= services
     nodes |= provider_nodes
     return nodes
+
+
+def _relink_name_refs(
+    engine: GraphEngine, repo_id: str, added: set[tuple[str, str, str]], skip: set[str]
+) -> None:
+    """Re-write the by-name edges that code files outside `skip` recorded in
+    their Modules' `name_refs` (see name_ref_properties) and that meet a node
+    in `added`: by their target, or by an unpinned non-Module source (a Rust
+    `impl Trait for Foo` whose `Foo` was just added). Those files were
+    indexed before the node existed, so the edge was skipped then. One graph
+    read and one upsert, no file read; each edge's origin is its file.
+
+    The end that met an added node is pinned to it when its label is keyed
+    by file. Its edges to same-named nodes that were already there exist
+    (they were written when the file was indexed, or relinked when that node
+    was added), and a bare-name match can't use the file-keyed index.
+    """
+    if not added:
+        return
+    pinned: dict[tuple[str, str], set[str | None]] = {}
+    for label, name, file in added:
+        pinned.setdefault((label, name), set()).add(file if label in FILE_SCOPED_LABELS else None)
+    rels = []
+
+    def relink(origin, rel_type, from_label, from_name, from_file, to_label, to_name, to_file, caller_class):
+        rels.append({
+            "from_label": from_label, "from_name": from_name, "rel_type": rel_type,
+            "to_label": to_label, "to_name": to_name, "repo_id": repo_id,
+            "properties": {"caller_class": caller_class} if caller_class else None,
+            "from_file": from_file or None, "to_file": to_file, "origin": origin,
+        })
+
+    names = sorted({name for _label, name in pinned})
+    for origin, refs in engine.find_name_refs(repo_id, names, sorted(skip)):
+        for entry in refs:
+            rel_type, from_label, from_name, from_file, to_label, to_name, caller_class = entry.split(NAME_REF_SEP)
+            for to_file in pinned.get((to_label, to_name), ()):
+                relink(origin, rel_type, from_label, from_name, from_file, to_label, to_name, to_file, caller_class)
+            if not from_file and from_label != "Module":
+                for source_file in pinned.get((from_label, from_name), ()):
+                    relink(origin, rel_type, from_label, from_name, source_file, to_label, to_name, None, caller_class)
+    if rels:
+        engine.upsert_relationships(rels)
 
 
 def _find_referrers(
@@ -1141,7 +1222,9 @@ def _find_referrers(
     node of a label it can target, and it only reads files outside the
     batch. A full scan has no files outside the batch, and a batch that
     only re-saves files adds no nodes, so either way this is close to free.
-    (Markdown mentions are found separately, by _mention_referrers.)
+    (Markdown mentions are found separately, by _mention_referrers, and the
+    by-name edges of other code files are relinked from the graph, without
+    re-indexing them, by _relink_name_refs.)
     """
     if not added:
         return set()
@@ -1626,6 +1709,7 @@ def full_scan(engine: GraphEngine, repo_id: str, repo_root: Path, docs_path: str
     indexed = index_paths(
         engine, repo_id, repo_root, all_files, docs_path=docs_path, mentions_enabled=mentions_enabled,
         sync_provider=False,  # applied just above
+        relink_outside=False,  # every file is in the batch
     )
     if applied:
         _sync_docs_edges(engine, repo_id, repo_root, applied_docs)
@@ -1710,7 +1794,7 @@ def _load_services_with_build_context(engine: GraphEngine, repo_id: str) -> dict
     `file` (the compose file the Service was declared in) is carried
     alongside build_context so _owning_service_relationships can set
     from_file/to_file on the edges it emits -- Service is now file-scoped
-    (see schema.py's _FILE_SCOPED_LABELS), so a MATCH by bare name alone
+    (see schema.py's FILE_SCOPED_LABELS), so a MATCH by bare name alone
     would hit every same-named Service across every compose file again.
 
     Loaded once per index_paths batch (not once per file) since Services are

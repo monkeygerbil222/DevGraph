@@ -19,6 +19,7 @@ from neo4j.exceptions import ServiceUnavailable, SessionExpired, TransientError
 from neo4j.graph import Node, Relationship
 
 from devgraph.graph.schema import RELATIONSHIP_TYPES, RESERVED_NODE_PROPERTIES, constraint_statements
+from devgraph.indexer.common import NAME_REF_SEP
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     # Imported for annotations only: `devgraph.config.project_schema` imports
@@ -155,6 +156,7 @@ def _claim_nodes_tx(tx, label: str, rows: list[dict[str, Any]]) -> None:
 
 
 def _delete_by_source_file_tx(tx, repo_id: str, file_name: str) -> None:
+    _unclaim_foreign_sources_tx(tx, repo_id, file_name)
     if file_name.endswith(".py"):
         _unclaim_service_api_edges_tx(tx, repo_id, file_name)
     tx.run(_DELETE_BY_SOURCE_FILE_CYPHER, repo_id=repo_id, file_name=file_name)
@@ -226,6 +228,27 @@ _UNCLAIM_DOC_NOTE_EDGES_CYPHER = (
     "CALL (n) { MATCH (n)<-[r:DOCUMENTED_BY|SATISFIES]-() " + _UNCLAIM_EDGE + " } "
     "CALL (n) { MATCH (n)-[r:SUPERSEDES|DECIDED_BY]->() " + _UNCLAIM_EDGE + " }"
 )
+
+# G2 set (b): edges the file wrote out of nodes another file owns (a Rust
+# `impl Trait for Foo` writes `Foo -EXTENDS->`), found through the names its
+# Module's `name_ref_sources` recorded when it was last written. Only edges
+# that list the file are touched: a legacy edge with no `origins` can't be
+# attributed, and is healed by set (a) on its source's own file instead.
+_OLD_NAME_REF_SOURCES_CYPHER = (
+    "MATCH (m:Module {repo_id: $repo_id, name: $f}) RETURN coalesce(m.name_ref_sources, []) AS sources"
+)
+_UNCLAIM_FOREIGN_SOURCES_CYPHER = (
+    "MATCH (a {repo_id: $repo_id})-[r]->() WHERE a.name IN $sources AND $f IN r.origins " + _UNCLAIM_EDGE
+)
+
+
+def _unclaim_foreign_sources_tx(tx, repo_id: str, file_name: str) -> None:
+    """G2 set (b), run before the file's Module is overwritten or deleted."""
+    sources = sorted({name for record in tx.run(_OLD_NAME_REF_SOURCES_CYPHER, repo_id=repo_id, f=file_name)
+                      for name in record["sources"]})
+    if sources:
+        tx.run(_UNCLAIM_FOREIGN_SOURCES_CYPHER, repo_id=repo_id, f=file_name, sources=sources)
+
 
 # G2 set (c): the edges a Python file writes out of nodes it doesn't own,
 # the owning-service USES/CALLS and the API pass's Endpoint edges. Only the
@@ -584,6 +607,7 @@ def _replace_file_nodes_tx(
             or (node.get("properties") or {}).get("source_file") == file_name
         )
     ]
+    _unclaim_foreign_sources_tx(tx, repo_id, file_name)
     tx.run(_REPLACE_OWNED_NODES_CYPHER, repo_id=repo_id, f=file_name, keep=keep)
     if service_api:
         _unclaim_service_api_edges_tx(tx, repo_id, file_name)
@@ -782,7 +806,9 @@ class GraphEngine:
 
         `service_api` (a Python file) also unclaims the file from the
         owning-service USES and the Endpoint CALLS/IMPLEMENTS edges it wrote,
-        which `nodes`/`rels` and index_paths' service pass write again.
+        which `nodes`/`rels` and index_paths' service pass write again. The
+        file is always unclaimed from the edges it wrote out of other files'
+        nodes, found through its Module's old `name_ref_sources`.
         """
         with self._driver.session() as session:
             session.execute_write(_replace_file_nodes_tx, repo_id, file_name, nodes, rels, service_api)
@@ -1158,14 +1184,17 @@ class GraphEngine:
             )
             return {record["path"] for record in result}
 
-    def list_file_nodes(self, repo_id: str, files: list[str]) -> set[tuple[str, str]]:
-        """Return (label, name) for every node whose file provenance
+    def list_file_nodes(self, repo_id: str, files: list[str]) -> set[tuple[str, str, str]]:
+        """Return (label, name, file) for every node whose file provenance
         (`source_file`/`file`, a `Module` named by its path, or a schema
-        provider's node, which its `path` owns) is one of `files`.
+        provider's node, which its `path` owns) is one of `files`. `file` is
+        that provenance: the Module's name, else `file`, `source_file` or
+        `path`, in that order.
 
         index_paths snapshots this before re-indexing a batch so it can tell
         which nodes the batch *adds* -- only those can be the missing
-        target of an edge from a file outside the batch.
+        target of an edge from a file outside the batch. A node moving
+        between two of the batch's files counts as added.
         """
         with self._driver.session() as session:
             result = _retry_transient(
@@ -1174,12 +1203,36 @@ class GraphEngine:
                 "WHERE n.source_file IN $files OR n.file IN $files "
                 "   OR (n:Module AND n.name IN $files) "
                 "   OR (n.extractor IS NOT NULL AND n.path IN $files) "
-                "RETURN DISTINCT labels(n)[0] AS label, n.name AS name",
+                "RETURN DISTINCT labels(n)[0] AS label, n.name AS name, "
+                "CASE WHEN n:Module THEN n.name ELSE coalesce(n.file, n.source_file, n.path) END AS file",
                 repo_id=repo_id,
                 files=files,
             )
             records = result or []
-            return {(record["label"], record["name"]) for record in records}
+            return {(record["label"], record["name"], record["file"]) for record in records}
+
+    def find_name_refs(self, repo_id: str, names: list[str], skip: list[str]) -> list[tuple[str, list[str]]]:
+        """(Module name, entries) for every Module outside `skip` whose
+        `name_refs` (see indexer/common.py `name_ref_properties`) target, or
+        come from an unpinned source, named one of `names`, with just those
+        entries. The short `name_ref_targets`/`name_ref_sources` lists filter
+        the Modules before any entry is split."""
+        with self._driver.session() as session:
+            result = _retry_transient(
+                session.run,
+                "MATCH (m:Module {repo_id: $repo_id}) "
+                "WHERE NOT m.name IN $skip "
+                "  AND (any(t IN m.name_ref_targets WHERE t IN $names) "
+                "       OR any(s IN m.name_ref_sources WHERE s IN $names)) "
+                "RETURN m.name AS origin, "
+                "       [e IN m.name_refs WHERE split(e, $sep)[5] IN $names OR split(e, $sep)[2] IN $names] AS refs",
+                repo_id=repo_id,
+                names=names,
+                skip=skip,
+                sep=NAME_REF_SEP,
+            )
+            records = result or []
+            return [(record["origin"], list(record["refs"])) for record in records]
 
     def find_mentioning_documents(
         self, repo_id: str, pairs: list[tuple[str, str]], batch_keys: list[str]

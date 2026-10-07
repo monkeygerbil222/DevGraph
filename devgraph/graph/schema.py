@@ -59,10 +59,13 @@ RELATIONSHIP_TYPES: tuple[str, ...] = (
 # `sources` wrote (see graph/engine.py `_claims_of`). A per-project schema may not redeclare any of
 # them: a user-defined field of the same name would silently collide with
 # the value the pipeline writes. `extractor` marks nodes a schema-declared
-# provider owns (see devgraph/indexer/providers/).
-RESERVED_NODE_PROPERTIES: frozenset[str] = frozenset(
-    {"repo_id", "name", "file", "source_file", "source", "sources", "claims", "extractor"}
-)
+# provider owns (see devgraph/indexer/providers/). `name_refs`,
+# `name_ref_targets` and `name_ref_sources` record a code Module's by-name
+# edges (see devgraph/indexer/common.py `name_ref_properties`).
+RESERVED_NODE_PROPERTIES: frozenset[str] = frozenset({
+    "repo_id", "name", "file", "source_file", "source", "sources", "claims", "extractor",
+    "name_refs", "name_ref_targets", "name_ref_sources",
+})
 
 # Labels other than Repository must be uniquely keyed on (repo_id, name)
 # so incremental MERGE writes update in place instead of duplicating.
@@ -78,7 +81,7 @@ _REPO_SCOPED_LABELS = tuple(l for l in NODE_LABELS if l != "Repository")
 # and Container deliberately stays bare-name keyed too, since it represents
 # a shared base image, not a per-file entity (see
 # indexer/dispatch.py:_upsert_container_result).
-_FILE_SCOPED_LABELS = ("Class", "Function", "Service")
+FILE_SCOPED_LABELS = ("Class", "Function", "Service")
 
 
 def constraint_statements() -> list[str]:
@@ -96,7 +99,7 @@ def constraint_statements() -> list[str]:
         "FOR (r:Repository) REQUIRE r.repo_id IS UNIQUE"
     ]
     for label in _REPO_SCOPED_LABELS:
-        if label in _FILE_SCOPED_LABELS:
+        if label in FILE_SCOPED_LABELS:
             statements.append(f"DROP CONSTRAINT {label.lower()}_repo_name IF EXISTS")
             statements.append(
                 f"CREATE CONSTRAINT {label.lower()}_repo_name_file IF NOT EXISTS "

@@ -278,7 +278,7 @@ def test_delete_edges_matches_a_keyed_node_by_its_path(engine):
 
 def test_list_file_nodes_finds_a_keyed_node_by_its_path(engine):
     seed_keyed(engine)
-    assert engine.list_file_nodes(REPO, ["decisions/a.md"]) == {("Adr", "ADR-012")}
+    assert engine.list_file_nodes(REPO, ["decisions/a.md"]) == {("Adr", "ADR-012", "decisions/a.md")}
     assert engine.list_file_nodes(REPO, ["ADR-012"]) == set()
 
 
