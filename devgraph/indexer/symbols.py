@@ -48,10 +48,6 @@ class Symbol:
     end_line: int
     body: str
 
-    @property
-    def key(self) -> tuple[str, str | None, str, int]:
-        return (self.kind, self.container, self.name, self.ordinal)
-
 
 def language_for(path: str) -> str | None:
     """The code route of a repo-relative path, by its suffix, or `None`."""
@@ -63,10 +59,45 @@ def decode_source(data: bytes) -> str:
     return data.decode("utf-8", errors="replace").replace("\r\n", "\n")
 
 
-def extract_symbols(path: str, text: str) -> list[Symbol]:
+class TooManySymbols(Exception):
+    """The file has more functions and classes than `extract_symbols` was allowed to detail."""
+
+
+def _containers(nodes: list) -> list[str | None]:
+    """Each node's innermost enclosing class name, or `None`, in O(n log n).
+
+    Enclosing means the class's lines include the node's (`<=` both ends) and the
+    class is not the node itself. Innermost is the latest start, then the earliest
+    end. Equal line ranges cannot show nesting, so among them the earlier node (the
+    extractors list a parent before its children) is the outer one: a class is never
+    the container of its own container."""
+    order = sorted(
+        range(len(nodes)),
+        key=lambda i: (nodes[i].properties["start_line"], -nodes[i].properties["end_line"], i),
+    )
+    containers: list[str | None] = [None] * len(nodes)
+    stack: list[tuple[int, str]] = []  # (end_line, name) of classes opened so far, outermost first
+    for i in order:
+        start, end = nodes[i].properties["start_line"], nodes[i].properties["end_line"]
+        while stack and stack[-1][0] < start:
+            stack.pop()  # closed before this node, and so before every later one
+        # Classes are pushed in (start, -end) order, so the first from the top that
+        # reaches `end` is the innermost. On properly nested ranges that is the top.
+        for class_end, name in reversed(stack):
+            if class_end >= end:
+                containers[i] = name
+                break
+        if nodes[i].label == "Class":
+            stack.append((end, nodes[i].name))
+    return containers
+
+
+def extract_symbols(path: str, text: str, max_symbols: int | None = None) -> list[Symbol]:
     """The functions and classes of `text` (already normalised), in source order.
 
-    Raises whatever the language's extractor raises; `path` must have a code route."""
+    Raises `TooManySymbols` when there are more than `max_symbols`, before any
+    per-symbol work, and whatever the language's extractor raises; `path` must have
+    a code route."""
     result = EXTRACTORS[language_for(path)](text, path)
     nodes = [
         n
@@ -75,22 +106,19 @@ def extract_symbols(path: str, text: str) -> list[Symbol]:
         and n.properties.get("start_line") is not None
         and n.properties.get("end_line") is not None
     ]
-    nodes.sort(key=lambda n: (n.properties["start_line"], n.properties["end_line"]))
+    if max_symbols is not None and len(nodes) > max_symbols:
+        raise TooManySymbols(len(nodes))
+    containers = _containers(nodes)
     lines = text.split("\n")  # tree-sitter's rows; splitlines() would also break on \f, \x85, ...
-    classes = [n for n in nodes if n.label == "Class"]
     seen: dict[tuple[str, str | None, str], int] = {}
     symbols = []
-    for node in nodes:
+    source_order = sorted(
+        range(len(nodes)),
+        key=lambda i: (nodes[i].properties["start_line"], nodes[i].properties["end_line"], i),
+    )
+    for i in source_order:
+        node, container = nodes[i], containers[i]
         start, end = node.properties["start_line"], node.properties["end_line"]
-        enclosing = [
-            c
-            for c in classes
-            if c is not node and c.properties["start_line"] <= start and end <= c.properties["end_line"]
-        ]
-        container = None
-        if enclosing:
-            inner = min(enclosing, key=lambda c: (-c.properties["start_line"], c.properties["end_line"]))
-            container = inner.name
         group = (node.label, container, node.name)
         ordinal = seen.get(group, 0)
         seen[group] = ordinal + 1
@@ -112,19 +140,40 @@ def _order(entry: dict) -> tuple:
     return (entry["start_line"], entry["kind"], entry["name"])
 
 
-def diff_symbols(old: list[Symbol], new: list[Symbol]) -> tuple[list[dict], list[dict], list[dict]]:
-    """(added, removed, changed) entries, paired by (kind, container, name, ordinal).
+def _group(symbols: list[Symbol]) -> dict[tuple[str, str | None, str], list[Symbol]]:
+    groups: dict[tuple[str, str | None, str], list[Symbol]] = {}
+    for symbol in symbols:
+        groups.setdefault((symbol.kind, symbol.container, symbol.name), []).append(symbol)
+    return groups
 
+
+def diff_symbols(old: list[Symbol], new: list[Symbol]) -> tuple[list[dict], list[dict], list[dict]]:
+    """(added, removed, changed) entries, paired by (kind, container, name).
+
+    Within a group of same-keyed symbols (overloads, Go methods on two types), the
+    ones with identical bodies pair first, so reordering them reports nothing; the
+    rest pair in source order (by ordinal), and the leftovers are added or removed.
     `added` and `changed` carry head-side lines, `removed` base-side ones; a `changed`
     entry adds `old_start_line`/`old_end_line`. A symbol with the same body on both
     sides is not reported, wherever it moved. Each list is sorted by (line, kind, name)."""
-    before = {s.key: s for s in old}
-    after = {s.key: s for s in new}
-    added = [_entry(s) for key, s in after.items() if key not in before]
-    removed = [_entry(s) for key, s in before.items() if key not in after]
-    changed = [
-        {**_entry(s), "old_start_line": before[key].start_line, "old_end_line": before[key].end_line}
-        for key, s in after.items()
-        if key in before and before[key].body != s.body
-    ]
+    before, after = _group(old), _group(new)
+    added, removed, changed = [], [], []
+    for key in before.keys() | after.keys():
+        olds, news = before.get(key, []), after.get(key, [])
+        by_body: dict[str, list[Symbol]] = {}
+        for symbol in reversed(olds):
+            by_body.setdefault(symbol.body, []).append(symbol)  # popped from the end: source order
+        matched: set[int] = set()
+        unmatched_new = []
+        for symbol in news:
+            same = by_body.get(symbol.body)
+            if same:
+                matched.add(id(same.pop()))
+            else:
+                unmatched_new.append(symbol)
+        unmatched_old = [s for s in olds if id(s) not in matched]
+        for was, now in zip(unmatched_old, unmatched_new):
+            changed.append({**_entry(now), "old_start_line": was.start_line, "old_end_line": was.end_line})
+        added += [_entry(s) for s in unmatched_new[len(unmatched_old) :]]
+        removed += [_entry(s) for s in unmatched_old[len(unmatched_new) :]]
     return sorted(added, key=_order), sorted(removed, key=_order), sorted(changed, key=_order)

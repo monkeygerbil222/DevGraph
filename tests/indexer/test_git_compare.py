@@ -496,7 +496,7 @@ def detail(repo, base="main", head="feature", clock=None, after_open=None):
     with open_comparison(repo, REPO_ID, base, head, **kwargs) as cmp:
         if after_open is not None:
             after_open()
-        detailed = symbol_detail(cmp, **kwargs)
+        detailed = symbol_detail(cmp)  # the clock and deadline come from the comparison
     return {c.path: c for c in detailed}, [c.path for c in detailed], cmp
 
 
@@ -1050,3 +1050,24 @@ def test_symlink_side_of_a_modified_file_has_no_symbols(tmp_path):
     files, _, _ = detail(repo, base="feature", head="real")
     assert files["s.py"].status == "modified" and files["s.py"].kind == "blob"
     assert triples(files["s.py"].symbols) == {"added": {(F, None, "own")}, "removed": set(), "changed": set()}
+
+
+def test_per_file_symbol_cap(tmp_path, monkeypatch):
+    repo = two_branch_repo(tmp_path, {"a.py": "a = 1\n"}, {"p.py": five_functions("p"), "q.py": "def q():\n    pass\n"})
+    monkeypatch.setattr(compare, "_COMPARE_MAX_FILE_SYMBOLS", 4)
+    files, _, cmp = detail(repo)
+    assert (files["p.py"].symbols, files["p.py"].symbols_skipped) == (None, "limit")
+    assert triples(files["q.py"].symbols)["added"] == {(F, None, "q")}  # not sticky: the next file is detailed
+    assert cmp.truncated_reasons == ["symbols"]
+
+
+def test_a_stray_value_error_is_not_a_missing_object(tmp_path, monkeypatch):
+    repo = two_branch_repo(tmp_path, {"a.py": "a = 1\n"}, {"a.py": "a = 2\n"})
+
+    def boom(old, new):
+        raise ValueError("a bug, not git")
+
+    monkeypatch.setattr(compare, "diff_symbols", boom)
+    with pytest.raises(ValueError, match="a bug, not git") as err:
+        detail(repo)
+    assert not isinstance(err.value, CompareError)

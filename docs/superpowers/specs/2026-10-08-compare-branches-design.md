@@ -178,7 +178,12 @@ which functions or classes were added, removed or edited.
     distinct nodes can share exact lines (a one-line class around a one-line
     method), so identity, not strict containment, is the test. The innermost
     is the enclosing class with the latest `start_line`, then the earliest
-    `end_line`.
+    `end_line`. Equal line ranges cannot show nesting (`class A {} class B {}`
+    on one line), so among them the one the extractor lists first is the
+    outer one, and a class is never the container of its own container.
+    - The search is a sort plus a stack of open classes, O(n log n). A file
+      with more than `_COMPARE_MAX_FILE_SYMBOLS` (5,000) functions and classes
+      gets `symbols_skipped: "limit"` before any per-symbol work (C5).
     - This tells apart `A.__init__` and `B.__init__`, and two `Run` methods in
       Java/C#/Kotlin classes.
     - Go methods are written outside their type, so their container is
@@ -190,6 +195,10 @@ which functions or classes were added, removed or edited.
   - So a pure name-plus-kind comparison is exact whenever names are unique in
     a file, which is the common case. The tie-breakers only matter for
     duplicates.
+  - **Pairing within a duplicate group.** Among symbols sharing
+    `(kind, container, name)`, those with identical bodies on both sides pair
+    first, so overloads that are only reordered report nothing. The rest pair
+    by ordinal (source order), and the leftovers are `added` or `removed`.
 - **Classification:**
   - a key only on the head side is `added`;
   - a key only on the base side is `removed`;
@@ -200,16 +209,24 @@ which functions or classes were added, removed or edited.
   differs. That is accurate and cheap. The method's own entry says what
   changed inside it.
 - **Known imprecision, accepted:**
-  - inserting a new overload before an existing one shifts ordinals, so it can
-    read as one overload `changed` and one `added`;
+  - when an overload is both edited and another inserted before it, the
+    by-ordinal fallback can pair the wrong two, so it can read as one overload
+    `changed` and one `added` with their lines swapped;
   - a Python decorator line sits outside `start_line` (the extractors start at
     the `def`), so a decorator-only edit is not seen;
-  - a moved Go method on another type with the same name may swap ordinals;
+  - a moved and edited Go method on another type with the same name may pair
+    with the wrong type's method;
   - Rust methods on two types with the same name (`impl A { fn new }` and
     `impl B { fn new }`) are told apart only by ordinal, the same way as Go;
   - a nested function (a function inside a function) gets the enclosing
     class as its container, not the enclosing function, so it can share a key
     with a same-named method of that class and be told apart only by ordinal.
+
+  - extractor blind spots, inherited from the indexer: TypeScript method
+    decorators and Rust `#[attr]` lines sit outside the symbol's lines, so an
+    edit to them alone is not seen; C++ templates, nested C++ classes, Kotlin
+    companion objects and TypeScript interfaces and enums produce no symbols;
+    a Kotlin class whose body is on one line fails to parse (`parse_error`).
 
   The response always carries line numbers, so the assistant can check.
 
@@ -345,6 +362,7 @@ named like `describe_node`'s:
 | `_COMPARE_MAX_TOTAL_BYTES` | 16 MiB of blob data parsed in one call | Later files get `symbols_skipped: "limit"`. Reason `bytes`. |
 | `_COMPARE_MAX_SYMBOLS_PER_LIST` | 50 per file per list | The list is capped and the file is marked `symbols_truncated`. Reason `symbols`. |
 | `_COMPARE_MAX_SYMBOLS` | 1,000 symbol entries in the whole response | Later files get `symbols_skipped: "limit"`. Reason `symbols`. |
+| `_COMPARE_MAX_FILE_SYMBOLS` | 5,000 functions and classes on one side of one file | That file gets `symbols_skipped: "limit"`, checked right after the extractor and before any per-symbol work, so one generated file cannot hold the call. Not sticky: later files are still detailed. Reason `symbols`. |
 | `_COMPARE_MAX_CALLERS` | 25 callers | `impacted_callers.truncated`. `count` is 26, a lower bound (as in `describe_node`). |
 | `_COMPARE_DEADLINE_S` | 20 s from the start of the call | Checked before each tree read and each file parse. The walk stops, or later files get `symbols_skipped: "limit"`. Reason `deadline`. Also bounds `merge-base` (C4). |
 
@@ -367,6 +385,8 @@ named like `describe_node`'s:
   bytes still count toward the total.
 - **The deadline is wall clock** (`time.monotonic`). The comparison function
   takes a `clock` argument so tests can make it expire deterministically.
+  `symbol_detail` takes the clock and the deadline from the comparison, so
+  the two can never disagree.
 - **The graph read** uses `engine.run_read_cypher` with `DEFAULT_TIMEOUT_S`
   (10 s) and `max_rows=_COMPARE_MAX_CALLERS + 1`, outside the 20 s git
   deadline.
@@ -400,7 +420,9 @@ named like `describe_node`'s:
   `symbols_skipped: "parse_error"` and the comparison goes on, as
   `index_paths` does per file.
 - **An exact rename** has identical content, so it gets empty symbol lists
-  without being parsed.
+  without being parsed. This holds even when the rename changes the language
+  (`a.txt` to `a.py`): such a file reports no symbols, though every symbol is
+  new to code.
 - **A symlink replaced by a file** is a `modified` blob whose base side is
   link text. That side counts as no symbols, so the file's symbols are all
   `added`. A file replaced by a symlink is listed with `symbols_skipped:

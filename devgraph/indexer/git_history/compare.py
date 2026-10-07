@@ -24,7 +24,7 @@ import git
 from git.exc import BadName, CommandError, GitCommandError, InvalidGitRepositoryError, NoSuchPathError
 from gitdb.exc import BadObject
 
-from devgraph.indexer.symbols import decode_source, diff_symbols, extract_symbols, language_for
+from devgraph.indexer.symbols import TooManySymbols, decode_source, diff_symbols, extract_symbols, language_for
 from devgraph.paths import MAX_CONFIG_BYTES
 
 log = logging.getLogger(__name__)
@@ -35,6 +35,7 @@ _COMPARE_MAX_FILE_BYTES = MAX_CONFIG_BYTES
 _COMPARE_MAX_TOTAL_BYTES = 16 * 1024 * 1024
 _COMPARE_MAX_SYMBOLS_PER_LIST = 50
 _COMPARE_MAX_SYMBOLS = 1_000
+_COMPARE_MAX_FILE_SYMBOLS = 5_000
 _COMPARE_DEADLINE_S = 20.0
 
 _MAX_REF_LENGTH = 256
@@ -79,7 +80,8 @@ class RefComparison:
     merge_base: git.Commit
     changes: list[FileChange] = field(default_factory=list)
     truncated_reasons: list[str] = field(default_factory=list)
-    deadline: float = float("inf")  # on the `clock` given to `open_comparison`
+    deadline: float = float("inf")  # on `clock`
+    clock: Callable[[], float] = time.monotonic  # the one given to `open_comparison`
 
 
 def _echo(value: str) -> str:
@@ -314,6 +316,7 @@ def open_comparison(
             changes=_pair_renames(walk.changes),
             truncated_reasons=walk.reasons,
             deadline=deadline,
+            clock=clock,
         )
     except CompareError:
         raise
@@ -331,9 +334,13 @@ class _Detail:
     """C5's per-call budgets for `symbol_detail`. Once a byte, symbol or deadline limit
     is hit, every later file that would need parsing gets `symbols_skipped: "limit"`."""
 
-    def __init__(self, deadline: float, clock: Callable[[], float]):
-        self.deadline = deadline
-        self.clock = clock
+    def __init__(self, comparison: RefComparison):
+        self.deadline = comparison.deadline
+        self.clock = comparison.clock
+        self.missing = (
+            f"git object missing while comparing {_echo(comparison.base_ref)} and {_echo(comparison.head_ref)}; "
+            "the clone may be partial or shallow"
+        )
         self.bytes = 0
         self.symbols = 0
         self.reasons: set[str] = set()
@@ -344,6 +351,18 @@ class _Detail:
         self.stopped = True
         return "limit"
 
+    def _size(self, blob: git.Blob) -> int:
+        try:
+            return blob.size  # cat-file --batch-check: the data is not read
+        except (BadName, BadObject, ValueError) as exc:
+            raise CompareError(self.missing) from exc
+
+    def _data(self, blob: git.Blob) -> bytes:
+        try:
+            return blob.data_stream.read()
+        except (BadName, BadObject, ValueError) as exc:
+            raise CompareError(self.missing) from exc
+
     def skip_reason(self, change: FileChange) -> str | None:
         """Why `change` gets no symbols, before any blob data is read; `None` to parse it."""
         if change.kind != "blob":
@@ -352,7 +371,7 @@ class _Detail:
             return "unsupported_language"
         if change.status == "renamed":
             return None
-        sizes = [blob.size for blob in (change.base_blob, change.head_blob) if blob is not None]
+        sizes = [self._size(blob) for blob in (change.base_blob, change.head_blob) if blob is not None]
         if any(size > _COMPARE_MAX_FILE_BYTES for size in sizes):
             return "too_large"
         if self.stopped:
@@ -374,12 +393,17 @@ class _Detail:
                 # A symlink side of a link-to-file change: its blob is link text, not source.
                 sides.append([])
                 continue
-            data = blob.data_stream.read()
+            data = self._data(blob)
             if b"\0" in data[:_BINARY_SNIFF_BYTES]:
                 change.symbols_skipped = "binary"
                 return
             try:
-                sides.append(extract_symbols(change.path, decode_source(data)))
+                sides.append(extract_symbols(change.path, decode_source(data), _COMPARE_MAX_FILE_SYMBOLS))
+            except TooManySymbols:
+                # Not sticky: the next file may be small. Bounds the per-symbol work on one file.
+                change.symbols_skipped = "limit"
+                self.reasons.add("symbols")
+                return
             except Exception:
                 log.debug("compare_branches: extractor failed on %s", change.path, exc_info=True)
                 change.symbols_skipped = "parse_error"
@@ -395,36 +419,31 @@ class _Detail:
         change.symbols = lists
 
 
-def symbol_detail(comparison: RefComparison, *, clock: Callable[[], float] = time.monotonic) -> list[FileChange]:
+def symbol_detail(comparison: RefComparison) -> list[FileChange]:
     """Detail the changes `files.results` lists, and return them in listing order.
 
-    Code-language files come first (path order), then the rest (path order), up to
-    `_COMPARE_MAX_FILES` in all; only these get `language`, `symbols` and
-    `symbols_skipped` filled. The changes past the cap are left as they are. The C5
-    reasons hit here join `comparison.truncated_reasons`, in the spec's order.
-    Must run inside the `open_comparison` block, while the blobs are readable."""
+    Every change gets `language`. Code-language files come first (path order), then
+    the rest (path order), up to `_COMPARE_MAX_FILES` in all; only these get
+    `symbols` or `symbols_skipped`, and the changes past the cap keep both `None`.
+    The deadline and clock are the comparison's. The C5 reasons hit here join
+    `comparison.truncated_reasons`, in the spec's order. Must run inside the
+    `open_comparison` block, while the blobs are readable."""
     for change in comparison.changes:
         change.language = language_for(change.path) if change.kind == "blob" else None
     code = [c for c in comparison.changes if c.language is not None]
     rest = [c for c in comparison.changes if c.language is None]
     listed = (code + rest)[:_COMPARE_MAX_FILES]
-    budget = _Detail(comparison.deadline, clock)
+    budget = _Detail(comparison)
     if len(comparison.changes) > _COMPARE_MAX_FILES:
         budget.reasons.add("files")
-    try:
-        for change in listed:
-            change.symbols_skipped = budget.skip_reason(change)
-            if change.symbols_skipped is not None:
-                continue
-            if change.status == "renamed":
-                change.symbols = {"added": [], "removed": [], "changed": []}  # identical content, never read
-            else:
-                budget.parse(change)
-    except (BadName, BadObject, ValueError) as exc:  # extractor failures are caught in `parse`
-        raise CompareError(
-            f"git object missing while comparing {_echo(comparison.base_ref)} and {_echo(comparison.head_ref)}; "
-            "the clone may be partial or shallow"
-        ) from exc
+    for change in listed:
+        change.symbols_skipped = budget.skip_reason(change)
+        if change.symbols_skipped is not None:
+            continue
+        if change.status == "renamed":
+            change.symbols = {"added": [], "removed": [], "changed": []}  # identical content, never read
+        else:
+            budget.parse(change)
     reasons = set(comparison.truncated_reasons) | budget.reasons
     comparison.truncated_reasons = [r for r in _REASON_ORDER if r in reasons]
     return listed
