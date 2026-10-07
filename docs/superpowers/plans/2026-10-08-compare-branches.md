@@ -12,10 +12,10 @@
 
 - **Read-only (C1).**
   - Nothing writes to the graph, the working tree, the staging area or `.git`.
-  - Both sides are read from git objects (`commit.tree`, `Blob.size`, `Blob.data_stream`). The checked-out files are never read, whatever branch is checked out.
+  - Both sides are read from git objects (`commit.tree`, `Blob.size`, `Blob.data_stream`), with CRLF normalised to LF before extraction (C3). The checked-out files are never read, whatever branch is checked out.
 - **Git process surface (C4).**
   - The only `git` subcommands a comparison may run are `cat-file` (GitPython's object database) and `merge-base`.
-  - `merge-base` gets the two resolved `hexsha`s, never caller strings. It gets `kill_after_timeout` only when `sys.platform != "win32"`.
+  - `merge-base` gets the two resolved `hexsha`s, never caller strings. It gets `kill_after_timeout=max(remaining, 1)` only when `sys.platform != "win32"`.
   - No `git diff`, `log` or `rev-parse`, and no `subprocess` call of our own.
 - **Ref validation before resolution (C4).** The spec's rules apply, and they run before `git.Repo` is even opened. An invalid ref never reaches GitPython.
 - **No `search_parent_directories`.** `git.Repo(record.path)` opens the registered root exactly. The `Repo` is closed in a `finally`.
@@ -23,7 +23,7 @@
 - **Errors are plain text (C7).**
   - `compare.py` raises `CompareError(ValueError)` with the spec's exact messages.
   - `tools.compare_branches` turns it, and an unknown `repo_id`, into `ToolError`.
-  - No other exception escapes for a caller-fixable case.
+  - No other exception escapes for a caller-fixable case. `repo.commit()` alone is wrapped in `except Exception`. The whole comparison is wrapped in a final `except (GitCommandError, OSError)` that becomes the generic git-failure message.
   - Caller values are echoed through `tools._echo` in `tools.py`; `compare.py` has its own 100-character echo with the same behaviour.
 - **One routing table (C6).** `devgraph/indexer/symbols.py` maps `dispatch._CODE_ROUTES` values to extractors. It adds no suffix list of its own.
 - **Signatures.**
@@ -32,6 +32,8 @@
   - No new config knob, and no new dependency.
 - **Sanitised output.** Every string from git or source (paths, symbol names, refs) passes `_sanitize_value`, through `_envelope` or directly, before it leaves `tools.py`.
 - **Test repos are real.** Every comparison test builds a temporary git repository with `main` and a second branch, using `git` via `subprocess` in the test, as `tests/mcp/test_tools_impact_diff.py` does. Each test repository has `-c user.email=dev@example.com -c user.name="Dev Example" -c commit.gpgsign=false`, and `init -b main`. No real names or paths.
+- **Observable reads.** Tests that assert a blob was or was not read patch `git.db.GitCmdObjectDB.stream` and `GitCmdObjectDB.info` at class level. GitPython's `Blob.data_stream` and `Blob.size` go through those, while a patch on one `Blob` instance or on `repo.odb` taken from a different `Repo` would miss them. `RefComparison` also exposes `repo`, so a test can assert against the very object database the comparison used.
+- **Windows.** The symlink and chmod tests are `@pytest.mark.skipif(sys.platform == "win32", ...)`. The deadline test for `merge-base`'s `kill_after_timeout` is POSIX-only too.
 - **TDD.** Each task starts with failing tests, then the implementation, then `uv run pytest -q` (the full suite).
 - **Commits.** Plain imperative messages, with no `Co-Authored-By` trailer and no AI attribution. Never stage `uv.lock`, real names or personal paths.
 
@@ -45,7 +47,7 @@ Each item names the test that proves it.
 
    Tests: Task 1 `test_changes_on_base_after_branch_point_are_not_reported` and `test_merged_head_is_empty`.
 2. **Process surface.** Every `Git.execute` during a full comparison, including the symbol pass, is recorded. The set of subcommands must be a subset of `{"cat-file", "merge-base"}`, and `merge-base`'s argv must be exactly two 40-hex SHAs after the subcommand. Tests: Task 1 `test_only_cat_file_and_merge_base_run`; Task 2 reruns it with symbols.
-3. **Hostile refs never reach git.** `-h`, `--output=x`, `a..b`, `HEAD:secret.txt`, `../../x`, `""`, a 300-character ref and `ma in` each give a `CompareError` naming the rule. A patched `git.Repo` that fails the test if it is constructed proves nothing was opened. Test: Task 1 `test_invalid_refs_are_rejected_before_git`.
+3. **Hostile refs never reach git, odd refs never crash.** `-h`, `--output=x`, `a..b`, `HEAD:secret.txt`, `../../x`, `""`, a 300-character ref, `ma in`, `a\x07b` and `x*` each give a `CompareError` naming the rule. A patched `git.Repo` that fails the test if it is constructed proves nothing was opened. Valid-looking refs that GitPython cannot resolve (`main@{yesterday}`, `HEAD@{}`, `HEAD@{99}`, `@{-9}`, `@{upstream}`, `HEAD^{tree}`) and `logs/HEAD` (the all-zero SHA) each give the unknown-ref `CompareError`, never another exception type. Tests: Task 1 `test_invalid_refs_are_rejected_before_git` and `test_unresolvable_refs_are_unknown`.
 4. **One test per language family.**
    - The eight families are `py`, `js` (one test covers `.ts`), `cs`, `cpp`, `java`, `rs`, `kt` and `go`.
    - Each builds a two-branch repository, then asserts the exact `added`, `removed` and `changed` symbol keys, plus one moved-but-identical symbol that is not reported.
@@ -59,16 +61,20 @@ Each item names the test that proves it.
 **Files:**
 - `devgraph/indexer/git_history/compare.py` (new):
   - **`CompareError(ValueError)`**.
-  - **`validate_ref(arg_name, ref)`**. It applies the C4 rules in this order: empty or too long, leading `-`, `..`, `:`, character set, leading `/`. It raises `CompareError` with the C7 "is not a valid ref" message.
+  - **`validate_ref(arg_name, ref)`**. It applies the C4 rules in this order: empty or too long, leading `-`, leading `/`, `..`, `:`, whitespace or control character, `*?[\`. There is no allow-list charset, so `fix#123` and non-ASCII names pass. It raises `CompareError` with the C7 "is not a valid ref" message.
   - **`FileChange` dataclass**: `path`, `status`, `old_path=None`, `base_blob`/`head_blob` (GitPython `Blob` or `None`), `kind` (`"blob"`, `"symlink"` or `"submodule"`).
-  - **`RefComparison` dataclass**: `base_ref`, `head_ref`, `base_commit`, `head_commit`, `merge_base`, `changes: list[FileChange]` (sorted by path, uncapped by `_COMPARE_MAX_FILES`, capped by `_COMPARE_MAX_DIFF_ENTRIES`), `truncated_reasons: list[str]`.
+  - **`RefComparison` dataclass**: `repo` (the open `git.Repo`, for tests and Task 2), `base_ref`, `head_ref`, `base_commit`, `head_commit`, `merge_base`, `changes: list[FileChange]` (sorted by path, uncapped by `_COMPARE_MAX_FILES`, capped by `_COMPARE_MAX_DIFF_ENTRIES`), `truncated_reasons: list[str]`.
   - **`open_comparison(repo_path, repo_id, base_ref, head_ref, *, clock=time.monotonic)`**. A context manager that yields a `RefComparison` and closes the `Repo` on exit. The blobs stay readable for Task 2 while it is open. It:
     - validates both refs;
     - opens the repository, mapping `NoSuchPathError` and `InvalidGitRepositoryError` to the C7 message;
-    - resolves each ref with `repo.commit(ref)`, mapping `BadName`, `BadObject`, `ValueError` and a non-commit to the C7 messages, with the shallow sentence when `Path(repo.common_dir, "shallow")` exists;
-    - calls `repo.merge_base(base.hexsha, head.hexsha, **timeout_kw)`, mapping `[]` to "share no history" (with the shallow sentence) and a `GitCommandError` after the deadline to the timeout message;
+    - resolves each ref with `repo.commit(ref)` inside `except Exception` (that call only), mapping any exception to the unknown-ref message. It then rejects the all-zero `hexsha`, and a commit whose `.tree` can't be read, with the same message. The shallow sentence is added when `Path(repo.common_dir, "shallow")` exists;
+    - calls `repo.merge_base(base.hexsha, head.hexsha, **timeout_kw)`, with `timeout_kw = {"kill_after_timeout": max(remaining, 1)}` on POSIX and `{}` on win32. It maps:
+      - `[]` to "share no history", with the shallow sentence;
+      - a `GitCommandError` whose `stderr` (stripped, decoded) starts with `Timeout:` to the timeout message;
+      - any other `GitCommandError`, including `GitCommandNotFound`, to the generic git-failure message;
     - walks the trees (C2), checking the deadline before each tree read;
-    - pairs exact renames.
+    - pairs exact renames;
+    - wraps everything from `git.Repo(...)` to the end of the walk (and, through the context manager, Task 2's reads) in a final `except (GitCommandError, OSError)`, mapped to the generic git-failure message. `CompareError` itself passes through untouched.
   - **The caps** `_COMPARE_MAX_DIFF_ENTRIES`, `_COMPARE_MAX_FILES`, `_COMPARE_DEADLINE_S`, `_COMPARE_MAX_FILE_BYTES`, `_COMPARE_MAX_TOTAL_BYTES`, `_COMPARE_MAX_SYMBOLS_PER_LIST` and `_COMPARE_MAX_SYMBOLS`, all defined here. Task 2 uses the last four.
 - `tests/indexer/git_compare_helpers.py` (new), a helper module like `docs_live_helpers.py`:
   - **`git(repo, *args)`**: `subprocess.run(["git", "-c", "user.email=dev@example.com", "-c", "user.name=Dev Example", "-c", "commit.gpgsign=false", *args], cwd=repo, check=True, capture_output=True, text=True)`, returning stdout stripped.
@@ -81,34 +87,44 @@ Each item names the test that proves it.
 
     It returns the repository path.
   - **`record_git_commands(monkeypatch)`**. It wraps `git.cmd.Git.execute` and appends each `command` list to a returned list.
+  - **`record_object_reads(monkeypatch)`**. It wraps `git.db.GitCmdObjectDB.stream` and `GitCmdObjectDB.info` at class level and returns two lists of the hex SHAs passed to each.
 - `tests/indexer/test_git_compare.py` (new).
 
 - [ ] Write failing tests:
   - **`test_added_removed_modified_and_nested_paths`.**
     - `base` has `a.py`, `pkg/b.py`, `pkg/sub/c.txt` and `d.md`.
     - `branch` modifies `pkg/b.py`, removes `d.md`, and adds `pkg/sub/new.go` and `e/f/g.rs` (a new directory).
-    - The changes are exactly `[("e/f/g.rs","added"), ("d.md","removed"), ("pkg/b.py","modified"), ("pkg/sub/new.go","added")]`, sorted by path.
+    - The changes are exactly `[("d.md","removed"), ("e/f/g.rs","added"), ("pkg/b.py","modified"), ("pkg/sub/new.go","added")]`, sorted by path.
     - `merge_base` is `main`'s commit.
   - **`test_changes_on_base_after_branch_point_are_not_reported`.** `main_after` edits `a.py` and adds `only_main.py`. Neither appears, and the branch's own change does.
   - **`test_merged_head_is_empty`.** Comparing `branch_a="feature", branch_b="main"`, after `main` has merged `feature` (`git merge --no-ff`), gives no changes. `branch_a == branch_b` also gives no changes, and no error.
-  - **`test_refs_of_every_shape_resolve`.** These all resolve: a tag, a full SHA, a 7-character SHA, `feature~1`, `HEAD`, and `refs/heads/feature`.
+  - **`test_refs_of_every_shape_resolve`.** These all resolve: a tag, a full SHA, a 7-character SHA, `feature~1`, `HEAD`, `HEAD@{1}`, `refs/heads/feature`, and a branch named `fix#123`.
   - **`test_exact_rename_and_edited_rename`.**
     - `x/old.py` is moved unchanged to `y/new.py`. That gives one `renamed` entry, with `old_path="x/old.py"`.
     - `m.py` is moved and edited to `n.py`. That gives `removed` `m.py` and `added` `n.py`.
     - Two empty files deleted and two others added stay `removed`/`added`, unpaired.
   - **`test_tree_blob_swap`.** `thing` is a file on `main` and a directory `thing/inner.py` on the branch. That gives `thing` `removed` and `thing/inner.py` `added`.
-  - **`test_mode_only_change_is_not_reported`.** A `chmod +x` on an unchanged file (`git update-index --chmod=+x`) is not reported.
-  - **`test_symlink_and_submodule_are_listed_not_opened`.**
+  - **`test_mode_only_change_is_not_reported`** (skipped on win32). A `chmod +x` on an unchanged file (`git update-index --chmod=+x`) is not reported.
+  - **`test_symlink_and_submodule_are_listed_not_opened`** (skipped on win32).
     - The branch adds a symlink `link -> a.py`, giving `kind="symlink"`.
     - It adds a gitlink, via `git update-index --add --cacheinfo 160000,<some sha>,vendor/sub`, giving `kind="submodule"`.
-    - The recorded `cat-file` traffic does not include the gitlink's SHA. Check with `record_git_commands` plus a spy on `repo.odb.stream`.
+    - Neither `record_object_reads` list contains the gitlink's SHA, and the symlink's blob is never `stream`ed.
   - **`test_only_cat_file_and_merge_base_run`.** Over a full comparison, the recorded subcommands are a subset of `{"cat-file", "merge-base"}`. The `merge-base` command is `[..., "merge-base", <40hex>, <40hex>]`.
   - **`test_invalid_refs_are_rejected_before_git`.**
-    - It is parametrized over `"-h"`, `"--output=x"`, `"a..b"`, `"HEAD:secret.txt"`, `"../../x"`, `""`, `"a"*300`, `"ma in"` and `"/abs"`.
+    - It is parametrized over `"-h"`, `"--output=x"`, `"a..b"`, `"HEAD:secret.txt"`, `"../../x"`, `""`, `"a"*300`, `"ma in"`, `"a\tb"`, `"a\x07b"`, `"x*"`, `"x?"`, `"x[1]"`, `"a\\b"` and `"/abs"`.
     - With `git.Repo` monkeypatched in `compare` to `pytest.fail`, each raises `CompareError` whose message names `branch_a` and the rule.
   - **`test_unknown_ref`.** The message is exactly the C7 text, and it has no shallow sentence.
+  - **`test_unresolvable_refs_are_unknown`.**
+    - It is parametrized over `main@{yesterday}` and `HEAD@{}` (`NotImplementedError`), `HEAD@{99}` and `@{-9}` (`IndexError`), `@{upstream}` (`ValueError`; the branch has an upstream set with `git branch --set-upstream-to=main feature`, which proves GitPython 3.2.0 does not support the form rather than the branch lacking one), and `HEAD^{tree}` (`ValueError`).
+    - Each raises `CompareError` with the unknown-ref message, never another type.
+  - **`test_all_zero_sha_is_unknown`.** `logs/HEAD` resolves through the reflog file to `0000…0`. That gives the unknown-ref message, and `merge-base` is never run (per `record_git_commands`).
+  - **`test_merge_base_failures`.**
+    - `Git.execute` is monkeypatched to raise `GitCommandError(["git", "merge-base"], -9, stderr="Timeout: the command ... was killed")` for `merge-base` only. That gives the timeout message.
+    - With `stderr="fatal: something"`, it gives the generic git-failure message.
+  - **`test_git_missing`.** `Git.execute` is monkeypatched to raise `GitCommandNotFound("git", "not found")` for every command. That gives the generic git-failure `CompareError`, with no other exception type.
+  - **`test_cat_file_failure`.** `GitCmdObjectDB.stream` is patched to raise `OSError` during the walk. That gives the generic git-failure message, and the `Repo` is still closed (spy on `Repo.close`).
   - **`test_not_a_git_repository`.** A plain `tmp_path` directory, and a missing path, both give the C7 text.
-  - **`test_ref_naming_a_tree`.** A lightweight tag pointing at a tree (`git tag treetag <tree sha>`) gives "does not name a commit".
+  - **`test_ref_naming_a_tree`.** A lightweight tag pointing at a tree (`git tag treetag <tree sha>`) gives the unknown-ref message.
   - **`test_shallow_clone_without_base`.** `git clone --depth 1 --branch feature file://<src> <dst>`, then `branch_a="main"` gives the unknown-ref message plus `this is a shallow clone, so older commits may be missing: git fetch --unshallow`.
   - **`test_shallow_clone_without_common_history`.**
     - Run `git clone --depth 1 --no-single-branch file://<src> <dst>`, where `src` has diverging `main` and `feature`.
@@ -118,6 +134,7 @@ Each item names the test that proves it.
   - **`test_diff_entry_cap_and_deadline`.**
     - With `_COMPARE_MAX_DIFF_ENTRIES` monkeypatched to 3 and 5 added files, the result has 3 changes and `"diff_entries" in truncated_reasons`.
     - With a `clock` that jumps past the deadline after the first call, the walk stops and gives `"deadline"`.
+    - With a `clock` that leaves 0.2 s, `merge-base` receives `kill_after_timeout=1` (POSIX only; asserted through `record_git_commands`' kwargs).
 - [ ] Implement `compare.py` (C1, C2, C4, C5 walk, C7).
 - [ ] `uv run pytest -q`. Commit "Compare two local refs from their merge base".
 
@@ -128,11 +145,15 @@ Each item names the test that proves it.
   - **`EXTRACTORS: dict[str, Callable[[str, str], ExtractionResult]]`**. It is keyed by every `_CODE_ROUTES` value and calls `extract_*_file(source, path, "")` (`extract_go_file(..., module_path=None)`).
   - **`Symbol` dataclass**: `kind`, `name`, `container`, `ordinal`, `start_line`, `end_line`, `body`.
   - **`language_for(path) -> str | None`**. It routes by `PurePosixPath(path).suffix` through `_CODE_ROUTES`.
-  - **`extract_symbols(path, text) -> list[Symbol]`**. It keeps the `Function`/`Class` nodes that have both lines, and takes the body from the decoded lines. `container` is the innermost strictly enclosing `Class` by line range, and `ordinal` is the position by `(kind, container, name)` in `start_line` order.
-  - **`diff_symbols(old, new) -> (added, removed, changed)`**. Each list is sorted by `(start_line, kind, name)`.
+  - **`decode_source(data: bytes) -> str`**: `data.decode("utf-8", errors="replace").replace("\r\n", "\n")`.
+  - **`extract_symbols(path, text) -> list[Symbol]`**. It keeps the `Function`/`Class` nodes that have both lines.
+    - The body comes from `text.split("\n")[start-1:end]`, never `splitlines()`.
+    - `container` is the innermost `Class` whose range encloses the symbol's (`<=` both ends) and that is not the symbol itself (identity, not equality of lines). Innermost means the latest `start_line`, then the earliest `end_line`.
+    - `ordinal` is the position by `(kind, container, name)` in `(start_line, end_line)` order.
+  - **`diff_symbols(old, new) -> (added, removed, changed)`**. Each list is sorted by `(start_line, kind, name)`. A `changed` entry carries both sides' lines (`start_line`/`end_line` from the head side, `old_start_line`/`old_end_line` from the base side).
 - `devgraph/indexer/git_history/compare.py`:
   - **`symbol_detail(comparison, *, clock)`**. It fills, per change, `language`, `symbols` (or `None`) and `symbols_skipped`, applying C5's per-file, byte and symbol caps and the deadline.
-  - It goes through the changes in path order and stops detailing after `_COMPARE_MAX_FILES`. Those later files are counted in `counts` but not listed.
+  - It orders the changes code-language files first (path order), then the rest (path order), and details at most `_COMPARE_MAX_FILES` in that order. An `unsupported_language` file takes a slot only after every code file has one. The files past the cap are counted in `counts` and `files.count` but not listed. `symbol_counts` and the caller targets are built from the detailed files only.
   - It reads each blob's size from `Blob.size` before reading its data.
   - The binary check (a NUL byte in the first 8,000 bytes) and the `parse_error` catch are per side.
   - It adds the `files`, `bytes`, `symbols` and `deadline` reasons to `truncated_reasons`, keeping the spec's order with no duplicates.
@@ -161,15 +182,19 @@ Each item names the test that proves it.
       - its symbol triples equal `expected`;
       - removed symbols carry base-side line numbers.
     - A guard asserts that the parametrized routes equal `set(_CODE_ROUTES.values())`.
+  - **`test_body_slicing_ignores_form_feeds`.** A Python file with a `\f` line (a form feed, legal Python whitespace) before `def b()` gives `b`'s exact body, and an unchanged `b` is not reported when only a function above the form feed changes. A `splitlines()` slice would shift the body by one line and fail this.
+  - **`test_crlf_only_change_is_not_changed`.** `main` commits `app.py` with LF endings, and the branch rewrites the same text with CRLF. The file is `modified` (its blob differs), but its `symbols` lists are all empty.
+  - **`test_changed_entry_has_old_lines`.** A function moved down five lines and edited is `changed`, with `old_start_line`/`old_end_line` from the base and `start_line`/`end_line` from the head.
+  - **`test_container_is_not_self`.** A one-line class `class A: pass` and a one-line method sharing the class's lines get containers `None` and `"A"`; the class never contains itself.
   - **`test_class_with_changed_method_is_changed`.** Python: the class and the method both appear in `changed`.
   - **`test_whole_file_added_and_removed`.** An added `.py` lists all its symbols as `added`, and a removed one lists all as `removed`.
   - **`test_unsupported_and_special_files`.** These are listed with `symbols is None`:
     - `README.md` and `notes.c`: `unsupported_language`;
     - a symlink: `symlink`;
     - a gitlink: `submodule`;
-    - an exact rename of a `.py` file: `symbols == {"added": [], "removed": [], "changed": []}`, and the blob is never read (a spy on `data_stream`).
+    - an exact rename of a `.py` file: `symbols == {"added": [], "removed": [], "changed": []}`, and the blob's SHA is not in `record_object_reads`' `stream` list.
   - **`test_too_large_and_binary`.**
-    - A 1 MiB + 1 byte `big.py` gives `too_large`, and its `data_stream` is never called.
+    - A 1 MiB + 1 byte `big.py` gives `too_large`. Its SHA appears in the `info` list (the size check) but not in the `stream` list.
     - A `.py` containing `b"\x00"` gives `binary`.
   - **`test_parse_error_is_per_file`.** An extractor monkeypatched to raise, for `.go` only, gives `parse_error` on the Go file, while a `.py` beside it still has symbols.
   - **`test_symbol_caps`.**
@@ -180,6 +205,10 @@ Each item names the test that proves it.
     - With `_COMPARE_MAX_TOTAL_BYTES` patched small, later files get `limit` and the `bytes` reason.
     - With a jumping clock, the result gives `limit` and `deadline`.
   - **`test_file_cap`.** With `_COMPARE_MAX_FILES` patched to 2 and 4 changed files, only 2 are detailed and the `files` reason is set.
+  - **`test_code_files_get_the_slots_first`.**
+    - `_COMPARE_MAX_FILES` is patched to 2. The branch changes `a.md`, `b.json`, `c.py` and `d.go`.
+    - The detailed files are `c.py` then `d.go`, and the two others are counted (`files.count == 4`) but not listed.
+    - With `_COMPARE_MAX_FILES` at 3, `a.md` takes the third slot.
   - **Rerun `test_only_cat_file_and_merge_base_run`** with `symbol_detail` included.
 - [ ] Implement `symbols.py` and `symbol_detail` (C3, C5, C6).
 - [ ] `uv run pytest -q`. Commit "Extract and diff symbols at both refs in memory".
@@ -191,7 +220,7 @@ Each item names the test that proves it.
   - **`compare_branches(engine, registry, repo_id, branch_a, branch_b)`** replaces the stub. It:
     - raises `ToolError` for an unknown `repo_id` (C7);
     - runs `open_comparison` + `symbol_detail` inside `try`/`except CompareError as exc: raise ToolError(str(exc)) from exc`;
-    - builds the C1 response. `files` is built directly as `{"count": len(comparison.changes), "results": <the detailed entries>, "truncated": len(comparison.changes) > _COMPARE_MAX_FILES}`, not through `_envelope`: only the first `_COMPARE_MAX_FILES` changes were detailed. `impacted_callers` goes through `_envelope(rows, _COMPARE_MAX_CALLERS)`;
+    - builds the C1 response. `files` is built directly as `{"count": len(comparison.changes), "results": <the detailed entries>, "truncated": len(comparison.changes) > _COMPARE_MAX_FILES}`, not through `_envelope`: only the first `_COMPARE_MAX_FILES` changes were detailed. `impacted_callers` comes from `rows, more = engine.run_read_cypher(...)`, as `{"count": len(rows), "results": <sanitised rows[:_COMPARE_MAX_CALLERS]>, "truncated": more or len(rows) > _COMPARE_MAX_CALLERS}`. The tuple is unpacked, never treated as the row list;
     - runs the C8 query through `engine.run_read_cypher(..., timeout_s=DEFAULT_TIMEOUT_S, max_rows=_COMPARE_MAX_CALLERS + 1)`, catching `Neo4jError` and `DriverError`;
     - sanitises every string with `_sanitize_value`, including the nested symbol entries, which `_sanitize_row` alone does not reach.
   - **`_COMPARE_CALLERS_CYPHER`**, the spec's query, verbatim.
@@ -214,9 +243,10 @@ Each item names the test that proves it.
     - The stub engine records params. `targets` holds exactly the changed and removed `{name, file}` pairs, and no added ones.
     - `repo_id` is a parameter, and the query text equals `_COMPARE_CALLERS_CYPHER`.
     - `max_rows == 26` and `timeout_s == DEFAULT_TIMEOUT_S`.
-    - The canned rows come back as the `impacted_callers` envelope, and the "last index" notice is present.
+    - The canned `(rows, False)` come back as the `impacted_callers` envelope, and the "last index" notice is present.
   - **`test_no_targets_no_query`.** A comparison with only added symbols makes no engine call, and `impacted_callers` is the empty envelope.
-  - **`test_callers_capped`.** 26 canned rows give `truncated is True`, 25 results, and `count == 26`.
+  - **`test_callers_capped`.** The stub returns `(26 rows, True)`, as the real `run_read_cypher` does at `max_rows=26`. That gives `truncated is True`, 25 results, and `count == 26`. A second case returns `(3 rows, False)` and gives `truncated is False`, `count == 3`.
+  - **`test_callers_cover_detailed_files_only`.** With `_COMPARE_MAX_FILES` patched to 1 and changed functions in two `.py` files, `targets` holds only the first file's symbols.
   - **`test_graph_down_keeps_the_git_answer`.**
     - The engine raises `ServiceUnavailable`.
     - Files and symbols are present, and `impacted_callers is None`.

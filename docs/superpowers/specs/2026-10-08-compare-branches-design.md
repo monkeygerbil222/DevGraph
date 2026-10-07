@@ -78,8 +78,12 @@ which functions or classes were added, removed or edited.
   }
   ```
 
-  - `counts` covers every changed path walked. `files` lists the first 200 by
-    path (C5).
+  - `counts` covers every changed path walked. `files` lists at most 200
+    files: code-language files first, then other files while slots remain
+    (C5).
+  - `symbol_counts` and `impacted_callers` cover only the files that were
+    detailed (listed with `symbols` not `null`), never the files past the
+    cap.
   - `<file>` is `{"path", "status", "language", "symbols"}`, plus:
     - `old_path`, for a rename only;
     - `symbols_skipped`, when `symbols` is `null` (C6);
@@ -88,6 +92,8 @@ which functions or classes were added, removed or edited.
     entry is `{"kind", "name", "container", "start_line", "end_line"}`.
     - Lines are on the head side for `added` and `changed`, and on the base
       side (the merge base) for `removed`.
+    - A `changed` entry also carries `old_start_line` and `old_end_line`, its
+      lines on the base side.
     - `container` is the enclosing class's name, or `null`.
   - `<caller>` is `{"caller", "caller_type", "caller_file", "calls", "calls_file"}`.
 - **The old stub keys go.** `added_in_b`, `removed_in_b`, `changed` and `note`
@@ -133,31 +139,51 @@ which functions or classes were added, removed or edited.
     similarity-based renames would need `git diff -M` (a subprocess, plus
     rename-limit tuning) or an in-Python similarity scorer. The symbol lists
     of the two entries still show what moved.
-- **Paths are sorted** by their full repo-relative path (forward slashes), and
-  the output keeps that order.
+- **Paths are sorted** by their full repo-relative path (forward slashes).
+- **Listing order puts code first.** `files.results` holds the code-language
+  files (C6) in path order, then the other files in path order, up to
+  `_COMPARE_MAX_FILES` in all. On a large diff, generated assets, lock files
+  and docs therefore never crowd out the source files. Every file still counts
+  in `counts` and `files.count`.
 
 ### C3: symbols and "changed"
 
 - **Extraction.** For each code file and each side that has the file:
-  - decode the blob as UTF-8 with `errors="replace"`, exactly as
-    `_index_single_path` does with `read_text`;
+  - decode the blob as UTF-8 with `errors="replace"` and normalise `\r\n` to
+    `\n`, matching what `_index_single_path` gets from `read_text`
+    (universal newlines);
   - run the language's `extract_*_file(source, path, repo_id="")`;
   - keep the `Function` and `Class` nodes that carry `start_line` and
     `end_line`, and drop the `Module` node and every relationship.
 
   Nothing is written.
 - **The body** of a symbol is the text of lines `start_line..end_line` of the
-  decoded source, inclusive. The comparison is exact: a whitespace or
-  line-ending change inside a symbol is a change.
+  normalised source, inclusive. Lines are split on `"\n"` only, never with
+  `str.splitlines()`: tree-sitter counts rows by `\n` alone, while
+  `splitlines()` also breaks on form feeds, `\x1c`–`\x1e`, `\x85`, `\u2028`
+  and similar characters, which would shift every later body.
+- **The comparison is exact after normalisation.** A whitespace change inside a
+  symbol is a change. A CRLF-only edit (a file converted between `\r\n` and
+  `\n` line endings) is not, because both sides normalise to the same text.
+  That matches what the indexer sees: it reads files with universal newlines.
+  A lone `\r` (classic Mac line endings) is left as it is, which is the one
+  place this differs from `read_text`, which would turn it into `\n`. Such
+  files are rare enough that the simpler rule wins.
 - **Identity: kind plus name, then two tie-breakers.** The key is
   `(kind, container, name, ordinal)`.
   - `kind` is the label, `Function` or `Class`.
   - `container` is the name of the innermost `Class` node in the same file
-    whose line range strictly encloses the symbol, or `None`.
+    whose line range encloses the symbol's (`start <= s.start` and
+    `s.end <= end`) and that is not the symbol itself, or `None`. Two
+    distinct nodes can share exact lines (a one-line class around a one-line
+    method), so identity, not strict containment, is the test. The innermost
+    is the enclosing class with the latest `start_line`, then the earliest
+    `end_line`.
     - This tells apart `A.__init__` and `B.__init__`, and two `Run` methods in
       Java/C#/Kotlin classes.
-    - Go and Rust methods are written outside their type's braces, so their
-      container is `None`.
+    - Go methods are written outside their type, so their container is
+      `None`. Rust methods sit inside an `impl` block, but the `impl` is not a
+      `Class` node, so theirs is `None` too.
   - `ordinal` is the symbol's position among symbols with the same
     `(kind, container, name)`, in source order. This tells apart Go methods
     on two types that share a name, and overloads (Java, C#, C++, Kotlin).
@@ -178,19 +204,30 @@ which functions or classes were added, removed or edited.
     read as one overload `changed` and one `added`;
   - a Python decorator line sits outside `start_line` (the extractors start at
     the `def`), so a decorator-only edit is not seen;
-  - a moved Go method on another type with the same name may swap ordinals.
+  - a moved Go method on another type with the same name may swap ordinals;
+  - Rust methods on two types with the same name (`impl A { fn new }` and
+    `impl B { fn new }`) are told apart only by ordinal, the same way as Go;
+  - a nested function (a function inside a function) gets the enclosing
+    class as its container, not the enclosing function, so it can share a key
+    with a same-named method of that class and be told apart only by ordinal.
 
   The response always carries line numbers, so the assistant can check.
 
 ### C4: git safety
 
 - **Refs are validated before resolution.** `branch_a` and `branch_b` must each
-  be 1–256 characters from `[A-Za-z0-9._/~^@{}+-]`, and:
+  be 1–256 characters, and:
   - must not start with `-` (option-like) or `/`;
   - must not contain `..` (a range, or a path escape attempt);
-  - must not contain `:` (`<rev>:<path>` names a blob, not a commit).
+  - must not contain `:` (`<rev>:<path>` names a blob, not a commit);
+  - must not contain whitespace or a control character (Unicode category
+    `C*`);
+  - must not contain `*`, `?`, `[` or `\` (globs and Windows separators).
 
-  Anything else is a `ToolError` naming the argument and the rule.
+  Everything else is allowed, so `fix#123`, `feature/ünïcode` and `v1.2+build`
+  pass. A rejected ref is a `ToolError` naming the argument and the rule.
+  Validation only screens out option-like and path-like input. Whether a ref
+  exists is decided by resolution, below.
 - **Resolution stays inside the repository.**
   - `git.Repo(record.path)` opens the registered root. As in
     `impact_analysis_for_diff`, there is no `search_parent_directories`, so a
@@ -199,7 +236,28 @@ which functions or classes were added, removed or edited.
   - `repo.commit(ref)` resolves the ref by GitPython's own `rev_parse`. That
     reads only `refs/…`, `packed-refs` and the object database of this
     repository, and peels a tag to its commit.
-  - A ref that does not resolve, or does not name a commit, is an error.
+  - **Only `repo.commit(ref)` sits in `except Exception`,** mapped to the
+    unknown-ref message (C7). GitPython 3.2.0's `rev_parse` raises a zoo of
+    types for refs that pass validation: `BadName`, `BadObject`,
+    `ValueError` (`HEAD^{tree}` and anything that peels to a non-commit),
+    `NotImplementedError` (`main@{yesterday}`, `HEAD@{}`) and `IndexError`
+    (`HEAD@{99}`, `@{-1}` past the reflog). Listing them would miss the next
+    one. The broad catch covers that one call only, so a bug elsewhere is
+    never mislabelled as a bad ref.
+  - **A resolved commit is then checked:**
+    - the all-zero SHA is rejected (`logs/HEAD` resolves to it through the
+      reflog file, and `merge-base` would fail on it);
+    - the commit's `.tree` must be readable.
+
+    Either failure is the unknown-ref message.
+  - **What GitPython 3.2.0 does not support is an unknown ref, by design.**
+    A probe showed `@{upstream}` (and `<branch>@{upstream}`) raises
+    `ValueError`, and date forms like `main@{yesterday}` raise
+    `NotImplementedError`. Both get the unknown-ref message, and the caller
+    passes the branch name instead (`origin/main`). Numeric reflog forms
+    GitPython does support (`HEAD@{1}`, `@{-1}`) resolve the way GitPython
+    resolves them. An out-of-range one (`HEAD@{99}`, `@{-9}`) raises
+    `IndexError` and is unknown.
   - A probe confirmed that a `../../file` ref does not resolve in GitPython
     3.2.0. The `..` rule above keeps that true whatever GitPython does in
     future.
@@ -226,10 +284,16 @@ which functions or classes were added, removed or edited.
     textconv.
   - It is called with the two resolved 40-hex SHAs (`commit.hexsha`), never
     with the caller's strings, so its argv can't carry an option.
-  - On POSIX it gets `kill_after_timeout` equal to the time left on the
-    deadline (C5). GitPython raises on Windows if `kill_after_timeout` is
-    passed, so it is omitted there. `merge-base` on two local SHAs is fast
-    there too.
+  - On POSIX it gets `kill_after_timeout = max(remaining, 1)`: the time left
+    on the deadline (C5), floored at one second so a nearly spent deadline
+    never passes zero or a negative timeout. GitPython raises on Windows if
+    `kill_after_timeout` is passed, so it is omitted there, and **only POSIX
+    has a merge-base timeout**. `merge-base` on two local SHAs is normally
+    fast, but on Windows nothing bounds it.
+  - **Its failures are mapped by stderr.** GitPython reports a kill as a
+    `GitCommandError` whose stderr starts with `Timeout:`. That gives the
+    timeout message. Any other `GitCommandError`, and `GitCommandNotFound`,
+    gives the generic git-failure message (C7).
 - **No other `git` subcommand runs:** no `diff` (unlike
   `impact_analysis_for_diff`'s `git diff --name-only`), no `log`, no
   `rev-parse`. A test records every `Git.execute` call during a comparison
@@ -241,6 +305,13 @@ which functions or classes were added, removed or edited.
   purpose.
 - **The `Repo` is closed in a `finally`,** which ends its `cat-file`
   processes, as `impact_analysis_for_diff` does.
+- **A final catch-all.** The whole comparison, from opening the repository to
+  the last blob read, sits inside a last `except (GitCommandError, OSError)`
+  that becomes the generic git-failure `CompareError` (C7). `GitCommandNotFound`
+  is a `GitCommandError`. This covers a `cat-file` that cannot start or dies:
+  a missing `git` binary, a `safe.directory` refusal on a repository owned by
+  another user, or a killed process. The more specific mappings above run
+  first.
 
 ### C5: cost bounds
 
@@ -261,7 +332,11 @@ named like `describe_node`'s:
 - **`truncated`** is true when any reason was hit. `truncated_reasons` lists
   the reasons in the order above, without duplicates.
 - **`symbol_counts`** counts the entries actually listed, so a capped list
-  counts as its cap.
+  counts as its cap. Like `impacted_callers`, it covers only the detailed
+  files.
+- **Code files get the slots first** (C2). An `unsupported_language` file costs
+  no bytes or symbols, but it would cost a listed slot, so it is listed only
+  after every code file and only while slots remain.
 - **Binary files.** A NUL byte in the first 8,000 bytes of either side makes
   the file `symbols_skipped: "binary"`, which is git's own heuristic. Its
   bytes still count toward the total.
@@ -312,12 +387,12 @@ cut to 100 characters and quoted, as `tools._echo` does. The messages:
 | --- | --- |
 | `repo_id` not registered (explicit) | `no such repo_id: '<id>'; run devgraph list to see registered repositories` |
 | Registered root missing, or not a git repository root (`NoSuchPathError`, `InvalidGitRepositoryError`) | `repository '<id>' is not a git repository at its registered root; compare_branches needs the repository's own .git` |
-| Ref fails validation | `branch_a '<ref>' is not a valid ref: <rule>`. The rule is one of "it starts with '-'", "it contains '..'", "it contains ':'", "it has characters other than letters, digits and ._/~^@{}+-", "it is empty or longer than 256 characters". |
-| Ref does not resolve (`BadName`, `BadObject`, `ValueError`) | `branch_b '<ref>' is not a branch, tag or commit in repository '<id>'; refs must exist locally (DevGraph never fetches)`. If the repository is shallow (a `shallow` file in `repo.common_dir`), add `; this is a shallow clone, so older commits may be missing: git fetch --unshallow`. |
-| Ref names a tree or blob | `branch_a '<ref>' does not name a commit` |
+| Ref fails validation | `branch_a '<ref>' is not a valid ref: <rule>`. The rule is one of "it starts with '-'", "it starts with '/'", "it contains '..'", "it contains ':'", "it contains whitespace or a control character", "it contains one of * ? [ \", "it is empty or longer than 256 characters". |
+| `repo.commit(ref)` raises anything; the result is the all-zero SHA; or its tree can't be read | `branch_b '<ref>' is not a branch, tag or commit in repository '<id>'; refs must exist locally (DevGraph never fetches)`. If the repository is shallow (a `shallow` file in `repo.common_dir`), add `; this is a shallow clone, so older commits may be missing: git fetch --unshallow`. This also covers a ref naming a tree or blob, which GitPython reports as a `ValueError` when it peels to a commit. |
 | No merge base (`merge_base` returns `[]`) | `'<a>' and '<b>' share no history in repository '<id>'`, plus the same shallow-clone sentence when the repository is shallow. |
-| `merge-base` killed by the deadline | `compare_branches timed out finding the merge base of '<a>' and '<b>'` |
+| `merge-base` killed by the deadline (`GitCommandError` whose stderr starts with `Timeout:`) | `compare_branches timed out finding the merge base of '<a>' and '<b>'` |
 | An object missing mid-walk (`BadObject`, `ValueError` from `cat-file`, as in a partial clone) | `git object missing while comparing '<a>' and '<b>'; the clone may be partial or shallow` |
+| Any other `GitCommandError` (including `GitCommandNotFound`) or `OSError`, from `merge-base` or anywhere in the comparison | `git failed while comparing '<a>' and '<b>' in repository '<id>': <exception class name>`. This covers a missing `git` binary or a `safe.directory` refusal. The exception's own text (which may hold paths) is logged, not returned. |
 
 - **Errors are raised by the git module itself.** It raises its own
   `CompareError(ValueError)` with the message, and `tools.compare_branches`
@@ -349,7 +424,12 @@ cut to 100 characters and quoted, as `tools._echo` does. The messages:
 
   - Every value is a parameter, and nothing is interpolated.
   - It runs through `engine.run_read_cypher` (read access, `DEFAULT_TIMEOUT_S`,
-    `max_rows=26`).
+    `max_rows=26`), which returns `(rows, more)`. `impacted_callers` is
+    `{"count": len(rows), "results": rows[:25], "truncated": more or len(rows) > 25}`,
+    with strings sanitised.
+  - The scoped `CALL (t) { ... }` form needs Neo4j 5.23 or later, the same as
+    the `CALL () { ... }` that `summarise_repository` and `describe_node`
+    already use. This adds no new version requirement.
   - With no targets, no query runs and `impacted_callers` is the empty
     envelope.
 - **The graph is the working tree's last index, not either ref.** The notice
@@ -381,7 +461,8 @@ cut to 100 characters and quoted, as `tools._echo` does. The messages:
   - local refs only, never fetches;
   - per-file symbol detail for the eight language families;
   - the caps and `truncated`;
-  - that `impacted_callers` reflect the last index.
+  - that `impacted_callers` reflect the last index;
+  - that only POSIX has a merge-base timeout.
 
   `tools.compare_branches` gains `registry` after `engine`, as
   `impact_analysis_for_diff` has, and the server passes it.
@@ -413,3 +494,5 @@ cut to 100 characters and quoted, as `tools._echo` does. The messages:
   subprocess, its `error` key). It could reuse `compare.py` later; that is a
   separate change.
 - Opening submodules or nested repositories.
+- A merge-base timeout on Windows. GitPython cannot kill the process there
+  (C4), so only the tree walk and parsing are bounded.
