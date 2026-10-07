@@ -584,7 +584,7 @@ def index_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[P
     py_extractions: dict[str, tuple[list[dict], list[dict]]] = {}
     # Same two-pass cross-link machinery as py_files/py_extractions above,
     # kept as parallel lists rather than merged with the Python one:
-    # datastore/API extraction (_index_datastores/_index_apis/
+    # datastore/API extraction (_datastore_nodes/_api_nodes_and_rels/
     # _owning_service_relationships below) is still keyed to Python source
     # conventions (regex/AST patterns tuned for Python), so non-Python files
     # don't participate in those passes — only in their own node/edge
@@ -918,8 +918,14 @@ def _index_single_path(
     if "py" in routes:
         content = resolved.read_text(encoding="utf-8", errors="replace")
         result = extract_python_file(content, rel_path, repo_id)
-        nodes = [n.to_dict() for n in result.nodes]
-        rels = [r.to_dict() for r in result.relationships]
+        # Datastore/API extraction reads the same content, so it runs
+        # alongside the Python indexer rather than as a separate dispatch
+        # branch. Passed the repo-relative path (not bare filename) so
+        # their 'source'/'file' provenance properties match what
+        # delete_nodes_by_source_file looks up on file deletion.
+        api_nodes, api_rels = _api_nodes_and_rels(repo_id, rel_path, content)
+        nodes = [n.to_dict() for n in result.nodes] + _datastore_nodes(repo_id, rel_path, content) + api_nodes
+        rels = [r.to_dict() for r in result.relationships] + api_rels
         # Delete this file's previously-indexed nodes and write the
         # freshly-extracted ones in one transaction, not just
         # MERGE-upsert the current contents: a Function/Class removed
@@ -927,22 +933,16 @@ def _index_single_path(
         # the graph forever, since MERGE only ever adds/updates matching
         # nodes, never removes ones the current source no longer
         # produces. One transaction also means a reader never observes
-        # this file's nodes as gone-but-not-yet-rebuilt.
-        engine.replace_file_nodes(repo_id, rel_path, nodes, rels)
+        # this file's nodes as gone-but-not-yet-rebuilt. The Datastore/
+        # Endpoint/handler claims go through the same call, so the ones
+        # the file still makes are re-claimed in place, not recreated.
+        engine.replace_file_nodes(repo_id, rel_path, nodes, rels, service_api=True)
         indexed += 1
-
-        # Datastore/API extraction reads the same content, so it runs
-        # alongside the Python indexer rather than as a separate dispatch
-        # branch. Passed the repo-relative path (not bare filename) so
-        # their 'source'/'file' provenance properties match what
-        # delete_nodes_by_source_file looks up on file deletion.
-        _index_datastores(engine, repo_id, rel_path, content)
-        api_rels = _index_apis(engine, repo_id, rel_path, content)
         py_files.append((rel_path, content))
         # API edges ride along in the re-upsert pass: an Endpoint's
         # IMPLEMENTS target can be a handler defined in a later file (e.g.
         # a Django urls.py naming a view from views.py).
-        py_extractions[rel_path] = (nodes, rels + api_rels)
+        py_extractions[rel_path] = (nodes, rels)
     elif "js" in routes:
         content = resolved.read_text(encoding="utf-8", errors="replace")
         result = extract_js_file(content, rel_path, repo_id)
@@ -1693,15 +1693,15 @@ def _upsert_container_result(engine: GraphEngine, repo_id: str, rel_path: str, r
         {"label": "Service", "repo_id": repo_id, "name": s.name, "properties": s.properties}
         for s in result.services
     ]
-    engine.upsert_nodes(nodes)
-    engine.upsert_relationships([_relationship_dict(rel, repo_id, rel_path) for rel in result.relationships])
+    # A replace, so a service or stage the file no longer declares is
+    # retracted; a Container it still runs is re-claimed in place.
+    rels = [_relationship_dict(rel, repo_id, rel_path) for rel in result.relationships]
+    engine.replace_file_nodes(repo_id, rel_path, nodes, rels)
 
 
-def _index_datastores(engine: GraphEngine, repo_id: str, rel_path: str, content: str) -> None:
+def _datastore_nodes(repo_id: str, rel_path: str, content: str) -> list[dict]:
     result = DatastoreExtractor(repo_id).extract_from_source(content, rel_path)
-    nodes = [{"label": ds.datastore_type, "repo_id": repo_id, "name": ds.name, "properties": ds.properties} for ds in result.datastores]
-    engine.upsert_nodes(nodes)
-    engine.upsert_relationships([_relationship_dict(rel, repo_id, rel_path) for rel in result.relationships])
+    return [{"label": ds.datastore_type, "repo_id": repo_id, "name": ds.name, "properties": ds.properties} for ds in result.datastores]
 
 
 def _load_services_with_build_context(engine: GraphEngine, repo_id: str) -> dict[str, tuple[str, str]]:
@@ -1806,7 +1806,7 @@ def _owning_service_relationships(
     return rels
 
 
-def _index_apis(engine: GraphEngine, repo_id: str, rel_path: str, content: str) -> list[dict]:
+def _api_nodes_and_rels(repo_id: str, rel_path: str, content: str) -> tuple[list[dict], list[dict]]:
     result = APIExtractor(repo_id).extract_from_source(content, rel_path)
     nodes = [
         {"label": "Endpoint", "repo_id": repo_id, "name": f"{e.method} {e.path}", "properties": e.properties}
@@ -1815,7 +1815,4 @@ def _index_apis(engine: GraphEngine, repo_id: str, rel_path: str, content: str) 
         {"label": "Function", "repo_id": repo_id, "name": f.name, "properties": f.properties}
         for f in result.functions
     ]
-    engine.upsert_nodes(nodes)
-    rels = [_relationship_dict(rel, repo_id, rel_path) for rel in result.relationships]
-    engine.upsert_relationships(rels)
-    return rels
+    return nodes, [_relationship_dict(rel, repo_id, rel_path) for rel in result.relationships]

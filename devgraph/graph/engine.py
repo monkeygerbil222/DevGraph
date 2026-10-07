@@ -59,6 +59,7 @@ _UNCLAIM_SOURCE_CYPHER = (
     "MATCH (n {repo_id: $repo_id}) "
     "WHERE n.file IS NULL AND n.source_file IS NULL "
     "  AND (n.source = $file_name OR $file_name IN coalesce(n.sources, [])) "
+    "  AND NOT any(p IN $keep WHERE labels(n)[0] = p[0] AND n.name = p[1]) "
     + _LOCK_AND_READ
 )
 
@@ -154,16 +155,20 @@ def _claim_nodes_tx(tx, label: str, rows: list[dict[str, Any]]) -> None:
 
 
 def _delete_by_source_file_tx(tx, repo_id: str, file_name: str) -> None:
+    if file_name.endswith(".py"):
+        _unclaim_service_api_edges_tx(tx, repo_id, file_name)
     tx.run(_DELETE_BY_SOURCE_FILE_CYPHER, repo_id=repo_id, file_name=file_name)
-    _unclaim_source_tx(tx, repo_id, file_name)
+    _unclaim_source_tx(tx, repo_id, file_name, [])
 
 
-def _unclaim_source_tx(tx, repo_id: str, file_name: str) -> None:
-    """Drop `file_name`'s claim on every shared node: re-attribute the node from
-    the new first source, or delete it when no claim is left."""
+def _unclaim_source_tx(tx, repo_id: str, file_name: str, keep: list[list[str]]) -> None:
+    """Drop `file_name`'s claim on every shared node except the `keep` ones
+    ([label, name] pairs the file still claims, which the upsert that follows
+    re-claims in place): re-attribute the node from the new first source, or
+    delete it when no claim is left."""
     gone: list[str] = []
     kept: list[dict[str, Any]] = []
-    for record in tx.run(_UNCLAIM_SOURCE_CYPHER, repo_id=repo_id, file_name=file_name):
+    for record in tx.run(_UNCLAIM_SOURCE_CYPHER, repo_id=repo_id, file_name=file_name, keep=keep):
         props = dict(record["props"])
         claims = _claims_of(props)
         before = _attribution(claims)
@@ -221,6 +226,26 @@ _UNCLAIM_DOC_NOTE_EDGES_CYPHER = (
     "CALL (n) { MATCH (n)<-[r:DOCUMENTED_BY|SATISFIES]-() " + _UNCLAIM_EDGE + " } "
     "CALL (n) { MATCH (n)-[r:SUPERSEDES|DECIDED_BY]->() " + _UNCLAIM_EDGE + " }"
 )
+
+# G2 set (c): the edges a Python file writes out of nodes it doesn't own,
+# the owning-service USES/CALLS and the API pass's Endpoint edges. Only the
+# edges that list the file (or list no writer) are touched.
+_UNCLAIM_SERVICE_USES_CYPHER = (
+    "MATCH (:Service {repo_id: $repo_id})-[r:USES]->() WHERE $f IN coalesce(r.origins, [$f]) " + _UNCLAIM_EDGE
+)
+_UNCLAIM_ENDPOINT_EDGES_CYPHER = (
+    "MATCH (:Endpoint {repo_id: $repo_id})-[r:CALLS|IMPLEMENTS]->() WHERE $f IN coalesce(r.origins, [$f]) "
+    + _UNCLAIM_EDGE
+)
+
+
+def _unclaim_service_api_edges_tx(tx, repo_id: str, file_name: str) -> None:
+    # The owning-service edges come back only in index_paths' final service
+    # pass, which needs every compose file in the batch, so between this
+    # file's replace and that pass a reader can briefly miss them.
+    tx.run(_UNCLAIM_SERVICE_USES_CYPHER, repo_id=repo_id, f=file_name)
+    tx.run(_UNCLAIM_ENDPOINT_EDGES_CYPHER, repo_id=repo_id, f=file_name)
+
 
 # Nodes a schema-declared provider owns (devgraph/indexer/providers/) are
 # tagged with `extractor`. Their `path` property is the repo-relative file
@@ -533,7 +558,12 @@ def _write_insights_tx(tx, repo_id: str, rows: list[dict[str, Any]], summary: di
 
 
 def _replace_file_nodes_tx(
-    tx, repo_id: str, file_name: str, nodes: list[dict[str, Any]], rels: list[dict[str, Any]]
+    tx,
+    repo_id: str,
+    file_name: str,
+    nodes: list[dict[str, Any]],
+    rels: list[dict[str, Any]],
+    service_api: bool = False,
 ) -> None:
     # Unclaim the file from the edges out of the nodes it owns (G2 set (a)),
     # and delete only the file-scoped nodes (Class/Function, keyed on `file`)
@@ -555,7 +585,18 @@ def _replace_file_nodes_tx(
         )
     ]
     tx.run(_REPLACE_OWNED_NODES_CYPHER, repo_id=repo_id, f=file_name, keep=keep)
-    _unclaim_source_tx(tx, repo_id, file_name)
+    if service_api:
+        _unclaim_service_api_edges_tx(tx, repo_id, file_name)
+    # Shared nodes the file still claims are re-claimed in place by the
+    # upsert below, not deleted and recreated, so a single-claimant
+    # Container or Datastore keeps its incoming edges (MENTIONS, USES).
+    claimed = [
+        [node["label"], node["name"]]
+        for node in nodes
+        if not (node.get("properties") or {}).get("file")
+        and (node.get("properties") or {}).get("source") == file_name
+    ]
+    _unclaim_source_tx(tx, repo_id, file_name, claimed)
     _upsert_nodes_tx(tx, nodes)
     _upsert_relationships_tx(tx, rels)
 
@@ -711,7 +752,12 @@ class GraphEngine:
             session.execute_write(_upsert_relationships_tx, rels)
 
     def replace_file_nodes(
-        self, repo_id: str, file_name: str, nodes: list[dict[str, Any]], rels: list[dict[str, Any]]
+        self,
+        repo_id: str,
+        file_name: str,
+        nodes: list[dict[str, Any]],
+        rels: list[dict[str, Any]],
+        service_api: bool = False,
     ) -> None:
         """Atomically replace one file's provenance-tagged nodes: delete the
         old ones and upsert the new nodes/rels in a single transaction.
@@ -721,9 +767,13 @@ class GraphEngine:
         observe the file's nodes as gone-but-not-yet-rebuilt — under
         read-committed isolation it sees either the pre-reindex state or the
         fully-rebuilt state, never in between.
+
+        `service_api` (a Python file) also unclaims the file from the
+        owning-service USES and the Endpoint CALLS/IMPLEMENTS edges it wrote,
+        which `nodes`/`rels` and index_paths' service pass write again.
         """
         with self._driver.session() as session:
-            session.execute_write(_replace_file_nodes_tx, repo_id, file_name, nodes, rels)
+            session.execute_write(_replace_file_nodes_tx, repo_id, file_name, nodes, rels, service_api)
 
     def replace_doc_note(
         self, repo_id: str, file_name: str, nodes: list[dict[str, Any]], rels: list[dict[str, Any]]

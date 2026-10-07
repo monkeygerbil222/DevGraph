@@ -1,7 +1,7 @@
 """Graph accuracy against a live Neo4j: edge sources are pinned, and a file's re-index
 retracts the edges it no longer writes and nothing else.
 
-See docs/superpowers/specs/2026-10-08-graph-accuracy-design.md (G1, G2). Every
+See docs/superpowers/specs/2026-10-08-graph-accuracy-design.md (G1, G2, G3). Every
 scenario ends in "incremental equals a fresh `full_scan`" or "`full_scan`
 equals the expected graph".
 """
@@ -12,7 +12,7 @@ import uuid
 import pytest
 
 from devgraph.graph.engine import _UNCLAIM_EDGE, GraphEngine, provision_repository_schema
-from devgraph.indexer.dispatch import full_scan, index_paths
+from devgraph.indexer.dispatch import full_scan, index_paths, remove_paths
 from tests.watcher.live_helpers import fresh_snapshot, graph_snapshot, snapshot_diff
 
 _TOKEN = uuid.uuid4().hex[:8]
@@ -398,3 +398,234 @@ def test_reindex_keeps_incoming_and_foreign_edges(engine, repo_id, tmp_path):
     index_paths(engine, repo_id, tmp_path, {app}, mentions_enabled=True)
     assert kept() == before
     incremental_equals_fresh(engine, repo_id, tmp_path, mentions_enabled=True)
+
+
+# --- shared nodes, compose files and Containerfiles (G3) ------------------------
+
+API_AND_DB = """\
+    services:
+      api:
+        image: python:3.12
+      db:
+        image: postgres:16
+"""
+API_ONLY = """\
+    services:
+      api:
+        image: python:3.12
+"""
+
+
+def node(engine, repo_id, label, name):
+    """[(elementId, sources)] of the nodes with this label and name."""
+    return [
+        (row["id"], row["sources"]) for row in engine.run_cypher(
+            f"MATCH (n:{label} {{repo_id: $r, name: $n}}) RETURN elementId(n) AS id, n.sources AS sources",
+            {"r": repo_id, "n": name},
+        )
+    ]
+
+
+def _db_is_gone(engine, repo_id):
+    assert node(engine, repo_id, "Service", "db") == []
+    assert node(engine, repo_id, "Container", "postgres") == []
+    assert [e for e in edges(engine, repo_id, "RUNS") if e[1] == "db"] == []
+
+
+def test_removed_service_is_retracted(engine, repo_id, tmp_path):
+    compose = write(tmp_path, "compose.yaml", API_AND_DB)
+    scan(engine, repo_id, tmp_path)
+    assert len(node(engine, repo_id, "Container", "postgres")) == 1
+
+    write(tmp_path, "compose.yaml", API_ONLY)
+    index_paths(engine, repo_id, tmp_path, {compose})
+    incremental_equals_fresh(engine, repo_id, tmp_path)
+    _db_is_gone(engine, repo_id)
+
+
+def test_full_scan_drops_a_removed_service(engine, repo_id, tmp_path):
+    write(tmp_path, "compose.yaml", API_AND_DB)
+    scan(engine, repo_id, tmp_path)
+
+    write(tmp_path, "compose.yaml", API_ONLY)
+    scan(engine, repo_id, tmp_path)
+    _db_is_gone(engine, repo_id)
+    assert edges(engine, repo_id, "RUNS") == [
+        ("Service", "api", "compose.yaml", "RUNS", "Container", "python", "", ("compose.yaml",)),
+    ]
+    incremental_equals_fresh(engine, repo_id, tmp_path)
+
+
+def test_removed_service_unclaims_its_image(engine, repo_id, tmp_path):
+    # `compose.override.yaml` is not a compose name the indexer routes, so
+    # the second claimant is a compose file in another folder.
+    compose = write(tmp_path, "compose.yaml", API_AND_DB)
+    write(tmp_path, "ops/compose.yaml", "services:\n  db:\n    image: postgres:16\n")
+    scan(engine, repo_id, tmp_path)
+    assert [sources for _id, sources in node(engine, repo_id, "Container", "postgres")] == [
+        ["compose.yaml", "ops/compose.yaml"]
+    ]
+
+    write(tmp_path, "compose.yaml", API_ONLY)
+    index_paths(engine, repo_id, tmp_path, {compose})
+    assert [sources for _id, sources in node(engine, repo_id, "Container", "postgres")] == [["ops/compose.yaml"]]
+    incremental_equals_fresh(engine, repo_id, tmp_path)
+
+
+def _mentions_of(engine, repo_id, name):
+    return [e for e in edges(engine, repo_id, "MENTIONS") if e[5] == name]
+
+
+def test_container_mentions_survive_dockerfile_reindex(engine, repo_id, tmp_path):
+    dockerfile = write(tmp_path, "Dockerfile", "FROM postgres:16\n")
+    write(tmp_path, "notes.md", "Runs on `postgres`.\n")
+    scan(engine, repo_id, tmp_path, mentions_enabled=True)
+    before = node(engine, repo_id, "Container", "postgres")
+    assert len(before) == 1
+    assert len(_mentions_of(engine, repo_id, "postgres")) == 1
+
+    write(tmp_path, "Dockerfile", "FROM postgres:16\nRUN echo ready\n")
+    index_paths(engine, repo_id, tmp_path, {dockerfile}, mentions_enabled=True)
+    assert len(_mentions_of(engine, repo_id, "postgres")) == 1
+    assert node(engine, repo_id, "Container", "postgres") == before
+    incremental_equals_fresh(engine, repo_id, tmp_path, mentions_enabled=True)
+
+
+REDIS_APP = """\
+    import redis
+
+    client = redis.from_url("redis://cache:6379/0")
+"""
+
+
+def test_datastore_mentions_survive_python_reindex(engine, repo_id, tmp_path):
+    app = write(tmp_path, "app.py", REDIS_APP)
+    write(tmp_path, "notes.md", "Sessions live in `Redis`.\n")
+    scan(engine, repo_id, tmp_path, mentions_enabled=True)
+    before = node(engine, repo_id, "Cache", "Redis")
+    assert len(before) == 1
+    assert len(_mentions_of(engine, repo_id, "Redis")) == 1
+
+    write(tmp_path, "app.py", REDIS_APP + "\n\n# Touched.\n")
+    index_paths(engine, repo_id, tmp_path, {app}, mentions_enabled=True)
+    assert len(_mentions_of(engine, repo_id, "Redis")) == 1
+    assert node(engine, repo_id, "Cache", "Redis") == before
+    incremental_equals_fresh(engine, repo_id, tmp_path, mentions_enabled=True)
+
+
+BUILT_API = """\
+    services:
+      api:
+        build: ./services/api
+"""
+
+
+def _uses(engine, repo_id):
+    return [e for e in edges(engine, repo_id, "USES") if e[0] == "Service"]
+
+
+def _uses_edge(*origins):
+    return ("Service", "api", "compose.yaml", "USES", "Cache", "Redis", "", tuple(origins))
+
+
+def test_compose_reindex_keeps_owning_service_uses(engine, repo_id, tmp_path):
+    compose = write(tmp_path, "compose.yaml", BUILT_API)
+    write(tmp_path, "services/api/app.py", REDIS_APP)
+    scan(engine, repo_id, tmp_path)
+    assert _uses(engine, repo_id) == [_uses_edge("services/api/app.py")]
+
+    write(tmp_path, "compose.yaml", BUILT_API + "      worker:\n        image: busybox:1\n")
+    index_paths(engine, repo_id, tmp_path, {compose})
+    assert _uses(engine, repo_id) == [_uses_edge("services/api/app.py")]
+    incremental_equals_fresh(engine, repo_id, tmp_path)
+
+
+def test_shared_uses_edge_has_two_writers(engine, repo_id, tmp_path):
+    write(tmp_path, "compose.yaml", BUILT_API)
+    a = write(tmp_path, "services/api/a.py", REDIS_APP)
+    b = write(tmp_path, "services/api/b.py", REDIS_APP)
+    scan(engine, repo_id, tmp_path)
+    assert _uses(engine, repo_id) == [_uses_edge("services/api/a.py", "services/api/b.py")]
+
+    write(tmp_path, "services/api/a.py", "def a():\n    return 1\n")
+    index_paths(engine, repo_id, tmp_path, {a})
+    assert _uses(engine, repo_id) == [_uses_edge("services/api/b.py")]
+    incremental_equals_fresh(engine, repo_id, tmp_path)
+
+    b.unlink()
+    remove_paths(engine, repo_id, tmp_path, {b})
+    assert _uses(engine, repo_id) == []
+    incremental_equals_fresh(engine, repo_id, tmp_path)
+
+    # The mirror image: both restored, then a.py deleted first.
+    write(tmp_path, "services/api/a.py", REDIS_APP)
+    write(tmp_path, "services/api/b.py", REDIS_APP)
+    index_paths(engine, repo_id, tmp_path, {a, b})
+    assert _uses(engine, repo_id) == [_uses_edge("services/api/a.py", "services/api/b.py")]
+    a.unlink()
+    remove_paths(engine, repo_id, tmp_path, {a})
+    assert _uses(engine, repo_id) == [_uses_edge("services/api/b.py")]
+    incremental_equals_fresh(engine, repo_id, tmp_path)
+
+
+def _routed(handler):
+    return f"""\
+        from fastapi import FastAPI
+
+        app = FastAPI()
+
+
+        @app.get("/items")
+        def {handler}():
+            return 1
+    """
+
+
+# The route and its handler both go. A handler left defined but no longer
+# routed keeps the stub's claim (see the task report): the stub MERGEs onto
+# the file-scoped Function, which an unclaim never matches.
+UNROUTED = "def helper():\n    return 1\n"
+
+
+def _endpoint_edges(engine, repo_id):
+    return sorted(
+        (e[3], e[4], e[5], e[7]) for rel_type in ("IMPLEMENTS", "CALLS")
+        for e in edges(engine, repo_id, rel_type) if e[0] == "Endpoint"
+    )
+
+
+def test_removed_route_retracts_endpoint_edges(engine, repo_id, tmp_path):
+    write(tmp_path, "compose.yaml", BUILT_API)
+    a = write(tmp_path, "services/api/a.py", _routed("items_a"))
+    b = write(tmp_path, "services/api/b.py", _routed("items_b"))
+    scan(engine, repo_id, tmp_path)
+    implements_a = ("IMPLEMENTS", "Function", "items_a", ("services/api/a.py",))
+    assert implements_a in _endpoint_edges(engine, repo_id)
+
+    # b.py still routes GET /items, so the Endpoint and its CALLS stay with
+    # b.py alone.
+    write(tmp_path, "services/api/a.py", UNROUTED)
+    index_paths(engine, repo_id, tmp_path, {a})
+    assert implements_a not in _endpoint_edges(engine, repo_id)
+    assert ("CALLS", "Service", "api", ("services/api/b.py",)) in _endpoint_edges(engine, repo_id)
+    incremental_equals_fresh(engine, repo_id, tmp_path)
+
+    write(tmp_path, "services/api/b.py", UNROUTED)
+    index_paths(engine, repo_id, tmp_path, {b})
+    assert _endpoint_edges(engine, repo_id) == []
+    incremental_equals_fresh(engine, repo_id, tmp_path)
+
+
+def test_containerfile_retracts_a_removed_stage(engine, repo_id, tmp_path):
+    containerfile = write(tmp_path, "Containerfile", """\
+        FROM golang:1.22 AS build
+        RUN go build -o /app .
+
+        FROM alpine:3.20
+        COPY --from=build /app /app
+    """)
+    scan(engine, repo_id, tmp_path)
+
+    write(tmp_path, "Containerfile", "FROM alpine:3.20\nCOPY app /app\n")
+    index_paths(engine, repo_id, tmp_path, {containerfile})
+    incremental_equals_fresh(engine, repo_id, tmp_path)
