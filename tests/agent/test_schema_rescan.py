@@ -16,6 +16,7 @@ class Repo:
     docs_path: str | None = None
     mentions_enabled: bool = False
     watch_enabled: bool = True
+    last_indexed: str | None = "2026-10-01T00:00:00+00:00"
 
 
 class Registry:
@@ -239,9 +240,14 @@ def test_outdated_index_rescans_without_quiet_period(monkeypatch, tmp_path):
 
     def exclusive(repo_id, fn):
         calls.append(repo_id)
-        state["outdated"].discard(repo_id)
         return fn()
 
+    def scan(engine, repo_id, root, docs_path=None, mentions_enabled=False):
+        state["scans"].append(repo_id)
+        state["outdated"].discard(repo_id)
+        return 7
+
+    monkeypatch.setattr(schema_rescan, "full_scan", scan)
     registry = Registry([Repo("old", tmp_path), Repo("current", tmp_path)])
     sched = SchemaRescanScheduler(
         None, registry, on_rescanned=lambda r, n: done.append((r, n)), clock=Clock(), run_exclusive=exclusive,
@@ -291,3 +297,58 @@ def test_a_failing_upgrade_backs_off_and_resets_on_success(monkeypatch, tmp_path
     clock.now += 30
     sched.run_once()
     assert len(attempts) == count + 2
+
+
+def test_an_upgrade_already_done_under_the_lock_is_not_repeated(monkeypatch, tmp_path):
+    """The start catch-up upgrades under the repo's batch lock while the
+    scheduler's pass, which saw the index outdated, waits on that lock: the
+    scheduler must re-check under the lock, so exactly one full scan runs."""
+    from devgraph.watcher.manager import WatcherManager
+
+    state = setup(monkeypatch, tmp_path)
+    state["pending"] = False
+    state["outdated"] = {"old"}
+    holding, release = threading.Event(), threading.Event()
+
+    def scan(engine, repo_id, root, docs_path=None, mentions_enabled=False):
+        state["scans"].append(repo_id)
+        state["outdated"].discard(repo_id)
+        return 7
+
+    monkeypatch.setattr(schema_rescan, "full_scan", scan)
+    watcher = WatcherManager(None, lambda *a: None)
+
+    def start_catch_up():
+        holding.set()
+        assert release.wait(5)
+        scan(None, "old", tmp_path)          # catch_up's upgrade path
+
+    catch_up = threading.Thread(target=watcher.run_exclusive, args=("old", start_catch_up))
+    catch_up.start()
+    assert holding.wait(5)
+    done = []
+    sched = SchemaRescanScheduler(
+        None, Registry([Repo("old", tmp_path)]), on_rescanned=lambda r, n: done.append(r),
+        clock=Clock(), run_exclusive=watcher.run_exclusive,
+    )
+    passing = threading.Thread(target=lambda: done.append(sched.run_once()))
+    passing.start()                          # sees "old" outdated, then waits on the lock
+    passing.join(0.2)
+    assert passing.is_alive()
+    release.set()
+    catch_up.join(5)
+    passing.join(5)
+    assert state["scans"] == ["old"]         # exactly one full scan
+    assert done == [[]]                      # the scheduler reports nothing
+
+
+def test_a_never_indexed_repo_is_left_to_its_first_scan(monkeypatch, tmp_path):
+    """`devgraph add` registers the repo (watched) before its first full scan
+    stamps the format: the missing stamp must not start a parallel scan."""
+    state = setup(monkeypatch, tmp_path)
+    state["pending"] = False
+    state["outdated"] = {"new"}
+    registry = Registry([Repo("new", tmp_path, last_indexed=None)])
+    sched = SchemaRescanScheduler(None, registry, clock=Clock())
+    assert sched.run_once() == []
+    assert state["scans"] == []

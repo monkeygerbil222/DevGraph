@@ -77,20 +77,25 @@ class SchemaRescanScheduler:
             if not repo.watch_enabled:
                 continue
             try:
-                if index_outdated(self._engine, repo.repo_id):
+                # A never-indexed repo has no stamp either: its first scan
+                # (devgraph add / rescan, maybe running now) is left to them.
+                if repo.last_indexed and index_outdated(self._engine, repo.repo_id):
                     # An index from an older format: upgrade it now, no quiet
                     # period; a failing upgrade backs off (reset on success).
                     backoff = self._upgrade_backoff.get(repo.repo_id)
                     if backoff is not None and now < backoff[0]:
                         continue
                     try:
-                        count, _ = self._run_exclusive(repo.repo_id, lambda: self._rescan(repo))
+                        result = self._run_exclusive(repo.repo_id, lambda: self._upgrade(repo))
                     except Exception:
                         delay = min(backoff[1] * 2, UPGRADE_BACKOFF_MAX_S) if backoff else self._interval_s
                         self._upgrade_backoff[repo.repo_id] = (now + delay, delay)
                         raise
                     self._upgrade_backoff.pop(repo.repo_id, None)
                     self._failing.discard(repo.repo_id)
+                    if result is None:
+                        continue
+                    count, _ = result
                     rescanned.append(repo.repo_id)
                     logger.info("upgraded the graph index of %s with a full rescan (%d files)", repo.repo_id, count)
                     if self._on_rescanned is not None:
@@ -141,6 +146,13 @@ class SchemaRescanScheduler:
                     "schema rescan check failed for %s", repo.repo_id, exc_info=True,
                 )
         return rescanned
+
+    def _upgrade(self, repo: Any) -> tuple[int, bool] | None:
+        """`_rescan` unless the index got upgraded while this pass waited on
+        the batch lock (the start catch-up or a registration scan); None then."""
+        if not index_outdated(self._engine, repo.repo_id):
+            return None
+        return self._rescan(repo)
 
     def _rescan(self, repo: Any) -> tuple[int, bool]:
         """Full-scan `repo` and, if its schema got applied, stamp the scan's
