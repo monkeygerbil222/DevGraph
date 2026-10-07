@@ -163,6 +163,20 @@ its edge. That is now in scope (G2).
   `devgraph rescan --full`.
 - **Deletions don't relink.** For example, a skip-mode ambiguous name stays
   unlinked after the duplicate goes.
+- **A handler that loses its route decorator keeps the stub's claim.** The
+  handler stub's claim MERGEs onto the file-scoped `Function`, and an unclaim
+  never matches a node with a `file`, so its `source`/`sources`/`claims` and
+  `type: handler` stay. A `full_scan` doesn't heal it either. The fuzz has no
+  route code.
+- **A docs note whose `id` changes in place leaves the old-id node.** A
+  `full_scan` doesn't heal it either. The fuzz never changes a note's `id`.
+- **A docs note moved to another path, indexed there before the old path is
+  removed** (two batches: the new file, then the deletion). The note's node
+  takes the new `source_file`, so the removal no longer matches it, and its
+  edges keep the old path in `origins`. An edge the new file later stops
+  writing then survives. A single batch (a rename seen as one change) and a
+  `full_scan` are correct. The fuzz removes a renamed note's old path first
+  when it splits a batch.
 
 ## Docs to update
 
