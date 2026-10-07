@@ -2,14 +2,12 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task.
 
-**Goal:** after any sequence of edits, deletes and restores, the graph equals the graph that a fresh `full_scan` of the same files produces, and a `full_scan` equals the expected graph. Four bugs are fixed:
+**Goal:** after any sequence of edits, deletes, restores, renames and symbol moves, in single or split batches, the graph equals the one a fresh `full_scan` of the same files produces. A `full_scan` equals the expected graph, and an existing graph upgrades itself. Bugs fixed:
 
-1. same-named functions steal each other's `CALLS`, `EXTENDS` and nested `CONTAINS`;
-2. a service removed from a compose file stays;
-3. a removed Markdown mention keeps its `MENTIONS`;
-4. deleting and restoring an import target, or adding one later, loses the `IMPORTS`/`CALLS`/`EXTENDS` that point at it.
-
-Bug 1's stale-edge companion (1b: a removed call, base or import keeps its edge) is fixed as well.
+1. same-named sources steal edges, together with 1b: stale outgoing edges, docs-note edges included;
+2. a removed compose service stays;
+3. a removed mention keeps its `MENTIONS`;
+4. a deleted-and-restored (or later-added) target loses its by-name edges.
 
 **Spec:** `docs/superpowers/specs/2026-10-08-graph-accuracy-design.md`. Every task implements the decisions it names (G1–G7).
 
@@ -17,22 +15,39 @@ Bug 1's stale-edge companion (1b: a removed call, base or import keeps its edge)
 
 ## Global Constraints
 
-- **Order.** Task 1 lands first. G1 and G2 ship together (spec G2). Task 2 depends on Task 1's edge reset (it adds the `Service -USES->` exception), and Task 4 depends on Task 1's pinned `from_file` (it stores pinned edges). Task 3 is independent.
-- **Target ends stay bare-name matched.** Only the source end is pinned, and only to a node of the file being parsed that carries `file`. No IMPORTS-based callee resolution, and no file+scope identity.
-- **One transaction per file.** Each retraction (G2, G3, G4) runs inside the same write transaction as the re-upsert it precedes, so a reader never sees a file's edges half gone. No new autocommit `session.run` writes.
-- **Nothing outside a file's own nodes is retracted.**
-  - G2 matches only `n.file = $file_name OR n.source_file = $file_name OR (n:Module AND n.name = $file_name)`.
-  - It deletes only outgoing relationships.
-  - Claimed shared nodes (`source`/`sources` without `file`) and provider nodes (`extractor`) are never matched.
-- **G5 never re-reads a file.** The relink is one read query plus one `upsert_relationships`, with no cap. It runs after pass 2 and skips batch files and `_find_referrers` files.
-- **Deterministic properties.** `name_refs` is `json.dumps(..., sort_keys=True)` of a list sorted by `(rel_type, from_label, from_name, from_file, to_label, to_name)`. `name_ref_targets` is sorted. Incremental and fresh scans must give byte-equal values, because `graph_snapshot` hashes properties.
-- **Regression shape.** Every bug's live test ends in either "incremental equals a fresh `full_scan`" or "`full_scan` equals the expected graph". The comparison uses a file-aware edge projection (Task 1 extends `graph_snapshot`). Where the bug is "even after `full_scan`", the test also runs `full_scan` over the polluted graph and checks the result.
+- **Order.**
+  - Task 1 lands first: every later task writes or relies on `origin`.
+  - Task 2 needs Task 1's single-scan replace.
+  - Task 4 needs pinned sources and origins.
+  - Task 5 needs Tasks 1–4, because the format bump is what makes their rescan happen.
+  - Task 6 runs last, over everything.
+- **Ownership is `origin` (G2).**
+  - Every built-in extracted-edge writer passes `origin`.
+  - A retraction only ever deletes:
+    - a code, compose or Containerfile replace: `(owned a)-[r]->()` with `coalesce(r.origin, $file) = $file`;
+    - a docs note: edges of the four docs types with `r.origin = $file`, plus the legacy rule;
+    - a full mentions index: `MENTIONS` out of its `Document`.
+  - No per-label exceptions.
+  - `upsert_relationships` without `origin` never clears an existing one.
+- **Re-claim, never recreate (G3).** No replace may `DETACH DELETE` a shared node that the new extraction still claims.
+- **One transaction per file.** Each retraction runs in the same write transaction as the re-upsert it precedes. The G2 code retraction and the stale-node delete are one scan over the file's owned nodes. No new autocommit writes.
+- **`name_refs` (G5).**
+  - Sorted, de-duplicated `\x1f`-joined strings. The field order is fixed in the spec, and an empty `caller_class` is an empty field.
+  - All three lists are written on every Module, empty when there is nothing to record.
+  - They are written only by the pass-1 replace, never by the pass-2 re-upsert.
+  - The G5 read filters on `name_ref_targets`/`name_ref_sources` before it splits an entry.
+  - `full_scan` never runs G5.
+  - No file is read by G5.
+- **Regression shape.**
+  - Every bug's live test ends in "incremental equals a fresh `full_scan`" or "`full_scan` equals the expected graph".
+  - The comparison uses `graph_snapshot`, extended in Task 1 so that each edge carries both ends' files and its `origin`, and `fresh_snapshot(..., mentions_enabled=, docs_path=)`.
+  - Where the bug is "even after `full_scan`", the test also runs `full_scan` over a polluted graph.
 - **Fixtures.**
   - Unique repo ids: `f"zz-accuracy-{uuid.uuid4().hex[:8]}"`.
-  - `engine.delete_repository` before the test and in a finaliser, plus `delete_repository(f"{repo_id}_fresh")`.
+  - `engine.delete_repository` before the test and in a finaliser, for the repo and its `_fresh` twin.
   - `tmp_path` repositories only.
-  - Fictional names only: `app.py`, `worker.py`, `helper`, `api`, `db`, `notes.md`.
-- **No new config knob, and no new dependency.** No change to MCP tool signatures, apart from the hidden properties (G6).
+  - Fictional names only: `app.py`, `worker.py`, `helper`, `api`, `db`, `notes.md`, `Foo`.
+- **No new config knob, and no new dependency.** The only new environment variables are the fuzz's opt-in length knobs (Task 6), which are test-only. `index_paths` gains one keyword, `relink_outside: bool = True`, passed only by `full_scan`.
 - **TDD.** Each task starts with failing tests, then the implementation, then `uv run pytest -q` (the full suite, live tests included).
 - **Commits.** Plain imperative messages, with no `Co-Authored-By` trailer and no AI attribution. Never stage `uv.lock`, real names or personal paths.
 
@@ -40,153 +55,286 @@ Bug 1's stale-edge companion (1b: a removed call, base or import keeps its edge)
 
 Each item names the test that proves it.
 
-1. **No wrong source.** Across all eight languages, a by-name edge from a file's `Function`/`Class` is pinned to that file, and edges from file-less nodes and Modules are not. Tests:
-   - `test_sources_pinned_to_the_parsed_file[<lang>]` (unit, parametrised over the eight extractors);
-   - `test_same_named_functions_keep_their_own_calls` (live).
-2. **Retraction is scoped.** A code re-index drops its own stale outgoing edges and nothing else:
-   - incoming `MODIFIES`, `MENTIONS`, docs-provider and filesystem edges survive;
-   - edges from shared nodes survive;
-   - `Service -USES-> Database` survives a compose re-index.
-
-   Tests: `test_reindex_keeps_incoming_and_foreign_edges`, `test_compose_reindex_keeps_owning_service_uses`.
-3. **Polluted graphs heal on rescan (G7).** A graph seeded with the old wrong and stale edges equals a fresh scan after one `full_scan`. Tests:
-   - `test_full_scan_heals_a_cross_linked_graph`;
-   - `test_full_scan_drops_a_removed_service`;
-   - `test_full_scan_drops_a_removed_mention`.
-4. **Shared-node attribution.** Removing a service unclaims its `Container`. A `Container` another file still claims survives, re-attributed. Test: `test_removed_service_unclaims_its_image`.
-5. **Docs notes are safe.** A Markdown file that is both a docs note and a mentions `Document` keeps its note after a mention-changing edit. Test: `test_mentions_replace_keeps_the_docs_note`.
-6. **Cross-batch relink.** Each of these equals a fresh scan, with no file read by the relink:
-   - delete-then-restore across two batches;
-   - a module added after its importer;
+1. **No wrong source.** Across all eight languages, by-name edges from a file's own `Function`/`Class` are pinned. Module sources and sources that aren't this file's nodes are not pinned. Tests:
+   - `test_edges_owned_by_the_parsed_file[<lang>]`;
+   - `test_same_named_functions_keep_their_own_calls`.
+2. **Retraction is scoped by origin.**
+   - A docs-note `DOCUMENTED_BY` survives re-indexing the code file. Test: `test_docs_note_edge_survives_code_reindex`.
+   - A Rust `impl Display for Foo` written in `conv.rs` survives re-indexing `foo.rs`. Test: `test_foreign_impl_edge_survives_owner_reindex`.
+   - `Service -USES-> Datastore` survives a compose re-index. Test: `test_compose_reindex_keeps_owning_service_uses`.
+   - Incoming, provider, `MODIFIES` and `IMPLEMENTS` edges survive. Test: `test_reindex_keeps_incoming_and_foreign_edges`.
+3. **Shared nodes are re-claimed in place.**
+   - `MENTIONS` to a single-claimant `Container` survives a Dockerfile re-index. Test: `test_container_mentions_survive_dockerfile_reindex`.
+   - The same holds for a `Datastore` across a Python re-index. Test: `test_datastore_mentions_survive_python_reindex`.
+   - A removed service unclaims its image. Test: `test_removed_service_unclaims_its_image`.
+4. **Polluted graphs heal (G7).** Seeded wrong, stale and legacy (no-origin) edges equal a fresh scan after one `full_scan`. Tests: the `test_full_scan_*` cases in Tasks 1–3.
+5. **Cross-batch relink.** Each of these equals a fresh scan, with no file read:
+   - delete-then-restore;
+   - a module added later;
    - a supertype added in another directory;
-   - a second same-named function added outside the caller's batch.
+   - a second same-named function;
+   - a restored `foo.rs` regaining `conv.rs`'s `impl` edge;
+   - a symbol moved between files in one batch.
 
-   Tests: Task 4 live cases, plus `test_relink_reads_no_files`. A real-watcher scenario: `test_an_import_target_deleted_and_restored`.
-7. **Watcher equality still holds** with the stricter, file-aware snapshot: every existing `tests/watcher/test_watcher_live.py` scenario passes unchanged.
+   Tests: Task 4.
+6. **Cost.** `test_name_refs_are_compact` checks the size bound, and `test_name_ref_relink_benchmark` checks about 5k Modules within budget. `test_full_scan_skips_relink` and `test_pass_two_omits_name_refs` check the two skips.
+7. **Upgrade.** An outdated repository is rescanned by the scheduler with no quiet period, and by the start catch-up, and `devgraph status` says "rescan pending". Tests: Task 5.
+8. **Everything together.** `test_graph_accuracy_fuzz[seed]` (Task 6) and every existing `tests/watcher/test_watcher_live.py` scenario pass with the stricter snapshot.
 
-### Task 1: Pin edge sources and retract a re-indexed file's own outgoing edges (bug 1, 1b; G1, G2, G6)
+### Task 1: Origin stamps, pinned sources and owned-edge retraction (bugs 1, 1b, docs notes; G1, G2)
 
 **Files:**
 - `devgraph/indexer/common.py`:
-  - `pin_local_sources(result: ExtractionResult, file_path: str) -> ExtractionResult`. It collects `{(n.label, n.name) for n in result.nodes if n.properties.get("file") == file_path}` and sets `from_file = file_path` on every relationship whose `(from_label, from_name)` is in that set and whose `from_file` is `None`. It returns `result`.
-  - Update the `GraphRelationship` docstring: the source end of an extracted edge is always known; only the target end stays bare.
-- Each of `devgraph/indexer/{python,jsts,java,csharp,cpp,go,rust,kotlin}/extractor.py`: wrap the top-level `extract_*_file` return in `pin_local_sources(result, file_path)`. Check each function for early returns, and pin those too.
+  - `GraphRelationship.origin: str | None = None`, also in `to_dict`.
+  - `own_edges(result, file_path) -> ExtractionResult`, per G1: pin the sources that are this file's `file` nodes, and stamp `origin` on every relationship. Leave an already-set `from_file` as it is.
+  - Update the `GraphRelationship` docstring.
+- Each of `devgraph/indexer/{python,jsts,java,csharp,cpp,go,rust,kotlin}/extractor.py`: return `own_edges(result, file_path)` from the top-level `extract_*_file`, early returns included.
 - `devgraph/graph/engine.py`:
-  - a new `_DELETE_OWNED_EDGES_CYPHER`:
-    ```
-    MATCH (a {repo_id: $repo_id})-[r]->(b)
-    WHERE (a.file = $file_name OR a.source_file = $file_name OR (a:Module AND a.name = $file_name))
-    DELETE r
-    ```
-    Task 2 adds the `Service -USES->` exception, when compose files start going through this path.
-  - `_replace_file_nodes_tx` runs it first, before `_DELETE_STALE_FILE_NODES_CYPHER`. Comment why: the file re-emits every edge it owns, and a surviving node otherwise keeps edges the source no longer has.
-- `devgraph/graph/schema.py`: add `name_refs` and `name_ref_targets` to `RESERVED_NODE_PROPERTIES` (G6; used in Task 4, reserved now so the schema check and the docs land once).
-- `devgraph/mcp/tools.py`: add both to `_DESCRIBE_HIDDEN`.
+  - `_group_rels_by_triple` carries `origin`; `_upsert_relationships_tx` adds `SET r.origin = coalesce(row.origin, r.origin)`.
+  - `_replace_file_nodes_tx`: one statement over `(n {repo_id})` owned by the file (`n.file = $f OR n.source_file = $f OR (n:Module AND n.name = $f)`). It first deletes `(n)-[r]->()` with `coalesce(r.origin, $f) = $f`, inside a `CALL { ... }` subquery, then `DETACH DELETE`s the stale non-Module nodes (today's `keep` rule). This replaces the separate `_DELETE_STALE_FILE_NODES_CYPHER` run.
+  - `replace_doc_note(repo_id, file_name, nodes, rels)`: one transaction. It deletes the edges with `r.origin = $f AND type(r) IN $docs_types`; then, for legacy edges with no origin, the outgoing `SUPERSEDES`/`DECIDED_BY` from nodes with `source_file = $f` and the incoming `DOCUMENTED_BY`/`SATISFIES` into them; then it upserts the nodes and the rels.
+- `devgraph/indexer/docs/extractor.py`: `index_file` builds dicts with `origin = source_key(...)` and calls `engine.replace_doc_note`.
+- `devgraph/indexer/dispatch.py`:
+  - `_relationship_dict(rel, repo_id, origin)`. `_index_apis` and `_owning_service_relationships` pass the Python file's `rel_path`; the compose and Containerfile paths pass theirs.
+  - Update the docstrings.
 - `tests/watcher/live_helpers.py`:
-  - `graph_snapshot`'s edge tuple gains each end's `coalesce(a.file, a.source_file, a.path, '')`.
-  - `fresh_snapshot` gains `mentions_enabled: bool = False` and passes it to `full_scan`.
-- `tests/indexer/test_pin_local_sources.py` (new, unit).
-- `tests/indexer/test_graph_accuracy_live.py` (new, live). Holds a shared `incremental_equals_fresh(engine, repo_id, root, mentions_enabled=False)` that asserts `graph_snapshot(engine, repo_id) == fresh_snapshot(...)`, with a readable diff on failure (reuse `wait_until_equal`'s diff formatting, without polling).
+  - `graph_snapshot`: edges gain `coalesce(a.file, a.source_file, a.path, '')`, the same for `b`, and `coalesce(x.origin, '')`.
+  - `fresh_snapshot(engine, repo_id, root, mentions_enabled=False, docs_path=None)` passes both to `full_scan` (lines ~69-83).
+- `tests/indexer/test_own_edges.py` (new, unit).
+- `tests/indexer/test_graph_accuracy_live.py` (new, live), holding `incremental_equals_fresh(engine, repo_id, root, mentions_enabled=False, docs_path=None)`. It shows a readable diff (reuse `wait_until_equal`'s formatting) and does not poll.
 
 - [ ] Write failing unit tests:
-  - **`test_sources_pinned_to_the_parsed_file[<lang>]`**, parametrised over the eight extractors. Each source defines `main` calling `helper`, a class extending `Base`, and (where the language has them) a nested function. Every `CALLS`/`EXTENDS`/`CONTAINS` whose source is a `Function`/`Class` in that file has `from_file == path`. Every `to_file` is unchanged.
-  - **`test_module_and_fileless_sources_stay_bare`.**
-    - A Python module-level call keeps `from_file is None` (`Module` source).
-    - A C++ out-of-class `void Foo::bar() { baz(); }` keeps the `Class` stub `Foo`'s edges unpinned, while `bar`'s `CALLS` is pinned.
-  - **`test_pin_keeps_existing_from_file`.** A relationship that already has a `from_file` is left as it is.
+  - **`test_edges_owned_by_the_parsed_file[<lang>]`**, parametrised over the eight extractors. Each source has `main` → `helper`, a subtype of `Base`, and, where the language has one, a nested function.
+    - Every `CALLS`/`EXTENDS`/`CONTAINS` from a `Function`/`Class` that has `file == path` in the result is pinned to `path`.
+    - Every relationship has `origin == path`.
+    - `to_file` is unchanged.
+  - **`test_unowned_sources_stay_bare`.**
+    - A Python module-level call keeps `from_file is None`.
+    - Rust: `conv.rs` with `impl Display for Foo {}` (no `struct Foo`) has an `EXTENDS` from `Foo` with `from_file is None` and `origin == "conv.rs"`.
+    - C++: `void Foo::bar() { baz(); }` alone pins `bar`'s `CALLS`. The file-less stub `Foo` gains no `file`. The existing stub `CONTAINS` keeps the `from_file` the extractor already sets; it is a known gap, and the test asserts the current value so a change is deliberate.
+  - **`test_upsert_without_origin_keeps_origin`** (live engine). Upsert an edge with `origin="a.py"`, then the same edge without one: `r.origin` is still `"a.py"`.
 - [ ] Write failing live tests:
   - **`test_same_named_functions_keep_their_own_calls`.**
-    - `src/app.py` (`helper`, `main` → `helper`), `src/worker.py` (`main` returning `2`), `full_scan`.
-    - The only `CALLS` is `main@src/app.py → helper@src/app.py`. Assert by a file-aware query, and also as `full_scan` equals this expected edge set.
-    - Then `index_paths({src/worker.py})` after touching it, and check incremental equals fresh.
-  - **`test_same_named_classes_keep_their_own_bases`.** `a.py`: `class K(Base)`; `b.py`: `class K:`, and `class Base:` in `base.py`. Only `K@a.py` EXTENDS `Base`.
-  - **`test_removed_call_base_and_import_are_retracted`.** This is bug 1b. `m.py` with `import pkg.util`, `class K(Base)`, `main` → `helper`, and `pkg/util.py`. `full_scan`, then edit all three away and `index_paths({m.py})`: incremental equals fresh. Then `full_scan`: it equals the expected graph (no `IMPORTS`/`EXTENDS`/`CALLS` from `m.py`).
-  - **`test_full_scan_heals_a_cross_linked_graph`.** After the app/worker `full_scan`, seed the old wrong edge with `engine.run_cypher` (`MATCH` `main@src/worker.py` and `helper@src/app.py`, `MERGE` `CALLS`). After `full_scan`, the graph equals a fresh scan.
-  - **`test_reindex_keeps_incoming_and_foreign_edges`.** With mentions on and a docs-provider schema:
+    - `src/app.py` (`helper`, `main` → `helper`) and `src/worker.py` (`main` returning `2`).
+    - `full_scan` equals the expected edge set: the only `CALLS` is `main@src/app.py → helper@src/app.py`.
+    - After `index_paths({src/worker.py})`, incremental equals fresh.
+  - **`test_same_named_classes_keep_their_own_bases`.** `a.py` `class K(Base)`, `b.py` `class K:`, `base.py` `class Base:`. Only `K@a.py` EXTENDS `Base`.
+  - **`test_removed_call_base_and_import_are_retracted`.**
+    - `m.py` with `import pkg.util`, `class K(Base)`, and `main` → `helper`. Edit all three away.
+    - `index_paths({m.py})`: incremental equals fresh.
+    - `full_scan` equals the expected graph.
+  - **`test_full_scan_heals_a_polluted_graph`.**
+    - After the app/worker `full_scan`, seed the old wrong edge `main@src/worker.py -CALLS-> helper@src/app.py` with no origin, using `run_cypher`.
+    - Seed a stale no-origin `CALLS` out of `helper@src/app.py`.
+    - `full_scan` equals a fresh scan.
+  - **`test_docs_note_edge_survives_code_reindex`.**
+    - `docs_path="docs"`, and `docs/adr-1.md` with `links: [src/app.py]`. `full_scan`.
+    - Touch `src/app.py` and `index_paths({src/app.py})`: `Module src/app.py -DOCUMENTED_BY-> ADR-1` remains, and incremental equals fresh (`docs_path`).
+  - **`test_removed_note_links_are_retracted`.**
+    - Drop `links` from `docs/adr-1.md`, then `index_paths`: incremental equals fresh.
+    - Do the same with `supersedes` between two `DesignDecision` notes.
+    - `full_scan` over a graph seeded with a legacy no-origin `DOCUMENTED_BY` equals the expected graph.
+  - **`test_foreign_impl_edge_survives_owner_reindex`.**
+    - `foo.rs` `pub struct Foo;`, `display.rs` `pub trait Display {}`, and `conv.rs` `impl Display for Foo {}`. `full_scan`.
+    - Touch `foo.rs` and `index_paths({foo.rs})`: `Foo@foo.rs -EXTENDS-> Display` remains, with `origin == "conv.rs"`, and incremental equals fresh.
+  - **`test_reindex_keeps_incoming_and_foreign_edges`.** With mentions on and a docs-provider schema (reuse `tests/indexer/test_docs_provider_live.py`'s scaffolding), set up:
     - a `notes.md` mentioning `` `helper` ``;
     - a seeded `Commit -MODIFIES-> Module src/app.py`;
-    - a docs-provider node whose edge targets `Module src/app.py` (reuse `tests/indexer/test_docs_provider_live.py`'s schema scaffolding);
-    - an `Endpoint -IMPLEMENTS-> Function` from a FastAPI route in `src/app.py`.
+    - a provider edge into `Module src/app.py`;
+    - a FastAPI route in `src/app.py`.
 
-    `index_paths({src/app.py})` keeps the `MENTIONS`, `MODIFIES`, provider and `IMPLEMENTS` edges, and incremental equals fresh. The fresh comparison ignores `Commit` by construction; assert `MODIFIES` directly.
-- [ ] Implement G1, G2 and G6 so that both files pass.
-- [ ] Run `uv run pytest tests/watcher -q` against the file-aware snapshot. A newly failing watcher scenario is a real accuracy bug: fix it or report it; never loosen the projection.
-- [ ] `uv run pytest -q`. Commit "Pin edge sources to their file and retract stale outgoing edges".
+    After `index_paths({src/app.py})`, all four kinds of edge remain, and incremental equals fresh. Assert `MODIFIES` directly, because the snapshot leaves out `Commit`.
+- [ ] Implement G1 and G2 so that both files pass.
+- [ ] `uv run pytest tests/watcher -q` with the stricter snapshot. A newly failing scenario is a real accuracy bug: fix it or report it; never loosen the projection.
+- [ ] `uv run pytest -q`. Commit "Stamp edge origins and retract a file's own stale edges".
 
-### Task 2: Compose files and Containerfiles retract removed services (bug 2; G3)
+### Task 2: Re-claim shared nodes in place; compose files and Containerfiles replace (bug 2; G3)
 
 **Files:**
-- `devgraph/indexer/dispatch.py`: `_upsert_container_result(engine, repo_id, result, rel_path)` calls `engine.replace_file_nodes(repo_id, rel_path, nodes, rels)` in place of `upsert_nodes` plus `upsert_relationships`. Update `_index_containerfile` and `_index_compose_file` to pass `rel_path`. Keep the existing comment about `Container` vs `Service` keying, and add one line saying why it replaces.
-- `devgraph/graph/engine.py`: add the `AND NOT (a:Service AND type(r) = 'USES' AND NOT b:Volume)` clause to `_DELETE_OWNED_EDGES_CYPHER`, with a comment naming `_owning_service_relationships` as the other writer.
+- `devgraph/graph/engine.py`:
+  - `_unclaim_source_tx(tx, repo_id, file_name, keep=None)`: `_UNCLAIM_SOURCE_CYPHER` gains `AND NOT any(p IN $keep WHERE labels(n)[0] = p[0] AND n.name = p[1])`.
+  - `_replace_file_nodes_tx` passes the claimed `(label, name)` pairs of `nodes` (no `file`, `properties.source == file_name`).
+  - `_delete_by_source_file_tx` passes `[]`.
+- `devgraph/indexer/dispatch.py`:
+  - `_upsert_container_result(engine, repo_id, result, rel_path)` builds nodes and rels (with `origin=rel_path`), and calls `engine.replace_file_nodes`.
+  - The Python branch of `_index_single_path` extracts the datastore and API nodes and rels first: `_index_datastores` and `_index_apis` become `_datastore_nodes` and `_api_nodes_and_rels`, which return dicts and write nothing. It passes them, with the language nodes and rels, to the one `replace_file_nodes` call.
+  - `py_extractions` keeps the same combined lists for pass 2.
 - `tests/indexer/test_graph_accuracy_live.py`.
 
 - [ ] Write failing live tests:
-  - **`test_removed_service_is_retracted`.** `compose.yaml` with `api` (`python:3.12`, volume `data:/var/lib`, `volumes: {data: {}}`) and `db` (`postgres:16`). `full_scan`, drop `db`, `index_paths({compose.yaml})`: incremental equals fresh. `Service db`, `Container postgres` and `db -RUNS-> postgres` are gone.
-  - **`test_full_scan_drops_a_removed_service`.** The same edit, followed by `full_scan` alone (no `index_paths`), equals the expected graph.
-  - **`test_removed_service_unclaims_its_image`.** `compose.yaml` and `compose.override.yaml` both run `postgres:16`. Remove `db` from `compose.yaml`: `Container postgres` survives with `sources == ["compose.override.yaml"]`, and incremental equals fresh.
-  - **`test_compose_reindex_keeps_owning_service_uses`.** `compose.yaml` `api` with `build: ./services/api` and `services/api/app.py` using `redis.from_url("redis://cache:6379/0")`. After `full_scan`, `Service api -USES-> <the redis Datastore>` exists. Edit `compose.yaml` (add an unrelated service) and `index_paths({compose.yaml})`: the `USES` edge is kept, and incremental equals fresh.
-  - **`test_containerfile_retracts_a_removed_stage`.** A `Containerfile` with two `FROM` stages loses one: incremental equals fresh.
-- [ ] Implement G3 and the G2 exception.
-- [ ] `uv run pytest -q`. Commit "Retract services removed from compose files".
+  - **`test_removed_service_is_retracted`.**
+    - `compose.yaml` with `api` (`python:3.12`) and `db` (`postgres:16`). `full_scan`, drop `db`, `index_paths({compose.yaml})`.
+    - Incremental equals fresh.
+    - `Service db`, `Container postgres` and `db -RUNS-> postgres` are gone.
+  - **`test_full_scan_drops_a_removed_service`.** The same edit, followed by `full_scan` alone, equals the expected graph.
+  - **`test_removed_service_unclaims_its_image`.**
+    - `compose.yaml` and `compose.override.yaml` both run `postgres:16`. Remove `db` from `compose.yaml`.
+    - `Container postgres` survives with `sources == ["compose.override.yaml"]`, and incremental equals fresh.
+  - **`test_container_mentions_survive_dockerfile_reindex`.**
+    - Mentions on. `Dockerfile` `FROM postgres:16`, and `notes.md` mentioning `` `postgres` ``. `full_scan`.
+    - Append a `RUN` line to `Dockerfile` and `index_paths({Dockerfile})`: `MENTIONS -> Container postgres` remains, the node's `elementId` is unchanged, and incremental equals fresh.
+  - **`test_datastore_mentions_survive_python_reindex`.** The same shape, with `app.py` using `redis.from_url("redis://cache:6379/0")` and `notes.md` naming the Datastore in a code span.
+  - **`test_compose_reindex_keeps_owning_service_uses`.**
+    - `compose.yaml` `api` with `build: ./services/api`, and `services/api/app.py` using redis. `full_scan`: `Service api -USES-> <Datastore>` exists.
+    - Add an unrelated service and `index_paths({compose.yaml})`: the edge remains, and incremental equals fresh.
+  - **`test_containerfile_retracts_a_removed_stage`.** A two-`FROM` `Containerfile` loses one stage: incremental equals fresh.
+- [ ] Implement G3.
+- [ ] `uv run pytest -q`. Commit "Re-claim shared nodes in place and retract removed services".
 
 ### Task 3: A full mentions re-index replaces the Document's MENTIONS (bug 3; G4)
 
 **Files:**
-- `devgraph/graph/engine.py`: `GraphEngine.replace_mentions(repo_id, doc_name, documents, rels)`. A single `execute_write`:
-  1. `MATCH (d:Document {repo_id: $repo_id, name: $doc_name})-[r:MENTIONS]->() DELETE r`;
-  2. `_upsert_nodes_tx(tx, documents)`;
-  3. `_upsert_relationships_tx(tx, rels)`.
-
-  Wrap it in `_retry_transient`, as `replace_file_nodes` is.
-- `devgraph/indexer/mentions/extractor.py`: `index_file` builds the node and relationship dicts once. When `names is None` it calls `engine.replace_mentions(...)`; otherwise it keeps today's additive `_upsert_documents` plus `upsert_relationships`. Update the `names` docstring: "Existing edges are kept; without `names`, the Document's MENTIONS are replaced."
-- `tests/indexer/test_mentions_extractor.py` (unit, with a recording stub engine if one exists there; otherwise only the live tests).
+- `devgraph/graph/engine.py`: `replace_mentions(repo_id, file_name, nodes, rels)` uses the same signature and retry wrapper as `replace_file_nodes`. It deletes `(:Document {repo_id, name: $f})-[:MENTIONS]->()`, then upserts the nodes and the rels.
+- `devgraph/indexer/mentions/extractor.py`:
+  - `index_file` builds the dicts once, with `origin = doc_name`.
+  - `names is None` → `replace_mentions`. Otherwise, today's additive upserts, also with `origin`.
+  - Update the docstring.
 - `tests/indexer/test_graph_accuracy_live.py`.
 
-- [ ] Write failing tests:
-  - **`test_removed_mention_is_retracted`** (live, `mentions_enabled=True`). `app.py` (`helper`, `other`) and `notes.md` mentioning `` `helper` `` and `` `other` ``. `full_scan`, edit to `` `other` `` only, `index_paths({notes.md}, mentions_enabled=True)`: incremental equals fresh (`fresh_snapshot(..., mentions_enabled=True)`).
-  - **`test_full_scan_drops_a_removed_mention`.** The same edit followed by `full_scan` alone equals the expected graph.
-  - **`test_mention_relink_stays_additive`.** Add `def later()` to `app.py` while `notes.md` already mentions `` `later` ``: the relink adds `MENTIONS later` and keeps `MENTIONS other`.
-  - **`test_mentions_replace_keeps_the_docs_note`.** `docs_path="docs"` and mentions on. `docs/adr-1.md` is a docs note (`id: ADR-1`) mentioning `` `helper` ``; drop the mention and `index_paths`. The `DesignDecision`/`ArchitectureNote` node at `docs/adr-1.md` survives, and incremental equals fresh.
+- [ ] Write failing live tests:
+  - **`test_removed_mention_is_retracted`.**
+    - `app.py` (`helper`, `other`), and `notes.md` mentioning `` `helper` `` and `` `other` ``. Edit it to mention `` `other` `` only.
+    - `index_paths({notes.md}, mentions_enabled=True)`: incremental equals fresh.
+  - **`test_full_scan_drops_a_removed_mention`.** The same edit, followed by `full_scan` alone, equals the expected graph.
+  - **`test_mention_relink_stays_additive`.** Add `def later()` while `notes.md` already mentions `` `later` ``: `MENTIONS later` is added, and `MENTIONS other` is kept.
+  - **`test_mentions_replace_keeps_the_docs_note`.**
+    - `docs_path="docs"`, mentions on, and `docs/adr-1.md` (`id: ADR-1`) mentioning `` `helper` ``.
+    - Drop the mention and `index_paths`: the note node survives, and incremental equals fresh.
 - [ ] Implement G4.
 - [ ] `uv run pytest -q`. Commit "Replace a document's mentions on re-index".
 
-### Task 4: Relink by-name referrers when a batch adds their target (bug 4; G5, G7)
+### Task 4: Relink by-name edges when a batch adds their endpoint (bug 4; G5, G6)
 
 **Files:**
-- `devgraph/indexer/common.py`: `name_ref_properties(rels: list[dict]) -> dict` returns `{"name_refs": <json>, "name_ref_targets": [...]}`. It covers the relationships with `to_file is None`, minus `repo_id`, and keeps `properties` (`caller_class`). The order and encoding follow the Global Constraints.
+- `devgraph/indexer/common.py`: `name_ref_properties(rels) -> dict` returns the three lists per the spec's G5 format. The entries are sorted and de-duplicated, with `\x1f` as the separator.
 - `devgraph/indexer/dispatch.py`:
-  - **Module properties.** In each of the eight code branches of `_index_single_path`, after `rels` is built and before `replace_file_nodes`, merge `name_ref_properties(rels)` into the `Module` node dict's `properties` (the node with `label == "Module"` and `name == rel_path`). Do it with one helper, `_with_name_refs(nodes, rels, rel_path)`, and not inline eight times. The Python branch uses the language `rels`, not `api_rels`.
-  - **The relink step.** `_relink_name_refs(engine, repo_id, added, skip) -> None`. It returns at once when `added` is empty. Otherwise:
-    1. It runs `engine.find_name_ref_modules(repo_id, sorted({name for _l, name in added}), sorted(skip))`.
-    2. It decodes each `name_refs`, keeps edges whose `(to_label, to_name)` is in `added`, and adds `repo_id`.
-    3. It upserts them with one `engine.upsert_relationships`.
-  - **Where it runs.** `index_paths` calls it after the eight pass-2 loops and before the service pass, with `skip = set(by_rel_path) | referrers`. Comment why it is there: every batch node exists, and the edges come from the graph, so no file is read.
-  - Update `index_paths`' docstring and `_find_referrers`' docstring to name the new path.
-- `devgraph/graph/engine.py`: `find_name_ref_modules(repo_id, names, skip) -> list[str]`, which returns the `name_refs` strings:
+  - **Module properties.** `_with_name_refs(nodes, rels, rel_path) -> list[dict]` returns a copy of `nodes` in which the Module (`name == rel_path`) carries `name_ref_properties(rels)`. The eight code branches pass that copy to `replace_file_nodes`, and store the plain `nodes` in `*_extractions` for pass 2.
+  - **`added` by file.** `list_file_nodes` returns `(label, name, file)`. `_batch_nodes` returns triples, with the same `file` rule. `added = triples - previous - {t for t in triples if t[:2] in docs_batch.existing}`. `_find_referrers`, `_mention_referrers` and `_relink_docs` get `{t[:2] for t in added}`.
+  - **The relink step.** `_relink_name_refs(engine, repo_id, added, skip)`:
+    1. It returns at once when `added` is empty.
+    2. It calls `engine.find_name_refs(repo_id, names, skip)`.
+    3. It parses each entry and keeps those whose `(to_label, to_name)`, or unpinned non-Module `(from_label, from_name)`, is in `added`'s pairs.
+    4. It builds rel dicts with `origin = module name`, and makes one `upsert_relationships` call.
+  - **Where it runs.** After the eight pass-2 loops and before the service pass, when `relink_outside` is true. `skip = set(by_rel_path) | referrers`.
+  - **`index_paths(..., relink_outside: bool = True)`.** `full_scan` passes `False`.
+- `devgraph/graph/engine.py`: `find_name_refs(repo_id, names, skip) -> list[tuple[str, list[str]]]`:
   ```
   MATCH (m:Module {repo_id: $repo_id})
-  WHERE m.name_refs IS NOT NULL AND NOT m.source_file IN $skip
-    AND any(t IN m.name_ref_targets WHERE t IN $names)
-  RETURN m.name_refs AS refs
+  WHERE NOT m.name IN $skip
+    AND (any(t IN m.name_ref_targets WHERE t IN $names) OR any(s IN m.name_ref_sources WHERE s IN $names))
+  RETURN m.name AS origin,
+         [e IN m.name_refs WHERE split(e, '\x1f')[5] IN $names OR split(e, '\x1f')[2] IN $names] AS refs
   ```
-- `tests/indexer/test_graph_accuracy_live.py`; `tests/watcher/test_watcher_live.py`; `tests/indexer/test_dispatch.py` (unit, for the relink's read-nothing property).
+- `devgraph/graph/schema.py`: the three properties go into `RESERVED_NODE_PROPERTIES`.
+- `devgraph/mcp/tools.py`: the three properties go into `_DESCRIBE_HIDDEN`.
+- Tests: `tests/indexer/test_graph_accuracy_live.py`, `tests/indexer/test_dispatch.py`, `tests/mcp/test_describe_node.py`, `tests/watcher/test_watcher_live.py`.
 
 - [ ] Write failing tests:
-  - **`test_import_target_deleted_and_restored`** (live). `pkg/a.py`: `from pkg.b import helper`, `main` → `helper`; `pkg/b.py`: `helper`. `full_scan`, then two batches as the watcher sends them: `unlink`, `remove_paths({pkg/b.py})`, then restore and `index_paths({pkg/b.py})`. Incremental equals fresh. Both `pkg/a.py -IMPORTS-> pkg/b.py` and `main@pkg/a.py -CALLS-> helper@pkg/b.py` are present.
-  - **`test_module_added_after_its_importer`.** `pkg/a.py` imports `lib.b`; `full_scan`; add `lib/b.py`; `index_paths({lib/b.py})`. Incremental equals fresh.
-  - **`test_supertype_added_in_another_directory`.** `app/k.py`: `from base.b import Base`, `class K(Base)`; add `base/b.py` later. Incremental equals fresh. Repeat with Java (`app/K.java` `extends Base`, `base/Base.java` with an import). This is the case `_same_package_subtype_referrers` cannot see.
-  - **`test_second_same_named_function_links_outside_callers`.** `a.py` calls `helper` and `b.py` defines it. Add `c.py` defining another `helper`, and `index_paths({c.py})`: `main@a.py -CALLS-> helper@c.py` exists, and incremental equals fresh.
-  - **`test_relink_reads_no_files`** (unit, `test_dispatch.py`). Patch `Path.read_text` and `_read_text` to count calls for paths outside the batch, and run `index_paths` on a batch that adds a name that a non-batch Module refers to (stub engine or live). Zero reads outside the batch; the expected edge dicts reach `upsert_relationships`.
-  - **`test_name_refs_are_deterministic`** (unit). Two extractions of the same source, with relationships shuffled, give byte-equal `name_refs`.
-  - **`test_name_refs_hidden_from_describe_node`** (unit, `tests/mcp/test_describe_node.py`). Neither property appears.
-  - **`test_an_import_target_deleted_and_restored`** (live watcher, `tests/watcher/test_watcher_live.py`). Before `start`, write `tools/use.py` (`from pkg.sub.util import helper`, `def go(): return helper()`) and commit. Then `start`, delete `pkg/sub/util.py`, `converges`, `git checkout -- pkg/sub/util.py`, `converges`. Then `git checkout -q -b other`, delete it and commit, `git checkout -q main`, `converges` (the branch-switch form).
-- [ ] Implement G5.
-- [ ] Docs (spec "Docs to update"):
+  - **`test_import_target_deleted_and_restored`** (live).
+    - `pkg/a.py` (`from pkg.b import helper`, `main` → `helper`) and `pkg/b.py`.
+    - `full_scan`, then two batches: `unlink` + `remove_paths({pkg/b.py})`, then restore + `index_paths({pkg/b.py})`.
+    - Incremental equals fresh, and the `IMPORTS` and `CALLS` are back, with `origin == "pkg/a.py"`.
+  - **`test_module_added_after_its_importer`.** `pkg/a.py` imports `lib.b`; add `lib/b.py` later. Incremental equals fresh.
+  - **`test_supertype_added_in_another_directory`.** Python (`app/k.py` `class K(Base)` from `base.b`), and Java (`app/K.java` `extends Base` with an import, `base/Base.java` added later). Both: incremental equals fresh.
+  - **`test_second_same_named_function_links_outside_callers`.** `a.py` calls `helper` (defined in `b.py`). Add `c.py` with its own `helper`: `main@a.py -CALLS-> helper@c.py` exists, and incremental equals fresh.
+  - **`test_restored_type_regains_foreign_impl`.** Use Task 1's Rust trio. `remove_paths({foo.rs})`, restore, `index_paths({foo.rs})`: `Foo@foo.rs -EXTENDS-> Display` is back (through `name_ref_sources`), and incremental equals fresh.
+  - **`test_symbol_moved_between_files_in_one_batch`.** `a.py` `main` → `helper`, with no import; `helper` moves from `b.py` to `c.py`; `index_paths({b.py, c.py})`. `main@a.py -CALLS-> helper@c.py` exists, and incremental equals fresh. Add `notes.md` mentioning `` `helper` `` (mentions on): its `MENTIONS` to `helper@c.py` matches fresh too.
+  - **`test_relink_reads_no_files`** (live, docs and mentions off).
+    - Count `Path.read_text` and `dispatch._read_text` calls on paths outside the batch, while a batch adds a name that a non-batch Module refers to.
+    - There are zero such reads, and the edge exists.
+  - **`test_full_scan_skips_relink`.** Spy on `GraphEngine.find_name_refs`: `full_scan` never calls it, and `index_paths` of an adding batch calls it once.
+  - **`test_pass_two_omits_name_refs`.** Spy on `upsert_nodes` during `index_paths`: no Module dict carries `name_refs`. The Module in the graph does.
+  - **`test_name_refs_written_empty`.** A file with no by-name edges has `name_refs == []`, and so do the other two lists. A file that loses all its calls is overwritten to `[]`.
+  - **`test_name_refs_are_compact`** (unit). Extract `devgraph/cli/main.py` (a real file in this repo):
+    - the entries are unique and sorted;
+    - no entry contains `{` or the repo id;
+    - the total encoded size is under 1/4 of the measured 348 KiB JSON (assert `< 90_000` bytes);
+    - two extractions with shuffled rels give equal lists.
+  - **`test_name_ref_relink_benchmark`** (live).
+    - Seed 5,000 Modules with `upsert_nodes`. Each carries 60 `name_refs` drawn from 2,000 names, with matching target and source lists.
+    - Time `find_name_refs` for 20 added names, plus the parse, plus the upsert of the result.
+    - Assert the time is under 2.0 s, and log it.
+  - **`test_name_refs_hidden_from_describe_node`** (unit).
+  - **`test_an_import_target_deleted_and_restored`** (live watcher).
+    - Before `start`, write and commit `tools/use.py` (`from pkg.sub.util import helper`, `def go(): return helper()`).
+    - `start`, delete `pkg/sub/util.py`, `converges`. Then `git checkout -- pkg/sub/util.py`, `converges`.
+    - Branch-switch form: on a new branch delete it and commit, `git checkout -q main`, `converges`.
+- [ ] Implement G5 and G6.
+- [ ] `uv run pytest -q`. Commit "Relink by-name edges when their endpoint is added".
+
+### Task 5: Automatic index upgrade (G7)
+
+**Files:**
+- `devgraph/indexer/dispatch.py`:
+  - `INDEX_FORMAT = 2`.
+  - `index_outdated(engine, repo_id) -> bool`.
+  - `full_scan` calls `engine.set_index_format(repo_id, INDEX_FORMAT)` last.
+  - `catch_up`, when `index_outdated`, returns `CatchUp(indexed=full_scan(...), pruned=0, checked=0, offered=0, unknown=0)` in place of the incremental pass.
+- `devgraph/graph/engine.py`:
+  - `set_index_format(repo_id, version)`: a `MERGE` on the Repository node that `SET`s `index_format`.
+  - `index_format(repo_id) -> int | None`.
+- `devgraph/agent/schema_rescan.py`, in `run_once`:
+  - Before the `schema_pending` check, `index_outdated(...)` → `self._run_exclusive(repo.repo_id, lambda: self._rescan(repo))`, with no quiet period, then `on_rescanned`, logging "upgraded the graph index of <repo> with a full rescan (N files)".
+  - The rest of the loop runs only when the repository is not outdated.
+  - An exception follows the existing `_failing` path.
+- `devgraph/cli/main.py`: `status` adds a "Graph Index" section, when Neo4j is reachable. It lists each active repository whose index is outdated as `"<repo_id>: rescan pending (the agent rescans it automatically, or run 'devgraph rescan')"`, or prints `up to date`.
+- Tests: `tests/agent/test_schema_rescan.py`, `tests/indexer/test_catch_up.py`, `tests/cli/` (the existing `status` test module), and `tests/indexer/test_graph_accuracy_live.py`.
+
+- [ ] Write failing tests:
+  - **`test_outdated_index_rescans_without_quiet_period`** (unit, stub engine and registry). The first `run_once` rescans an outdated repository through `run_exclusive`, and calls `on_rescanned`. A current one is untouched.
+  - **`test_full_scan_stamps_index_format`** (live). After `full_scan`, `index_format(repo_id) == INDEX_FORMAT`, and `index_outdated` is false. Remove the property: it is true again.
+  - **`test_catch_up_upgrades_an_outdated_index`** (live). Pollute a graph as in Task 1, and remove `index_format`. `catch_up(...)` leaves the graph equal to a fresh scan and stamped.
+  - **`test_status_shows_rescan_pending`.**
+- [ ] Implement G7.
+- [ ] Docs:
   - **PROJECT_STATUS.**
-    - Drop the `IMPORTS`/supertype/`CALLS` sentence from "Remaining gaps" and describe the `name_refs` relink in its place.
-    - Drop the three "Pre-existing bugs found by the watcher fuzz" from the watcher paragraph.
-    - Correct the skip-mode sentence: a re-index of the doc now drops the old edge.
-    - Add the G7 upgrade note: run `devgraph rescan` once after updating to heal wrong or stale edges.
-    - Add the claimed-node edge gap from the spec's "Out of scope".
-  - **`HANDOVER_node_identity.md`.** Sources are pinned; only targets are bare-name.
-- [ ] `uv run pytest -q`. Commit "Relink by-name referrers when their target is added".
+    - Rewrite the "Remaining gaps" by-name sentence to describe the origin-scoped retraction and the `name_refs` relink.
+    - Drop the three watcher-fuzz pre-existing bugs.
+    - Correct the skip-mode sentence.
+    - Say the upgrade is automatic.
+    - Add the spec's "Out of scope" list.
+  - **`HANDOVER_node_identity.md`.** Pinned sources, `origin`, the C#/TS partial-`EXTENDS` note, and Go/Rust/C++ cross-file methods.
+- [ ] `uv run pytest -q`. Commit "Upgrade outdated graph indexes automatically".
+
+### Task 6: Seeded multi-language fuzz
+
+**Files:**
+- `tests/indexer/test_graph_accuracy_fuzz.py` (new, live).
+
+**The repository:**
+- `py/` (three modules that import and call each other, a class hierarchy);
+- `rs/` (`foo.rs`, `display.rs`, `conv.rs` with an `impl`);
+- `java/` (two packages, an `extends` across them);
+- `go/` (`go.mod`, two packages);
+- `compose.yaml` (two services, `image:` only, no `build:`);
+- `Dockerfile`;
+- `notes.md` (code-span mentions of symbols from every language);
+- `docs/adr-1.md` and `docs/adr-2.md` (`links`, `supersedes`).
+
+`docs_path="docs"`, and mentions on.
+
+**The operations,** drawn by `random.Random(seed)`:
+- add or remove a call, a base or an import;
+- add or remove a function;
+- move a function between two files of the same language;
+- rename a file;
+- delete a file;
+- restore the last deleted file;
+- add or remove a service or a `FROM`;
+- add or remove a mention;
+- add or remove a note's `links`/`supersedes`.
+
+**Exclusions** (spec "Out of scope"):
+- no `build:`;
+- no datastore or route code;
+- no method moved out of its type's file;
+- no C++;
+- the default `mentions_ambiguous_mode` (`all`).
+
+**Batching:** each step either applies one batch (`remove_paths` of the deleted paths, then `index_paths` of the changed paths) or splits the same changes into one batch per path, in a random order.
+
+- [ ] Write the fuzz:
+  - **`test_graph_accuracy_fuzz[seed]`**, parametrised over seeds `1, 2, 3`, with 15 steps each. After every step it asserts `incremental_equals_fresh(..., mentions_enabled=True, docs_path="docs")`. On failure, the message names the seed, the step and the operation log.
+  - `DEVGRAPH_ACCURACY_FUZZ_STEPS` (default 15) and `DEVGRAPH_ACCURACY_FUZZ_SEEDS` (a comma list) lengthen it locally. Without them, CI runs the three fixed seeds.
+- [ ] Run it with a long setting once, for example `DEVGRAPH_ACCURACY_FUZZ_SEEDS=1,2,...,20 DEVGRAPH_ACCURACY_FUZZ_STEPS=60`. Every divergence is either fixed in the task it belongs to, or added to the spec's "Out of scope" with a matching exclusion. Never weaken the assertion.
+- [ ] `uv run pytest -q`. Commit "Add a seeded multi-language graph accuracy fuzz".
