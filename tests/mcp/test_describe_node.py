@@ -105,6 +105,12 @@ def test_name_refs_hidden_from_describe_node():
     assert set(_found(engine)["node"]["properties"]) == {"source_file"}
 
 
+def test_describe_node_hides_the_shared_internal_properties():
+    props = {key: ["x"] for key in schema.INTERNAL_NODE_PROPERTIES} | {"source_file": "a.py"}
+    engine = StubEngine(([{**LOOKUP_ROW, "properties": props}], False), ([], False))
+    assert set(_found(engine)["node"]["properties"]) == {"source_file"}
+
+
 def test_refs_are_raw():
     odd = "n\t" + "z" * 600
     groups = [{"dir": "out", "rel": "CALLS", "total": 1, "refs": [{"label": "Function", "name": odd, "file": "a.py"}]}]

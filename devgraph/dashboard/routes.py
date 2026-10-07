@@ -61,7 +61,7 @@ from devgraph.dashboard.git_info import get_git_log, get_git_status
 from devgraph.dashboard.layout_store import load_layout, save_layout
 from devgraph.dashboard.query_log import QueryLog
 from devgraph.graph.engine import GraphEngine, identity_key, provision_repository_schema
-from devgraph.graph.schema import NODE_LABELS, RELATIONSHIP_TYPES
+from devgraph.graph.schema import INTERNAL_NODE_PROPERTIES, NODE_LABELS, RELATIONSHIP_TYPES
 from devgraph.indexer.dispatch import full_scan
 from devgraph.mcp import tools as devgraph_tools
 from devgraph.registry.store import RepoRegistry
@@ -563,6 +563,7 @@ def build_router(
             "relationship_types": relationship_types,
             "schema_state": state,
             "notices": notices,
+            "hidden_properties": sorted(INTERNAL_NODE_PROPERTIES),
         }
 
     def _insights_payload(repo_id: str) -> dict[str, Any]:

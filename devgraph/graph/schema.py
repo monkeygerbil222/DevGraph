@@ -67,6 +67,12 @@ RESERVED_NODE_PROPERTIES: frozenset[str] = frozenset({
     "name_refs", "name_ref_targets", "name_ref_sources",
 })
 
+# The pipeline's own bookkeeping among those: hidden wherever a node's
+# properties are shown (describe_node, the dashboard's node inspector).
+INTERNAL_NODE_PROPERTIES: frozenset[str] = frozenset({
+    "claims", "extractor", "name_refs", "name_ref_targets", "name_ref_sources",
+})
+
 # Labels other than Repository must be uniquely keyed on (repo_id, name)
 # so incremental MERGE writes update in place instead of duplicating.
 _REPO_SCOPED_LABELS = tuple(l for l in NODE_LABELS if l != "Repository")
