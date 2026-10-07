@@ -359,7 +359,9 @@ def index_file(
         ambiguous_mode: How to handle ambiguous names: "all" (link all) or "skip" (skip).
         names: When given, only match entities with one of these names -- for
             linking an unchanged file to newly added entities without
-            re-matching every name in the repo. Existing edges are kept.
+            re-matching every name in the repo. Existing edges are kept
+            (additive). Without `names`, the Document's MENTIONS are replaced,
+            so a mention removed from the file loses its edge.
 
     Raises:
         FileNotFoundError: If the file does not exist.
@@ -384,20 +386,25 @@ def index_file(
     extractor = MentionsExtractor(repo_id, ambiguous_mode=ambiguous_mode)
     result = extractor.extract_from_source(content, doc_name, known_entities)
 
-    _upsert_documents(engine, result)
-
-    # Upsert relationships
-    engine.upsert_relationships(
-        [
-            {
-                "from_label": rel.source_label,
-                "from_name": rel.source_name,
-                "rel_type": rel.relationship_type,
-                "to_label": rel.target_label,
-                "to_name": rel.target_name,
-                "repo_id": repo_id,
-                "properties": {},
-            }
-            for rel in result.relationships
-        ]
-    )
+    nodes = [
+        {"label": doc.label, "repo_id": doc.repo_id, "name": doc.name, "properties": doc.properties}
+        for doc in result.documents
+    ]
+    rels = [
+        {
+            "from_label": rel.source_label,
+            "from_name": rel.source_name,
+            "rel_type": rel.relationship_type,
+            "to_label": rel.target_label,
+            "to_name": rel.target_name,
+            "repo_id": repo_id,
+            "properties": {},
+            "origin": doc_name,
+        }
+        for rel in result.relationships
+    ]
+    if names is None:
+        engine.replace_mentions(repo_id, doc_name, nodes, rels)
+    else:
+        engine.upsert_nodes(nodes)
+        engine.upsert_relationships(rels)

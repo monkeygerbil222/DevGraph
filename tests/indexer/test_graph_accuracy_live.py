@@ -629,3 +629,60 @@ def test_containerfile_retracts_a_removed_stage(engine, repo_id, tmp_path):
     write(tmp_path, "Containerfile", "FROM alpine:3.20\nCOPY app /app\n")
     index_paths(engine, repo_id, tmp_path, {containerfile})
     incremental_equals_fresh(engine, repo_id, tmp_path)
+
+
+# --- mentions (G4) -----------------------------------------------------------
+
+MENTIONED = "def helper():\n    return 1\n\n\ndef other():\n    return 2\n"
+
+
+def _mentioned_names(engine, repo_id):
+    return sorted(e[5] for e in edges(engine, repo_id, "MENTIONS"))
+
+
+def test_removed_mention_is_retracted(engine, repo_id, tmp_path):
+    write(tmp_path, "app.py", MENTIONED)
+    notes = write(tmp_path, "notes.md", "Uses `helper` and `other`.\n")
+    scan(engine, repo_id, tmp_path, mentions_enabled=True)
+    assert _mentioned_names(engine, repo_id) == ["helper", "other"]
+
+    write(tmp_path, "notes.md", "Uses `other`.\n")
+    index_paths(engine, repo_id, tmp_path, {notes}, mentions_enabled=True)
+    assert _mentioned_names(engine, repo_id) == ["other"]
+    incremental_equals_fresh(engine, repo_id, tmp_path, mentions_enabled=True)
+
+
+def test_full_scan_drops_a_removed_mention(engine, repo_id, tmp_path):
+    write(tmp_path, "app.py", MENTIONED)
+    write(tmp_path, "notes.md", "Uses `helper` and `other`.\n")
+    scan(engine, repo_id, tmp_path, mentions_enabled=True)
+
+    write(tmp_path, "notes.md", "Uses `other`.\n")
+    full_scan(engine, repo_id, tmp_path, mentions_enabled=True)
+    assert _mentioned_names(engine, repo_id) == ["other"]
+    incremental_equals_fresh(engine, repo_id, tmp_path, mentions_enabled=True)
+
+
+def test_mention_relink_stays_additive(engine, repo_id, tmp_path):
+    app = write(tmp_path, "app.py", MENTIONED)
+    write(tmp_path, "notes.md", "Uses `other` and `later`.\n")
+    scan(engine, repo_id, tmp_path, mentions_enabled=True)
+    assert _mentioned_names(engine, repo_id) == ["other"]
+
+    write(tmp_path, "app.py", MENTIONED + "\n\ndef later():\n    return 3\n")
+    index_paths(engine, repo_id, tmp_path, {app}, mentions_enabled=True)
+    assert _mentioned_names(engine, repo_id) == ["later", "other"]
+    incremental_equals_fresh(engine, repo_id, tmp_path, mentions_enabled=True)
+
+
+def test_mentions_replace_keeps_the_docs_note(engine, repo_id, tmp_path):
+    write(tmp_path, "app.py", MENTIONED)
+    adr = write(tmp_path, "docs/adr-1.md", "---\ntype: design_decision\nid: ADR-1\n---\n# Note\nSee `helper`.\n")
+    scan(engine, repo_id, tmp_path, docs_path="docs", mentions_enabled=True)
+    assert _mentioned_names(engine, repo_id) == ["helper"]
+
+    write(tmp_path, "docs/adr-1.md", "---\ntype: design_decision\nid: ADR-1\n---\n# Note\nNothing.\n")
+    index_paths(engine, repo_id, tmp_path, {adr}, docs_path="docs", mentions_enabled=True)
+    assert node(engine, repo_id, "DesignDecision", "ADR-1")
+    assert _mentioned_names(engine, repo_id) == []
+    incremental_equals_fresh(engine, repo_id, tmp_path, mentions_enabled=True, docs_path="docs")

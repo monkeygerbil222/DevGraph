@@ -609,6 +609,18 @@ def _replace_doc_note_tx(
     _upsert_relationships_tx(tx, rels)
 
 
+def _replace_mentions_tx(
+    tx, repo_id: str, file_name: str, nodes: list[dict[str, Any]], rels: list[dict[str, Any]]
+) -> None:
+    tx.run(
+        "MATCH (:Document {repo_id: $repo_id, name: $f})-[r:MENTIONS]->() DELETE r",
+        repo_id=repo_id,
+        f=file_name,
+    )
+    _upsert_nodes_tx(tx, nodes)
+    _upsert_relationships_tx(tx, rels)
+
+
 def repository_constraint_statements(effective: EffectiveSchema | None = None) -> list[str]:
     """Constraint Cypher to provision for one repository.
 
@@ -785,6 +797,16 @@ class GraphEngine:
         writer also wrote stays."""
         with self._driver.session() as session:
             session.execute_write(_replace_doc_note_tx, repo_id, file_name, nodes, rels)
+
+    def replace_mentions(
+        self, repo_id: str, file_name: str, nodes: list[dict[str, Any]], rels: list[dict[str, Any]]
+    ) -> None:
+        """Re-write one Markdown file's Document in one transaction: delete
+        its MENTIONS edges, then upsert `nodes` and `rels`. A mention the
+        file dropped therefore goes. `replace_file_nodes` isn't used: it
+        would delete a docs note at the same path as stale."""
+        with self._driver.session() as session:
+            session.execute_write(_replace_mentions_tx, repo_id, file_name, nodes, rels)
 
     def find_importing_modules(self, repo_id: str, module_name: str) -> list[str]:
         """Return the repo-relative paths of every Module with an IMPORTS edge
