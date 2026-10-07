@@ -47,7 +47,7 @@ Each item names the test that proves it.
 
    Tests: Task 1 `test_changes_on_base_after_branch_point_are_not_reported` and `test_merged_head_is_empty`.
 2. **Process surface.** Every `Git.execute` during a full comparison, including the symbol pass, is recorded. The set of subcommands must be a subset of `{"cat-file", "merge-base"}`, and `merge-base`'s argv must be exactly two 40-hex SHAs after the subcommand. Tests: Task 1 `test_only_cat_file_and_merge_base_run`; Task 2 reruns it with symbols.
-3. **Hostile refs never reach git, odd refs never crash.** `-h`, `--output=x`, `a..b`, `HEAD:secret.txt`, `../../x`, `""`, a 300-character ref, `ma in`, `a\x07b` and `x*` each give a `CompareError` naming the rule. A patched `git.Repo` that fails the test if it is constructed proves nothing was opened. Valid-looking refs that GitPython cannot resolve (`main@{yesterday}`, `HEAD@{}`, `HEAD@{99}`, `@{-9}`, `@{upstream}`, `HEAD^{tree}`) and `logs/HEAD` (the all-zero SHA) each give the unknown-ref `CompareError`, never another exception type. Tests: Task 1 `test_invalid_refs_are_rejected_before_git` and `test_unresolvable_refs_are_unknown`.
+3. **Hostile refs never reach git, odd refs never crash.** `-h`, `--output=x`, `a..b`, `HEAD:secret.txt`, `../../x`, `""`, a 300-character ref, `ma in`, `a\x07b`, `x*` and every `@{...}` form (`HEAD@{1}`, `@{-9}`, `@{upstream}`, `main@{yesterday}`, ...) each give a `CompareError` naming the rule. A patched `git.Repo` that fails the test if it is constructed proves nothing was opened. Valid-looking refs that GitPython cannot resolve (`HEAD^{tree}`, `HEAD~99`, an unknown short SHA) and `logs/HEAD` (the all-zero SHA) each give the unknown-ref `CompareError`, never another exception type. Tests: Task 1 `test_invalid_refs_are_rejected_before_git` and `test_unresolvable_refs_are_unknown`.
 4. **One test per language family.**
    - The eight families are `py`, `js` (one test covers `.ts`), `cs`, `cpp`, `java`, `rs`, `kt` and `go`.
    - Each builds a two-branch repository, then asserts the exact `added`, `removed` and `changed` symbol keys, plus one moved-but-identical symbol that is not reported.
@@ -98,7 +98,7 @@ Each item names the test that proves it.
     - `merge_base` is `main`'s commit.
   - **`test_changes_on_base_after_branch_point_are_not_reported`.** `main_after` edits `a.py` and adds `only_main.py`. Neither appears, and the branch's own change does.
   - **`test_merged_head_is_empty`.** Comparing `branch_a="feature", branch_b="main"`, after `main` has merged `feature` (`git merge --no-ff`), gives no changes. `branch_a == branch_b` also gives no changes, and no error.
-  - **`test_refs_of_every_shape_resolve`.** These all resolve: a tag, a full SHA, a 7-character SHA, `feature~1`, `HEAD`, `HEAD@{1}`, `refs/heads/feature`, and a branch named `fix#123`.
+  - **`test_refs_of_every_shape_resolve`.** These all resolve: a tag, a full SHA, a 7-character SHA, `feature~1`, `HEAD`, `refs/heads/feature`, and a branch named `fix#123`.
   - **`test_exact_rename_and_edited_rename`.**
     - `x/old.py` is moved unchanged to `y/new.py`. That gives one `renamed` entry, with `old_path="x/old.py"`.
     - `m.py` is moved and edited to `n.py`. That gives `removed` `m.py` and `added` `n.py`.
@@ -115,7 +115,7 @@ Each item names the test that proves it.
     - With `git.Repo` monkeypatched in `compare` to `pytest.fail`, each raises `CompareError` whose message names `branch_a` and the rule.
   - **`test_unknown_ref`.** The message is exactly the C7 text, and it has no shallow sentence.
   - **`test_unresolvable_refs_are_unknown`.**
-    - It is parametrized over `main@{yesterday}` and `HEAD@{}` (`NotImplementedError`), `HEAD@{99}` and `@{-9}` (`IndexError`), `@{upstream}` (`ValueError`; the branch has an upstream set with `git branch --set-upstream-to=main feature`, which proves GitPython 3.2.0 does not support the form rather than the branch lacking one), and `HEAD^{tree}` (`ValueError`).
+    - It is parametrized over `HEAD^{tree}` (`ValueError`), `HEAD~99`, `deadbeef` and `refs/heads/nosuch`. The `@{...}` forms are rejected by validation instead (`test_invalid_refs_are_rejected_before_git`).
     - Each raises `CompareError` with the unknown-ref message, never another type.
   - **`test_all_zero_sha_is_unknown`.** `logs/HEAD` resolves through the reflog file to `0000…0`. That gives the unknown-ref message, and `merge-base` is never run (per `record_git_commands`).
   - **`test_merge_base_failures`.**

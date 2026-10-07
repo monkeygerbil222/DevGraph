@@ -55,9 +55,9 @@ which functions or classes were added, removed or edited.
   on `branch_a` after the branch point is not reported as "removed on the
   branch".
 - **Any ref works, not only branch names:** a branch, tag, remote-tracking
-  branch, SHA, `HEAD`, or a suffix like `~2`, `^` or `@{1}`. All of them must
-  already exist locally, and DevGraph never fetches (like
-  `impact_analysis_for_diff`).
+  branch, SHA, `HEAD`, or a suffix like `~2` or `^`. Reflog, upstream and date
+  forms (`@{...}`) are rejected (C4). All of them must already exist locally,
+  and DevGraph never fetches (like `impact_analysis_for_diff`).
 - **Same commit, or head already merged into base.** If `M` equals
   `branch_b`'s commit, the result has no files. That is not an error, and the
   response's `merge_base` and `head.commit` show why.
@@ -222,7 +222,12 @@ which functions or classes were added, removed or edited.
   - must not contain `:` (`<rev>:<path>` names a blob, not a commit);
   - must not contain whitespace or a control character (Unicode category
     `C*`);
-  - must not contain `*`, `?`, `[` or `\` (globs and Windows separators).
+  - must not contain `*`, `?`, `[` or `\` (globs and Windows separators);
+  - must not contain `@{` (reflog, upstream and date forms such as
+    `HEAD@{1}`, `@{-1}`, `@{upstream}` and `main@{yesterday}`). GitPython's
+    handling of these may not match git's, so such a ref could silently
+    compare the wrong commit. The rule is checked before the repository is
+    opened, and the caller passes a branch name, tag or SHA instead.
 
   Everything else is allowed, so `fix#123`, `feature/ünïcode` and `v1.2+build`
   pass. A rejected ref is a `ToolError` naming the argument and the rule.
@@ -238,26 +243,26 @@ which functions or classes were added, removed or edited.
     repository, and peels a tag to its commit.
   - **Only `repo.commit(ref)` sits in `except Exception`,** mapped to the
     unknown-ref message (C7). GitPython 3.2.0's `rev_parse` raises a zoo of
-    types for refs that pass validation: `BadName`, `BadObject`,
-    `ValueError` (`HEAD^{tree}` and anything that peels to a non-commit),
-    `NotImplementedError` (`main@{yesterday}`, `HEAD@{}`) and `IndexError`
-    (`HEAD@{99}`, `@{-1}` past the reflog). Listing them would miss the next
+    types for refs that pass validation: `BadName`, `BadObject` and
+    `ValueError` (`HEAD^{tree}` and anything that peels to a non-commit), and
+    for the `@{...}` forms that validation now rejects also
+    `NotImplementedError` and `IndexError`. Listing them would miss the next
     one. The broad catch covers that one call only, so a bug elsewhere is
-    never mislabelled as a bad ref.
+    never mislabelled as a bad ref. The one carve-out: a `CommandError` or
+    `OSError` raised there (a `cat-file` that cannot start, a missing `git`)
+    is re-raised to the final catch-all below, since git failed rather than
+    the ref.
   - **A resolved commit is then checked:**
     - the all-zero SHA is rejected (`logs/HEAD` resolves to it through the
       reflog file, and `merge-base` would fail on it);
     - the commit's `.tree` must be readable.
 
     Either failure is the unknown-ref message.
-  - **What GitPython 3.2.0 does not support is an unknown ref, by design.**
-    A probe showed `@{upstream}` (and `<branch>@{upstream}`) raises
-    `ValueError`, and date forms like `main@{yesterday}` raise
-    `NotImplementedError`. Both get the unknown-ref message, and the caller
-    passes the branch name instead (`origin/main`). Numeric reflog forms
-    GitPython does support (`HEAD@{1}`, `@{-1}`) resolve the way GitPython
-    resolves them. An out-of-range one (`HEAD@{99}`, `@{-9}`) raises
-    `IndexError` and is unknown.
+  - **`@{...}` forms never reach GitPython.** A probe showed GitPython 3.2.0
+    raises on `@{upstream}` and the date forms, and resolves numeric reflog
+    forms (`HEAD@{1}`, `@{-1}`) its own way, which may not match git's. Rather
+    than risk comparing the wrong commit, validation rejects every ref
+    containing `@{` (above).
   - A probe confirmed that a `../../file` ref does not resolve in GitPython
     3.2.0. The `..` rule above keeps that true whatever GitPython does in
     future.
@@ -291,7 +296,8 @@ which functions or classes were added, removed or edited.
     has a merge-base timeout**. `merge-base` on two local SHAs is normally
     fast, but on Windows nothing bounds it.
   - **Its failures are mapped by stderr.** GitPython reports a kill as a
-    `GitCommandError` whose stderr starts with `Timeout:`. That gives the
+    `GitCommandError` whose stderr starts with `Timeout:` (GitPython stores it
+    wrapped as `stderr: '...'`, which is stripped first). That gives the
     timeout message. Any other `GitCommandError`, and `GitCommandNotFound`,
     gives the generic git-failure message (C7).
 - **No other `git` subcommand runs:** no `diff` (unlike
@@ -306,9 +312,10 @@ which functions or classes were added, removed or edited.
 - **The `Repo` is closed in a `finally`,** which ends its `cat-file`
   processes, as `impact_analysis_for_diff` does.
 - **A final catch-all.** The whole comparison, from opening the repository to
-  the last blob read, sits inside a last `except (GitCommandError, OSError)`
-  that becomes the generic git-failure `CompareError` (C7). `GitCommandNotFound`
-  is a `GitCommandError`. This covers a `cat-file` that cannot start or dies:
+  the last blob read, sits inside a last `except (CommandError, OSError)`
+  that becomes the generic git-failure `CompareError` (C7). `CommandError` is
+  the common base of `GitCommandError` and `GitCommandNotFound` (in GitPython
+  3.2.0 the latter is not a `GitCommandError`). This covers a `cat-file` that cannot start or dies:
   a missing `git` binary, a `safe.directory` refusal on a repository owned by
   another user, or a killed process. The more specific mappings above run
   first.
@@ -387,7 +394,7 @@ cut to 100 characters and quoted, as `tools._echo` does. The messages:
 | --- | --- |
 | `repo_id` not registered (explicit) | `no such repo_id: '<id>'; run devgraph list to see registered repositories` |
 | Registered root missing, or not a git repository root (`NoSuchPathError`, `InvalidGitRepositoryError`) | `repository '<id>' is not a git repository at its registered root; compare_branches needs the repository's own .git` |
-| Ref fails validation | `branch_a '<ref>' is not a valid ref: <rule>`. The rule is one of "it starts with '-'", "it starts with '/'", "it contains '..'", "it contains ':'", "it contains whitespace or a control character", "it contains one of * ? [ \", "it is empty or longer than 256 characters". |
+| Ref fails validation | `branch_a '<ref>' is not a valid ref: <rule>`. The rule is one of "it starts with '-'", "it starts with '/'", "it contains '..'", "it contains ':'", "it contains whitespace or a control character", "it contains one of * ? [ \", "it is empty or longer than 256 characters", "reflog and upstream forms like @{...} aren't supported; pass a branch name, tag or commit SHA". |
 | `repo.commit(ref)` raises anything; the result is the all-zero SHA; or its tree can't be read | `branch_b '<ref>' is not a branch, tag or commit in repository '<id>'; refs must exist locally (DevGraph never fetches)`. If the repository is shallow (a `shallow` file in `repo.common_dir`), add `; this is a shallow clone, so older commits may be missing: git fetch --unshallow`. This also covers a ref naming a tree or blob, which GitPython reports as a `ValueError` when it peels to a commit. |
 | No merge base (`merge_base` returns `[]`) | `'<a>' and '<b>' share no history in repository '<id>'`, plus the same shallow-clone sentence when the repository is shallow. |
 | `merge-base` killed by the deadline (`GitCommandError` whose stderr starts with `Timeout:`) | `compare_branches timed out finding the merge base of '<a>' and '<b>'` |
