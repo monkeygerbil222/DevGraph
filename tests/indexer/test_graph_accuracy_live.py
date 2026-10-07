@@ -958,3 +958,14 @@ def test_name_ref_relink_benchmark(engine, repo_id):
     )
     assert row["n"] > 0
     assert elapsed < 2.0
+
+
+def test_full_scan_stamps_index_format(engine, repo_id, tmp_path):
+    app_and_worker(tmp_path)
+    scan(engine, repo_id, tmp_path)
+    assert engine.index_format(repo_id) == dispatch.INDEX_FORMAT
+    assert not dispatch.index_outdated(engine, repo_id)
+
+    engine.run_cypher("MATCH (r:Repository {repo_id: $r}) REMOVE r.index_format", {"r": repo_id})
+    assert engine.index_format(repo_id) is None
+    assert dispatch.index_outdated(engine, repo_id)

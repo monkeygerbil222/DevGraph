@@ -41,7 +41,8 @@ class Clock:
 
 
 def setup(monkeypatch, tmp_path, *, valid=True):
-    state = {"pending": True, "hash": "h1", "scans": []}
+    state = {"pending": True, "hash": "h1", "scans": [], "outdated": set()}
+    monkeypatch.setattr(schema_rescan, "index_outdated", lambda e, r: r in state["outdated"])
     monkeypatch.setattr(schema_rescan, "schema_pending", lambda e, r, p: state["pending"])
     monkeypatch.setattr(schema_rescan, "schema_file_hash", lambda p: state["hash"])
 
@@ -228,3 +229,26 @@ def test_the_stamp_is_the_scans_start_and_the_scan_runs_exclusively(monkeypatch,
     assert sched.run_once() == ["r"]
     assert exclusive == ["r"]
     assert registry.stamps == [T0]
+
+
+def test_outdated_index_rescans_without_quiet_period(monkeypatch, tmp_path):
+    state = setup(monkeypatch, tmp_path)
+    state["pending"] = False
+    state["outdated"] = {"old"}
+    calls, done = [], []
+
+    def exclusive(repo_id, fn):
+        calls.append(repo_id)
+        state["outdated"].discard(repo_id)
+        return fn()
+
+    registry = Registry([Repo("old", tmp_path), Repo("current", tmp_path)])
+    sched = SchemaRescanScheduler(
+        None, registry, on_rescanned=lambda r, n: done.append((r, n)), clock=Clock(), run_exclusive=exclusive,
+    )
+    assert sched.run_once() == ["old"]      # the very first pass: no quiet period
+    assert calls == ["old"] and state["scans"] == ["old"]
+    assert done == [("old", 7)]
+    assert registry.marked == ["old"]
+    assert sched.run_once() == []           # now current: untouched
+    assert state["scans"] == ["old"]

@@ -648,8 +648,13 @@ def status() -> None:
     try:
         engine.verify_connectivity()
         console.print(f"  [green][OK] Reachable[/green] at {escape(str(settings.neo4j_uri))}")
+        reachable = True
     except Exception as e:
         console.print(f"  [red][X] Not reachable:[/red] {escape(str(e))}")
+        reachable = False
+    try:
+        if reachable:
+            _print_graph_index(engine)
     finally:
         engine.close()
 
@@ -691,6 +696,31 @@ def status() -> None:
             pass
 
     console.print()
+
+
+def _print_graph_index(engine: GraphEngine) -> None:
+    """The `status` "Graph Index" section: active repositories whose index
+    predates the current format and so await an automatic rescan."""
+    from devgraph.indexer.dispatch import index_outdated
+
+    console.print("[bold]Graph Index[/bold]")
+    try:
+        registry = _get_registry()
+        try:
+            repos = [r for r in registry.list_repos() if r.active]
+        finally:
+            registry.close()
+        pending = [r.repo_id for r in repos if index_outdated(engine, r.repo_id)]
+    except Exception as e:
+        console.print(f"  [red]Error:[/red] {escape(str(e))}")
+        return
+    for repo_id in pending:
+        console.print(
+            f"  [yellow]{escape(repo_id)}: rescan pending[/yellow] "
+            "(the agent rescans it automatically, or run 'devgraph rescan')"
+        )
+    if not pending:
+        console.print("  up to date")
 
 
 def _registered_repo_id(root: Path) -> str:

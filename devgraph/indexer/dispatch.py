@@ -98,6 +98,16 @@ def _provider_specs(repo_root: Path) -> tuple[bool, filesystem.FilesystemSpec | 
     return True, filesystem.filesystem_spec(effective), docs.docs_spec(effective)
 
 
+#: The graph index format a full scan produces (edge `origins`, `name_refs`).
+#: An index stamped lower, or not at all, is rescanned automatically.
+INDEX_FORMAT = 2
+
+
+def index_outdated(engine: GraphEngine, repo_id: str) -> bool:
+    """True when the repository's last full scan predates `INDEX_FORMAT`."""
+    return (engine.index_format(repo_id) or 1) < INDEX_FORMAT
+
+
 def schema_pending(engine: GraphEngine, repo_id: str, repo_root: Path) -> bool:
     """True when the schema file differs from the one the graph was built with.
 
@@ -1652,7 +1662,13 @@ def catch_up(
     file for its key, or when any of its change stamps is at or after `since`
     less `CATCH_UP_MARGIN_NS`. A file nothing would index (a `.txt` with no
     filesystem type declared) is never offered.
+
+    An index older than `INDEX_FORMAT` gets a `full_scan` instead, which
+    upgrades it.
     """
+    if index_outdated(engine, repo_id):
+        indexed = full_scan(engine, repo_id, repo_root, docs_path=docs_path, mentions_enabled=mentions_enabled)
+        return CatchUp(indexed=indexed, pruned=0, checked=0, offered=0, unknown=0)
     pruned = prune_stale_files(engine, repo_id, repo_root, docs_path=docs_path, mentions_enabled=mentions_enabled)
     specs = _applied_provider_specs(engine, repo_id, repo_root)
     known = _graph_files(engine, repo_id, repo_root, specs)
@@ -1713,6 +1729,7 @@ def full_scan(engine: GraphEngine, repo_id: str, repo_root: Path, docs_path: str
     )
     if applied:
         _sync_docs_edges(engine, repo_id, repo_root, applied_docs)
+    engine.set_index_format(repo_id, INDEX_FORMAT)
     return indexed
 
 

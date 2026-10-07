@@ -17,7 +17,7 @@ from collections.abc import Callable
 from typing import Any
 
 from devgraph.config.project_schema import ProjectSchemaError, resolve_effective_schema, schema_file_hash
-from devgraph.indexer.dispatch import full_scan, schema_pending
+from devgraph.indexer.dispatch import full_scan, index_outdated, schema_pending
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +73,18 @@ class SchemaRescanScheduler:
             if not repo.watch_enabled:
                 continue
             try:
+                if index_outdated(self._engine, repo.repo_id):
+                    # An index from an older format: upgrade it now, no quiet period.
+                    count, _ = self._run_exclusive(repo.repo_id, lambda: self._rescan(repo))
+                    self._failing.discard(repo.repo_id)
+                    rescanned.append(repo.repo_id)
+                    logger.info("upgraded the graph index of %s with a full rescan (%d files)", repo.repo_id, count)
+                    if self._on_rescanned is not None:
+                        try:
+                            self._on_rescanned(repo.repo_id, count)
+                        except Exception:
+                            logger.debug("schema rescan callback failed for %s", repo.repo_id, exc_info=True)
+                    continue
                 if not schema_pending(self._engine, repo.repo_id, repo.path):
                     self._seen.pop(repo.repo_id, None)
                     self._invalid.pop(repo.repo_id, None)

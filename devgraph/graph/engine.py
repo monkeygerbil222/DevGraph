@@ -997,6 +997,26 @@ class GraphEngine:
             records = [record.data() for record in result or []]
         return records[0] if records else None
 
+    def set_index_format(self, repo_id: str, version: int) -> None:
+        """Stamp the graph index format the repository was last fully scanned with."""
+        with self._driver.session() as session:
+            _retry_transient(
+                session.run,
+                "MERGE (r:Repository {repo_id: $repo_id}) SET r.index_format = $version",
+                repo_id=repo_id, version=version,
+            )
+
+    def index_format(self, repo_id: str) -> int | None:
+        """The index format stamped by the last full scan, or None for an older index."""
+        with self._driver.session() as session:
+            result = _retry_transient(
+                session.run,
+                "MATCH (r:Repository {repo_id: $repo_id}) RETURN r.index_format AS format",
+                repo_id=repo_id,
+            )
+            records = [record.data() for record in result or []]
+        return records[0]["format"] if records else None
+
     def read_all_applied_schemas(self) -> list[dict[str, Any]]:
         """Every repository's recorded user labels and keys, from the graph itself."""
         with self._driver.session() as session:

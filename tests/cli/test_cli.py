@@ -379,6 +379,31 @@ def test_cli_status(runner, temp_registry_db, temp_git_repo):
         assert "Total:" in result.stdout
 
 
+def test_status_shows_rescan_pending(runner, temp_registry_db, temp_git_repo):
+    """'devgraph status' lists an active repository whose index is outdated."""
+    db_path, registry = temp_registry_db
+    repo_id = registry.add_repo(temp_git_repo).repo_id
+    registry.close()
+
+    from devgraph.cli import main as cli_main
+
+    settings = _mock_settings(db_path)
+    outdated = {repo_id}
+    with patch.object(cli_main, "get_settings", return_value=settings), \
+         patch.object(cli_main, "GraphEngine") as engine_cls, \
+         patch("devgraph.indexer.dispatch.index_outdated", side_effect=lambda e, r: r in outdated):
+        engine_cls.return_value.verify_connectivity.return_value = None
+        pending = runner.invoke(app, ["status"])
+        outdated.clear()
+        current = runner.invoke(app, ["status"])
+
+    assert pending.exit_code == 0 and current.exit_code == 0
+    assert "Graph Index" in pending.stdout
+    assert f"{repo_id}: rescan pending" in pending.stdout
+    assert "devgraph rescan" in pending.stdout
+    assert "up to date" in current.stdout and "rescan pending" not in current.stdout
+
+
 def test_cli_annotate_set_docs_path(runner, temp_git_repo, temp_registry_db):
     """Test 'devgraph annotate --docs-path' command."""
     db_path, registry = temp_registry_db

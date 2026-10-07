@@ -36,6 +36,7 @@ def stubbed(monkeypatch):
 
     monkeypatch.setattr(dispatch, "prune_stale_files", lambda *a, **k: state["pruned"])
     monkeypatch.setattr(dispatch, "schema_pending", lambda *a, **k: False)
+    monkeypatch.setattr(dispatch, "index_outdated", lambda *a, **k: False)
     monkeypatch.setattr(dispatch, "_graph_files", lambda *a, **k: set(state["known"]))
     monkeypatch.setattr(dispatch, "_docs_note_files", lambda *a, **k: set(state["known"]))
 
@@ -599,3 +600,26 @@ def test_a_bare_note_key_naming_a_real_root_file_is_rekeyed(engine, tmp_path, he
     assert _note_files(engine) == [("overview", "docs/README.md")]
     _scan_docs(engine, root, FRESH)
     assert snapshot(engine, REPO) == snapshot(engine, FRESH)
+
+
+def test_catch_up_upgrades_an_outdated_index(engine, repo):
+    scan(engine, repo)
+    engine.run_cypher(
+        "MATCH (a:Class {repo_id: $r, name: 'Alpha'}) MATCH (b:Class {repo_id: $r, name: 'Beta'}) "
+        "MERGE (a)-[:EXTENDS]->(b)",
+        {"r": REPO},
+    )
+    engine.run_cypher("MATCH (r:Repository {repo_id: $r}) REMOVE r.index_format", {"r": REPO})
+    assert dispatch.index_outdated(engine, REPO)
+
+    result = catch_up(engine, REPO, repo, datetime.now(timezone.utc) + timedelta(hours=1))
+
+    assert result.indexed > 0 and (result.pruned, result.checked, result.offered, result.unknown) == (0, 0, 0, 0)
+    assert not dispatch.index_outdated(engine, REPO)
+    scan_fresh = snapshot(engine, REPO)
+    assert scan_fresh[1] == snapshot_of_fresh(engine, repo)
+
+
+def snapshot_of_fresh(engine, root):
+    scan(engine, root, FRESH)
+    return snapshot(engine, FRESH)[1]

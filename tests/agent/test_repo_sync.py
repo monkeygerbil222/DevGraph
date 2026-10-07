@@ -40,6 +40,7 @@ class Rig:
         self.registry = MagicMock()
         self.registry.get.return_value = RepoRecord(REPO, root, True, True, None, docs_path=None)
         self.engine = MagicMock()
+        self.engine.index_format.return_value = dispatch.INDEX_FORMAT
         self.events: list[dict] = []
         self.requests: list[tuple] = []
         self.sync = RepoSync(
