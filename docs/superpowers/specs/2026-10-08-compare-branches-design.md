@@ -227,7 +227,11 @@ which functions or classes were added, removed or edited.
     `HEAD@{1}`, `@{-1}`, `@{upstream}` and `main@{yesterday}`). GitPython's
     handling of these may not match git's, so such a ref could silently
     compare the wrong commit. The rule is checked before the repository is
-    opened, and the caller passes a branch name, tag or SHA instead.
+    opened, and the caller passes a branch name, tag or SHA instead;
+  - must not contain `{/` (the `^{/regex}` commit search). GitPython runs it
+    as `git rev-parse --verify <sha>^{/pattern}` with no timeout, a
+    history-wide search that is neither `cat-file` nor `merge-base` and is
+    not bounded by the deadline.
 
   Everything else is allowed, so `fix#123`, `feature/ünïcode` and `v1.2+build`
   pass. A rejected ref is a `ToolError` naming the argument and the rule.
@@ -274,6 +278,14 @@ which functions or classes were added, removed or edited.
     `--filters` runs no textconv driver, no clean/smudge filter and no hook.
   - Every SHA and path goes over stdin, never argv, so nothing can be read as
     an option.
+  - **No lazy fetch.** In a partial clone (`--filter=blob:none`, or treeless
+    `--filter=tree:0`), git fetches a missing object from the promisor remote
+    on demand: network access, possibly a credential prompt, and no deadline.
+    The `Repo`'s git environment gets `GIT_NO_LAZY_FETCH=1` before its first
+    command, so a missing object is reported as missing instead and becomes
+    the "git object missing" message (C7). The variable exists from git 2.44.
+    Older git ignores it, so there a partial clone can still lazy-fetch during
+    a comparison; that is accepted rather than probing the git version.
   - This is the same object access `impact_analysis_for_diff`,
     `GitHistoryExtractor` and `blame` already use.
 - **`merge_base` is the one deliberate subprocess.**
@@ -404,7 +416,7 @@ cut to 100 characters and quoted, as `tools._echo` does. The messages:
 | --- | --- |
 | `repo_id` not registered (explicit) | `no such repo_id: '<id>'; run devgraph list to see registered repositories` |
 | Registered root missing, or not a git repository root (`NoSuchPathError`, `InvalidGitRepositoryError`) | `repository '<id>' is not a git repository at its registered root; compare_branches needs the repository's own .git` |
-| Ref fails validation | `branch_a '<ref>' is not a valid ref: <rule>`. The rule is one of "it starts with '-'", "it starts with '/'", "it contains '..'", "it contains ':'", "it contains whitespace or a control character", "it contains one of * ? [ \", "it is empty or longer than 256 characters", "reflog and upstream forms like @{...} aren't supported; pass a branch name, tag or commit SHA". |
+| Ref fails validation | `branch_a '<ref>' is not a valid ref: <rule>`. The rule is one of "it starts with '-'", "it starts with '/'", "it contains '..'", "it contains ':'", "it contains whitespace or a control character", "it contains one of * ? [ \", "it is empty or longer than 256 characters", "reflog and upstream forms like @{...} aren't supported; pass a branch name, tag or commit SHA", "regex forms like ^{/...} aren't supported; pass a branch name, tag or commit SHA". |
 | `repo.commit(ref)` raises anything; the result is the all-zero SHA; or its tree can't be read | `branch_b '<ref>' is not a branch, tag or commit in repository '<id>'; refs must exist locally (DevGraph never fetches)`. If the repository is shallow (a `shallow` file in `repo.common_dir`), add `; this is a shallow clone, so older commits may be missing: git fetch --unshallow`. This also covers a ref naming a tree or blob, which GitPython reports as a `ValueError` when it peels to a commit. |
 | No merge base (`merge_base` returns `[]`) | `'<a>' and '<b>' share no history in repository '<id>'`, plus the same shallow-clone sentence when the repository is shallow. |
 | `merge-base` killed by the deadline (`GitCommandError` whose stderr starts with `Timeout:`) | `compare_branches timed out finding the merge base of '<a>' and '<b>'` |

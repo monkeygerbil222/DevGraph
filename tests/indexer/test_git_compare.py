@@ -208,6 +208,13 @@ def test_only_cat_file_and_merge_base_run(tmp_path, monkeypatch):
     assert [(c.path, c.status) for c in detailed] == [("a.py", "modified"), ("d/y.py", "added")]
     assert [e["name"] for e in detailed[0].symbols["changed"]] == ["a"]
     assert {subcommand(c) for c in calls} <= {"cat-file", "merge-base"}
+    # A regex ref would make GitPython run an untimed `git rev-parse`; it is refused before any git runs.
+    before = len(calls)
+    for ref in ("HEAD^{/feat}", "feature^{/(}"):
+        with pytest.raises(CompareError, match="regex forms"):
+            changes_of(repo, head=ref)
+    assert calls[before:] == []
+    assert "rev-parse" not in {subcommand(c) for c in calls}
     merge_bases = [c for c in calls if subcommand(c) == "merge-base"]
     assert len(merge_bases) == 1
     assert merge_bases[0][-3] == "merge-base"
@@ -232,11 +239,17 @@ INVALID = [
     ("/abs", "it starts with '/'"),
 ]
 REFLOG = "reflog and upstream forms like @{...} aren't supported; pass a branch name, tag or commit SHA"
+REGEX = "regex forms like ^{/...} aren't supported; pass a branch name, tag or commit SHA"
+REGEX_FORMS = ["HEAD^{/x}", "HEAD^{/(}", "main^{/feat}", ":/feat"]
 REFLOG_FORMS = ["HEAD@{1}", "@{-9}", "@{-1}", "@{upstream}", "feature@{u}", "main@{yesterday}", "HEAD@{}", "HEAD@{99}"]
 
 
 @pytest.mark.parametrize(
-    ("ref", "rule"), INVALID + [(form, REFLOG) for form in REFLOG_FORMS], ids=lambda v: repr(v)[:20]
+    ("ref", "rule"),
+    INVALID
+    + [(form, REFLOG) for form in REFLOG_FORMS]
+    + [(form, REGEX if form.startswith("H") or form.startswith("m") else "it contains ':'") for form in REGEX_FORMS],
+    ids=lambda v: repr(v)[:20],
 )
 def test_invalid_refs_are_rejected_before_git(tmp_path, monkeypatch, ref, rule):
     monkeypatch.setattr(compare.git, "Repo", lambda *a, **k: pytest.fail("the repository was opened"))
@@ -275,10 +288,49 @@ def test_all_zero_sha_is_unknown(tmp_path, monkeypatch):
     repo = two_branch_repo(tmp_path, {"a.py": "a = 1\n"}, {"b.py": "b = 1\n"})
     assert Path(repo, ".git", "logs", "HEAD").read_text().startswith("0" * 40)
     calls = record_git_commands(monkeypatch)
+    streamed, infoed = record_object_reads(monkeypatch)
     with pytest.raises(CompareError) as err:
         changes_of(repo, head="logs/HEAD")
     assert str(err.value) == unknown("branch_b", "logs/HEAD")
     assert "merge-base" not in {subcommand(c) for c in calls}
+    assert "0" * 40 not in streamed and "0" * 40 not in infoed
+
+
+def test_missing_subtree_is_object_missing(tmp_path):
+    repo = two_branch_repo(tmp_path, {"a.py": "a = 1\n", "d/x.py": "x\n"}, {"d/y.py": "y\n"})
+    subtree = git(repo, "rev-parse", "feature:d")
+    Path(repo, ".git", "objects", subtree[:2], subtree[2:]).unlink()
+    with pytest.raises(CompareError) as err:
+        changes_of(repo)
+    assert type(err.value) is CompareError
+    assert str(err.value) == (
+        "git object missing while comparing 'main' and 'feature'; the clone may be partial or shallow"
+    )
+
+
+def _git_version():
+    return tuple(int(n) for n in re.findall(r"\d+", git(".", "--version"))[:2])
+
+
+@posix_only
+@pytest.mark.skipif(_git_version() < (2, 44), reason="GIT_NO_LAZY_FETCH needs git 2.44 or later")
+@pytest.mark.parametrize("filter_spec", ["blob:none", "tree:0"])
+def test_partial_clone_never_lazy_fetches(tmp_path, filter_spec):
+    src = two_branch_repo(tmp_path, {"a.py": "def a():\n    return 1\n"}, {"a.py": "def a():\n    return 2\n"})
+    git(src, "config", "uploadpack.allowFilter", "true")
+    dst = Path(tmp_path, "partial")
+    git(tmp_path, "clone", "-q", "--no-checkout", f"--filter={filter_spec}", f"file://{src}", str(dst))
+    marker = Path(tmp_path, "ssh-was-called")
+    script = Path(tmp_path, "fake-ssh")
+    script.write_text(f"#!/bin/sh\necho called >> '{marker}'\nexit 1\n")
+    script.chmod(0o755)
+    git(dst, "remote", "set-url", "origin", "ssh://git.example.invalid/repo.git")
+    git(dst, "config", "core.sshCommand", str(script))
+    with pytest.raises(CompareError) as err:
+        with open_comparison(dst, REPO_ID, "origin/main", "origin/feature") as cmp:
+            symbol_detail(cmp)
+    assert str(err.value).startswith("git object missing while comparing 'origin/main' and 'origin/feature'")
+    assert not marker.exists()
 
 
 def _fail_merge_base(monkeypatch, stderr):

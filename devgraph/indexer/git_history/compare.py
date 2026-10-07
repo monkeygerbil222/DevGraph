@@ -107,6 +107,9 @@ def _ref_rule(ref: str) -> str | None:
     # so such a ref could silently compare the wrong commit.
     if "@{" in ref:
         return "reflog and upstream forms like @{...} aren't supported; pass a branch name, tag or commit SHA"
+    # GitPython hands `^{/regex}` to an untimed `git rev-parse` that searches all history.
+    if "{/" in ref:
+        return "regex forms like ^{/...} aren't supported; pass a branch name, tag or commit SHA"
     return None
 
 
@@ -277,6 +280,9 @@ def open_comparison(
                 f"repository {_echo(repo_id)} is not a git repository at its registered root; "
                 "compare_branches needs the repository's own .git"
             ) from exc
+        # In a partial clone, a missing tree or blob would otherwise be fetched from the
+        # remote: network, maybe a credential prompt, and no deadline. Needs git 2.44+.
+        repo.git.update_environment(GIT_NO_LAZY_FETCH="1")
         base = _resolve(repo, repo_id, "branch_a", base_ref)
         head = _resolve(repo, repo_id, "branch_b", head_ref)
 
