@@ -18,7 +18,12 @@ from neo4j import Driver, GraphDatabase, READ_ACCESS, unit_of_work
 from neo4j.exceptions import ServiceUnavailable, SessionExpired, TransientError
 from neo4j.graph import Node, Relationship
 
-from devgraph.graph.schema import RELATIONSHIP_TYPES, RESERVED_NODE_PROPERTIES, constraint_statements
+from devgraph.graph.schema import (
+    RELATIONSHIP_TYPES,
+    RESERVED_NODE_PROPERTIES,
+    constraint_statements,
+    lookup_index_statements,
+)
 from devgraph.indexer.common import NAME_REF_SEP
 from devgraph.indexer.docs.extractor import DOC_NOTE_LABELS
 
@@ -129,16 +134,23 @@ _WRITE_CHANGES_CYPHER = "UNWIND $rows AS row MATCH (n) WHERE elementId(n) = row.
 def _claim_nodes_tx(tx, label: str, rows: list[dict[str, Any]]) -> None:
     """Claim shared nodes of one label for each row's `source`, in row order.
 
-    MERGEs as `MERGE (n:{label} {repo_id, name})` did, so a row claims every
-    node that MERGE matches, or the one it creates."""
-    keys = sorted({(row["repo_id"], row["name"]) for row in rows})
+    A row claims every file-less node of its label and name, or the one it
+    creates. A file-scoped node of the same name is never claimed: a handler
+    stub `Function` stays its own node whichever file is written first."""
+    keys = [list(key) for key in sorted({(row["repo_id"], row["name"]) for row in rows})]
     read: dict[str, dict[str, Any]] = {}
     current: dict[str, dict[str, Any]] = {}
-    by_key: dict[tuple[str, str], list[str]] = {key: [] for key in keys}
+    by_key: dict[tuple[str, str], list[str]] = {(key[0], key[1]): [] for key in keys}
+    tx.run(
+        f"UNWIND $keys AS k WITH k WHERE NOT EXISTS {{ "
+        f"MATCH (m:{label} {{repo_id: k[0], name: k[1]}}) WHERE m.file IS NULL }} "
+        f"CREATE (:{label} {{repo_id: k[0], name: k[1]}})",
+        keys=keys,
+    )
     for record in tx.run(
-        f"UNWIND $keys AS k MERGE (n:{label} {{repo_id: k[0], name: k[1]}}) "
+        f"UNWIND $keys AS k MATCH (n:{label} {{repo_id: k[0], name: k[1]}}) WHERE n.file IS NULL "
         "WITH k, n " + _LOCK_AND_READ + ", k[0] AS repo_id, k[1] AS name",
-        keys=[list(key) for key in keys],
+        keys=keys,
     ):
         read[record["id"]] = dict(record["props"])
         current[record["id"]] = dict(record["props"])
@@ -698,10 +710,11 @@ class GraphEngine:
         that aren't scoped to one repository omit `effective` and get exactly
         the built-in statements. Statements always come from
         `repository_constraint_statements`, never from
-        `EffectiveSchema.constraint_statements()` directly.
+        `EffectiveSchema.constraint_statements()` directly. The built-in
+        `(repo_id, name)` lookup indexes follow.
         """
         with self._driver.session() as session:
-            for stmt in repository_constraint_statements(effective):
+            for stmt in repository_constraint_statements(effective) + lookup_index_statements():
                 _retry_transient(session.run, stmt)
 
     def upsert_repository(self, repo_id: str, name: str, path: str) -> None:

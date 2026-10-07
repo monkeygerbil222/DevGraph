@@ -638,9 +638,7 @@ def _routed(handler):
     """
 
 
-# The route and its handler both go. A handler left defined but no longer
-# routed keeps the stub's claim (see the task report): the stub MERGEs onto
-# the file-scoped Function, which an unclaim never matches.
+# The route and its handler both go.
 UNROUTED = "def helper():\n    return 1\n"
 
 
@@ -670,6 +668,53 @@ def test_removed_route_retracts_endpoint_edges(engine, repo_id, tmp_path):
     write(tmp_path, "services/api/b.py", UNROUTED)
     index_paths(engine, repo_id, tmp_path, {b})
     assert _endpoint_edges(engine, repo_id) == []
+    incremental_equals_fresh(engine, repo_id, tmp_path)
+
+
+DJANGO_ROUTE = """\
+    from django.urls import path
+
+    urlpatterns = [path("search/", search)]
+"""
+
+
+def _search_nodes(engine, repo_id):
+    return sorted(
+        (row["file"] or "", row["type"] or "", tuple(row["sources"] or ()))
+        for row in engine.run_cypher(
+            "MATCH (f:Function {repo_id: $r, name: 'search'}) "
+            "RETURN f.file AS file, f.type AS type, f.sources AS sources",
+            {"r": repo_id},
+        )
+    )
+
+
+@pytest.mark.parametrize("first", ["a/routes.py", "b/x.py"])
+def test_a_handler_stub_never_claims_a_same_named_function(engine, repo_id, tmp_path, first):
+    """A route file's handler stub is its own file-less Function: it never
+    MERGEs onto another file's `def search()`, whichever is written first."""
+    write(tmp_path, "a/routes.py", DJANGO_ROUTE)
+    write(tmp_path, "b/x.py", "def search():\n    return 1\n")
+    scan(engine, repo_id, tmp_path)
+    expected = graph_snapshot(engine, repo_id)
+    assert _search_nodes(engine, repo_id) == [("", "view", ("a/routes.py",)), ("b/x.py", "function", ())]
+
+    engine.delete_repository(repo_id)
+    second = "b/x.py" if first == "a/routes.py" else "a/routes.py"
+    for rel in (first, second):
+        index_paths(engine, repo_id, tmp_path, {tmp_path / rel})
+    assert graph_snapshot(engine, repo_id) == expected
+    incremental_equals_fresh(engine, repo_id, tmp_path)
+
+
+def test_a_handler_that_loses_its_route_decorator_drops_the_stub(engine, repo_id, tmp_path):
+    routes = write(tmp_path, "api/routes.py", _routed("search"))
+    scan(engine, repo_id, tmp_path)
+    assert _search_nodes(engine, repo_id) == [("", "handler", ("api/routes.py",)), ("api/routes.py", "function", ())]
+
+    write(tmp_path, "api/routes.py", "def search():\n    return 1\n")
+    index_paths(engine, repo_id, tmp_path, {routes})
+    assert _search_nodes(engine, repo_id) == [("api/routes.py", "function", ())]
     incremental_equals_fresh(engine, repo_id, tmp_path)
 
 

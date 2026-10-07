@@ -131,7 +131,7 @@ def render(f: File) -> str:
     if f.kind == "notes":
         return "# Notes\n\n" + "".join(f"Uses `{m}`.\n" for m in f.mentions)
     if f.kind == "note":
-        front = [f"type: design_decision", f"id: {f.head}"]
+        front = ["type: design_decision", f"id: {f.head}"]
         if f.links:
             front.append("links: [" + ", ".join(f.links) + "]")
         if f.supersedes:

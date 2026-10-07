@@ -228,3 +228,35 @@ class TestBatchingReducesRoundTrips:
             assert call_count["n"] == 5
         finally:
             engine.delete_repository(repo_id)
+
+
+class TestNameLookupIndexes:
+    """Bare-name edge ends and describe_node match Class/Function/Service on
+    (repo_id, name); their uniqueness constraint indexes (repo_id, name, file)."""
+
+    def test_init_schema_provisions_one_per_file_scoped_label(self, engine):
+        from devgraph.graph.schema import FILE_SCOPED_LABELS
+
+        engine.init_schema()  # a second run is a no-op
+        rows = engine.run_cypher(
+            "SHOW INDEXES YIELD name, type, labelsOrTypes, properties "
+            "WHERE name ENDS WITH '_repo_name_lookup' RETURN name, type, labelsOrTypes, properties"
+        )
+        assert sorted((r["labelsOrTypes"][0], r["type"], tuple(r["properties"])) for r in rows) == sorted(
+            (label, "RANGE", ("repo_id", "name")) for label in FILE_SCOPED_LABELS
+        )
+
+    def test_a_bare_name_match_is_an_index_seek(self, engine):
+        with engine._driver.session() as session:
+            summary = session.run(
+                "EXPLAIN MATCH (b:Function {repo_id: $r, name: $n}) RETURN b", r="r", n="g"
+            ).consume()
+
+        def operators(node):
+            yield node["operatorType"]
+            for child in node.get("children", []):
+                yield from operators(child)
+
+        ops = list(operators(summary.plan))
+        assert any(op.startswith("NodeIndexSeek") for op in ops), ops
+        assert not any(op.startswith("NodeByLabelScan") for op in ops), ops
