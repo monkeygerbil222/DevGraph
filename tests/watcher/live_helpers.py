@@ -2,7 +2,7 @@
 
 `graph_snapshot` is the plan's comparison projection: every node as
 (sorted labels, name, its file, a hash of its non-volatile properties) and
-every edge as (label, name, type, label, name), leaving out `Commit` and
+every edge as (label, name, file, type, label, name, file, origins), leaving out `Commit` and
 `Repository` nodes and their edges. `fresh_snapshot` is the same projection of
 a fresh `full_scan` of the same files, and `wait_until_equal` polls the live
 graph until it matches.
@@ -55,18 +55,24 @@ def graph_snapshot(engine, repo_id: str) -> tuple[list, list]:
     edges = engine.run_cypher(
         "MATCH (a {repo_id: $r})-[x]->(b {repo_id: $r}) "
         "WHERE NOT a:Commit AND NOT a:Repository AND NOT b:Commit AND NOT b:Repository "
-        "RETURN labels(a)[0] AS a, a.name AS an, type(x) AS t, labels(b)[0] AS b, b.name AS bn",
+        "RETURN labels(a)[0] AS a, a.name AS an, coalesce(a.file, a.source_file, a.path, '') AS af, "
+        "type(x) AS t, labels(b)[0] AS b, b.name AS bn, coalesce(b.file, b.source_file, b.path, '') AS bf, "
+        "coalesce(x.origins, []) AS o",
         {"r": repo_id},
     )
     return (
         sorted(
             (tuple(sorted(n["labels"])), n["name"] or "", n["file"], _props_hash(n["props"])) for n in nodes
         ),
-        sorted((e["a"], e["an"] or "", e["t"], e["b"], e["bn"] or "") for e in edges),
+        sorted(
+            (e["a"], e["an"] or "", e["af"], e["t"], e["b"], e["bn"] or "", e["bf"], tuple(e["o"])) for e in edges
+        ),
     )
 
 
-def fresh_snapshot(engine, repo_id: str, root: Path) -> tuple[list, list]:
+def fresh_snapshot(
+    engine, repo_id: str, root: Path, mentions_enabled: bool = False, docs_path: str | None = None
+) -> tuple[list, list]:
     """The snapshot of a fresh `full_scan` of `root` under `<repo_id>_fresh`,
     read uncached, which is deleted again afterwards."""
     fresh = f"{repo_id}_fresh"
@@ -79,10 +85,19 @@ def fresh_snapshot(engine, repo_id: str, root: Path) -> tuple[list, list]:
             patch.object(docs_cache, "read_fresh", _uncached),
             patch.object(docs_cache, "forget", lambda root: None),
         ):
-            full_scan(engine, fresh, root)
+            full_scan(engine, fresh, root, docs_path=docs_path, mentions_enabled=mentions_enabled)
         return graph_snapshot(engine, fresh)
     finally:
         engine.delete_repository(fresh)
+
+
+def snapshot_diff(expected, actual) -> str:
+    """A unified diff of two snapshots, the fresh scan's first."""
+    return "\n".join(difflib.unified_diff(
+        pprint.pformat(expected, width=160).splitlines(),
+        pprint.pformat(actual, width=160).splitlines(),
+        "fresh full_scan", "live graph", lineterm="",
+    ))
 
 
 def wait_until_equal(engine, repo_id: str, expected, timeout_s: float = 30) -> None:
@@ -100,12 +115,9 @@ def wait_until_equal(engine, repo_id: str, expected, timeout_s: float = 30) -> N
         else:
             equal_since = None
         if time.monotonic() > deadline:
-            diff = difflib.unified_diff(
-                pprint.pformat(expected, width=160).splitlines(),
-                pprint.pformat(actual, width=160).splitlines(),
-                "fresh full_scan", "live graph", lineterm="",
+            pytest.fail(
+                f"live graph did not match a fresh scan within {timeout_s} s:\n" + snapshot_diff(expected, actual)
             )
-            pytest.fail(f"live graph did not match a fresh scan within {timeout_s} s:\n" + "\n".join(diff))
         time.sleep(0.2)
 
 

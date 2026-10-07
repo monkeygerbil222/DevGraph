@@ -41,7 +41,7 @@ from pathlib import Path
 import tree_sitter_go as tsgo
 from tree_sitter import Language, Node, Parser
 
-from devgraph.indexer.common import ExtractionResult, GraphNode, GraphRelationship
+from devgraph.indexer.common import ExtractionResult, GraphNode, GraphRelationship, own_edges
 
 logger = logging.getLogger(__name__)
 
@@ -478,7 +478,7 @@ def extract_go_file(
         elif node.type == "method_declaration":
             _visit_method(node)
 
-    return result
+    return own_edges(result, file_path)
 
 
 def _find_module_path(repo_root: Path) -> str | None:

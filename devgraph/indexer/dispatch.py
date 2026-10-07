@@ -1635,18 +1635,18 @@ def full_scan(engine: GraphEngine, repo_id: str, repo_root: Path, docs_path: str
 def _index_containerfile(engine: GraphEngine, repo_id: str, path: Path, rel_path: str) -> ExtractionResult:
     content = path.read_text(encoding="utf-8", errors="replace")
     result = ContainerExtractor(repo_id).extract_from_containerfile(content, rel_path)
-    _upsert_container_result(engine, repo_id, result)
+    _upsert_container_result(engine, repo_id, rel_path, result)
     return result
 
 
 def _index_compose_file(engine: GraphEngine, repo_id: str, path: Path, rel_path: str) -> ExtractionResult:
     content = path.read_text(encoding="utf-8", errors="replace")
     result = ContainerExtractor(repo_id).extract_from_compose_file(content, rel_path)
-    _upsert_container_result(engine, repo_id, result)
+    _upsert_container_result(engine, repo_id, rel_path, result)
     return result
 
 
-def _relationship_dict(rel, repo_id: str) -> dict:
+def _relationship_dict(rel, repo_id: str, origin: str) -> dict:
     """Canonical upsert_relationships dict from any extractor's
     source_label/source_name/relationship_type/target_label/target_name
     Relationship dataclass shape (docs/apis/containers/datastores all share
@@ -1656,6 +1656,9 @@ def _relationship_dict(rel, repo_id: str) -> dict:
     containers/extractor.py's Relationship carries them (Service is the one
     label from this family that's file-scoped) -- every other module's
     Relationship dataclass predates that field and stays bare-name matched.
+
+    `origin` is the repo-relative path of the file that wrote the edge, added
+    to the edge's `origins` (see GraphRelationship).
     """
     return {
         "from_label": rel.source_label,
@@ -1667,10 +1670,11 @@ def _relationship_dict(rel, repo_id: str) -> dict:
         "properties": getattr(rel, "properties", None) or {},
         "from_file": getattr(rel, "from_file", None),
         "to_file": getattr(rel, "to_file", None),
+        "origin": origin,
     }
 
 
-def _upsert_container_result(engine: GraphEngine, repo_id: str, result) -> None:
+def _upsert_container_result(engine: GraphEngine, repo_id: str, rel_path: str, result) -> None:
     # Container nodes deliberately stay keyed on (repo_id, name) alone, no
     # `file` -- a Container node represents a shared base image (e.g.
     # "python"), and two compose/Containerfiles both building FROM the same
@@ -1690,14 +1694,14 @@ def _upsert_container_result(engine: GraphEngine, repo_id: str, result) -> None:
         for s in result.services
     ]
     engine.upsert_nodes(nodes)
-    engine.upsert_relationships([_relationship_dict(rel, repo_id) for rel in result.relationships])
+    engine.upsert_relationships([_relationship_dict(rel, repo_id, rel_path) for rel in result.relationships])
 
 
 def _index_datastores(engine: GraphEngine, repo_id: str, rel_path: str, content: str) -> None:
     result = DatastoreExtractor(repo_id).extract_from_source(content, rel_path)
     nodes = [{"label": ds.datastore_type, "repo_id": repo_id, "name": ds.name, "properties": ds.properties} for ds in result.datastores]
     engine.upsert_nodes(nodes)
-    engine.upsert_relationships([_relationship_dict(rel, repo_id) for rel in result.relationships])
+    engine.upsert_relationships([_relationship_dict(rel, repo_id, rel_path) for rel in result.relationships])
 
 
 def _load_services_with_build_context(engine: GraphEngine, repo_id: str) -> dict[str, tuple[str, str]]:
@@ -1756,7 +1760,8 @@ def _owning_service_relationships(
     directory against each repo Service's build_context (see
     containers/extractor.py's _extract_build_context) — the longest matching
     prefix wins, so a service at 'services/api' isn't shadowed by an
-    unrelated top-level Service with no build_context.
+    unrelated top-level Service with no build_context. Each edge's `origin`
+    is the Python file, so a compose file's re-index leaves it alone.
     """
     owning_service = _match_owning_service(services, rel_path)
     if owning_service is None:
@@ -1777,6 +1782,7 @@ def _owning_service_relationships(
                 "to_name": ds.name,
                 "repo_id": repo_id,
                 "properties": {},
+                "origin": rel_path,
             }
         )
 
@@ -1793,6 +1799,7 @@ def _owning_service_relationships(
                 "to_file": owning_service_file,
                 "repo_id": repo_id,
                 "properties": {},
+                "origin": rel_path,
             }
         )
 
@@ -1809,6 +1816,6 @@ def _index_apis(engine: GraphEngine, repo_id: str, rel_path: str, content: str) 
         for f in result.functions
     ]
     engine.upsert_nodes(nodes)
-    rels = [_relationship_dict(rel, repo_id) for rel in result.relationships]
+    rels = [_relationship_dict(rel, repo_id, rel_path) for rel in result.relationships]
     engine.upsert_relationships(rels)
     return rels

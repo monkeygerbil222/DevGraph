@@ -178,22 +178,48 @@ def _unclaim_source_tx(tx, repo_id: str, file_name: str) -> None:
         tx.run("MATCH (n) WHERE elementId(n) IN $ids DETACH DELETE n", ids=gone)
 
 
-# Used by _replace_file_nodes_tx: delete only the file-scoped symbol nodes
-# (Class/Function) whose symbol no longer exists in the file's current
-# extraction. Unlike _DELETE_BY_SOURCE_FILE_CYPHER, this does NOT DETACH
-# DELETE every node with the file's provenance — surviving nodes keep their
-# incoming edges (MODIFIES from git history, MENTIONS from docs, cross-file
-# CALLS/IMPORTS), which a blanket delete-then-recreate silently destroyed.
-# The Module node (the file itself) is always excluded and MERGEd in place.
-# `keep` is a list of [label, name] pairs for the file-scoped nodes the
-# current extraction still produces; an empty list (file now has no
-# classes/functions) correctly deletes them all.
-_DELETE_STALE_FILE_NODES_CYPHER = (
+# Unclaim edge, applied to a bound `r`: remove the file `$f` from the
+# edge's `origins` (the files that wrote it, kept sorted by
+# _upsert_relationships_tx), and delete the edge once no writer is left. An
+# edge with no `origins` was written before they were recorded, and counts
+# as written by `$f` alone.
+_UNCLAIM_EDGE = (
+    "WITH r, [x IN coalesce(r.origins, [$f]) WHERE x <> $f] AS left "
+    "FOREACH (_ IN CASE WHEN size(left) = 0 THEN [1] ELSE [] END | DELETE r) "
+    "FOREACH (_ IN CASE WHEN size(left) > 0 THEN [1] ELSE [] END | SET r.origins = left)"
+)
+
+# Used by _replace_file_nodes_tx, in one scan over the nodes the file owns
+# (`file` for Class/Function, `source_file` or its path as `name` for its
+# Module): G2 set (a) unclaims the file from every edge out of them, so an
+# edge the file no longer writes goes while one another file wrote out of
+# the same node (a docs note's DOCUMENTED_BY, a Rust `impl` in another file)
+# stays. Then it deletes only the file-scoped symbol nodes whose symbol is
+# no longer in the file's current extraction. Unlike
+# _DELETE_BY_SOURCE_FILE_CYPHER, this does NOT DETACH DELETE every node with
+# the file's provenance -- surviving nodes keep their incoming edges
+# (MODIFIES from git history, MENTIONS from docs, cross-file CALLS/IMPORTS),
+# which a blanket delete-then-recreate silently destroyed. The Module node
+# (the file itself) is always kept and MERGEd in place. `keep` is a list of
+# [label, name] pairs for the file-scoped nodes the current extraction still
+# produces; an empty list (file now has no classes/functions) correctly
+# deletes them all.
+_REPLACE_OWNED_NODES_CYPHER = (
     "MATCH (n {repo_id: $repo_id}) "
-    "WHERE NOT n:Module "
-    "  AND (n.file = $file_name OR n.source_file = $file_name) "
+    "WHERE n.file = $f OR n.source_file = $f OR (n:Module AND n.name = $f) "
+    "CALL (n) { MATCH (n)-[r]->() " + _UNCLAIM_EDGE + " } "
+    "WITH n WHERE NOT n:Module "
     "  AND NOT any(pair IN $keep WHERE labels(n)[0] = pair[0] AND n.name = pair[1]) "
     "DETACH DELETE n"
+)
+
+# G2 set (d): every edge a docs note writes touches one of the note's own
+# nodes, so unclaiming the note file from the edges into and out of them
+# (and nothing else) retracts the links it dropped.
+_UNCLAIM_DOC_NOTE_EDGES_CYPHER = (
+    "MATCH (n {repo_id: $repo_id, source_file: $f}) "
+    "CALL (n) { MATCH (n)<-[r:DOCUMENTED_BY|SATISFIES]-() " + _UNCLAIM_EDGE + " } "
+    "CALL (n) { MATCH (n)-[r:SUPERSEDES|DECIDED_BY]->() " + _UNCLAIM_EDGE + " }"
 )
 
 # Nodes a schema-declared provider owns (devgraph/indexer/providers/) are
@@ -407,12 +433,16 @@ def _group_rels_by_triple(
     """Group by (from_label, rel_type, to_label, has_from_file, has_to_file).
 
     from_file/to_file (see GraphRelationship) are only ever set by a caller
-    that knows an endpoint's exact file at extraction time (currently: only
-    CONTAINS, whose two ends are always the file just parsed). Grouping on
-    their presence, not just the label triple, means every other
-    relationship type keeps matching by bare name exactly as before —
-    genuinely ambiguous by nature (a CALLS target could live anywhere in the
-    repo) rather than a bug to paper over.
+    that knows an endpoint's exact file at extraction time: a code edge's
+    source when it is one of the parsed file's own nodes (see
+    indexer.common.own_edges), CONTAINS's target, a compose Service. Grouping
+    on their presence, not just the label triple, means every other end keeps
+    matching by bare name exactly as before — genuinely ambiguous by nature
+    (a CALLS target could live anywhere in the repo) rather than a bug to
+    paper over.
+
+    Each row carries its `origin`, the file that wrote it (None for a writer
+    that doesn't record one).
     """
     groups: dict[tuple[str, str, str, bool, bool], list[dict[str, Any]]] = {}
     for rel in rels:
@@ -427,6 +457,7 @@ def _group_rels_by_triple(
                 "from_file": from_file,
                 "to_file": to_file,
                 "properties": rel.get("properties") or {},
+                "origin": rel.get("origin"),
             }
         )
     return groups
@@ -459,6 +490,17 @@ def _upsert_nodes_tx(tx, nodes: list[dict[str, Any]]) -> None:
             _claim_nodes_tx(tx, label, claimed)
 
 
+# Adds the row's `origin` to the edge's `origins`, kept sorted and without
+# repeats, so an edge several files write is the same whatever order they
+# write it in. A row without an origin leaves `origins` as it is.
+_ADD_ORIGIN = (
+    "SET r.origins = CASE "
+    "WHEN row.origin IS NULL OR row.origin IN coalesce(r.origins, []) THEN r.origins "
+    "ELSE [x IN coalesce(r.origins, []) WHERE x < row.origin] + [row.origin] "
+    "   + [x IN coalesce(r.origins, []) WHERE x > row.origin] END"
+)
+
+
 def _upsert_relationships_tx(tx, rels: list[dict[str, Any]]) -> None:
     for (from_label, rel_type, to_label, has_from_file, has_to_file), rows in _group_rels_by_triple(rels).items():
         from_match = (
@@ -476,7 +518,7 @@ def _upsert_relationships_tx(tx, rels: list[dict[str, Any]]) -> None:
             f"MATCH (a:{from_label} {from_match}) "
             f"MATCH (b:{to_label} {to_match}) "
             f"MERGE (a)-[r:{rel_type}]->(b) "
-            "SET r += row.properties",
+            "SET r += row.properties " + _ADD_ORIGIN,
             rows=rows,
         )
 
@@ -493,7 +535,8 @@ def _write_insights_tx(tx, repo_id: str, rows: list[dict[str, Any]], summary: di
 def _replace_file_nodes_tx(
     tx, repo_id: str, file_name: str, nodes: list[dict[str, Any]], rels: list[dict[str, Any]]
 ) -> None:
-    # Delete only the file-scoped nodes (Class/Function, keyed on `file`)
+    # Unclaim the file from the edges out of the nodes it owns (G2 set (a)),
+    # and delete only the file-scoped nodes (Class/Function, keyed on `file`)
     # whose symbol is no longer in the file's current extraction. The Module
     # node (keyed on `source_file`) and any surviving Class/Function nodes
     # are MERGEd in place below, so their incoming edges — MODIFIES from git
@@ -511,8 +554,16 @@ def _replace_file_nodes_tx(
             or (node.get("properties") or {}).get("source_file") == file_name
         )
     ]
-    tx.run(_DELETE_STALE_FILE_NODES_CYPHER, repo_id=repo_id, file_name=file_name, keep=keep)
+    tx.run(_REPLACE_OWNED_NODES_CYPHER, repo_id=repo_id, f=file_name, keep=keep)
     _unclaim_source_tx(tx, repo_id, file_name)
+    _upsert_nodes_tx(tx, nodes)
+    _upsert_relationships_tx(tx, rels)
+
+
+def _replace_doc_note_tx(
+    tx, repo_id: str, file_name: str, nodes: list[dict[str, Any]], rels: list[dict[str, Any]]
+) -> None:
+    tx.run(_UNCLAIM_DOC_NOTE_EDGES_CYPHER, repo_id=repo_id, f=file_name)
     _upsert_nodes_tx(tx, nodes)
     _upsert_relationships_tx(tx, rels)
 
@@ -648,7 +699,8 @@ class GraphEngine:
         """Batched MATCH-MATCH-MERGE for many relationships in one transaction.
 
         Each dict needs `from_label`/`from_name`/`rel_type`/`to_label`/
-        `to_name`/`repo_id` (`properties` optional). Grouped by
+        `to_name`/`repo_id` (`properties`, `from_file`/`to_file` and
+        `origin`, the writing file added to the edge's `origins`, optional). Grouped by
         `(from_label, rel_type, to_label)` — same reasoning as `upsert_nodes`,
         since label/rel-type can't be parameterized. An edge whose endpoint
         doesn't exist yet is silently skipped, same as `upsert_relationship`.
@@ -672,6 +724,17 @@ class GraphEngine:
         """
         with self._driver.session() as session:
             session.execute_write(_replace_file_nodes_tx, repo_id, file_name, nodes, rels)
+
+    def replace_doc_note(
+        self, repo_id: str, file_name: str, nodes: list[dict[str, Any]], rels: list[dict[str, Any]]
+    ) -> None:
+        """Re-write one docs note file in one transaction: unclaim the file
+        from the edges into and out of the nodes it wrote (`source_file`),
+        deleting those it was the last writer of, then upsert `nodes` and
+        `rels`. A link the note dropped therefore goes; an edge another
+        writer also wrote stays."""
+        with self._driver.session() as session:
+            session.execute_write(_replace_doc_note_tx, repo_id, file_name, nodes, rels)
 
     def find_importing_modules(self, repo_id: str, module_name: str) -> list[str]:
         """Return the repo-relative paths of every Module with an IMPORTS edge

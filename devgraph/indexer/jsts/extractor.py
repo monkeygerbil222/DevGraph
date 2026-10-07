@@ -65,7 +65,7 @@ import tree_sitter_javascript as tsjs
 import tree_sitter_typescript as tsts
 from tree_sitter import Language, Node, Parser
 
-from devgraph.indexer.common import ExtractionResult, GraphNode, GraphRelationship
+from devgraph.indexer.common import ExtractionResult, GraphNode, GraphRelationship, own_edges
 
 logger = logging.getLogger(__name__)
 
@@ -659,7 +659,7 @@ def extract_js_file(source_code: str, file_path: str, repo_id: str) -> Extractio
     for node in root.named_children:
         _visit_statement(node, None, "Module")
 
-    return result
+    return own_edges(result, file_path)
 
 
 def index_file(

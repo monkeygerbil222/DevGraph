@@ -41,6 +41,17 @@ class GraphRelationship:
     defined anywhere in the repo) -- that keeps today's bare-name matching,
     ambiguity and all, since guessing wrong there would silently drop edges
     rather than just being imprecise.
+
+    The source end is pinned for every edge out of one of the parsed file's
+    own file-scoped nodes (see `own_edges`), so a `main` in one file never
+    writes another file's calls. A source that isn't one of those (a Module,
+    whose name is already its path, or a type defined in another file, such
+    as a Rust `impl Trait for Foo`) stays bare.
+
+    `origin` is the file that wrote the edge. The engine keeps every writer
+    in the edge's sorted `origins` list, and a re-index of that file removes
+    it from the edges it no longer writes, deleting an edge whose last writer
+    is gone.
     """
 
     from_label: str
@@ -52,6 +63,7 @@ class GraphRelationship:
     properties: dict | None = None
     from_file: str | None = None
     to_file: str | None = None
+    origin: str | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -64,6 +76,7 @@ class GraphRelationship:
             "properties": self.properties,
             "from_file": self.from_file,
             "to_file": self.to_file,
+            "origin": self.origin,
         }
 
 
@@ -79,3 +92,21 @@ class ExtractionResult:
             "nodes": [n.to_dict() for n in self.nodes],
             "relationships": [r.to_dict() for r in self.relationships],
         }
+
+
+def own_edges(result: ExtractionResult, file_path: str) -> ExtractionResult:
+    """Mark `result` as `file_path`'s own edges, in place, and return it.
+
+    Pins the source end (`from_file`) of every relationship whose source
+    `(label, name)` is one of the result's nodes with `file == file_path`,
+    and stamps `origin = file_path` on every relationship. An already-set
+    `from_file` is left as it is.
+    """
+    owned = {
+        (node.label, node.name) for node in result.nodes if node.properties.get("file") == file_path
+    }
+    for rel in result.relationships:
+        rel.origin = file_path
+        if rel.from_file is None and (rel.from_label, rel.from_name) in owned:
+            rel.from_file = file_path
+    return result

@@ -179,7 +179,8 @@ def source_key(file_path: Path, repo_root: str | Path | None) -> str:
 
 
 def index_file(engine, repo_id: str, file_path: str | Path, repo_root: str | Path | None = None) -> None:
-    """Extract a docs Markdown file and upsert results into the graph.
+    """Extract a docs Markdown file and write it to the graph, retracting the
+    edges the note no longer writes (see GraphEngine.replace_doc_note).
 
     Args:
         engine: A GraphEngine instance.
@@ -198,12 +199,13 @@ def index_file(engine, repo_id: str, file_path: str | Path, repo_root: str | Pat
         raise FileNotFoundError(f"File not found: {file_path}")
 
     content = file_path.read_text(encoding="utf-8")
-    result = DocsExtractor(repo_id).extract_from_source(content, source_key(file_path, repo_root))
+    origin = source_key(file_path, repo_root)
+    result = DocsExtractor(repo_id).extract_from_source(content, origin)
 
-    engine.upsert_nodes(
-        [{"label": doc.label, "repo_id": doc.repo_id, "name": doc.name, "properties": doc.properties} for doc in result.docs]
-    )
-    engine.upsert_relationships(
+    engine.replace_doc_note(
+        repo_id,
+        origin,
+        [{"label": doc.label, "repo_id": doc.repo_id, "name": doc.name, "properties": doc.properties} for doc in result.docs],
         [
             {
                 "from_label": rel.source_label,
@@ -213,7 +215,8 @@ def index_file(engine, repo_id: str, file_path: str | Path, repo_root: str | Pat
                 "to_name": rel.target_name,
                 "repo_id": repo_id,
                 "properties": {},
+                "origin": origin,
             }
             for rel in result.relationships
-        ]
+        ],
     )

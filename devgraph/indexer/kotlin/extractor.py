@@ -69,7 +69,7 @@ from pathlib import Path
 import tree_sitter_kotlin as tskotlin
 from tree_sitter import Language, Node, Parser
 
-from devgraph.indexer.common import ExtractionResult, GraphNode, GraphRelationship
+from devgraph.indexer.common import ExtractionResult, GraphNode, GraphRelationship, own_edges
 
 logger = logging.getLogger(__name__)
 
@@ -544,7 +544,7 @@ def extract_kotlin_file(source_code: str, file_path: str, repo_id: str) -> Extra
 
     visit_block(root, None, "Module")
 
-    return result
+    return own_edges(result, file_path)
 
 
 def index_file(
