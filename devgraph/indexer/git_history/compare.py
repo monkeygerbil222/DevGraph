@@ -4,8 +4,9 @@
 finds their merge base, and walks the merge base's tree against the head's,
 like `git diff branch_a...branch_b`. Objects are read through GitPython's
 `cat-file` processes; the one other git subcommand is `merge-base`, on resolved
-SHAs. Nothing is written: not the working tree, the index or the graph. See
-docs/superpowers/specs/2026-10-08-compare-branches-design.md (C1, C2, C4, C5, C7).
+SHAs. `symbol_detail` then reads the changed blobs and diffs their symbols.
+Nothing is written: not the working tree, the index or the graph. See
+docs/superpowers/specs/2026-10-08-compare-branches-design.md (C1, C2, C3, C4, C5, C6, C7).
 """
 
 from __future__ import annotations
@@ -23,6 +24,7 @@ import git
 from git.exc import BadName, CommandError, GitCommandError, InvalidGitRepositoryError, NoSuchPathError
 from gitdb.exc import BadObject
 
+from devgraph.indexer.symbols import decode_source, diff_symbols, extract_symbols, language_for
 from devgraph.paths import MAX_CONFIG_BYTES
 
 log = logging.getLogger(__name__)
@@ -41,6 +43,8 @@ _NULL_SHA = "0" * 40
 _EMPTY_BLOB_SHA = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"
 _SYMLINK_MODE = 0o120000
 _SHALLOW_HINT = "; this is a shallow clone, so older commits may be missing: git fetch --unshallow"
+_BINARY_SNIFF_BYTES = 8_000  # git's own heuristic: a NUL byte this early means binary
+_REASON_ORDER = ("diff_entries", "files", "bytes", "symbols", "deadline")
 
 
 class CompareError(ValueError):
@@ -58,6 +62,11 @@ class FileChange:
     base_blob: git.Blob | None = None
     head_blob: git.Blob | None = None
     kind: str = "blob"  # "blob", "symlink" or "submodule"
+    # Filled by `symbol_detail` for the files it details:
+    language: str | None = None  # the code route, or None
+    symbols: dict[str, list[dict]] | None = None  # {"added", "removed", "changed"}, or None
+    symbols_skipped: str | None = None  # why `symbols` is None
+    symbols_truncated: bool = False  # a list was capped
 
 
 @dataclass
@@ -70,6 +79,7 @@ class RefComparison:
     merge_base: git.Commit
     changes: list[FileChange] = field(default_factory=list)
     truncated_reasons: list[str] = field(default_factory=list)
+    deadline: float = float("inf")  # on the `clock` given to `open_comparison`
 
 
 def _echo(value: str) -> str:
@@ -297,6 +307,7 @@ def open_comparison(
             merge_base=merge_base,
             changes=_pair_renames(walk.changes),
             truncated_reasons=walk.reasons,
+            deadline=deadline,
         )
     except CompareError:
         raise
@@ -308,3 +319,106 @@ def open_comparison(
     finally:
         if repo is not None:
             repo.close()
+
+
+class _Detail:
+    """C5's per-call budgets for `symbol_detail`. Once a byte, symbol or deadline limit
+    is hit, every later file that would need parsing gets `symbols_skipped: "limit"`."""
+
+    def __init__(self, deadline: float, clock: Callable[[], float]):
+        self.deadline = deadline
+        self.clock = clock
+        self.bytes = 0
+        self.symbols = 0
+        self.reasons: set[str] = set()
+        self.stopped = False
+
+    def _limit(self, reason: str) -> str:
+        self.reasons.add(reason)
+        self.stopped = True
+        return "limit"
+
+    def skip_reason(self, change: FileChange) -> str | None:
+        """Why `change` gets no symbols, before any blob data is read; `None` to parse it."""
+        if change.kind != "blob":
+            return change.kind  # "symlink" or "submodule"
+        if change.language is None:
+            return "unsupported_language"
+        if change.status == "renamed":
+            return None
+        sizes = [blob.size for blob in (change.base_blob, change.head_blob) if blob is not None]
+        if any(size > _COMPARE_MAX_FILE_BYTES for size in sizes):
+            return "too_large"
+        if self.stopped:
+            return "limit"
+        if self.clock() >= self.deadline:
+            return self._limit("deadline")
+        if self.bytes + sum(sizes) > _COMPARE_MAX_TOTAL_BYTES:
+            return self._limit("bytes")
+        if self.symbols >= _COMPARE_MAX_SYMBOLS:
+            return self._limit("symbols")
+        self.bytes += sum(sizes)
+        return None
+
+    def parse(self, change: FileChange) -> None:
+        """Fill `change.symbols` (or `symbols_skipped`) from both sides' blobs."""
+        sides = []
+        for blob in (change.base_blob, change.head_blob):
+            if blob is None or blob.mode == _SYMLINK_MODE:
+                # A symlink side of a link-to-file change: its blob is link text, not source.
+                sides.append([])
+                continue
+            data = blob.data_stream.read()
+            if b"\0" in data[:_BINARY_SNIFF_BYTES]:
+                change.symbols_skipped = "binary"
+                return
+            try:
+                sides.append(extract_symbols(change.path, decode_source(data)))
+            except Exception:
+                log.debug("compare_branches: extractor failed on %s", change.path, exc_info=True)
+                change.symbols_skipped = "parse_error"
+                return
+        lists = dict(zip(("added", "removed", "changed"), diff_symbols(*sides)))
+        for name, entries in lists.items():
+            keep = min(_COMPARE_MAX_SYMBOLS_PER_LIST, _COMPARE_MAX_SYMBOLS - self.symbols)
+            if len(entries) > keep:
+                lists[name] = entries[:keep]
+                change.symbols_truncated = True
+                self.reasons.add("symbols")
+            self.symbols += len(lists[name])
+        change.symbols = lists
+
+
+def symbol_detail(comparison: RefComparison, *, clock: Callable[[], float] = time.monotonic) -> list[FileChange]:
+    """Detail the changes `files.results` lists, and return them in listing order.
+
+    Code-language files come first (path order), then the rest (path order), up to
+    `_COMPARE_MAX_FILES` in all; only these get `language`, `symbols` and
+    `symbols_skipped` filled. The changes past the cap are left as they are. The C5
+    reasons hit here join `comparison.truncated_reasons`, in the spec's order.
+    Must run inside the `open_comparison` block, while the blobs are readable."""
+    for change in comparison.changes:
+        change.language = language_for(change.path) if change.kind == "blob" else None
+    code = [c for c in comparison.changes if c.language is not None]
+    rest = [c for c in comparison.changes if c.language is None]
+    listed = (code + rest)[:_COMPARE_MAX_FILES]
+    budget = _Detail(comparison.deadline, clock)
+    if len(comparison.changes) > _COMPARE_MAX_FILES:
+        budget.reasons.add("files")
+    try:
+        for change in listed:
+            change.symbols_skipped = budget.skip_reason(change)
+            if change.symbols_skipped is not None:
+                continue
+            if change.status == "renamed":
+                change.symbols = {"added": [], "removed": [], "changed": []}  # identical content, never read
+            else:
+                budget.parse(change)
+    except (BadName, BadObject, ValueError) as exc:  # extractor failures are caught in `parse`
+        raise CompareError(
+            f"git object missing while comparing {_echo(comparison.base_ref)} and {_echo(comparison.head_ref)}; "
+            "the clone may be partial or shallow"
+        ) from exc
+    reasons = set(comparison.truncated_reasons) | budget.reasons
+    comparison.truncated_reasons = [r for r in _REASON_ORDER if r in reasons]
+    return listed

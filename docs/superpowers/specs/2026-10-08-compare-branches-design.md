@@ -343,7 +343,13 @@ named like `describe_node`'s:
   files.
 - **Code files get the slots first** (C2). An `unsupported_language` file costs
   no bytes or symbols, but it would cost a listed slot, so it is listed only
-  after every code file and only while slots remain.
+  after every code file and only while slots remain. Symlinks and submodules
+  have `language: null` and are listed among the other files.
+- **`limit` is sticky.** Once the byte budget, the symbol budget or the
+  deadline is hit, every later file that would need parsing gets
+  `symbols_skipped: "limit"`, even one small enough to fit. The file whose
+  lists would overrun `_COMPARE_MAX_SYMBOLS` keeps the entries that fit and is
+  marked `symbols_truncated`.
 - **Binary files.** A NUL byte in the first 8,000 bytes of either side makes
   the file `symbols_skipped: "binary"`, which is git's own heuristic. Its
   bytes still count toward the total.
@@ -383,6 +389,10 @@ named like `describe_node`'s:
   `index_paths` does per file.
 - **An exact rename** has identical content, so it gets empty symbol lists
   without being parsed.
+- **A symlink replaced by a file** is a `modified` blob whose base side is
+  link text. That side counts as no symbols, so the file's symbols are all
+  `added`. A file replaced by a symlink is listed with `symbols_skipped:
+  "symlink"`.
 
 ### C7: errors
 
@@ -398,7 +408,7 @@ cut to 100 characters and quoted, as `tools._echo` does. The messages:
 | `repo.commit(ref)` raises anything; the result is the all-zero SHA; or its tree can't be read | `branch_b '<ref>' is not a branch, tag or commit in repository '<id>'; refs must exist locally (DevGraph never fetches)`. If the repository is shallow (a `shallow` file in `repo.common_dir`), add `; this is a shallow clone, so older commits may be missing: git fetch --unshallow`. This also covers a ref naming a tree or blob, which GitPython reports as a `ValueError` when it peels to a commit. |
 | No merge base (`merge_base` returns `[]`) | `'<a>' and '<b>' share no history in repository '<id>'`, plus the same shallow-clone sentence when the repository is shallow. |
 | `merge-base` killed by the deadline (`GitCommandError` whose stderr starts with `Timeout:`) | `compare_branches timed out finding the merge base of '<a>' and '<b>'` |
-| An object missing mid-walk (`BadObject`, `ValueError` from `cat-file`, as in a partial clone) | `git object missing while comparing '<a>' and '<b>'; the clone may be partial or shallow` |
+| An object missing mid-walk or while reading a blob for symbols (`BadName`, `BadObject`, `ValueError` from `cat-file`, as in a partial clone) | `git object missing while comparing '<a>' and '<b>'; the clone may be partial or shallow` |
 | Any other `GitCommandError` (including `GitCommandNotFound`) or `OSError`, from `merge-base` or anywhere in the comparison | `git failed while comparing '<a>' and '<b>' in repository '<id>': <exception class name>`. This covers a missing `git` binary or a `safe.directory` refusal. The exception's own text (which may hold paths) is logged, not returned. |
 
 - **Errors are raised by the git module itself.** It raises its own

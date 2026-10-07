@@ -1,5 +1,6 @@
 """`compare.open_comparison`: refs, merge base and the changed-file list, on real temporary repositories."""
 
+import gc
 import os
 import re
 import sys
@@ -7,9 +8,12 @@ from pathlib import Path
 
 import git as git_pkg
 import pytest
+from gitdb.exc import BadObject
 
+from devgraph.indexer import symbols
+from devgraph.indexer.dispatch import _CODE_ROUTES
 from devgraph.indexer.git_history import compare
-from devgraph.indexer.git_history.compare import CompareError, open_comparison
+from devgraph.indexer.git_history.compare import CompareError, open_comparison, symbol_detail
 from tests.indexer.git_compare_helpers import (
     commit_files,
     git,
@@ -193,10 +197,16 @@ def test_symlink_and_submodule_are_listed_not_opened(tmp_path, monkeypatch):
 
 
 def test_only_cat_file_and_merge_base_run(tmp_path, monkeypatch):
-    repo = two_branch_repo(tmp_path, {"a.py": "a = 1\n", "d/x.py": "x\n"}, {"a.py": "a = 2\n", "d/y.py": "y\n"})
+    repo = two_branch_repo(
+        tmp_path,
+        {"a.py": "def a():\n    return 1\n", "d/x.py": "x\n"},
+        {"a.py": "def a():\n    return 2\n", "d/y.py": "y\n"},
+    )
     calls = record_git_commands(monkeypatch)
-    changes, _ = changes_of(repo)
-    assert changes == [("a.py", "modified"), ("d/y.py", "added")]
+    with open_comparison(repo, REPO_ID, "main", "feature") as cmp:
+        detailed = symbol_detail(cmp)
+    assert [(c.path, c.status) for c in detailed] == [("a.py", "modified"), ("d/y.py", "added")]
+    assert [e["name"] for e in detailed[0].symbols["changed"]] == ["a"]
     assert {subcommand(c) for c in calls} <= {"cat-file", "merge-base"}
     merge_bases = [c for c in calls if subcommand(c) == "merge-base"]
     assert len(merge_bases) == 1
@@ -319,6 +329,7 @@ def test_cat_file_failure(tmp_path, monkeypatch):
             raise OSError("cat-file died")
         return real_stream(self, binsha)
 
+    gc.collect()  # earlier tests' unreachable Repos would otherwise close (via __del__) mid-test
     closed = []
     real_close = git_pkg.Repo.close
 
@@ -336,6 +347,7 @@ def test_cat_file_failure(tmp_path, monkeypatch):
 
 def test_repo_is_closed_after_the_block(tmp_path, monkeypatch):
     repo = two_branch_repo(tmp_path, {"a.py": "a = 1\n"}, {"b.py": "b = 1\n"})
+    gc.collect()  # earlier tests' unreachable Repos would otherwise close (via __del__) mid-test
     closed = []
     real_close = git_pkg.Repo.close
     monkeypatch.setattr(git_pkg.Repo, "close", lambda self: (closed.append(self), real_close(self))[1])
@@ -421,3 +433,568 @@ def test_diff_entry_cap_and_deadline(tmp_path, monkeypatch):
         assert len(changes) == 5 and cmp.truncated_reasons == []
         index = next(i for i, c in enumerate(calls) if subcommand(c) == "merge-base")
         assert calls.kwargs[index]["kill_after_timeout"] == 1
+
+
+# --- Task 2: symbols at both refs (C3, C5 per-file caps, C6) ---
+
+
+def detail(repo, base="main", head="feature", clock=None, after_open=None):
+    """`symbol_detail` over `open_comparison`: ({path: FileChange}, [paths in listing order], comparison)."""
+    kwargs = {} if clock is None else {"clock": clock}
+    with open_comparison(repo, REPO_ID, base, head, **kwargs) as cmp:
+        if after_open is not None:
+            after_open()
+        detailed = symbol_detail(cmp, **kwargs)
+    return {c.path: c for c in detailed}, [c.path for c in detailed], cmp
+
+
+def triples(symbols):
+    return {name: {(e["kind"], e["container"], e["name"]) for e in entries} for name, entries in symbols.items()}
+
+
+def line_of(text, needle, nth=0):
+    return [i for i, line in enumerate(text.split("\n"), 1) if needle in line][nth]
+
+
+F, C = "Function", "Class"
+
+PY_BASE = """def keep():
+    return 0
+
+def gone():
+    return 1
+
+class A:
+    def __init__(self):
+        self.x = 1
+
+class B:
+    def __init__(self):
+        self.x = 1
+"""
+PY_HEAD = """class A:
+    def __init__(self):
+        self.x = 1
+
+class B:
+    def __init__(self):
+        self.x = 2
+
+def fresh():
+    return 3
+
+def keep():
+    return 0
+"""
+TS_BASE = """export function keep(): number {
+  return 0;
+}
+
+function gone(): number {
+  return 1;
+}
+
+class Box {
+  size(): number {
+    return 1;
+  }
+}
+"""
+TS_HEAD = """function fresh(): number {
+  return 3;
+}
+
+class Box {
+  size(): number {
+    return 2;
+  }
+}
+
+export function keep(): number {
+  return 0;
+}
+"""
+CS_BASE = """namespace Demo {
+  public class Svc {
+    public int Keep() {
+      return 0;
+    }
+    public int Run(int a) {
+      return a;
+    }
+    public int Run(string b) {
+      return 1;
+    }
+    public void Gone() {
+    }
+  }
+}
+"""
+CS_HEAD = """namespace Demo {
+  public class Svc {
+    public int Run(int a) {
+      return a;
+    }
+    public int Run(string b) {
+      return 2;
+    }
+    public int Keep() {
+      return 0;
+    }
+    public void Fresh() {
+    }
+  }
+}
+"""
+CPP_BASE = """class Shape {
+public:
+  int area() {
+    return 1;
+  }
+};
+
+int keep() {
+  return 0;
+}
+
+int gone() {
+  return 1;
+}
+"""
+CPP_HEAD = """int fresh() {
+  return 3;
+}
+
+class Shape {
+public:
+  int area() {
+    return 2;
+  }
+};
+
+int keep() {
+  return 0;
+}
+"""
+JAVA_BASE = """public class Main {
+  static int keep() {
+    return 0;
+  }
+  static int gone() {
+    return 1;
+  }
+  static int edit() {
+    return 1;
+  }
+}
+"""
+JAVA_HEAD = """public class Main {
+  static int edit() {
+    return 2;
+  }
+  static int keep() {
+    return 0;
+  }
+  static int fresh() {
+    return 3;
+  }
+}
+"""
+RS_BASE = """struct Point { x: i32 }
+
+impl Point {
+    fn norm(&self) -> i32 {
+        self.x
+    }
+}
+
+fn keep() -> i32 {
+    0
+}
+
+fn gone() -> i32 {
+    1
+}
+"""
+RS_HEAD = """fn keep() -> i32 {
+    0
+}
+
+struct Point { x: i32 }
+
+impl Point {
+    fn norm(&self) -> i32 {
+        self.x * 2
+    }
+}
+
+fn fresh() -> i32 {
+    3
+}
+"""
+KT_BASE = """class App {
+    fun run(): Int {
+        return 1
+    }
+}
+
+fun keep(): Int {
+    return 0
+}
+
+fun gone(): Int {
+    return 1
+}
+"""
+KT_HEAD = """fun keep(): Int {
+    return 0
+}
+
+class App {
+    fun run(): Int {
+        return 2
+    }
+}
+
+fun fresh(): Int {
+    return 3
+}
+"""
+GO_BASE = """package main
+
+type A struct{}
+
+func (a A) String() string {
+\treturn "a"
+}
+
+type B struct{}
+
+func (b B) String() string {
+\treturn "b"
+}
+
+func keep() int {
+\treturn 0
+}
+
+func gone() int {
+\treturn 1
+}
+"""
+GO_HEAD = """package main
+
+func keep() int {
+\treturn 0
+}
+
+type A struct{}
+
+func (a A) String() string {
+\treturn "a"
+}
+
+type B struct{}
+
+func (b B) String() string {
+\treturn "bb"
+}
+
+func fresh() int {
+\treturn 3
+}
+"""
+
+# (route, path, base text, head text, expected triples, (name, nth line match in head) of the one changed overload)
+FAMILIES = [
+    (
+        "py",
+        "app.py",
+        PY_BASE,
+        PY_HEAD,
+        {"added": {(F, None, "fresh")}, "removed": {(F, None, "gone")}, "changed": {(C, None, "B"), (F, "B", "__init__")}},
+        ("__init__", "def __init__", 1),
+    ),
+    (
+        "js",
+        "web/util.ts",
+        TS_BASE,
+        TS_HEAD,
+        {"added": {(F, None, "fresh")}, "removed": {(F, None, "gone")}, "changed": {(C, None, "Box"), (F, "Box", "size")}},
+        None,
+    ),
+    (
+        "cs",
+        "Svc.cs",
+        CS_BASE,
+        CS_HEAD,
+        {"added": {(F, "Svc", "Fresh")}, "removed": {(F, "Svc", "Gone")}, "changed": {(C, None, "Svc"), (F, "Svc", "Run")}},
+        ("Run", "public int Run", 1),
+    ),
+    (
+        "cpp",
+        "geo.cpp",
+        CPP_BASE,
+        CPP_HEAD,
+        {"added": {(F, None, "fresh")}, "removed": {(F, None, "gone")}, "changed": {(C, None, "Shape"), (F, "Shape", "area")}},
+        None,
+    ),
+    (
+        "java",
+        "src/Main.java",
+        JAVA_BASE,
+        JAVA_HEAD,
+        {"added": {(F, "Main", "fresh")}, "removed": {(F, "Main", "gone")}, "changed": {(C, None, "Main"), (F, "Main", "edit")}},
+        None,
+    ),
+    (
+        "rs",
+        "lib.rs",
+        RS_BASE,
+        RS_HEAD,
+        {"added": {(F, None, "fresh")}, "removed": {(F, None, "gone")}, "changed": {(F, None, "norm")}},
+        None,
+    ),
+    (
+        "kt",
+        "App.kt",
+        KT_BASE,
+        KT_HEAD,
+        {"added": {(F, None, "fresh")}, "removed": {(F, None, "gone")}, "changed": {(C, None, "App"), (F, "App", "run")}},
+        None,
+    ),
+    (
+        "go",
+        "main.go",
+        GO_BASE,
+        GO_HEAD,
+        {"added": {(F, None, "fresh")}, "removed": {(F, None, "gone")}, "changed": {(F, None, "String")}},
+        ("String", ") String()", 1),
+    ),
+]
+
+
+def test_language_families_cover_every_code_route():
+    assert {case[0] for case in FAMILIES} == set(_CODE_ROUTES.values())
+
+
+@pytest.mark.parametrize(("route", "path", "base", "head", "expected", "overload"), FAMILIES, ids=[c[0] for c in FAMILIES])
+def test_symbols_per_language_family(tmp_path, route, path, base, head, expected, overload):
+    repo = two_branch_repo(tmp_path, {path: base}, {path: head})
+    files, _, cmp = detail(repo)
+    change = files[path]
+    assert change.language == route
+    assert change.symbols_skipped is None
+    assert triples(change.symbols) == expected
+    (gone,) = change.symbols["removed"]
+    assert gone["start_line"] == line_of(base, gone["name"] + "(")
+    if overload is not None:
+        name, needle, nth = overload
+        (entry,) = [e for e in change.symbols["changed"] if e["name"] == name]
+        assert entry["start_line"] == line_of(head, needle, nth)  # the second same-named symbol, not the first
+        assert entry["old_start_line"] == line_of(base, needle, nth)
+    assert cmp.truncated_reasons == []
+
+
+def test_crlf_only_change_is_not_changed(tmp_path):
+    text = "def f():\n    return 1\n\nclass K:\n    def m(self):\n        pass\n"
+    repo = two_branch_repo(tmp_path, {"app.py": text.encode()}, {"app.py": text.replace("\n", "\r\n").encode()})
+    files, _, _ = detail(repo)
+    assert files["app.py"].status == "modified"
+    assert files["app.py"].symbols == {"added": [], "removed": [], "changed": []}
+
+
+def test_changed_entry_has_old_lines(tmp_path):
+    repo = two_branch_repo(
+        tmp_path,
+        {"app.py": "def f():\n    return 1\n"},
+        {"app.py": "x = 1\n" * 5 + "def f():\n    return 2\n"},
+    )
+    files, _, _ = detail(repo)
+    assert files["app.py"].symbols["changed"] == [
+        {"kind": F, "name": "f", "container": None, "start_line": 6, "end_line": 7, "old_start_line": 1, "old_end_line": 2}
+    ]
+
+
+def test_class_with_changed_method_is_changed(tmp_path):
+    repo = two_branch_repo(
+        tmp_path,
+        {"app.py": "class K:\n    def m(self):\n        return 1\n"},
+        {"app.py": "class K:\n    def m(self):\n        return 2\n"},
+    )
+    files, _, _ = detail(repo)
+    assert triples(files["app.py"].symbols) == {"added": set(), "removed": set(), "changed": {(C, None, "K"), (F, "K", "m")}}
+
+
+def test_whole_file_added_and_removed(tmp_path):
+    src = "def f():\n    pass\n\nclass K:\n    def m(self):\n        pass\n"
+    all_three = {(F, None, "f"), (C, None, "K"), (F, "K", "m")}
+    repo = two_branch_repo(tmp_path, {"old.py": src}, {"old.py": None, "new.py": src + "\nX = 1\n"})
+    files, _, _ = detail(repo)
+    assert files["new.py"].status == "added"
+    assert triples(files["new.py"].symbols) == {"added": all_three, "removed": set(), "changed": set()}
+    assert files["old.py"].status == "removed"
+    assert triples(files["old.py"].symbols) == {"added": set(), "removed": all_three, "changed": set()}
+
+
+@posix_only
+def test_unsupported_and_special_files(tmp_path, monkeypatch):
+    moved = "def kept():\n    return 1\n"
+    repo = two_branch_repo(
+        tmp_path,
+        {"x/old.py": moved, "a.py": "a = 1\n"},
+        {"README.md": "# hi\n", "notes.c": "int main() { return 0; }\n", "x/old.py": None, "y/new.py": moved},
+    )
+    git(repo, "checkout", "-q", "feature")
+    os.symlink("a.py", Path(repo, "link.py"))
+    git(repo, "add", "link.py")
+    git(repo, "update-index", "--add", "--cacheinfo", "160000,1234567890abcdef1234567890abcdef12345678,vendor/sub")
+    git(repo, "commit", "-q", "-m", "link and submodule")
+    git(repo, "checkout", "-q", "main")
+    moved_blob = git(repo, "rev-parse", "feature:y/new.py")
+    streamed, _ = record_object_reads(monkeypatch)
+    files, _, _ = detail(repo)
+    skipped = {path: (c.symbols, c.symbols_skipped) for path, c in files.items()}
+    assert skipped == {
+        "README.md": (None, "unsupported_language"),
+        "notes.c": (None, "unsupported_language"),
+        "link.py": (None, "symlink"),
+        "vendor/sub": (None, "submodule"),
+        "y/new.py": ({"added": [], "removed": [], "changed": []}, None),
+    }
+    assert files["README.md"].language is None and files["y/new.py"].language == "py"
+    assert moved_blob not in streamed
+
+
+def test_too_large_and_binary(tmp_path, monkeypatch):
+    big = b"x = 1\n" + b"#" * (compare._COMPARE_MAX_FILE_BYTES - 6 + 1)
+    repo = two_branch_repo(tmp_path, {"a.py": "a = 1\n"}, {"big.py": big, "bin.py": b"x = 1\n\x00\n"})
+    big_blob = git(repo, "rev-parse", "feature:big.py")
+    streamed, infoed = record_object_reads(monkeypatch)
+    files, _, cmp = detail(repo)
+    assert (files["big.py"].symbols, files["big.py"].symbols_skipped) == (None, "too_large")
+    assert big_blob in infoed and big_blob not in streamed
+    assert (files["bin.py"].symbols, files["bin.py"].symbols_skipped) == (None, "binary")
+    assert cmp.truncated_reasons == []
+
+
+def test_parse_error_is_per_file(tmp_path, monkeypatch):
+    repo = two_branch_repo(tmp_path, {"a.py": "a = 1\n"}, {"m.go": "package m\n", "p.py": "def f():\n    pass\n"})
+
+    def boom(source, path):
+        raise RuntimeError("parser exploded")
+
+    monkeypatch.setitem(symbols.EXTRACTORS, "go", boom)
+    files, _, _ = detail(repo)
+    assert (files["m.go"].symbols, files["m.go"].symbols_skipped) == (None, "parse_error")
+    assert triples(files["p.py"].symbols)["added"] == {(F, None, "f")}
+
+
+def five_functions(prefix):
+    return "".join(f"def {prefix}{i}():\n    pass\n" for i in range(5))
+
+
+def test_symbol_caps(tmp_path, monkeypatch):
+    repo = two_branch_repo(tmp_path, {"a.py": "a = 1\n"}, {"p.py": five_functions("p"), "q.py": five_functions("q")})
+    monkeypatch.setattr(compare, "_COMPARE_MAX_SYMBOLS_PER_LIST", 2)
+    files, _, cmp = detail(repo)
+    assert [e["name"] for e in files["p.py"].symbols["added"]] == ["p0", "p1"]
+    assert files["p.py"].symbols_truncated is True
+    assert cmp.truncated_reasons == ["symbols"]
+    monkeypatch.undo()
+
+    monkeypatch.setattr(compare, "_COMPARE_MAX_SYMBOLS", 3)
+    files, _, cmp = detail(repo)
+    assert len(files["p.py"].symbols["added"]) == 3 and files["p.py"].symbols_truncated is True
+    assert (files["q.py"].symbols, files["q.py"].symbols_skipped) == (None, "limit")
+    assert cmp.truncated_reasons == ["symbols"]
+
+
+def test_byte_budget_and_deadline(tmp_path, monkeypatch):
+    repo = two_branch_repo(tmp_path, {"a.py": "a = 1\n"}, {"p.py": five_functions("p"), "q.py": five_functions("q")})
+    monkeypatch.setattr(compare, "_COMPARE_MAX_TOTAL_BYTES", len(five_functions("p")) + 1)
+    files, _, cmp = detail(repo)
+    assert files["p.py"].symbols is not None
+    assert (files["q.py"].symbols, files["q.py"].symbols_skipped) == (None, "limit")
+    assert cmp.truncated_reasons == ["bytes"]
+    monkeypatch.undo()
+
+    now = [0.0]
+
+    def expire():
+        now[0] = compare._COMPARE_DEADLINE_S + 1
+
+    files, _, cmp = detail(repo, clock=lambda: now[0], after_open=expire)
+    assert {path: c.symbols_skipped for path, c in files.items()} == {"p.py": "limit", "q.py": "limit"}
+    assert cmp.truncated_reasons == ["deadline"]
+
+
+def test_file_cap(tmp_path, monkeypatch):
+    repo = two_branch_repo(tmp_path, {"a.py": "a = 1\n"}, {f"n{i}.py": f"n = {i}\n" for i in range(4)})
+    monkeypatch.setattr(compare, "_COMPARE_MAX_FILES", 2)
+    _, order, cmp = detail(repo)
+    assert order == ["n0.py", "n1.py"]
+    assert len(cmp.changes) == 4
+    assert cmp.truncated_reasons == ["files"]
+
+
+def test_code_files_get_the_slots_first(tmp_path, monkeypatch):
+    repo = two_branch_repo(
+        tmp_path,
+        {"z.txt": "z\n"},
+        {"a.md": "# a\n", "b.json": "{}\n", "c.py": "c = 1\n", "d.go": "package d\n"},
+    )
+    monkeypatch.setattr(compare, "_COMPARE_MAX_FILES", 2)
+    _, order, cmp = detail(repo)
+    assert order == ["c.py", "d.go"]
+    assert len(cmp.changes) == 4
+    assert cmp.truncated_reasons == ["files"]
+    monkeypatch.setattr(compare, "_COMPARE_MAX_FILES", 3)
+    files, order, _ = detail(repo)
+    assert order == ["c.py", "d.go", "a.md"]
+    assert files["a.md"].symbols_skipped == "unsupported_language"
+
+
+def test_truncated_reasons_keep_the_spec_order(tmp_path, monkeypatch):
+    repo = two_branch_repo(tmp_path, {"a.py": "a = 1\n"}, {f"n{i}.py": five_functions(f"n{i}_") for i in range(5)})
+    monkeypatch.setattr(compare, "_COMPARE_MAX_DIFF_ENTRIES", 4)
+    monkeypatch.setattr(compare, "_COMPARE_MAX_FILES", 3)
+    monkeypatch.setattr(compare, "_COMPARE_MAX_SYMBOLS_PER_LIST", 2)
+    monkeypatch.setattr(compare, "_COMPARE_MAX_TOTAL_BYTES", 2 * len(five_functions("n0_")) + 1)
+    _, order, cmp = detail(repo)
+    assert len(order) == 3
+    assert cmp.truncated_reasons == ["diff_entries", "files", "bytes", "symbols"]
+
+
+@pytest.mark.parametrize("error", [BadObject(b"\x00" * 20), ValueError("missing")], ids=["BadObject", "ValueError"])
+@pytest.mark.parametrize("method", ["stream", "info"])
+def test_missing_blob_is_a_compare_error(tmp_path, monkeypatch, method, error):
+    repo = two_branch_repo(tmp_path, {"a.py": "a = 1\n"}, {"a.py": "a = 2\n"})
+    blob = git(repo, "rev-parse", "feature:a.py")
+    real = getattr(git_pkg.db.GitCmdObjectDB, method)
+
+    def fail(self, binsha):
+        if binsha.hex() == blob:
+            raise error
+        return real(self, binsha)
+
+    monkeypatch.setattr(git_pkg.db.GitCmdObjectDB, method, fail)
+    with pytest.raises(CompareError) as err:
+        detail(repo)
+    assert str(err.value) == "git object missing while comparing 'main' and 'feature'; the clone may be partial or shallow"
+
+
+@posix_only
+def test_symlink_side_of_a_modified_file_has_no_symbols(tmp_path):
+    repo = two_branch_repo(tmp_path, {"t.py": "def target():\n    pass\n"}, {})
+    git(repo, "checkout", "-q", "feature")
+    os.symlink("class Target: pass", Path(repo, "s.py"))  # link text that would parse as a class
+    git(repo, "add", "s.py")
+    git(repo, "commit", "-q", "-m", "link")
+    git(repo, "checkout", "-q", "-b", "real")
+    Path(repo, "s.py").unlink()
+    commit_files(repo, {"s.py": "def own():\n    pass\n"}, "file replaces link")
+    git(repo, "checkout", "-q", "main")
+    files, _, _ = detail(repo, base="feature", head="real")
+    assert files["s.py"].status == "modified" and files["s.py"].kind == "blob"
+    assert triples(files["s.py"].symbols) == {"added": {(F, None, "own")}, "removed": set(), "changed": set()}
