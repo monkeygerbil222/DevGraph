@@ -44,6 +44,14 @@ and the node is only removed once no file claims it. See
   `(label, name, file)` for the source, and only targets stay bare-name
   (`CALLS`, `EXTENDS`, `MENTIONS` targets). Same-named functions or classes
   in two files keep their own edges.
+- One exception: a Rust `impl` or a Go method defined in another file than
+  its type keeps a bare-name source, because the type isn't a node of the
+  file being parsed. Its edges come out of every same-named type. The
+  file's Module records those names in `name_ref_sources`, so a re-index
+  still retracts the edges it no longer writes.
+- A route's handler stub is its own file-less `Function`. It never claims
+  a file-scoped `Function` of the same name, so the `Endpoint`
+  `IMPLEMENTS` both the stub and every real function of that name.
 - Every extracted edge carries a sorted `origins` list of the files that
   wrote it. A file's re-index removes itself from `origins` of the edges it
   no longer writes and deletes an edge when the list is empty. An edge with
