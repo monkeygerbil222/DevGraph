@@ -19,6 +19,7 @@ from neo4j.exceptions import ServiceUnavailable, SessionExpired, TransientError
 from neo4j.graph import Node, Relationship
 
 from devgraph.graph.schema import (
+    FILE_SCOPED_LABELS,
     RELATIONSHIP_TYPES,
     RESERVED_NODE_PROPERTIES,
     constraint_statements,
@@ -563,23 +564,24 @@ _ADD_ORIGIN = (
 )
 
 
+def _end_match(var: str, label: str, end: str, pinned: bool) -> str:
+    """The MATCH for one end of an edge row. A pinned end of a file-scoped
+    label names its (repo_id, name, file) unique index: with the
+    (repo_id, name) lookup index beside it, the planner can otherwise pick a
+    full scan of that one on a near-empty database."""
+    if not pinned:
+        return f"MATCH ({var}:{label} {{repo_id: row.repo_id, name: row.{end}_name}}) "
+    hint = f"USING INDEX {var}:{label}(repo_id, name, file) " if label in FILE_SCOPED_LABELS else ""
+    return f"MATCH ({var}:{label} {{repo_id: row.repo_id, name: row.{end}_name, file: row.{end}_file}}) " + hint
+
+
 def _upsert_relationships_tx(tx, rels: list[dict[str, Any]]) -> None:
     for (from_label, rel_type, to_label, has_from_file, has_to_file), rows in _group_rels_by_triple(rels).items():
-        from_match = (
-            "{repo_id: row.repo_id, name: row.from_name, file: row.from_file}"
-            if has_from_file
-            else "{repo_id: row.repo_id, name: row.from_name}"
-        )
-        to_match = (
-            "{repo_id: row.repo_id, name: row.to_name, file: row.to_file}"
-            if has_to_file
-            else "{repo_id: row.repo_id, name: row.to_name}"
-        )
         tx.run(
-            f"UNWIND $rows AS row "
-            f"MATCH (a:{from_label} {from_match}) "
-            f"MATCH (b:{to_label} {to_match}) "
-            f"MERGE (a)-[r:{rel_type}]->(b) "
+            "UNWIND $rows AS row "
+            + _end_match("a", from_label, "from", has_from_file)
+            + _end_match("b", to_label, "to", has_to_file)
+            + f"MERGE (a)-[r:{rel_type}]->(b) "
             "SET r += row.properties " + _ADD_ORIGIN,
             rows=rows,
         )

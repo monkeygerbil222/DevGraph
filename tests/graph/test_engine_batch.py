@@ -260,3 +260,27 @@ class TestNameLookupIndexes:
         ops = list(operators(summary.plan))
         assert any(op.startswith("NodeIndexSeek") for op in ops), ops
         assert not any(op.startswith("NodeByLabelScan") for op in ops), ops
+
+    def test_a_pinned_end_is_hinted_onto_its_unique_index(self):
+        """With a second (repo_id, name) index the planner can pick a full
+        scan of it for a pinned end on a near-empty database (seen in CI: a
+        5,000-module relink at 8 s instead of 0.5 s), so the pinned end of a
+        file-scoped label names the (repo_id, name, file) index."""
+        from devgraph.graph.engine import _upsert_relationships_tx
+
+        class Tx:
+            queries = []
+
+            def run(self, query, **params):
+                self.queries.append(query)
+
+        rel = {"repo_id": "r", "rel_type": "CALLS", "properties": {}, "origin": "a.py"}
+        _upsert_relationships_tx(Tx(), [
+            rel | {"from_label": "Function", "from_name": "f", "from_file": "a.py",
+                   "to_label": "Function", "to_name": "g", "to_file": "b.py"},
+            rel | {"from_label": "Module", "from_name": "a.py", "to_label": "Function", "to_name": "g"},
+        ])
+        pinned, bare = Tx.queries
+        assert "USING INDEX a:Function(repo_id, name, file)" in pinned
+        assert "USING INDEX b:Function(repo_id, name, file)" in pinned
+        assert "USING INDEX" not in bare
