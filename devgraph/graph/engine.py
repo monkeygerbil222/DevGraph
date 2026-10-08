@@ -565,13 +565,17 @@ _ADD_ORIGIN = (
 
 
 def _end_match(var: str, label: str, end: str, pinned: bool) -> str:
-    """The MATCH for one end of an edge row. A pinned end of a file-scoped
-    label names its (repo_id, name, file) unique index: with the
-    (repo_id, name) lookup index beside it, the planner can otherwise pick a
-    full scan of that one on a near-empty database."""
+    """The MATCH for one end of an edge row. An end of a file-scoped label
+    is hinted to seek its index: the (repo_id, name, file) unique one when
+    pinned, the (repo_id, name) lookup one when not. A plan made from index
+    statistics sampled while the label was near-empty estimates 0 rows, and
+    can then scan a whole index per row (a plain USING INDEX allows that
+    scan) after the label has filled; in CI that made a 5,000-module relink
+    take 20 s instead of under 1 s."""
+    keys = "repo_id, name, file" if pinned else "repo_id, name"
+    hint = f"USING INDEX SEEK {var}:{label}({keys}) " if label in FILE_SCOPED_LABELS else ""
     if not pinned:
-        return f"MATCH ({var}:{label} {{repo_id: row.repo_id, name: row.{end}_name}}) "
-    hint = f"USING INDEX {var}:{label}(repo_id, name, file) " if label in FILE_SCOPED_LABELS else ""
+        return f"MATCH ({var}:{label} {{repo_id: row.repo_id, name: row.{end}_name}}) " + hint
     return f"MATCH ({var}:{label} {{repo_id: row.repo_id, name: row.{end}_name, file: row.{end}_file}}) " + hint
 
 
@@ -1259,11 +1263,12 @@ class GraphEngine:
         `name_refs` (see indexer/common.py `name_ref_properties`) target, or
         come from an unpinned source, named one of `names`, with just those
         entries. The short `name_ref_targets`/`name_ref_sources` lists filter
-        the Modules before any entry is split."""
+        the Modules before any entry is split. The Module index is hinted to
+        seek, for the reason _end_match gives."""
         with self._driver.session() as session:
             result = _retry_transient(
                 session.run,
-                "MATCH (m:Module {repo_id: $repo_id}) "
+                "MATCH (m:Module {repo_id: $repo_id}) USING INDEX SEEK m:Module(repo_id, name) "
                 "WHERE NOT m.name IN $skip "
                 "  AND (any(t IN m.name_ref_targets WHERE t IN $names) "
                 "       OR any(s IN m.name_ref_sources WHERE s IN $names)) "
