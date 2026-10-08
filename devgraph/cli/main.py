@@ -699,8 +699,8 @@ def status() -> None:
 
 
 def _print_graph_index(engine: GraphEngine) -> None:
-    """The `status` "Graph Index" section: active repositories whose index
-    predates the current format and so await an automatic rescan."""
+    """The `status` "Graph Index" section: active, indexed repositories whose
+    index predates the current format and so await an automatic rescan."""
     from devgraph.indexer.dispatch import index_outdated
 
     console.print("[bold]Graph Index[/bold]")
@@ -710,7 +710,8 @@ def _print_graph_index(engine: GraphEngine) -> None:
             repos = [r for r in registry.list_repos() if r.active]
         finally:
             registry.close()
-        pending = [r for r in repos if index_outdated(engine, r.repo_id)]
+        # A never-indexed repo's first scan (add/rescan) stamps the format.
+        pending = [r for r in repos if r.last_indexed and index_outdated(engine, r.repo_id)]
     except Exception as e:
         console.print(f"  [red]Error:[/red] {escape(str(e))}")
         return

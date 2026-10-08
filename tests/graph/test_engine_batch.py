@@ -228,3 +228,59 @@ class TestBatchingReducesRoundTrips:
             assert call_count["n"] == 5
         finally:
             engine.delete_repository(repo_id)
+
+
+class TestNameLookupIndexes:
+    """Bare-name edge ends and describe_node match Class/Function/Service on
+    (repo_id, name); their uniqueness constraint indexes (repo_id, name, file)."""
+
+    def test_init_schema_provisions_one_per_file_scoped_label(self, engine):
+        from devgraph.graph.schema import FILE_SCOPED_LABELS
+
+        engine.init_schema()  # a second run is a no-op
+        rows = engine.run_cypher(
+            "SHOW INDEXES YIELD name, type, labelsOrTypes, properties "
+            "WHERE name ENDS WITH '_repo_name_lookup' RETURN name, type, labelsOrTypes, properties"
+        )
+        assert sorted((r["labelsOrTypes"][0], r["type"], tuple(r["properties"])) for r in rows) == sorted(
+            (label, "RANGE", ("repo_id", "name")) for label in FILE_SCOPED_LABELS
+        )
+
+    def test_a_bare_name_match_is_an_index_seek(self, engine):
+        with engine._driver.session() as session:
+            summary = session.run(
+                "EXPLAIN MATCH (b:Function {repo_id: $r, name: $n}) RETURN b", r="r", n="g"
+            ).consume()
+
+        def operators(node):
+            yield node["operatorType"]
+            for child in node.get("children", []):
+                yield from operators(child)
+
+        ops = list(operators(summary.plan))
+        assert any(op.startswith("NodeIndexSeek") for op in ops), ops
+        assert not any(op.startswith("NodeByLabelScan") for op in ops), ops
+
+    def test_a_pinned_end_is_hinted_onto_its_unique_index(self):
+        """With a second (repo_id, name) index the planner can pick a full
+        scan of it for a pinned end on a near-empty database (seen in CI: a
+        5,000-module relink at 8 s instead of 0.5 s), so the pinned end of a
+        file-scoped label names the (repo_id, name, file) index."""
+        from devgraph.graph.engine import _upsert_relationships_tx
+
+        class Tx:
+            queries = []
+
+            def run(self, query, **params):
+                self.queries.append(query)
+
+        rel = {"repo_id": "r", "rel_type": "CALLS", "properties": {}, "origin": "a.py"}
+        _upsert_relationships_tx(Tx(), [
+            rel | {"from_label": "Function", "from_name": "f", "from_file": "a.py",
+                   "to_label": "Function", "to_name": "g", "to_file": "b.py"},
+            rel | {"from_label": "Module", "from_name": "a.py", "to_label": "Function", "to_name": "g"},
+        ])
+        pinned, bare = Tx.queries
+        assert "USING INDEX a:Function(repo_id, name, file)" in pinned
+        assert "USING INDEX b:Function(repo_id, name, file)" in pinned
+        assert "USING INDEX" not in bare

@@ -397,13 +397,14 @@ def test_schema_without_a_file_is_the_builtins(client):
     assert counts["Service"] == 2 and counts["Module"] == 1
 
 
-def test_schema_serves_the_hidden_node_properties(client):
-    """The node inspector hides the same bookkeeping properties describe_node does."""
-    from devgraph.graph.schema import INTERNAL_NODE_PROPERTIES
+def test_schema_serves_the_hidden_properties(client):
+    """The node inspector hides the same bookkeeping properties describe_node
+    does, and the edge inspector an edge's `origins`."""
+    from devgraph.graph.schema import INTERNAL_EDGE_PROPERTIES, INTERNAL_NODE_PROPERTIES
 
     body = client.get("/api/repos/dash_repo_a/schema").json()
-    assert body["hidden_properties"] == sorted(INTERNAL_NODE_PROPERTIES)
-    assert {"claims", "name_refs", "name_ref_targets", "name_ref_sources"} <= set(body["hidden_properties"])
+    assert body["hidden_properties"] == sorted(INTERNAL_NODE_PROPERTIES | INTERNAL_EDGE_PROPERTIES)
+    assert {"claims", "name_refs", "name_ref_targets", "name_ref_sources", "origins"} <= set(body["hidden_properties"])
 
 
 def test_schema_applied_lists_project_types_with_colours_and_counts(schema_repo):

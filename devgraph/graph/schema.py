@@ -73,6 +73,11 @@ INTERNAL_NODE_PROPERTIES: frozenset[str] = frozenset({
     "claims", "extractor", "name_refs", "name_ref_targets", "name_ref_sources",
 })
 
+# An extracted edge's bookkeeping: `origins`, the files that wrote it
+# (devgraph/graph/engine.py `_ADD_ORIGIN`). The dashboard's edge inspector
+# hides it, from the same served list as the node properties above.
+INTERNAL_EDGE_PROPERTIES: frozenset[str] = frozenset({"origins"})
+
 # Labels other than Repository must be uniquely keyed on (repo_id, name)
 # so incremental MERGE writes update in place instead of duplicating.
 _REPO_SCOPED_LABELS = tuple(l for l in NODE_LABELS if l != "Repository")
@@ -117,3 +122,18 @@ def constraint_statements() -> list[str]:
                 f"FOR (n:{label}) REQUIRE (n.repo_id, n.name) IS UNIQUE"
             )
     return statements
+
+
+def lookup_index_statements() -> list[str]:
+    """Cypher for a `(repo_id, name)` RANGE index on each file-scoped label.
+
+    Their uniqueness constraint indexes `(repo_id, name, file)`, which a
+    bare-name match (an edge's target end, `describe_node`) can't seek, so
+    without these it scans every node of the label. Idempotent, like
+    `constraint_statements`; the names never collide with a generated
+    user-type constraint or index (built-in labels can't be redeclared).
+    """
+    return [
+        f"CREATE INDEX {label.lower()}_repo_name_lookup IF NOT EXISTS FOR (n:{label}) ON (n.repo_id, n.name)"
+        for label in FILE_SCOPED_LABELS
+    ]

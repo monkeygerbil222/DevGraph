@@ -383,6 +383,7 @@ def test_status_shows_rescan_pending(runner, temp_registry_db, temp_git_repo):
     """'devgraph status' lists an active repository whose index is outdated."""
     db_path, registry = temp_registry_db
     repo_id = registry.add_repo(temp_git_repo).repo_id
+    registry.mark_indexed(repo_id)
     registry.close()
 
     from devgraph.cli import main as cli_main
@@ -409,6 +410,7 @@ def test_status_tells_an_unwatched_repo_to_rescan(runner, temp_registry_db, temp
     db_path, registry = temp_registry_db
     repo_id = registry.add_repo(temp_git_repo).repo_id
     registry.disable_watch(repo_id)
+    registry.mark_indexed(repo_id)
     registry.close()
 
     from devgraph.cli import main as cli_main
@@ -424,6 +426,26 @@ def test_status_tells_an_unwatched_repo_to_rescan(runner, temp_registry_db, temp
     assert f"{repo_id}: rescan pending" in result.stdout
     assert "run 'devgraph rescan'" in result.stdout
     assert "automatically" not in result.stdout.split("Graph Index", 1)[1]
+
+
+def test_status_does_not_call_a_never_indexed_repo_pending(runner, temp_registry_db, temp_git_repo):
+    """A repo whose first scan hasn't finished has no format stamp yet: that
+    scan stamps it, so status doesn't offer an upgrade rescan for it."""
+    db_path, registry = temp_registry_db
+    repo_id = registry.add_repo(temp_git_repo).repo_id
+    registry.close()
+
+    from devgraph.cli import main as cli_main
+
+    settings = _mock_settings(db_path)
+    with patch.object(cli_main, "get_settings", return_value=settings), \
+         patch.object(cli_main, "GraphEngine") as engine_cls, \
+         patch("devgraph.indexer.dispatch.index_outdated", return_value=True):
+        engine_cls.return_value.verify_connectivity.return_value = None
+        result = runner.invoke(app, ["status"])
+
+    assert result.exit_code == 0
+    assert f"{repo_id}: rescan pending" not in result.stdout
 
 
 def test_cli_annotate_set_docs_path(runner, temp_git_repo, temp_registry_db):

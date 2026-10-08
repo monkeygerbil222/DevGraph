@@ -18,7 +18,13 @@ from neo4j import Driver, GraphDatabase, READ_ACCESS, unit_of_work
 from neo4j.exceptions import ServiceUnavailable, SessionExpired, TransientError
 from neo4j.graph import Node, Relationship
 
-from devgraph.graph.schema import RELATIONSHIP_TYPES, RESERVED_NODE_PROPERTIES, constraint_statements
+from devgraph.graph.schema import (
+    FILE_SCOPED_LABELS,
+    RELATIONSHIP_TYPES,
+    RESERVED_NODE_PROPERTIES,
+    constraint_statements,
+    lookup_index_statements,
+)
 from devgraph.indexer.common import NAME_REF_SEP
 from devgraph.indexer.docs.extractor import DOC_NOTE_LABELS
 
@@ -129,16 +135,23 @@ _WRITE_CHANGES_CYPHER = "UNWIND $rows AS row MATCH (n) WHERE elementId(n) = row.
 def _claim_nodes_tx(tx, label: str, rows: list[dict[str, Any]]) -> None:
     """Claim shared nodes of one label for each row's `source`, in row order.
 
-    MERGEs as `MERGE (n:{label} {repo_id, name})` did, so a row claims every
-    node that MERGE matches, or the one it creates."""
-    keys = sorted({(row["repo_id"], row["name"]) for row in rows})
+    A row claims every file-less node of its label and name, or the one it
+    creates. A file-scoped node of the same name is never claimed: a handler
+    stub `Function` stays its own node whichever file is written first."""
+    keys = [list(key) for key in sorted({(row["repo_id"], row["name"]) for row in rows})]
     read: dict[str, dict[str, Any]] = {}
     current: dict[str, dict[str, Any]] = {}
-    by_key: dict[tuple[str, str], list[str]] = {key: [] for key in keys}
+    by_key: dict[tuple[str, str], list[str]] = {(key[0], key[1]): [] for key in keys}
+    tx.run(
+        f"UNWIND $keys AS k WITH k WHERE NOT EXISTS {{ "
+        f"MATCH (m:{label} {{repo_id: k[0], name: k[1]}}) WHERE m.file IS NULL }} "
+        f"CREATE (:{label} {{repo_id: k[0], name: k[1]}})",
+        keys=keys,
+    )
     for record in tx.run(
-        f"UNWIND $keys AS k MERGE (n:{label} {{repo_id: k[0], name: k[1]}}) "
+        f"UNWIND $keys AS k MATCH (n:{label} {{repo_id: k[0], name: k[1]}}) WHERE n.file IS NULL "
         "WITH k, n " + _LOCK_AND_READ + ", k[0] AS repo_id, k[1] AS name",
-        keys=[list(key) for key in keys],
+        keys=keys,
     ):
         read[record["id"]] = dict(record["props"])
         current[record["id"]] = dict(record["props"])
@@ -551,23 +564,24 @@ _ADD_ORIGIN = (
 )
 
 
+def _end_match(var: str, label: str, end: str, pinned: bool) -> str:
+    """The MATCH for one end of an edge row. A pinned end of a file-scoped
+    label names its (repo_id, name, file) unique index: with the
+    (repo_id, name) lookup index beside it, the planner can otherwise pick a
+    full scan of that one on a near-empty database."""
+    if not pinned:
+        return f"MATCH ({var}:{label} {{repo_id: row.repo_id, name: row.{end}_name}}) "
+    hint = f"USING INDEX {var}:{label}(repo_id, name, file) " if label in FILE_SCOPED_LABELS else ""
+    return f"MATCH ({var}:{label} {{repo_id: row.repo_id, name: row.{end}_name, file: row.{end}_file}}) " + hint
+
+
 def _upsert_relationships_tx(tx, rels: list[dict[str, Any]]) -> None:
     for (from_label, rel_type, to_label, has_from_file, has_to_file), rows in _group_rels_by_triple(rels).items():
-        from_match = (
-            "{repo_id: row.repo_id, name: row.from_name, file: row.from_file}"
-            if has_from_file
-            else "{repo_id: row.repo_id, name: row.from_name}"
-        )
-        to_match = (
-            "{repo_id: row.repo_id, name: row.to_name, file: row.to_file}"
-            if has_to_file
-            else "{repo_id: row.repo_id, name: row.to_name}"
-        )
         tx.run(
-            f"UNWIND $rows AS row "
-            f"MATCH (a:{from_label} {from_match}) "
-            f"MATCH (b:{to_label} {to_match}) "
-            f"MERGE (a)-[r:{rel_type}]->(b) "
+            "UNWIND $rows AS row "
+            + _end_match("a", from_label, "from", has_from_file)
+            + _end_match("b", to_label, "to", has_to_file)
+            + f"MERGE (a)-[r:{rel_type}]->(b) "
             "SET r += row.properties " + _ADD_ORIGIN,
             rows=rows,
         )
@@ -698,10 +712,11 @@ class GraphEngine:
         that aren't scoped to one repository omit `effective` and get exactly
         the built-in statements. Statements always come from
         `repository_constraint_statements`, never from
-        `EffectiveSchema.constraint_statements()` directly.
+        `EffectiveSchema.constraint_statements()` directly. The built-in
+        `(repo_id, name)` lookup indexes follow.
         """
         with self._driver.session() as session:
-            for stmt in repository_constraint_statements(effective):
+            for stmt in repository_constraint_statements(effective) + lookup_index_statements():
                 _retry_transient(session.run, stmt)
 
     def upsert_repository(self, repo_id: str, name: str, path: str) -> None:

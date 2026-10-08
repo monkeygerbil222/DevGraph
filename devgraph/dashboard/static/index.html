@@ -1088,7 +1088,7 @@ renderTypeLists();
    "user:" + label, coloured from the payload, so it isolates, highlights and
    colours on its own. Nothing of the previous repo's survives the swap. */
 function applySchemaTypes(schema) {
-  HIDDEN_NODE_PROPS = new Set(schema.hidden_properties || []);
+  HIDDEN_PROPS = new Set(schema.hidden_properties || []);
   const counts = Object.fromEntries((schema.node_types || []).map(t => [t.label, t.count]));
   Object.keys(CAT_COLORS).filter(k => k.startsWith("user:")).forEach(k => { delete CAT_COLORS[k]; delete brightCache[k]; });
   Object.keys(REL_COLORS).forEach(k => delete REL_COLORS[k]);
@@ -1385,10 +1385,10 @@ cy.on("mouseout", "node", e => {
 const detailsCard = document.getElementById("detailsCard");
 const detailsTitle = document.getElementById("detailsTitle");
 const detailsBody = document.getElementById("detailsBody");
-/* Node properties that are pipeline bookkeeping (graph/schema.py's
-   INTERNAL_NODE_PROPERTIES, served by the schema route): the inspector hides
-   them, as describe_node does. */
-let HIDDEN_NODE_PROPS = new Set();
+/* Node and edge properties that are pipeline bookkeeping (graph/schema.py's
+   INTERNAL_NODE_PROPERTIES and INTERNAL_EDGE_PROPERTIES, served by the schema
+   route): the inspector hides them, as describe_node does for nodes. */
+let HIDDEN_PROPS = new Set();
 function renderPropsRows(props, hidden = new Set()) {
   const entries = Object.entries(props || {}).filter(([k]) => !hidden.has(k));
   if (!entries.length) return `<div class="placeholder-note">No properties.</div>`;
@@ -1449,12 +1449,12 @@ function showDetailsCard(ele, isEdge) {
         `<div class="metric-row"><span class="metric-label">Type</span><span class="metric-val">${escapeHtmlVal(type)}</span></div>` +
         `<div class="metric-row"><span class="metric-label">From</span><span class="metric-val">${escapeHtmlVal(s?.name || s?.repo_id || "—")}</span></div>` +
         `<div class="metric-row"><span class="metric-label">To</span><span class="metric-val">${escapeHtmlVal(t?.name || t?.repo_id || "—")}</span></div>` +
-        renderPropsRows(props);
+        renderPropsRows(props, HIDDEN_PROPS);
     } else {
       const [labels, props] = row;
       detailsBody.innerHTML =
         `<div class="metric-row"><span class="metric-label">Label</span><span class="metric-val">${escapeHtmlVal((labels||[]).join(", "))}</span></div>` +
-        renderPropsRows(props, HIDDEN_NODE_PROPS);
+        renderPropsRows(props, HIDDEN_PROPS);
     }
   }).catch(() => { if (detailsCard.classList.contains("open")) detailsBody.innerHTML = `<div class="placeholder-note">Request failed.</div>`; });
 }

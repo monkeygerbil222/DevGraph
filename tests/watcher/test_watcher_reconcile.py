@@ -833,10 +833,7 @@ def test_a_never_indexed_repo_gets_no_catch_up(cu, caplog):
     with caplog.at_level("INFO", logger="devgraph.watcher.manager"):
         cu.start_timer().fire()
     assert cu.catch_ups == []
-    assert (
-        f"DevGraph hasn't indexed {cu.repo_id} yet; the agent indexes it automatically shortly, "
-        f'or run "devgraph rescan {cu.repo_id}" to index it now'
-    ) in caplog.messages
+    assert f'DevGraph hasn\'t indexed {cu.repo_id} yet; run "devgraph rescan {cu.repo_id}"' in caplog.messages
 
 
 def test_since_is_snapshotted_before_the_watch_starts(cu):
