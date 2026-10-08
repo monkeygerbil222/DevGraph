@@ -261,11 +261,13 @@ class TestNameLookupIndexes:
         assert any(op.startswith("NodeIndexSeek") for op in ops), ops
         assert not any(op.startswith("NodeByLabelScan") for op in ops), ops
 
-    def test_a_pinned_end_is_hinted_onto_its_unique_index(self):
-        """With a second (repo_id, name) index the planner can pick a full
-        scan of it for a pinned end on a near-empty database (seen in CI: a
-        5,000-module relink at 8 s instead of 0.5 s), so the pinned end of a
-        file-scoped label names the (repo_id, name, file) index."""
+    def test_a_file_scoped_end_is_hinted_to_seek_its_index(self):
+        """A plan made from index statistics sampled while the label was
+        near-empty estimates 0 rows and can scan a whole index per row even
+        under a plain USING INDEX hint (seen in CI: a 5,000-module relink at
+        20 s instead of 0.5 s), so each end of a file-scoped label is hinted
+        to seek: a pinned end the (repo_id, name, file) index, a bare-name end
+        the (repo_id, name) one."""
         from devgraph.graph.engine import _upsert_relationships_tx
 
         class Tx:
@@ -281,6 +283,7 @@ class TestNameLookupIndexes:
             rel | {"from_label": "Module", "from_name": "a.py", "to_label": "Function", "to_name": "g"},
         ])
         pinned, bare = Tx.queries
-        assert "USING INDEX a:Function(repo_id, name, file)" in pinned
-        assert "USING INDEX b:Function(repo_id, name, file)" in pinned
-        assert "USING INDEX" not in bare
+        assert "USING INDEX SEEK a:Function(repo_id, name, file)" in pinned
+        assert "USING INDEX SEEK b:Function(repo_id, name, file)" in pinned
+        assert "USING INDEX SEEK b:Function(repo_id, name) " in bare
+        assert "USING INDEX SEEK a:" not in bare
