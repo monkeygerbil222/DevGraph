@@ -225,9 +225,10 @@ def test_hostile_strings_are_sanitised(tmp_path):
     src = Path(tmp_path, "evil-src.py")
     src.write_text("def bad():\n    return 1\n")
     blob = git(repo, "hash-object", "-w", str(src))
-    git(repo, "update-index", "--add", "--cacheinfo", f"100644,{blob},evil\x07.py")
+    # Git for Windows refuses control characters in paths unless core.protectNTFS is off.
+    git(repo, "-c", "core.protectNTFS=false", "update-index", "--add", "--cacheinfo", f"100644,{blob},evil\x07.py")
     git(repo, "commit", "-q", "-m", "evil")
-    git(repo, "checkout", "-q", "main")
+    git(repo, "-c", "core.protectNTFS=false", "checkout", "-q", "main")
     hostile = {**caller_row(0), "caller": "x\x1b[2J" + "y" * 600}
     engine = StubEngine(([hostile], False))
     result = compare_branches(engine, registered(tmp_path, repo), "demo", "main", "feature")

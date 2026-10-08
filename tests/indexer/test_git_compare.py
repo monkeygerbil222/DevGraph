@@ -299,7 +299,9 @@ def test_all_zero_sha_is_unknown(tmp_path, monkeypatch):
 def test_missing_subtree_is_object_missing(tmp_path):
     repo = two_branch_repo(tmp_path, {"a.py": "a = 1\n", "d/x.py": "x\n"}, {"d/y.py": "y\n"})
     subtree = git(repo, "rev-parse", "feature:d")
-    Path(repo, ".git", "objects", subtree[:2], subtree[2:]).unlink()
+    loose = Path(repo, ".git", "objects", subtree[:2], subtree[2:])
+    loose.chmod(0o644)  # git writes loose objects read-only, which Windows refuses to unlink
+    loose.unlink()
     with pytest.raises(CompareError) as err:
         changes_of(repo)
     assert type(err.value) is CompareError

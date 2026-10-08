@@ -7,9 +7,11 @@ import git as git_pkg
 
 
 def git(repo, *args):
-    """Run git in `repo` with a fixed fictional identity and no signing; stdout, stripped."""
+    """Run git in `repo` with a fixed fictional identity, no signing and no line-ending
+    conversion (a Windows runner's core.autocrlf would rewrite committed CRLF); stdout, stripped."""
     return subprocess.run(
-        ["git", "-c", "user.email=dev@example.com", "-c", "user.name=Dev Example", "-c", "commit.gpgsign=false", *args],
+        ["git", "-c", "user.email=dev@example.com", "-c", "user.name=Dev Example", "-c", "commit.gpgsign=false",
+         "-c", "core.autocrlf=false", *args],
         cwd=repo,
         check=True,
         capture_output=True,
