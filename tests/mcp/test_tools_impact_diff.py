@@ -1,6 +1,8 @@
 """Integration tests for impact_analysis_for_diff (Implementation Plan #3, Item 3)."""
 
+import re
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -14,6 +16,11 @@ from devgraph.registry.store import RepoRegistry
 
 def _run_git(repo_path: Path, *args: str) -> None:
     subprocess.run(["git", *args], cwd=str(repo_path), capture_output=True, check=True)
+
+
+def _git_version() -> tuple[int, ...]:
+    out = subprocess.run(["git", "--version"], capture_output=True, text=True, check=True).stdout
+    return tuple(int(n) for n in re.findall(r"\d+", out)[:2])
 
 
 @pytest.fixture
@@ -120,3 +127,42 @@ def test_impact_analysis_for_diff_unregistered_repo_returns_error(graph_engine, 
     result = impact_analysis_for_diff(graph_engine, registry, "_no_such_repo", "HEAD", "HEAD")
     assert "error" in result
     assert result["changed_files"] == []
+
+
+class _NoGraph:
+    def run_cypher(self, query, params=None):
+        return []
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the fake ssh command is a POSIX shell script")
+@pytest.mark.skipif(_git_version() < (2, 44), reason="GIT_NO_LAZY_FETCH needs git 2.44 or later")
+def test_a_rename_with_an_edit_in_a_blobless_clone_lists_both_paths_without_fetching(registry, tmp_path):
+    """Rename detection would read the old blob, which a blobless clone lacks."""
+    src = tmp_path / "src"
+    src.mkdir()
+    _run_git(src, "init", "-q", "-b", "main")
+    _run_git(src, "config", "user.email", "test@example.com")
+    _run_git(src, "config", "user.name", "Test Author")
+    _run_git(src, "config", "uploadpack.allowFilter", "true")
+    (src / "old.py").write_text("".join(f"line_{i} = {i}\n" for i in range(40)))
+    _run_git(src, "add", "-A")
+    _run_git(src, "commit", "-q", "-m", "base")
+    _run_git(src, "mv", "old.py", "new.py")
+    (src / "new.py").write_text("".join(f"line_{i} = {i}\n" for i in range(39)) + "tail = 1\n")
+    _run_git(src, "add", "-A")
+    _run_git(src, "commit", "-q", "-m", "rename and edit")
+
+    dst = tmp_path / "partial"
+    _run_git(tmp_path, "clone", "-q", "--filter=blob:none", f"file://{src}", str(dst))
+    marker = tmp_path / "ssh-was-called"
+    script = tmp_path / "fake-ssh"
+    script.write_text(f"#!/bin/sh\necho called >> '{marker}'\nexit 1\n")
+    script.chmod(0o755)
+    _run_git(dst, "remote", "set-url", "origin", "ssh://git.example.invalid/repo.git")
+    _run_git(dst, "config", "core.sshCommand", str(script))
+    record = registry.add_repo(dst, repo_id="_smoketest_impact_diff_partial")
+
+    result = impact_analysis_for_diff(_NoGraph(), registry, record.repo_id, "HEAD~1", "HEAD")
+    assert "error" not in result, result
+    assert sorted(result["changed_files"]) == ["new.py", "old.py"]
+    assert not marker.exists()

@@ -531,7 +531,7 @@ def build_server(
         {community, label, size, top_members}. top_members (highest PageRank first) is
         filled for the communities within max_results. Errors if graph insights have
         never been computed for the repository (the agent computes them after indexing)."""
-        return devgraph_tools.find_communities(engine, repo_id, max_results, members_per_community)
+        return devgraph_tools.find_communities(engine, registry, repo_id, max_results, members_per_community)
 
     @server.tool(annotations=_READ_ONLY)
     def key_nodes(
@@ -546,7 +546,7 @@ def build_server(
         CALLS edges are resolved by name, so widely used generic method names (such as get or
         close) can rank high.
         Errors if graph insights have never been computed for the repository."""
-        return devgraph_tools.key_nodes(engine, repo_id, metric, max_results)
+        return devgraph_tools.key_nodes(engine, registry, repo_id, metric, max_results)
 
     @server.tool(annotations=_READ_ONLY)
     def list_recent_changes(

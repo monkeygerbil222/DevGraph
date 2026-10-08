@@ -136,7 +136,8 @@ class GitHistoryExtractor:
         if unreadable:
             logger.warning(
                 f"{self.repo_id}: {unreadable} commit(s) have trees missing from this partial clone; "
-                "recorded without MODIFIES edges (DevGraph never fetches them)"
+                "recorded without MODIFIES edges (DevGraph never fetches them); after fetching them, "
+                "run `devgraph rescan --full`"
             )
         return result
 
@@ -315,7 +316,7 @@ def _current_py_files(engine, repo_id: str) -> set[str]:
 
 def _apply_function_recency(
     engine, repo: Repo, repo_id: str, file_path: str, overwrite: bool
-) -> None:
+) -> Exception | None:
     """Blame `file_path` once and stage/set recency on each Function/Class
     node whose stored line range overlaps a blamed hunk.
 
@@ -329,6 +330,9 @@ def _apply_function_recency(
     calling once per hunk in blame's line order would leave whichever hunk
     happens to be processed last as the final value — not necessarily the
     most recent one. Picking the max up front is correct for both paths.
+
+    Returns the blame's exception when it fails (the caller logs failures
+    once per sync), else None.
     """
     if not file_path.endswith(".py"):
         return
@@ -355,8 +359,7 @@ def _apply_function_recency(
     try:
         hunks = compute_function_recency(repo, file_path)
     except Exception as exc:
-        logger.warning(f"git blame failed for {file_path!r}, skipping: {exc}")
-        return
+        return exc
 
     track_author = get_settings().git_recency_track_author
     write = engine.set_recency if overwrite else engine.stage_recency
@@ -444,6 +447,7 @@ def sync_git_history(
             on_initial(count if max_count is None else min(count, max_count))
 
         extractor = GitHistoryExtractor(repo_id, repo_record.path)
+        blame_failures: dict[str, Exception | None] = {}
 
         if mode == "reconcile":
             # Full reachable-set walk, no cap — correctness matters more
@@ -465,7 +469,7 @@ def sync_git_history(
 
             _reconcile_module_recency(engine, repo_id)
             for file_path in _current_py_files(engine, repo_id):
-                _apply_function_recency(engine, repo, repo_id, file_path, overwrite=True)
+                blame_failures[file_path] = _apply_function_recency(engine, repo, repo_id, file_path, overwrite=True)
 
             commits_indexed = len(result.commits)
             commits_deleted = len(orphans)
@@ -480,10 +484,18 @@ def sync_git_history(
                 rel.target_name for rel in result.relationships if rel.target_name.endswith(".py")
             }
             for file_path in touched_py_files:
-                _apply_function_recency(engine, repo, repo_id, file_path, overwrite=False)
+                blame_failures[file_path] = _apply_function_recency(engine, repo, repo_id, file_path, overwrite=False)
 
             commits_indexed = len(result.commits)
             commits_deleted = 0
+
+        failed = sorted(path for path, exc in blame_failures.items() if exc is not None)
+        if failed:
+            # One line per sync: a blobless partial clone fails the blame of every file.
+            logger.warning(
+                f"{repo_id}: git blame failed for {len(failed)} file(s), recency skipped for them "
+                f"(first {failed[0]!r}: {blame_failures[failed[0]]})"
+            )
 
         registry.set_last_indexed_commit(repo_id, head_sha)
         return {"mode": mode, "commits_indexed": commits_indexed, "commits_deleted": commits_deleted}

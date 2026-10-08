@@ -315,6 +315,14 @@ def _echo(value: Any) -> str:
     return repr(str(value)[:_DESCRIBE_ECHO])
 
 
+def _registered(registry: RepoRegistry, repo_id: str) -> Any:
+    """The registry record for `repo_id`, or a ToolError naming the unknown id."""
+    record = registry.get(repo_id)
+    if record is None:
+        raise ToolError(f"no such repo_id: {_echo(repo_id)}; run devgraph list to see registered repositories")
+    return record
+
+
 def _validated_identifiers(values: list[str] | None, pattern: re.Pattern[str], what: str) -> list[str] | None:
     """The filter list, or None for no filter; any value that isn't an identifier is an error."""
     if isinstance(values, str):
@@ -717,6 +725,7 @@ _KEY_NODES_LIMIT = 50
 
 def find_communities(
     engine: GraphEngine,
+    registry: RepoRegistry,
     repo_id: str,
     max_results: int = 10,
     members_per_community: int = 5,
@@ -730,8 +739,9 @@ def find_communities(
     communities the repository stores.
 
     Raises:
-        ToolError: insights have never been computed for this repository.
+        ToolError: unknown repo_id, or insights never computed for it.
     """
+    _registered(registry, repo_id)
     summary = read_insights(engine, repo_id)
     if summary is None:
         raise ToolError(_INSIGHTS_NOT_COMPUTED)
@@ -752,6 +762,7 @@ def find_communities(
 
 def key_nodes(
     engine: GraphEngine,
+    registry: RepoRegistry,
     repo_id: str,
     metric: str = "pagerank",
     max_results: int = 10,
@@ -767,8 +778,9 @@ def key_nodes(
     (such as get or close) can rank high.
 
     Raises:
-        ToolError: unknown metric, or insights never computed.
+        ToolError: unknown repo_id or metric, or insights never computed.
     """
+    _registered(registry, repo_id)
     metric_key = metric.strip().lower() if isinstance(metric, str) else ""
     if metric_key not in INSIGHT_METRICS:
         raise ToolError(f"metric must be {' or '.join(INSIGHT_METRICS)}, not {_echo(metric)}")
@@ -1105,9 +1117,7 @@ def compare_branches(
     """
     from devgraph.indexer.git_history import compare as git_compare
 
-    record = registry.get(repo_id)
-    if record is None:
-        raise ToolError(f"no such repo_id: {_echo(repo_id)}; run devgraph list to see registered repositories")
+    record = _registered(registry, repo_id)
     try:
         with git_compare.open_comparison(record.path, repo_id, branch_a, branch_b) as comparison:
             detailed = git_compare.symbol_detail(comparison)
@@ -1258,7 +1268,9 @@ def impact_analysis_for_diff(
         git_repo = open_repo(repo.path)
         git_repo.commit(base_ref)
         git_repo.commit(head_ref)
-        diff_output = git_repo.git.diff("--name-only", f"{base_ref}..{head_ref}")
+        # No rename detection: it reads blobs a blobless partial clone lacks, and
+        # a rename's old and new paths are both changed files for impact.
+        diff_output = git_repo.git.diff("--name-only", "--no-renames", f"{base_ref}..{head_ref}")
     except Exception as exc:
         return {**empty, "error": f"could not diff {base_ref}..{head_ref}: {exc}"}
     finally:

@@ -100,3 +100,10 @@ def test_an_unknown_metric_names_the_metrics(call):
 @pytest.mark.parametrize("name", ["find_communities", "key_nodes"])
 def test_insights_not_computed_says_how_to_compute_them(call, name):
     assert call(name, {}) == f"Error executing tool {name}: {NOT_COMPUTED}"
+
+
+@pytest.mark.parametrize("name", ["find_communities", "key_nodes"])
+def test_an_unknown_repo_id_is_named_not_reported_as_uncomputed(call, name):
+    assert call(name, {"repo_id": "nope"}) == (
+        f"Error executing tool {name}: no such repo_id: 'nope'; run devgraph list to see registered repositories"
+    )

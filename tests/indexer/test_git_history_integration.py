@@ -361,7 +361,7 @@ def _git_version() -> tuple[int, ...]:
 @pytest.mark.skipif(sys.platform == "win32", reason="the fake ssh command is a POSIX shell script")
 @pytest.mark.skipif(_git_version() < (2, 44), reason="GIT_NO_LAZY_FETCH needs git 2.44 or later")
 @pytest.mark.parametrize("filter_spec", ["blob:none", "tree:0"])
-def test_sync_git_history_never_lazy_fetches_in_a_partial_clone(graph_engine, registry, tmp_path, filter_spec):
+def test_sync_git_history_never_lazy_fetches_in_a_partial_clone(graph_engine, registry, tmp_path, filter_spec, caplog):
     """Diffing old commits and blaming a file read trees and blobs a partial clone
     lacks; git must not fetch them (network, credential prompts, no deadline), and
     the sync still completes."""
@@ -372,6 +372,7 @@ def test_sync_git_history_never_lazy_fetches_in_a_partial_clone(graph_engine, re
     _run_git(src, "config", "user.name", "Test Author")
     _run_git(src, "config", "uploadpack.allowFilter", "true")
     (src / "a.py").write_text("def a():\n    return 1\n")
+    (src / "b.py").write_text("def b():\n    return 1\n")
     (src / "old.py").write_text("".join(f"line_{i} = {i}\n" for i in range(40)))
     _run_git(src, "add", "-A")
     _run_git(src, "commit", "-q", "-m", "first")
@@ -381,6 +382,7 @@ def test_sync_git_history_never_lazy_fetches_in_a_partial_clone(graph_engine, re
     _run_git(src, "add", "-A")
     _run_git(src, "commit", "-q", "-m", "second")
     (src / "a.py").write_text("def a():\n    return 3\n")
+    (src / "b.py").write_text("def b():\n    return 3\n")
     _run_git(src, "commit", "-q", "-am", "third")
 
     dst = tmp_path / "partial"
@@ -395,12 +397,25 @@ def test_sync_git_history_never_lazy_fetches_in_a_partial_clone(graph_engine, re
     record = registry.add_repo(dst, repo_id=f"_smoketest_sync_partial_{filter_spec.replace(':', '_')}")
     graph_engine.upsert_node("Module", record.repo_id, "a.py", {})
     graph_engine.upsert_node("Function", record.repo_id, "a", {"file": "a.py", "start_line": 1, "end_line": 2})
+    graph_engine.upsert_node("Module", record.repo_id, "b.py", {})
+    graph_engine.upsert_node("Function", record.repo_id, "b", {"file": "b.py", "start_line": 1, "end_line": 2})
     try:
+        caplog.set_level("WARNING", logger="devgraph.indexer.git_history.extractor")
         outcome = sync_git_history(graph_engine, registry, record.repo_id)
         assert outcome["mode"] == "initial"
         assert outcome["commits_indexed"] == 3
         assert sync_git_history(graph_engine, registry, record.repo_id, force=True)["mode"] == "reconcile"
         assert not marker.exists()
+        # Each sync logs its missing objects once, not once per file or commit.
+        blame = [r.message for r in caplog.records if "git blame failed" in r.message]
+        # (A treeless clone's initial sync records no MODIFIES, so blames nothing.)
+        assert len(blame) == (2 if filter_spec == "blob:none" else 1)
+        assert all("2 file(s)" in line for line in blame)
+        trees = [r.message for r in caplog.records if "trees missing" in r.message]
+        if filter_spec == "tree:0":
+            assert len(trees) == 2 and "run `devgraph rescan --full`" in trees[0]
+        else:
+            assert trees == []
         edges = graph_engine.run_cypher(
             "MATCH (:Commit {repo_id: $repo_id})-[r:MODIFIES]->(:Module {name: 'a.py'}) RETURN count(r) AS n",
             {"repo_id": record.repo_id},

@@ -493,7 +493,9 @@ def identity_key(label: str, repo_id: str, name: str, file: str | None) -> str:
 def _pin(file: str | None) -> str:
     """How an edge end matches its node: by bare name (`file` None), only the
     file-less node of that name (`file` "", a route's handler stub), or the
-    node in that one file."""
+    node in that one file. `file` "" is meant only for a file-scoped label
+    (`FILE_SCOPED_LABELS`); other labels never carry `file`, so it would match
+    every node of the name."""
     return "name" if file is None else "fileless" if file == "" else "file"
 
 
