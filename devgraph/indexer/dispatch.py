@@ -98,9 +98,10 @@ def _provider_specs(repo_root: Path) -> tuple[bool, filesystem.FilesystemSpec | 
     return True, filesystem.filesystem_spec(effective), docs.docs_spec(effective)
 
 
-#: The graph index format a full scan produces (edge `origins`, `name_refs`).
+#: The graph index format a full scan produces (2: edge `origins`, `name_refs`;
+#: 3: FastAPI/Flask IMPLEMENTS pinned to the route's file).
 #: An index stamped lower, or not at all, is rescanned automatically.
-INDEX_FORMAT = 2
+INDEX_FORMAT = 3
 
 
 def index_outdated(engine: GraphEngine, repo_id: str) -> bool:

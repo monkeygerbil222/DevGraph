@@ -7,6 +7,7 @@ equals the expected graph".
 """
 
 import textwrap
+from datetime import datetime, timezone
 import uuid
 from pathlib import Path
 
@@ -14,6 +15,8 @@ import pytest
 
 from devgraph.graph.engine import _UNCLAIM_EDGE, GraphEngine, provision_repository_schema
 from devgraph.indexer import dispatch
+from devgraph.indexer.apis import extractor as apis_extractor
+from devgraph.indexer.apis.extractor import Relationship
 from devgraph.indexer.dispatch import full_scan, index_paths, remove_paths
 from tests.watcher.live_helpers import fresh_snapshot, graph_snapshot, snapshot_diff
 
@@ -772,6 +775,32 @@ def test_a_by_name_call_relinks_to_an_added_handler_stub(engine, repo_id, tmp_pa
     index_paths(engine, repo_id, tmp_path, {routes})
     calls = sorted((e[5], e[6]) for e in edges(engine, repo_id, "CALLS") if e[1] == "caller")
     assert calls == [("search", ""), ("search", "api/routes.py")]
+    incremental_equals_fresh(engine, repo_id, tmp_path)
+
+
+def test_the_index_upgrade_heals_cross_file_route_implements(engine, repo_id, tmp_path, monkeypatch):
+    """A graph indexed before route IMPLEMENTS were pinned (format 2) has the
+    Endpoint implementing every same-named Function; catch_up's automatic
+    upgrade (a full_scan) retracts those and leaves the pinned edges."""
+    write(tmp_path, "api/routes.py", _routed("search"))
+    write(tmp_path, "other/x.py", "def search():\n    return 2\n")
+
+    def bare(endpoint_id, handler_name, filename):
+        return [Relationship("Endpoint", endpoint_id, "IMPLEMENTS", "Function", handler_name)]
+
+    with monkeypatch.context() as old_extractor:
+        old_extractor.setattr(apis_extractor, "_pinned_implements", bare)
+        scan(engine, repo_id, tmp_path)
+    engine.set_index_format(repo_id, 2)
+    assert ("GET /items", "search", "other/x.py", ("api/routes.py",)) in _implements(engine, repo_id)
+    assert dispatch.index_outdated(engine, repo_id)
+
+    dispatch.catch_up(engine, repo_id, tmp_path, since=datetime.now(timezone.utc))
+    assert _implements(engine, repo_id) == [
+        ("GET /items", "search", "", ("api/routes.py",)),
+        ("GET /items", "search", "api/routes.py", ("api/routes.py",)),
+    ]
+    assert not dispatch.index_outdated(engine, repo_id)
     incremental_equals_fresh(engine, repo_id, tmp_path)
 
 
