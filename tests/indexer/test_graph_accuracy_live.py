@@ -718,6 +718,75 @@ def test_a_handler_that_loses_its_route_decorator_drops_the_stub(engine, repo_id
     incremental_equals_fresh(engine, repo_id, tmp_path)
 
 
+FLASK_ROUTE = """\
+    from flask import Flask
+
+    app = Flask(__name__)
+
+
+    @app.route("/items")
+    def search():
+        return 1
+"""
+
+
+def _implements(engine, repo_id):
+    return sorted((e[1], e[5], e[6], e[7]) for e in edges(engine, repo_id, "IMPLEMENTS"))
+
+
+@pytest.mark.parametrize("route", [_routed("search"), FLASK_ROUTE], ids=["fastapi", "flask"])
+def test_a_route_implements_only_its_own_files_handler(engine, repo_id, tmp_path, route):
+    """A FastAPI/Flask handler's `def` is in the route's file, so the Endpoint
+    IMPLEMENTS that Function and the stub, never another file's same-named one,
+    in a fresh scan and through every incremental path that relinks it."""
+    expected = [
+        ("GET /items", "search", "", ("api/routes.py",)),
+        ("GET /items", "search", "api/routes.py", ("api/routes.py",)),
+    ]
+    write(tmp_path, "api/routes.py", route)
+    write(tmp_path, "other/x.py", "def search():\n    return 2\n")
+    scan(engine, repo_id, tmp_path)
+    assert _implements(engine, repo_id) == expected
+
+    # A later file adding a same-named Function re-indexes the route file
+    # (its stub's name was added) and must not gain an edge either.
+    later = write(tmp_path, "later/y.py", "def search():\n    return 3\n")
+    index_paths(engine, repo_id, tmp_path, {later})
+    assert _implements(engine, repo_id) == expected
+    incremental_equals_fresh(engine, repo_id, tmp_path)
+
+    # A second route file newly claiming the Endpoint adds it to the batch,
+    # which relinks the first file's by-name Endpoint edges.
+    second = write(tmp_path, "api/more.py", route.replace("def search", "def find"))
+    index_paths(engine, repo_id, tmp_path, {second})
+    assert [e for e in _implements(engine, repo_id) if e[1] == "search"] == expected
+    incremental_equals_fresh(engine, repo_id, tmp_path)
+
+
+def test_a_by_name_call_relinks_to_an_added_handler_stub(engine, repo_id, tmp_path):
+    """A route file added later brings a stub and a Function named `search`;
+    another file's by-name call relinks to both, as a fresh scan links it."""
+    write(tmp_path, "c.py", "def caller():\n    return search()\n")
+    scan(engine, repo_id, tmp_path)
+    routes = write(tmp_path, "api/routes.py", _routed("search"))
+    index_paths(engine, repo_id, tmp_path, {routes})
+    calls = sorted((e[5], e[6]) for e in edges(engine, repo_id, "CALLS") if e[1] == "caller")
+    assert calls == [("search", ""), ("search", "api/routes.py")]
+    incremental_equals_fresh(engine, repo_id, tmp_path)
+
+
+def test_a_django_route_still_implements_every_same_named_view(engine, repo_id, tmp_path):
+    write(tmp_path, "a/routes.py", DJANGO_ROUTE)
+    write(tmp_path, "b/views.py", "def search():\n    return 1\n")
+    write(tmp_path, "c/x.py", "def search():\n    return 2\n")
+    scan(engine, repo_id, tmp_path)
+    assert _implements(engine, repo_id) == [
+        ("* search/", "search", "", ("a/routes.py",)),
+        ("* search/", "search", "b/views.py", ("a/routes.py",)),
+        ("* search/", "search", "c/x.py", ("a/routes.py",)),
+    ]
+
+
 def test_containerfile_retracts_a_removed_stage(engine, repo_id, tmp_path):
     containerfile = write(tmp_path, "Containerfile", """\
         FROM golang:1.22 AS build

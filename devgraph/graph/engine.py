@@ -490,10 +490,17 @@ def identity_key(label: str, repo_id: str, name: str, file: str | None) -> str:
     return _IDENTITY_KEY_SEP.join(parts)
 
 
+def _pin(file: str | None) -> str:
+    """How an edge end matches its node: by bare name (`file` None), only the
+    file-less node of that name (`file` "", a route's handler stub), or the
+    node in that one file."""
+    return "name" if file is None else "fileless" if file == "" else "file"
+
+
 def _group_rels_by_triple(
     rels: list[dict[str, Any]],
-) -> dict[tuple[str, str, str, bool, bool], list[dict[str, Any]]]:
-    """Group by (from_label, rel_type, to_label, has_from_file, has_to_file).
+) -> dict[tuple[str, str, str, str, str], list[dict[str, Any]]]:
+    """Group by (from_label, rel_type, to_label, from pin, to pin); see `_pin`.
 
     from_file/to_file (see GraphRelationship) are only ever set by a caller
     that knows an endpoint's exact file at extraction time: a code edge's
@@ -507,11 +514,11 @@ def _group_rels_by_triple(
     Each row carries its `origin`, the file that wrote it (None for a writer
     that doesn't record one).
     """
-    groups: dict[tuple[str, str, str, bool, bool], list[dict[str, Any]]] = {}
+    groups: dict[tuple[str, str, str, str, str], list[dict[str, Any]]] = {}
     for rel in rels:
         from_file = rel.get("from_file")
         to_file = rel.get("to_file")
-        key = (rel["from_label"], rel["rel_type"], rel["to_label"], from_file is not None, to_file is not None)
+        key = (rel["from_label"], rel["rel_type"], rel["to_label"], _pin(from_file), _pin(to_file))
         groups.setdefault(key, []).append(
             {
                 "repo_id": rel["repo_id"],
@@ -564,23 +571,24 @@ _ADD_ORIGIN = (
 )
 
 
-def _end_match(var: str, label: str, end: str, pinned: bool) -> str:
-    """The MATCH for one end of an edge row. A pinned end of a file-scoped
-    label names its (repo_id, name, file) unique index: with the
-    (repo_id, name) lookup index beside it, the planner can otherwise pick a
-    full scan of that one on a near-empty database."""
-    if not pinned:
-        return f"MATCH ({var}:{label} {{repo_id: row.repo_id, name: row.{end}_name}}) "
+def _end_match(var: str, label: str, end: str, pin: str) -> str:
+    """The MATCH for one end of an edge row (`pin` from `_pin`). A pinned end
+    of a file-scoped label names its (repo_id, name, file) unique index: with
+    the (repo_id, name) lookup index beside it, the planner can otherwise pick
+    a full scan of that one on a near-empty database."""
+    if pin != "file":
+        match = f"MATCH ({var}:{label} {{repo_id: row.repo_id, name: row.{end}_name}}) "
+        return match + (f"WHERE {var}.file IS NULL " if pin == "fileless" else "")
     hint = f"USING INDEX {var}:{label}(repo_id, name, file) " if label in FILE_SCOPED_LABELS else ""
     return f"MATCH ({var}:{label} {{repo_id: row.repo_id, name: row.{end}_name, file: row.{end}_file}}) " + hint
 
 
 def _upsert_relationships_tx(tx, rels: list[dict[str, Any]]) -> None:
-    for (from_label, rel_type, to_label, has_from_file, has_to_file), rows in _group_rels_by_triple(rels).items():
+    for (from_label, rel_type, to_label, from_pin, to_pin), rows in _group_rels_by_triple(rels).items():
         tx.run(
             "UNWIND $rows AS row "
-            + _end_match("a", from_label, "from", has_from_file)
-            + _end_match("b", to_label, "to", has_to_file)
+            + _end_match("a", from_label, "from", from_pin)
+            + _end_match("b", to_label, "to", to_pin)
             + f"MERGE (a)-[r:{rel_type}]->(b) "
             "SET r += row.properties " + _ADD_ORIGIN,
             rows=rows,

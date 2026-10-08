@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from devgraph.graph.schema import FILE_SCOPED_LABELS
+
 
 @dataclass
 class GraphNode:
@@ -121,7 +123,9 @@ def name_ref_properties(rels: list[dict]) -> dict:
     that later adds one of their endpoints can relink them from the graph.
 
     An edge is by-name when its target has no `to_file`, or its source is
-    unpinned and not a Module. `name_refs` holds each one once, sorted, as
+    unpinned and not a Module. A pinned target's edge from an unpinned source
+    that is not a code symbol (a route's Endpoint, which the same file writes)
+    is not: neither end can be added by another file. `name_refs` holds each one once, sorted, as
     `rel_type, from_label, from_name, from_file, to_label, to_name,
     caller_class` joined by NAME_REF_SEP (an unset field is empty).
     `name_ref_targets` is their sorted distinct `to_name`s and
@@ -131,7 +135,7 @@ def name_ref_properties(rels: list[dict]) -> dict:
     refs, targets, sources = set(), set(), set()
     for rel in rels:
         unpinned_source = not rel.get("from_file") and rel["from_label"] != "Module"
-        if rel.get("to_file") and not unpinned_source:
+        if rel.get("to_file") is not None and not (unpinned_source and rel["from_label"] in FILE_SCOPED_LABELS):
             continue
         caller_class = (rel.get("properties") or {}).get("caller_class") or ""
         refs.add(NAME_REF_SEP.join((
