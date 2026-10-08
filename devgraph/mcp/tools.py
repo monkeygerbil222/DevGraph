@@ -621,17 +621,15 @@ def find_dependency_cycles(
         that clip is hit even if fewer than `max_results` cycles came back.
 
     Raises:
-        ValueError: if `relationship` is not one of the supported types. This
+        ToolError: if `relationship` is not one of the supported types. This
             fails loudly rather than returning an empty envelope, because an
             empty envelope from a cycle search reads as "no cycles here" — a
             false clean bill of health on a typo'd argument.
     """
     validated = str(relationship).strip().upper()
     if validated not in _CYCLE_RELATIONSHIPS:
-        # Deliberately does not echo the input back: the message reaches a
-        # model's context, and the argument is caller-controlled and unbounded.
-        raise ValueError(
-            "unsupported relationship for cycle detection; supported types are: "
+        raise ToolError(
+            f"unsupported relationship {_echo(relationship)} for cycle detection; supported types are: "
             + ", ".join(_CYCLE_RELATIONSHIPS)
         )
 
@@ -732,11 +730,11 @@ def find_communities(
     communities the repository stores.
 
     Raises:
-        ValueError: insights have never been computed for this repository.
+        ToolError: insights have never been computed for this repository.
     """
     summary = read_insights(engine, repo_id)
     if summary is None:
-        raise ValueError(_INSIGHTS_NOT_COMPUTED)
+        raise ToolError(_INSIGHTS_NOT_COMPUTED)
     communities = summary["communities"]
     shown = [c["community"] for c in communities[:max(0, max_results)]]
     k = max(1, min(members_per_community, _MAX_MEMBERS_PER_COMMUNITY))
@@ -769,13 +767,13 @@ def key_nodes(
     (such as get or close) can rank high.
 
     Raises:
-        ValueError: unknown metric, or insights never computed.
+        ToolError: unknown metric, or insights never computed.
     """
     metric_key = metric.strip().lower() if isinstance(metric, str) else ""
     if metric_key not in INSIGHT_METRICS:
-        raise ValueError(f"metric must be one of: {', '.join(INSIGHT_METRICS)}")
+        raise ToolError(f"metric must be {' or '.join(INSIGHT_METRICS)}, not {_echo(metric)}")
     if read_insights(engine, repo_id) is None:
-        raise ValueError(_INSIGHTS_NOT_COMPUTED)
+        raise ToolError(_INSIGHTS_NOT_COMPUTED)
     return _envelope(top_nodes(engine, repo_id, metric_key, _KEY_NODES_LIMIT), max_results)
 
 

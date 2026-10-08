@@ -15,6 +15,7 @@ import asyncio
 import json
 
 import pytest
+from mcp.server.mcpserver.exceptions import ToolError
 
 from devgraph.config.settings import Settings
 from devgraph.graph import schema
@@ -146,7 +147,7 @@ class TestRelationshipValidation:
     def test_an_unsupported_relationship_raises_before_any_query_runs(self, relationship):
         engine = _StubEngine()
 
-        with pytest.raises(ValueError):
+        with pytest.raises(ToolError):
             find_dependency_cycles(engine, "demo", relationship=relationship)
 
         assert engine.calls == []
@@ -154,20 +155,21 @@ class TestRelationshipValidation:
     def test_an_injection_attempt_never_reaches_the_engine(self):
         engine = _StubEngine()
 
-        with pytest.raises(ValueError):
+        with pytest.raises(ToolError):
             find_dependency_cycles(engine, "demo", relationship="IMPORTS] ) DETACH DELETE n //")
 
         assert engine.calls == []
 
-    def test_the_error_does_not_echo_the_rejected_input_back(self):
-        """The message lands in a model's context; the argument is
-        caller-controlled and unbounded, so it is described, not repeated."""
+    def test_the_error_echoes_at_most_100_characters_of_the_rejected_input(self):
+        """The message lands in a model's context and the argument is
+        caller-controlled and unbounded, so the echo is capped."""
         engine = _StubEngine()
 
-        with pytest.raises(ValueError) as excinfo:
+        with pytest.raises(ToolError) as excinfo:
             find_dependency_cycles(engine, "demo", relationship="zz-" + "x" * 5000)
 
-        assert "zz-" not in str(excinfo.value)
+        assert repr("zz-" + "x" * 97) in str(excinfo.value)
+        assert "x" * 98 not in str(excinfo.value)
         assert "IMPORTS" in str(excinfo.value)
 
 

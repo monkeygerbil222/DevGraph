@@ -4,6 +4,7 @@ import asyncio
 import json
 
 import pytest
+from mcp.server.mcpserver.exceptions import ToolError
 
 from devgraph.config.settings import Settings
 from devgraph.mcp import server as mcp_server
@@ -55,9 +56,9 @@ def test_members_per_community_is_clamped():
 
 
 def test_never_computed_is_an_error_that_names_the_command():
-    with pytest.raises(ValueError, match="devgraph insights"):
+    with pytest.raises(ToolError, match="devgraph insights"):
         find_communities(StubEngine(summary=None), "demo")
-    with pytest.raises(ValueError, match="devgraph insights"):
+    with pytest.raises(ToolError, match="devgraph insights"):
         key_nodes(StubEngine(summary=None), "demo")
 
 
@@ -80,11 +81,11 @@ def test_key_nodes_queries_the_allow_listed_property(metric, prop):
 
 
 @pytest.mark.parametrize("metric", ["degree", "pagerank; MATCH (x) DETACH DELETE x", "", None, 3])
-def test_key_nodes_rejects_other_metrics_without_echoing_them(metric):
+def test_key_nodes_rejects_other_metrics_before_any_query(metric):
     engine = StubEngine()
-    with pytest.raises(ValueError) as excinfo:
+    with pytest.raises(ToolError) as excinfo:
         key_nodes(engine, "demo", metric=metric)
-    assert "DETACH" not in str(excinfo.value)
+    assert str(excinfo.value) == f"metric must be pagerank or betweenness, not {str(metric)!r}"
     assert engine.queries == []
 
 
