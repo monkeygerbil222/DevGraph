@@ -1,6 +1,8 @@
 """Integration tests for index_repo_history with live Neo4j and a real RepoRegistry."""
 
+import re
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -347,5 +349,64 @@ def test_recency_never_creates_a_node_for_a_file_the_graph_does_not_hold(graph_e
             {"repo_id": record.repo_id},
         )
         assert staged[0]["c"] is not None
+    finally:
+        graph_engine.delete_repository(record.repo_id)
+
+
+def _git_version() -> tuple[int, ...]:
+    out = subprocess.run(["git", "--version"], capture_output=True, text=True, check=True).stdout
+    return tuple(int(n) for n in re.findall(r"\d+", out)[:2])
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the fake ssh command is a POSIX shell script")
+@pytest.mark.skipif(_git_version() < (2, 44), reason="GIT_NO_LAZY_FETCH needs git 2.44 or later")
+@pytest.mark.parametrize("filter_spec", ["blob:none", "tree:0"])
+def test_sync_git_history_never_lazy_fetches_in_a_partial_clone(graph_engine, registry, tmp_path, filter_spec):
+    """Diffing old commits and blaming a file read trees and blobs a partial clone
+    lacks; git must not fetch them (network, credential prompts, no deadline), and
+    the sync still completes."""
+    src = tmp_path / "src"
+    src.mkdir()
+    _run_git(src, "init", "-q", "-b", "main")
+    _run_git(src, "config", "user.email", "test@example.com")
+    _run_git(src, "config", "user.name", "Test Author")
+    _run_git(src, "config", "uploadpack.allowFilter", "true")
+    (src / "a.py").write_text("def a():\n    return 1\n")
+    (src / "old.py").write_text("".join(f"line_{i} = {i}\n" for i in range(40)))
+    _run_git(src, "add", "-A")
+    _run_git(src, "commit", "-q", "-m", "first")
+    (src / "a.py").write_text("def a():\n    return 2\n")
+    _run_git(src, "mv", "old.py", "new.py")
+    (src / "new.py").write_text("".join(f"line_{i} = {i}\n" for i in range(39)) + "tail = 1\n")
+    _run_git(src, "add", "-A")
+    _run_git(src, "commit", "-q", "-m", "second")
+    (src / "a.py").write_text("def a():\n    return 3\n")
+    _run_git(src, "commit", "-q", "-am", "third")
+
+    dst = tmp_path / "partial"
+    _run_git(tmp_path, "clone", "-q", f"--filter={filter_spec}", f"file://{src}", str(dst))
+    marker = tmp_path / "ssh-was-called"
+    script = tmp_path / "fake-ssh"
+    script.write_text(f"#!/bin/sh\necho called >> '{marker}'\nexit 1\n")
+    script.chmod(0o755)
+    _run_git(dst, "remote", "set-url", "origin", "ssh://git.example.invalid/repo.git")
+    _run_git(dst, "config", "core.sshCommand", str(script))
+
+    record = registry.add_repo(dst, repo_id=f"_smoketest_sync_partial_{filter_spec.replace(':', '_')}")
+    graph_engine.upsert_node("Module", record.repo_id, "a.py", {})
+    graph_engine.upsert_node("Function", record.repo_id, "a", {"file": "a.py", "start_line": 1, "end_line": 2})
+    try:
+        outcome = sync_git_history(graph_engine, registry, record.repo_id)
+        assert outcome["mode"] == "initial"
+        assert outcome["commits_indexed"] == 3
+        assert sync_git_history(graph_engine, registry, record.repo_id, force=True)["mode"] == "reconcile"
+        assert not marker.exists()
+        edges = graph_engine.run_cypher(
+            "MATCH (:Commit {repo_id: $repo_id})-[r:MODIFIES]->(:Module {name: 'a.py'}) RETURN count(r) AS n",
+            {"repo_id": record.repo_id},
+        )
+        # A blobless clone holds every tree, so every commit's paths are read without
+        # rename detection; a treeless one lacks every parent tree, so no commit's paths are read.
+        assert edges[0]["n"] == (3 if filter_spec == "blob:none" else 0)
     finally:
         graph_engine.delete_repository(record.repo_id)

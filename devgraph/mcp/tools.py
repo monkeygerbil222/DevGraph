@@ -10,7 +10,6 @@ query strings.
 
 from typing import Any
 
-import git
 import json
 import os
 import subprocess
@@ -27,6 +26,7 @@ from devgraph.config.project_schema import (
 from devgraph.config.project_tools import DEFAULT_TIMEOUT_S
 from devgraph.graph.engine import GraphEngine
 from devgraph.graph import schema
+from devgraph.indexer.git_history import open_repo
 from devgraph.paths import is_within
 from devgraph.registry.store import RepoRegistry
 from devgraph.analytics.insights import INSIGHT_METRICS, community_members, read_insights, top_nodes
@@ -77,7 +77,7 @@ def _resolve_gh_repo(repo_path: str) -> str | None:
     """Resolve a local repo path to its 'owner/name' GitHub slug via git remote.
     Returns None if no 'origin' remote exists or parsing fails."""
     try:
-        repo = git.Repo(repo_path)
+        repo = open_repo(repo_path)
         remote_url = repo.remote("origin").url
         repo.close()
         if "github.com" not in remote_url:
@@ -1257,7 +1257,7 @@ def impact_analysis_for_diff(
 
     git_repo = None
     try:
-        git_repo = git.Repo(str(repo.path))
+        git_repo = open_repo(repo.path)
         git_repo.commit(base_ref)
         git_repo.commit(head_ref)
         diff_output = git_repo.git.diff("--name-only", f"{base_ref}..{head_ref}")

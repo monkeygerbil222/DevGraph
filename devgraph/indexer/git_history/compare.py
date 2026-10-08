@@ -24,6 +24,7 @@ import git
 from git.exc import BadName, CommandError, GitCommandError, InvalidGitRepositoryError, NoSuchPathError
 from gitdb.exc import BadObject
 
+from devgraph.indexer.git_history import open_repo
 from devgraph.indexer.symbols import TooManySymbols, decode_source, diff_symbols, extract_symbols, language_for
 from devgraph.paths import MAX_CONFIG_BYTES
 
@@ -277,15 +278,12 @@ def open_comparison(
     repo = None
     try:
         try:
-            repo = git.Repo(repo_path)
+            repo = open_repo(repo_path)
         except (NoSuchPathError, InvalidGitRepositoryError) as exc:
             raise CompareError(
                 f"repository {_echo(repo_id)} is not a git repository at its registered root; "
                 "compare_branches needs the repository's own .git"
             ) from exc
-        # In a partial clone, a missing tree or blob would otherwise be fetched from the
-        # remote: network, maybe a credential prompt, and no deadline. Needs git 2.44+.
-        repo.git.update_environment(GIT_NO_LAZY_FETCH="1")
         base = _resolve(repo, repo_id, "branch_a", base_ref)
         head = _resolve(repo, repo_id, "branch_b", head_ref)
 

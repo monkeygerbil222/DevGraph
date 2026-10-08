@@ -20,9 +20,10 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from git import Repo
+from git import GitCommandError, Repo
 
 from devgraph.config.settings import get_settings
+from devgraph.indexer.git_history import open_repo
 from devgraph.indexer.git_history.blame import compute_function_recency
 
 logger = logging.getLogger(__name__)
@@ -78,7 +79,8 @@ class GitHistoryExtractor:
             preserves history order.
         """
         result = ExtractionResult()
-        repo = Repo(str(self.repo_path))
+        unreadable = 0
+        repo = open_repo(self.repo_path)
         try:
             commits = list(repo.iter_commits(max_count=max_count))
             commits.reverse()  # iter_commits is newest-first; we want oldest-first
@@ -108,7 +110,11 @@ class GitHistoryExtractor:
                     )
                 )
 
-                for changed_path in _changed_paths(commit):
+                changed = _changed_paths(commit)
+                if changed is None:
+                    unreadable += 1
+                    changed = []
+                for changed_path in changed:
                     # git already reports paths relative to the repo root
                     # with forward slashes — this must match how Module
                     # nodes are keyed (python/extractor.py's index_file:
@@ -127,22 +133,35 @@ class GitHistoryExtractor:
         finally:
             repo.close()
 
+        if unreadable:
+            logger.warning(
+                f"{self.repo_id}: {unreadable} commit(s) have trees missing from this partial clone; "
+                "recorded without MODIFIES edges (DevGraph never fetches them)"
+            )
         return result
 
 
-def _changed_paths(commit) -> list[str]:
-    """Return file paths touched by a commit (diff against its first parent, or full tree for a root commit)."""
+def _changed_paths(commit) -> list[str] | None:
+    """Return file paths touched by a commit (diff against its first parent, or full tree for a root commit).
+
+    Rename detection is off: a rename still yields both paths, and detecting it
+    reads blobs a blobless partial clone lacks. None when a tree is missing
+    (a `tree:0` partial clone), which the caller counts and logs.
+    """
     if commit.parents:
-        diffs = commit.parents[0].diff(commit)
+        try:
+            diffs = commit.parents[0].diff(commit, no_renames=True)
+        except GitCommandError:
+            return None
     else:
         # Root commit: diff against the empty tree isn't directly exposed;
-        # fall back to a tree walk. A root commit with no tree (or a tree
-        # that fails to traverse) is treated as touching nothing rather than
+        # fall back to a tree walk. A tree that fails to traverse (missing
+        # from a partial clone) is reported like a failed diff rather than
         # aborting the whole history sync.
         try:
             diffs = [d for d in commit.tree.traverse() if d.type == "blob"]
         except Exception:
-            return []
+            return None
         return [d.path for d in diffs]
 
     paths = set()
@@ -400,7 +419,7 @@ def sync_git_history(
     if repo_record is None:
         raise ValueError(f"no such repo_id: {repo_id}")
 
-    repo = Repo(str(repo_record.path))
+    repo = open_repo(repo_record.path)
     try:
         try:
             head_sha = repo.head.commit.hexsha
