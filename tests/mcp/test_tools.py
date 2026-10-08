@@ -17,7 +17,6 @@ from devgraph.mcp.tools import (
     find_callers,
     find_related_files,
     summarise_repository,
-    compare_branches,
     impact_analysis,
     explain_architecture,
     list_services,
@@ -276,14 +275,6 @@ class TestSummariseRepository:
             assert elapsed < 5.0, f"summarise_repository took {elapsed:.2f}s — possible cartesian-product regression"
         finally:
             engine.delete_repository(repo_id)
-
-
-class TestCompareBranches:
-    def test_compare_branches_stub(self, seeded_graph):
-        """Test that compare_branches returns placeholder (Phase 3)."""
-        result = compare_branches(seeded_graph, "test_repo_a", "main", "dev")
-        assert "note" in result
-        assert "Phase 3" in result["note"]
 
 
 class TestImpactAnalysis:

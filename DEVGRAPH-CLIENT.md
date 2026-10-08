@@ -38,7 +38,7 @@ TypeScript, C#, C++, Java, Kotlin, Rust, and Go source**, detected per file by
 extension (a repo doesn't need to be single-language; each file is routed
 to the matching extractor automatically) — and exposes it through purpose-built MCP tools
 (`search_component`, `describe_node`, `find_callers`, `impact_analysis`,
-`impact_analysis_for_diff`, `explain_architecture`, `blame_component`,
+`impact_analysis_for_diff`, `compare_branches`, `explain_architecture`, `blame_component`,
 `find_requirements_for`, `find_mentions`, `list_recent_changes`, `god_nodes`,
 `get_source`, and others), plus the opt-in `run_cypher` escape hatch. Read
 `devgraph://tool-catalog` for the live tool list and identifier expectations.
@@ -310,13 +310,24 @@ Prefer these over re-reading files when the question is structural:
 | "Trace a request from this endpoint through services/datastores" | `trace_request_flow` (endpoint name) |
 | "What changed recently?" | `list_recent_changes` (lists entities touched in the last N commits, most-recent first; filters by optional entity type) |
 | "What's the overall architecture?" | `explain_architecture`, `summarise_repository` |
-| "What changed between two branches?" | `compare_branches` — **stub**: registered and callable, but not yet fully wired to git metadata; treat results as unreliable until DevGraph's own docs say otherwise |
+| "What changed between my branch and main?" | `compare_branches(branch_a="main", branch_b="<branch>")`: files, per-file symbols added, removed and changed, and the graph callers of what changed |
 | "Why was X built this way?" | `explain_decision`, `trace_design_rationale` |
 | "What requirements does X satisfy?" | `find_requirements_for` |
 | "Which docs mention X?" | `find_mentions` (only useful if Markdown mentions indexing was enabled) |
 | "Who changed X and when?" | `blame_component` (file path, not name) |
 | "What PRs/issues touched X?" | `find_related_prs`, `issue_history_for` (only useful if PR/issue ingestion was enabled in step 2) |
 | "Show me X's actual code" | `get_source` (name, not path — returns source text + full docstring; reads live from disk using the last-indexed line range, so rescan first if the file may have changed) |
+
+`compare_branches` and `impact_analysis_for_diff` both take two local refs
+and never fetch. `compare_branches` compares from the merge base, like
+`git diff main...branch` (what a pull request shows), and names the functions
+and classes added, removed and changed in each file, with line numbers. Its
+`impacted_callers` come from the last index of the working tree, not from
+either ref, so read them as a hint. `impact_analysis_for_diff` compares the two
+refs directly (`base..head`) and traces dependents, direct and transitive, of
+every component in the changed files. Use `compare_branches` for "what did my
+branch change?" and `impact_analysis_for_diff` for "what could this diff
+break?".
 
 If a tool returns empty/sparse results, check whether the repo has actually
 been scanned (step 1/2) before concluding the graph has nothing to say — an

@@ -86,7 +86,7 @@ MIN_ARGS = {
 
 
 # Where each body receives repo_id: after the engine, or after engine and registry.
-REPO_ARG_INDEX = {name: 2 if name in {"impact_analysis_for_diff", "get_source"} else 1 for name in MIN_ARGS}
+REPO_ARG_INDEX = {name: 2 if name in {"impact_analysis_for_diff", "get_source", "compare_branches"} else 1 for name in MIN_ARGS}
 
 
 def payload(name):

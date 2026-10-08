@@ -18,7 +18,7 @@ TOOL_CATALOG: list[dict[str, Any]] = [
     {"name": "find_callers", "identifier_kind": "function/class/service/endpoint name (not a file path)", "envelope": True, "phase": 1},
     {"name": "find_related_files", "identifier_kind": "function/class name (not a file path)", "envelope": True, "phase": 1},
     {"name": "summarise_repository", "identifier_kind": None, "envelope": False, "phase": 1},
-    {"name": "compare_branches", "identifier_kind": "branch names", "envelope": False, "phase": 1, "note": "stub until git metadata is fully wired"},
+    {"name": "compare_branches", "identifier_kind": "two local git refs (branch_a = base, branch_b = head; compared from their merge base, like git diff a...b)", "envelope": False, "phase": 3, "note": "the response is not an envelope; files and impacted_callers inside it are {count, results, truncated}"},
     {"name": "impact_analysis", "identifier_kind": "function/class name (not a file path)", "envelope": True, "phase": 1},
     {"name": "impact_analysis_for_diff", "identifier_kind": "two git refs (base_ref, head_ref), both must exist locally", "envelope": True, "phase": 3},
     {"name": "explain_architecture", "identifier_kind": None, "envelope": False, "phase": 1},

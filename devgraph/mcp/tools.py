@@ -1026,31 +1026,126 @@ def summarise_repository(
     }
 
 
+_COMPARE_LAST_INDEX = "impacted_callers come from the last index of the working tree, not from either ref"
+_COMPARE_STATUSES = ("added", "removed", "modified", "renamed")
+_COMPARE_LISTS = ("added", "removed", "changed")
+_COMPARE_CALLERS_CYPHER = """
+UNWIND $targets AS t
+CALL (t) {
+  MATCH (n:Function {repo_id: $repo_id, name: t.name, file: t.file}) RETURN n
+  UNION
+  MATCH (n:Class {repo_id: $repo_id, name: t.name, file: t.file}) RETURN n
+}
+MATCH (caller)-[:CALLS]->(n)
+WHERE caller.repo_id = $repo_id
+RETURN DISTINCT caller.name AS caller, labels(caller)[0] AS caller_type,
+       caller.file AS caller_file, n.name AS calls, n.file AS calls_file
+ORDER BY caller_file, caller, calls_file, calls
+"""
+
+
+def _compare_file(change: Any) -> dict[str, Any]:
+    """One C1 `<file>` entry, every string sanitised."""
+    from devgraph.mcp.tool_plane import _sanitize_deep
+
+    entry: dict[str, Any] = {"path": change.path, "status": change.status}
+    if change.old_path is not None:
+        entry["old_path"] = change.old_path
+    entry["language"] = change.language
+    entry["symbols"] = change.symbols
+    if change.symbols is None:
+        entry["symbols_skipped"] = change.symbols_skipped
+    if change.symbols_truncated:
+        entry["symbols_truncated"] = True
+    return _sanitize_deep(entry)
+
+
+def _compare_callers(
+    engine: GraphEngine, repo_id: str, targets: list[dict[str, str]], max_callers: int
+) -> tuple[dict[str, Any] | None, list[str]]:
+    """C8: the graph's callers of `targets`, as an envelope plus notices. Best-effort:
+    a graph failure gives `None` and a notice, never an error."""
+    from neo4j.exceptions import DriverError, Neo4jError
+
+    if not targets:
+        return _envelope([], max_callers), []
+    try:
+        rows, more = engine.run_read_cypher(
+            _COMPARE_CALLERS_CYPHER,
+            {"repo_id": repo_id, "targets": targets},
+            timeout_s=DEFAULT_TIMEOUT_S,
+            max_rows=max_callers + 1,
+        )
+    except (Neo4jError, DriverError) as exc:
+        code = getattr(exc, "code", None) or type(exc).__name__
+        return None, [f"impacted callers unavailable: {code}"]
+    callers = {
+        "count": len(rows),
+        "results": [_sanitize_row(r) for r in rows[:max_callers]],
+        "truncated": more or len(rows) > max_callers,
+    }
+    return callers, [_COMPARE_LAST_INDEX]
+
+
 def compare_branches(
     engine: GraphEngine,
+    registry: RepoRegistry,
     repo_id: str,
     branch_a: str,
     branch_b: str,
 ) -> dict[str, Any]:
-    """Compare architecture between two branches (git metadata needed in graph).
+    """What changed on `branch_b` (head) since it diverged from `branch_a` (base), like
+    `git diff branch_a...branch_b`: files, per-file symbols added/removed/changed, and
+    the graph's callers of the changed and removed symbols.
 
-    Args:
-        engine: GraphEngine instance
-        repo_id: Repository ID
-        branch_a: First branch name
-        branch_b: Second branch name
+    Reads git objects in memory and never fetches; the graph is only read. See
+    docs/superpowers/specs/2026-10-08-compare-branches-design.md (C1, C7, C8).
 
-    Returns:
-        Dict with components added, removed, and changed between branches
-
-    Note: This is a stub until git metadata is indexed (Phase 3).
+    Raises:
+        ToolError: an unknown repo_id, a repository without its own .git, a bad or
+            unknown ref, no common history, or git failing (C7).
     """
-    # Placeholder: full implementation requires git history indexing (Phase 3)
+    from devgraph.indexer.git_history import compare as git_compare
+
+    record = registry.get(repo_id)
+    if record is None:
+        raise ToolError(f"no such repo_id: {_echo(repo_id)}; run devgraph list to see registered repositories")
+    try:
+        with git_compare.open_comparison(record.path, repo_id, branch_a, branch_b) as comparison:
+            detailed = git_compare.symbol_detail(comparison)
+    except git_compare.CompareError as exc:
+        raise ToolError(str(exc)) from exc
+
+    max_files = git_compare._COMPARE_MAX_FILES
+    symbol_counts = {name: 0 for name in _COMPARE_LISTS}
+    targets: list[dict[str, str]] = []
+    for change in detailed:
+        if change.symbols is None:
+            continue
+        for name in _COMPARE_LISTS:
+            symbol_counts[name] += len(change.symbols[name])
+        for name in ("changed", "removed"):
+            for entry in change.symbols[name]:
+                target = {"name": entry["name"], "file": change.path}
+                if target not in targets:
+                    targets.append(target)
+    callers, notices = _compare_callers(engine, repo_id, targets, git_compare._COMPARE_MAX_CALLERS)
+    reasons = comparison.truncated_reasons
     return {
-        "added_in_b": [],
-        "removed_in_b": [],
-        "changed": [],
-        "note": "Git history integration planned for Phase 3",
+        "base": {"ref": _sanitize_value(branch_a), "commit": comparison.base_commit.hexsha},
+        "head": {"ref": _sanitize_value(branch_b), "commit": comparison.head_commit.hexsha},
+        "merge_base": comparison.merge_base.hexsha,
+        "counts": {status: sum(c.status == status for c in comparison.changes) for status in _COMPARE_STATUSES},
+        "files": {
+            "count": len(comparison.changes),
+            "results": [_compare_file(c) for c in detailed],
+            "truncated": len(comparison.changes) > max_files,
+        },
+        "symbol_counts": symbol_counts,
+        "impacted_callers": callers,
+        "truncated": bool(reasons),
+        "truncated_reasons": list(reasons),
+        "notices": notices,
     }
 
 

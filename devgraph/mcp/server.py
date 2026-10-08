@@ -606,8 +606,19 @@ def build_server(
 
     @server.tool(annotations=_READ_ONLY)
     def compare_branches(repo_id: str, branch_a: str, branch_b: str) -> dict[str, Any]:
-        """Compare architecture between two branches. Stub until git metadata is fully wired (Phase 3)."""
-        return devgraph_tools.compare_branches(engine, repo_id, branch_a, branch_b)
+        """What changed on branch_b (the head) since it diverged from branch_a (the base),
+        compared from their merge base like `git diff branch_a...branch_b` (what a pull
+        request from branch_b into branch_a shows). Both refs (branch, tag, SHA, HEAD~2...)
+        must exist locally; never fetches. Lists the changed files (added, removed,
+        modified, exact-content renamed) and, for Python, JS/TS, C#, C++, Java, Rust,
+        Kotlin and Go files, the functions and classes added, removed and changed, with
+        line numbers. Capped (200 files, 50 symbols per list, 1,000 symbols, 16 MiB
+        parsed, 20 s); `truncated` and `truncated_reasons` say when a cap was hit.
+        impacted_callers are the graph's callers of the changed and removed symbols,
+        from the last index of the working tree, not from either ref: read them as a
+        hint. The merge-base step has a timeout on POSIX only. files and
+        impacted_callers are {count, results, truncated}."""
+        return devgraph_tools.compare_branches(engine, registry, repo_id, branch_a, branch_b)
 
     @server.tool(annotations=_READ_ONLY)
     def impact_analysis(repo_id: str, component_name: str, cross_repo: bool = False, max_results: int = 15) -> dict[str, Any]:
