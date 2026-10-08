@@ -1107,12 +1107,21 @@ def test_name_refs_written_empty(engine, repo_id, tmp_path):
     assert _module_name_refs(engine, repo_id, "caller.py") == ([], [], [])
 
 
-def test_name_ref_relink_benchmark(engine, repo_id):
+def test_name_ref_relink_benchmark(engine, repo_id, monkeypatch):
     """The relink read over 5,000 Modules, each with 60 by-name edges drawn
-    from 2,000 names, then the parse and the upsert of what it found."""
+    from 2,000 names, then the parse and the upsert of what it found.
+
+    Locally it is held to a wall-clock bound. A CI runner's clock is too
+    noisy for that, so there every query the relink runs is PROFILEd
+    instead, and the plans must seek, not scan: a scan per row (as a plan
+    made from stale index statistics did, at 20 s) is millions of db hits
+    against tens of thousands."""
     import logging
+    import os
     import random
     import time
+
+    from neo4j import ManagedTransaction, Session
 
     rng = random.Random(4)
     names = [f"fn{i}" for i in range(2000)]
@@ -1138,9 +1147,23 @@ def test_name_ref_relink_benchmark(engine, repo_id):
     ])
     added = {("Function", n, "new.py") for n in added_names}
 
+    profiles = []
+    if os.environ.get("CI"):
+        def profiled(run):
+            def run_profiled(self, query, *args, **kwargs):
+                result = run(self, "PROFILE " + query, *args, **kwargs)
+                records = list(result)
+                profiles.append(result.consume().profile)
+                return records
+            return run_profiled
+
+        monkeypatch.setattr(Session, "run", profiled(Session.run))
+        monkeypatch.setattr(ManagedTransaction, "run", profiled(ManagedTransaction.run))
+
     started = time.perf_counter()
     dispatch._relink_name_refs(engine, repo_id, added, set())
     elapsed = time.perf_counter() - started
+    monkeypatch.undo()
 
     logging.getLogger(__name__).warning("name_ref relink over 5,000 Modules: %.3f s", elapsed)
     print(f"name_ref relink over 5,000 Modules: {elapsed:.3f} s")
@@ -1150,7 +1173,21 @@ def test_name_ref_relink_benchmark(engine, repo_id):
     # Each caller links to exactly the added names among its module's targets.
     expected = sum(len(set(m["properties"]["name_ref_targets"]) & set(added_names)) for m in modules)
     assert expected > 0 and row["n"] == expected
-    assert elapsed < 2.0
+    if not os.environ.get("CI"):
+        assert elapsed < 2.0
+        return
+
+    def operators(plan):
+        yield plan["operatorType"], plan.get("args", {}).get("DbHits", 0)
+        for child in plan.get("children", []):
+            yield from operators(child)
+
+    ops = [op for plan in profiles for op in operators(plan)]
+    db_hits = sum(hits for _op, hits in ops)
+    print(f"name_ref relink db hits: {db_hits}")
+    assert len(profiles) == 2  # the Module read and the edge upsert
+    assert not [op for op, _hits in ops if "Scan" in op], ops
+    assert db_hits < 200_000, ops
 
 
 def test_full_scan_stamps_index_format(engine, repo_id, tmp_path):
