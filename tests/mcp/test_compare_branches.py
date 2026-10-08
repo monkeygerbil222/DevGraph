@@ -223,7 +223,7 @@ def test_hostile_strings_are_sanitised(tmp_path):
     repo = two_branch_repo(tmp_path, {"a.py": f"def {long_name}():\n    return 1\n"}, {"a.py": f"def {long_name}():\n    return 2\n"})
     git(repo, "checkout", "-q", "feature")
     src = Path(tmp_path, "evil-src.py")
-    src.write_text("def bad():\n    return 1\n")
+    src.write_bytes(b"def bad():\n    return 1\n")
     blob = git(repo, "hash-object", "-w", str(src))
     # Git for Windows refuses control characters in paths unless core.protectNTFS is off.
     git(repo, "-c", "core.protectNTFS=false", "update-index", "--add", "--cacheinfo", f"100644,{blob},evil\x07.py")

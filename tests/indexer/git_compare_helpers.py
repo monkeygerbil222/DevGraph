@@ -27,10 +27,8 @@ def commit_files(repo, files: dict[str, str | bytes | None], message):
             path.unlink()
             continue
         path.parent.mkdir(parents=True, exist_ok=True)
-        if isinstance(content, bytes):
-            path.write_bytes(content)
-        else:
-            path.write_text(content)
+        # Bytes as given: text mode would write CRLF on Windows.
+        path.write_bytes(content if isinstance(content, bytes) else content.encode())
     git(repo, "add", "-A")
     git(repo, "commit", "--allow-empty", "-m", message)
     return git(repo, "rev-parse", "HEAD")
