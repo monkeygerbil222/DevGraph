@@ -1,6 +1,7 @@
 """Tests for WatcherManager."""
 
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -507,3 +508,27 @@ def test_watcher_manager_gracefully_handles_missing_paths(temp_registry_db):
                 assert repo1.repo_id in issues
             finally:
                 watcher.stop()
+
+
+def test_watcher_manager_stop_waits_for_a_running_git_sync(temp_registry_db, temp_git_repo):
+    """stop() returns only once the catch-up's git sync has finished: the
+    agent closes the graph engine right after, and closing the driver under a
+    running query breaks the connection mid-write (BufferError)."""
+    registry = temp_registry_db
+    repo_id = registry.add_repo(temp_git_repo).repo_id
+    registry.mark_indexed(repo_id)
+    syncing, release, finished = threading.Event(), threading.Event(), threading.Event()
+
+    def on_git_state_changed(_repo_id: str) -> None:
+        syncing.set()
+        release.wait(5)
+        finished.set()
+
+    watcher = WatcherManager(
+        registry, lambda *a: None, on_git_state_changed=on_git_state_changed, on_catch_up=lambda *a: True
+    )
+    watcher.start()
+    assert syncing.wait(5)
+    threading.Timer(0.3, release.set).start()
+    watcher.stop()
+    assert finished.is_set()

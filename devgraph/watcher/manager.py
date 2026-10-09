@@ -50,6 +50,11 @@ MAX_SCHEDULE_FAILURES_PER_RECONCILE = 3
 #: counts as part of the same git operation (W6).
 GIT_LOCK_WINDOW_S = 5.0
 
+#: How long `WatcherManager.stop` waits for a batch, catch-up or git-history
+#: sync already running. The timer threads are daemons, so a job slower than
+#: this (a hung database) cannot hold shutdown hostage.
+STOP_WAIT_S = 3.0
+
 
 def _is_relevant_git_state_path(path: Path) -> bool:
     """Whether a path under `.git/` actually represents git *history* state.
@@ -311,7 +316,10 @@ class WatcherManager:
         Pending reconciles are cancelled, and one that is running finishes
         without queueing anything. Pending debounces and catch-ups are
         cancelled; the changes they held are left for the next start's
-        catch-up. A catch-up that is running is not waited for.
+        catch-up. A batch or catch-up (and its git-history sync) that is
+        running is waited for, up to `STOP_WAIT_S`: callers close the graph
+        engine next, and closing the driver under a running query breaks the
+        connection mid-write.
         """
         with self._reconcile_lock:
             self._stopping = True
@@ -340,6 +348,17 @@ class WatcherManager:
             self._handlers.clear()
             self._git_handlers.clear()
             self._watches.clear()
+            batch_locks = list(self._batch_locks.values())
+        # Every job that writes the graph runs under its repo's batch lock and,
+        # once there, checks the flags set above, so holding each lock once
+        # means no watcher job is still running and none will start.
+        deadline = time.monotonic() + STOP_WAIT_S
+        for lock in batch_locks:
+            if lock.acquire(timeout=max(0.0, deadline - time.monotonic())):
+                lock.release()
+            else:
+                logger.info("a watcher job was still running %.0f s after stop", STOP_WAIT_S)
+                break
 
     def run_exclusive(self, repo_id: str, fn: Callable[[], Any]) -> Any:
         """Run `fn` under the repo's batch lock, so it never interleaves with
