@@ -284,6 +284,8 @@ class TrayApp:
         self._sync.stopping = self._paused
         try:
             if self._paused:
+                # Waits up to STOP_WAIT_S (3 s) for a running batch or
+                # catch-up, so the menu can block that long.
                 self._watcher.stop()
             else:
                 self._watcher.start()

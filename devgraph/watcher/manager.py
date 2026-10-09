@@ -319,7 +319,10 @@ class WatcherManager:
         catch-up. A batch or catch-up (and its git-history sync) that is
         running is waited for, up to `STOP_WAIT_S`: callers close the graph
         engine next, and closing the driver under a running query breaks the
-        connection mid-write.
+        connection mid-write. A job still running after `STOP_WAIT_S` (say the
+        first git-history sync of a large repository, which reads its whole
+        history in one job) is abandoned: stop returns, and that job may
+        still race the driver close.
         """
         with self._reconcile_lock:
             self._stopping = True
@@ -463,7 +466,8 @@ class WatcherManager:
         """A git burst's debounce fired: catch up from the start of the burst
         (or `last_indexed`) shortly, to repair events the OS dropped (W6),
         then sync git history in the same job, under the batch lock. Without
-        a catch-up (none wired, or a never-indexed repo) the sync runs now."""
+        a catch-up (none wired, or a never-indexed repo) the sync runs now,
+        under the batch lock, so a stop waits for it or it never starts."""
         with self._catch_up_lock:
             if self._catch_up_stopped:
                 return  # the next start's catch-up and sync cover it
@@ -476,7 +480,12 @@ class WatcherManager:
                 self.request_catch_up(repo_id, since, self._git_catch_up_delay_s, "git")
                 return
         if self._on_git_state_changed is not None:
-            self._on_git_state_changed(repo_id)
+            def run() -> None:
+                if self._catch_up_stopped or repo_id not in self._git_handlers:
+                    return  # stopped (or the repo unwatched) while waiting for the lock
+                self._on_git_state_changed(repo_id)
+
+            self.run_exclusive(repo_id, run)
 
     def refresh(self) -> None:
         """Rebuild watcher set by re-reading the registry.

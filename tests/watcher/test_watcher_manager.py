@@ -532,3 +532,42 @@ def test_watcher_manager_stop_waits_for_a_running_git_sync(temp_registry_db, tem
     threading.Timer(0.3, release.set).start()
     watcher.stop()
     assert finished.is_set()
+
+
+def test_watcher_manager_stop_keeps_a_waiting_never_indexed_git_sync_from_starting(
+    temp_registry_db, temp_git_repo, monkeypatch
+):
+    """A git burst on a never-indexed repo syncs git history without a
+    catch-up. That sync runs under the batch lock too: one still waiting for
+    the lock when stop() runs never starts."""
+    registry = temp_registry_db
+    repo_id = registry.add_repo(temp_git_repo).repo_id
+    syncs: list[str] = []
+    watcher = WatcherManager(
+        registry, lambda *a: None, on_git_state_changed=syncs.append, on_catch_up=lambda *a: True
+    )
+    watcher.start()
+    holding, release, past_check = threading.Event(), threading.Event(), threading.Event()
+
+    def hold() -> None:
+        holding.set()
+        release.wait(5)
+
+    holder = threading.Thread(target=watcher.run_exclusive, args=(repo_id, hold))
+    holder.start()
+    assert holding.wait(5)
+    real_last_indexed = watcher._last_indexed
+
+    def last_indexed(rid):
+        past_check.set()  # the burst has passed its stopped check
+        return real_last_indexed(rid)
+
+    monkeypatch.setattr(watcher, "_last_indexed", last_indexed)
+    burst = threading.Thread(target=watcher._on_git_burst, args=(repo_id, None))
+    burst.start()
+    assert past_check.wait(5)
+    threading.Timer(0.3, release.set).start()
+    watcher.stop()
+    burst.join(5)
+    holder.join(5)
+    assert syncs == []
