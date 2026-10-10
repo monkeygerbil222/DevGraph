@@ -713,9 +713,10 @@ def _group_rels_by_triple(
     Within a group, the edges out of one source with the same properties and
     `origin` (the file that wrote them, None for a writer that doesn't record
     one) share a row, whose `targets` lists each edge's `to_name`, `to_file`
-    and `exact` (the files a "prefix" target pin leaves out, empty for every
-    other pin). The source is then matched once for all of them: a resolved
-    Python call names several candidate files per callee.
+    `exact` (the files a "prefix" target pin leaves out, empty for every
+    other pin) and `no_self` (the edge may not end at its source). The source
+    is then matched once for all of them: a resolved Python call names
+    several candidate files per callee.
     """
     groups: dict[tuple[str, str, str, str, str], dict[tuple, dict[str, Any]]] = {}
     for rel in rels:
@@ -737,7 +738,10 @@ def _group_rels_by_triple(
             "origin": origin,
             "targets": [],
         })
-        row["targets"].append({"to_name": rel["to_name"], "to_file": to_file, "exact": rel.get("exact") or []})
+        row["targets"].append({
+            "to_name": rel["to_name"], "to_file": to_file, "exact": rel.get("exact") or [],
+            "no_self": bool(rel.get("no_self")),
+        })
     return {key: list(rows.values()) for key, rows in groups.items()}
 
 
@@ -779,7 +783,7 @@ _ADD_ORIGIN = (
 )
 
 
-def _end_match(var: str, label: str, end: str, pin: str, ref: str = "row") -> str:
+def _end_match(var: str, label: str, end: str, pin: str, ref: str = "row", also: str | None = None) -> str:
     """The MATCH for one end of an edge row (`pin` from `_pin`), reading its
     `{end}_name`/`{end}_file` off `ref` (the row, or one of its targets). An
     end of a file-scoped label is hinted to seek its index: the (repo_id,
@@ -790,18 +794,20 @@ def _end_match(var: str, label: str, end: str, pin: str, ref: str = "row") -> st
     INDEX allows that scan) after the label has filled; in CI that made a
     5,000-module relink take 20 s instead of under 1 s. A "prefix" end seeks
     by name and keeps the nodes whose file is under the directory, less the
-    `exact` files."""
+    `exact` files. `also` is one more condition on the match."""
     pinned = pin == "file"
     keys = "repo_id, name, file" if pinned else "repo_id, name"
     hint = f"USING INDEX SEEK {var}:{label}({keys}) " if label in FILE_SCOPED_LABELS else ""
-    if not pinned:
-        match = f"MATCH ({var}:{label} {{repo_id: row.repo_id, name: {ref}.{end}_name}}) " + hint
+    conditions = [also] if also else []
+    if pinned:
+        match = f"MATCH ({var}:{label} {{repo_id: row.repo_id, name: {ref}.{end}_name, file: {ref}.{end}_file}}) "
+    else:
+        match = f"MATCH ({var}:{label} {{repo_id: row.repo_id, name: {ref}.{end}_name}}) "
         if pin == "prefix":
-            return match + f"WHERE {var}.file STARTS WITH {ref}.{end}_file AND NOT {var}.file IN {ref}.exact "
-        return match + (f"WHERE {var}.file IS NULL " if pin == "fileless" else "")
-    return (
-        f"MATCH ({var}:{label} {{repo_id: row.repo_id, name: {ref}.{end}_name, file: {ref}.{end}_file}}) " + hint
-    )
+            conditions.insert(0, f"{var}.file STARTS WITH {ref}.{end}_file AND NOT {var}.file IN {ref}.exact")
+        elif pin == "fileless":
+            conditions.insert(0, f"{var}.file IS NULL")
+    return match + hint + ("WHERE " + " AND ".join(conditions) + " " if conditions else "")
 
 
 def _upsert_relationships_tx(tx, rels: list[dict[str, Any]]) -> None:
@@ -810,7 +816,7 @@ def _upsert_relationships_tx(tx, rels: list[dict[str, Any]]) -> None:
             "UNWIND $rows AS row "
             + _end_match("a", from_label, "from", from_pin)
             + "UNWIND row.targets AS t "
-            + _end_match("b", to_label, "to", to_pin, "t")
+            + _end_match("b", to_label, "to", to_pin, "t", also="(NOT t.no_self OR a <> b)")
             + f"MERGE (a)-[r:{rel_type}]->(b) "
             "SET r += row.properties " + _ADD_ORIGIN,
             rows=rows,

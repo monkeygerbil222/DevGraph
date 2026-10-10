@@ -1539,7 +1539,7 @@ def test_a_directory_pin_is_tested_before_the_fileless_pin():
     groups = _group_rels_by_triple([_rel("f", "pkg/a.py"), {**_rel("f", "pkg/"), "exact": ["pkg/a.py"]}])
     assert {key[4] for key in groups} == {"file", "prefix"}
     (prefix_row,) = groups[("Function", "CALLS", "Function", "file", "prefix")]
-    assert prefix_row["targets"] == [{"to_name": "f", "to_file": "pkg/", "exact": ["pkg/a.py"]}]
+    assert prefix_row["targets"] == [{"to_name": "f", "to_file": "pkg/", "exact": ["pkg/a.py"], "no_self": False}]
     match = _end_match("b", "Function", "to", "prefix", "t")
     assert "USING INDEX SEEK b:Function(repo_id, name)" in match
     assert "b.file STARTS WITH t.to_file AND NOT b.file IN t.exact" in match

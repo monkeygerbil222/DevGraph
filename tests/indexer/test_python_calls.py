@@ -413,3 +413,15 @@ def test_the_index_upgrade_replaces_bare_python_calls(engine, repo_id, tmp_path,
     assert caller_edges(engine, repo_id, "main") == [("helper", "lib.py", "resolved")]
     assert not dispatch.index_outdated(engine, repo_id)
     equals_fresh(engine, repo_id, tmp_path)
+
+
+def test_an_untyped_member_call_never_links_its_own_caller(engine, repo_id, tmp_path):
+    """`items.save()` inside `save` is a call on some other object, never a
+    recursion; the same name elsewhere keeps its bare edge."""
+    write(tmp_path, "repo.py", "class Repo:\n    def save(self, items):\n        items.save(1)\n")
+    write(tmp_path, "store.py", "def save(x):\n    return x\n")
+    provision_repository_schema(engine, tmp_path)
+    engine.upsert_repository(repo_id, repo_id, str(tmp_path))
+    full_scan(engine, repo_id, tmp_path)
+    assert caller_edges(engine, repo_id, "save") == [("save", "store.py", "name")]
+    equals_fresh(engine, repo_id, tmp_path)

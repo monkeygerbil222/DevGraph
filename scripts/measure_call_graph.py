@@ -120,8 +120,10 @@ def measure_m1(engine: GraphEngine, repo_id: str) -> dict:
         )
     }
     resolved = totals.get("resolved", 0)
+    self_loops = _rows(engine, "MATCH (a {repo_id: $r})-[x:CALLS]->(a) RETURN count(x) AS n", r=repo_id)[0]["n"]
     return {
         "calls_by_confidence": totals,
+        "self_loops": self_loops,
         "multi_target_by_confidence": multi,
         "multi_target_total": sum(multi.values()),
         "resolved_multi_share": round(multi.get("resolved", 0) / resolved, 4) if resolved else None,

@@ -63,6 +63,9 @@ class GraphRelationship:
     A `to_file` ending in "/" is a package directory: the edge goes to every
     node of the name in a file under it, except the `exact` files (see
     engine._pin).
+
+    `no_self` keeps the edge off its own source: a call `x.m()` on a receiver
+    nothing types, inside `m` itself, is not a recursive call.
     """
 
     from_label: str
@@ -76,6 +79,7 @@ class GraphRelationship:
     to_file: str | None = None
     origin: str | None = None
     exact: list[str] | None = None
+    no_self: bool = False
 
     def to_dict(self) -> dict:
         return {
@@ -90,6 +94,7 @@ class GraphRelationship:
             "to_file": self.to_file,
             "origin": self.origin,
             "exact": self.exact,
+            "no_self": self.no_self,
         }
 
 
