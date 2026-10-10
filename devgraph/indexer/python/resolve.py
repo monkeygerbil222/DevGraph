@@ -85,8 +85,10 @@ def relative_module(module_text: str, current_dir: str) -> ModuleRef:
 @dataclass(frozen=True)
 class Symbol:
     """A name bound by `from P import n [as alias]`: `n` can be a name defined
-    in P (its files, or anywhere under its package) or the submodule P.n."""
+    in P (its files, or anywhere under its package) or the submodule P.n.
+    `name` is `n` as P defines it, whatever the alias."""
 
+    name: str
     module: ModuleRef
     submodule: ModuleRef
 
@@ -120,5 +122,5 @@ class Bindings:
             self.stars.append(module)
         for name, alias in names:
             submodule = module.child(name)
-            self.symbols[alias or name] = Symbol(module, submodule)
+            self.symbols[alias or name] = Symbol(name, module, submodule)
             self.targets.update(submodule.files())

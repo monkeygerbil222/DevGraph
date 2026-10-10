@@ -81,8 +81,9 @@ def incremental_equals_fresh(engine, repo_id, root, mentions_enabled=False, docs
 
 
 def edges(engine, repo_id, rel_type):
-    """The snapshot's edges of one type: (label, name, file, type, label, name, file, origins)."""
-    return [edge for edge in graph_snapshot(engine, repo_id)[1] if edge[3] == rel_type]
+    """The snapshot's edges of one type: (label, name, file, type, label, name, file, origins),
+    without their other properties."""
+    return [edge[:8] for edge in graph_snapshot(engine, repo_id)[1] if edge[3] == rel_type]
 
 
 # --- origins -----------------------------------------------------------------
@@ -770,7 +771,7 @@ def test_a_route_implements_only_its_own_files_handler(engine, repo_id, tmp_path
 def test_a_by_name_call_relinks_to_an_added_handler_stub(engine, repo_id, tmp_path):
     """A route file added later brings a stub and a Function named `search`;
     another file's by-name call relinks to both, as a fresh scan links it."""
-    write(tmp_path, "c.py", "def caller():\n    return search()\n")
+    write(tmp_path, "c.py", "def caller():\n    return api.search()\n")
     scan(engine, repo_id, tmp_path)
     routes = write(tmp_path, "api/routes.py", _routed("search"))
     index_paths(engine, repo_id, tmp_path, {routes})
@@ -974,7 +975,7 @@ def test_supertype_added_in_another_directory(engine, repo_id, tmp_path, files):
 
 
 def test_second_same_named_function_links_outside_callers(engine, repo_id, tmp_path):
-    write(tmp_path, "a.py", "def main():\n    return helper()\n")
+    write(tmp_path, "a.py", "def main():\n    return obj.helper()\n")
     write(tmp_path, "b.py", "def helper():\n    return 1\n")
     scan(engine, repo_id, tmp_path)
 
@@ -1038,7 +1039,7 @@ def test_removed_foreign_impl_is_retracted(engine, repo_id, tmp_path):
 
 
 def test_symbol_moved_between_files_in_one_batch(engine, repo_id, tmp_path):
-    write(tmp_path, "a.py", "def main():\n    return helper()\n")
+    write(tmp_path, "a.py", "def main():\n    return obj.helper()\n")
     b = write(tmp_path, "b.py", "def helper():\n    return 1\n")
     write(tmp_path, "notes.md", "Uses `helper`.\n")
     scan(engine, repo_id, tmp_path, mentions_enabled=True)
@@ -1054,7 +1055,7 @@ def test_symbol_moved_between_files_in_one_batch(engine, repo_id, tmp_path):
 
 
 def test_relink_reads_no_files(engine, repo_id, tmp_path, monkeypatch):
-    write(tmp_path, "a.py", "def main():\n    return helper()\n")
+    write(tmp_path, "a.py", "def main():\n    return obj.helper()\n")
     write(tmp_path, "other.py", "def unrelated():\n    return 0\n")
     scan(engine, repo_id, tmp_path)
 
@@ -1173,7 +1174,7 @@ def _spy(monkeypatch, cls, name):
 
 
 def test_full_scan_skips_relink(engine, repo_id, tmp_path, monkeypatch):
-    write(tmp_path, "a.py", "def main():\n    return helper()\n")
+    write(tmp_path, "a.py", "def main():\n    return obj.helper()\n")
     calls = _spy(monkeypatch, GraphEngine, "find_name_refs")
     scan(engine, repo_id, tmp_path)
     assert calls == []
@@ -1194,17 +1195,17 @@ def _module_name_refs(engine, repo_id, name):
 
 def test_pass_two_omits_name_refs(engine, repo_id, tmp_path, monkeypatch):
     scan(engine, repo_id, tmp_path)
-    a = write(tmp_path, "a.py", "def main():\n    return helper()\n")
+    a = write(tmp_path, "a.py", "def main():\n    return obj.helper()\n")
     calls = _spy(monkeypatch, GraphEngine, "upsert_nodes")
     index_paths(engine, repo_id, tmp_path, {a})
     modules = [n for (nodes,) in calls for n in nodes if n["label"] == "Module"]
     assert modules and not any("name_refs" in n["properties"] for n in modules)
-    assert _module_name_refs(engine, repo_id, "a.py")[0] == ["CALLS\x1fFunction\x1fmain\x1fa.py\x1fFunction\x1fhelper\x1f\x1f\x1f"]
+    assert _module_name_refs(engine, repo_id, "a.py")[0] == ["CALLS\x1fFunction\x1fmain\x1fa.py\x1fFunction\x1fhelper\x1f\x1f\x1fname"]
 
 
 def test_name_refs_written_empty(engine, repo_id, tmp_path):
     write(tmp_path, "plain.py", "X = 1\n")
-    caller = write(tmp_path, "caller.py", "def main():\n    return helper()\n")
+    caller = write(tmp_path, "caller.py", "def main():\n    return obj.helper()\n")
     scan(engine, repo_id, tmp_path)
     assert _module_name_refs(engine, repo_id, "plain.py") == ([], [], [])
     assert _module_name_refs(engine, repo_id, "caller.py")[1] == ["helper"]

@@ -160,8 +160,8 @@ def test_bindings_record_modules_symbols_aliases_and_stars():
     )
     assert b.modules == {"a.b": absolute_module("a.b", "x/f.py"), "d": absolute_module("c", "x/f.py")}
     pkg = absolute_module("pkg", "x/f.py")
-    assert b.symbols["alias"] == Symbol(pkg, pkg.child("name"))
-    assert b.symbols["other"] == Symbol(pkg, pkg.child("other"))
+    assert b.symbols["alias"] == Symbol("name", pkg, pkg.child("name"))
+    assert b.symbols["other"] == Symbol("other", pkg, pkg.child("other"))
     assert "thing" in b.symbols  # a function-local import binds file-wide
     assert b.stars == [relative_module(".rel", "x")]
 

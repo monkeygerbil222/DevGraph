@@ -130,7 +130,7 @@ def two_helpers(engine):
         (repo_root / ".git").mkdir()
         for stem in ("a", "b"):
             (repo_root / f"{stem}.py").write_text(
-                f"def helper():\n    return '{stem}'\n\n\ndef run():\n    return target()\n", encoding="utf-8"
+                f"def helper():\n    return '{stem}'\n\n\ndef run():\n    from t import target\n    return target()\n", encoding="utf-8"
             )
         (repo_root / "t.py").write_text("def target():\n    return 1\n", encoding="utf-8")
         registry = RepoRegistry(Path(regdir) / "registry.db")

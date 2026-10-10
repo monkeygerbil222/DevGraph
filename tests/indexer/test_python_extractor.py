@@ -265,7 +265,7 @@ def test_calls_edge_carries_caller_class_for_method_body_calls():
     """
     source_code = """
 def free_call():
-    helper()
+    obj.helper()
 
 class Service:
     def process(self):
@@ -278,8 +278,8 @@ class Service:
     calls_by_pair = {
         (r.from_name, r.to_name): r.properties for r in result.relationships if r.rel_type == "CALLS"
     }
-    assert calls_by_pair[("process", "helper")] == {"caller_class": "Service"}
-    assert calls_by_pair[("free_call", "helper")] is None
+    assert calls_by_pair[("process", "helper")] == {"caller_class": "Service", "confidence": "resolved"}
+    assert calls_by_pair[("free_call", "helper")] == {"confidence": "name"}
 
 
 def test_calls_edge_attributed_to_correct_nested_scope():
@@ -289,8 +289,8 @@ def test_calls_edge_attributed_to_correct_nested_scope():
     source_code = """
 def outer():
     def inner():
-        deep_call()
-    outer_call()
+        x.deep_call()
+    x.outer_call()
 """
     result = extract_python_file(source_code, "x.py", "test_repo")
     calls = {(r.from_name, r.to_name) for r in result.relationships if r.rel_type == "CALLS"}

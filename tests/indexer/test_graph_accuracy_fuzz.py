@@ -7,6 +7,12 @@ See docs/superpowers/specs/2026-10-08-graph-accuracy-design.md. CI runs three
 fixed seeds of 15 steps. `DEVGRAPH_ACCURACY_FUZZ_SEEDS` (a comma list) and
 `DEVGRAPH_ACCURACY_FUZZ_STEPS` lengthen it locally.
 
+Python files import and call in every style the call resolution reads
+(docs/superpowers/specs/2026-10-10-python-call-resolution-design.md): plain,
+aliased, relative and star imports, a package re-exporting from its module,
+a src/ layout, calls through modules, aliases and untyped values, and
+`self.shared()` reaching a base in the same or another file.
+
 The spec's "Out of scope" gaps are left out by construction:
 - compose services have `image:` only, never `build:`;
 - no datastore or route code (so no handler stub either);
@@ -85,12 +91,21 @@ class File:
         )
 
 
+def py_class(name: str, base: str | None) -> str:
+    """A class whose `act` calls `self.shared()`, which only `Base` defines."""
+    head = f"\n\nclass {name}({base}):\n" if base else f"\n\nclass {name}:\n"
+    shared = "\n    def shared(self):\n        return 0\n" if name == "Base" else ""
+    return head + "    def act(self):\n        return self.shared()\n" + shared
+
+
 def render(f: File) -> str:
     if f.kind == "py":
-        parts = [f"import {m}\n" for m in f.imports]
-        parts += [f"\n\nclass {c}({b}):\n    pass\n" if b else f"\n\nclass {c}:\n    pass\n" for c, b in f.bases.items()]
+        # A Python file's imports are whole statements and its calls whole
+        # call expressions (`helper()`, `b.helper()`, `obj.helper()`).
+        parts = [f"{m}\n" for m in f.imports]
+        parts += [py_class(c, b) for c, b in f.bases.items()]
         parts += [
-            f"\n\ndef {name}():\n" + "".join(f"    {g}()\n" for g in calls) + "    return 0\n"
+            f"\n\ndef {name}():\n" + "".join(f"    {g}\n" for g in calls) + "    return 0\n"
             for name, calls in f.funcs.items()
         ]
         return "".join(parts) or "X = 1\n"
@@ -146,9 +161,18 @@ GO_SERVER = "type Server struct{}\n\nfunc (s *Server) Run() {\n\tServe()\n}\n"
 
 def initial_repo() -> dict:
     return {
-        "py/a.py": File("py", imports=["py.b"], funcs={"main": ["helper", "util"]}),
-        "py/b.py": File("py", bases={"Base": None}, funcs={"helper": ["util"]}),
-        "py/c.py": File("py", imports=["py.b"], bases={"Child": "Base"}, funcs={"main": [], "util": []}),
+        "py/a.py": File("py", imports=["from py.b import helper", "from pkg import pkgfn", "import py.c as c"],
+                        funcs={"main": ["helper()", "c.util()", "obj.helper()", "pkgfn()"]}),
+        "py/b.py": File("py", imports=["from .c import util"], bases={"Base": None}, funcs={"helper": ["util()"]}),
+        "py/c.py": File("py", imports=["from py import b"], bases={"Child": "b.Base"},
+                        funcs={"main": ["b.helper()"], "util": []}),
+        # A package re-exporting from its own module, a sibling module, and a
+        # src/ layout project.
+        "pkg/__init__.py": File("py", imports=["from pkg.impl import helper, pkgfn"]),
+        "pkg/impl.py": File("py", funcs={"helper": [], "pkgfn": ["helper()"]}),
+        "pkg/other.py": File("py", funcs={"spare": []}),
+        "src/lib/core.py": File("py", imports=["from lib import util"], funcs={"core": ["util.render()"]}),
+        "src/lib/util.py": File("py", funcs={"render": []}),
         "rs/foo.rs": File("rs", extra=RS_FOO, funcs={"parse": ["render"]}),
         "rs/display.rs": File("rs", extra="pub trait Display {}\n", funcs={"render": []}),
         "rs/conv.rs": File("rs", imports=["display::Display"], impl=True, funcs={"convert": ["parse"]}),
@@ -167,12 +191,19 @@ def initial_repo() -> dict:
 
 
 IMPORTS = {
-    "py": ["py.a", "py.b", "py.c"],
+    "py": [
+        "import py.b", "import py.c as c", "from py.b import helper", "from py import b", "from .c import util",
+        "from . import a", "from pkg import helper", "from pkg import *", "from py.b import *",
+        "from lib import util", "import pkg.impl", "from pkg.impl import pkgfn as alias",
+    ],
     "rs": ["display::Display", "foo::Foo"],
     "go": ["example.com/fz/a", "example.com/fz/b"],
     "java": ["base.Base", "app.K"],
 }
-BASES = {"py": ["Base", "Child", "Foo", "Missing"], "java": ["Base", "K"]}
+BASES = {"py": ["Base", "Child", "Foo", "Missing", "b.Base", "pkg.impl.Base"], "java": ["Base", "K"]}
+# How a Python call to `{n}` is written: bare, through a module or alias, on
+# an untyped value, on `self`, or on a literal.
+PY_CALLS = ["{n}()", "b.{n}()", "c.{n}()", "obj.{n}()", "pkg.impl.{n}()", "alias.{n}()", "self.{n}()", "''.{n}()"]
 SERVICES = ["api", "web", "worker", "db"]
 IMAGES = ["python:3.12", "nginx:1.27", "postgres:16", "alpine:3.20"]
 EXTRA_NAMES = ["Foo", "Display", "Server", "K", "Child", "python", "postgres", "py/b.py", "missing"]
@@ -211,7 +242,10 @@ class Fuzz:
         if calls and self.rng.random() < 0.5:
             gone = calls.pop(self.rng.randrange(len(calls)))
             return f"remove call {fn}->{gone} in {path}", {path}
-        new = self.rng.choice([n for n in self._func_names() if n not in calls])
+        names = self._func_names()
+        if self.files[path].kind == "py":
+            names = [style.format(n=n) for style in PY_CALLS for n in names]
+        new = self.rng.choice([n for n in names if n not in calls])
         calls.append(new)
         return f"add call {fn}->{new} in {path}", {path}
 
@@ -239,6 +273,16 @@ class Fuzz:
         f.imports.append(m)
         return f"add import {m} in {path}", {path}
 
+    def op_import_style(self):
+        """Write one of a Python file's imports another way."""
+        path = self._pick(lambda f: f.kind == "py" and f.imports)
+        if not path:
+            return None
+        f = self.files[path]
+        i = self.rng.randrange(len(f.imports))
+        old, f.imports[i] = f.imports[i], self.rng.choice([m for m in IMPORTS["py"] if m not in f.imports])
+        return f"switch import {old!r} to {f.imports[i]!r} in {path}", {path}
+
     def op_impl(self):
         path = self._pick(lambda f: f.impl is not None)
         if not path:
@@ -252,6 +296,8 @@ class Fuzz:
             return None
         name = self._fresh("fn")
         names = self._func_names()
+        if self.files[path].kind == "py":
+            names = [style.format(n=n) for style in PY_CALLS for n in names]
         self.files[path].funcs[name] = self.rng.sample(names, self.rng.randrange(3))
         return f"add function {name} in {path}", {path}
 
@@ -357,7 +403,7 @@ class Fuzz:
         return f"{'set' if f.supersedes else 'remove'} supersedes in {path}", {path}
 
     OPS = [
-        "call", "base", "import", "impl", "add_function", "remove_function", "move_function",
+        "call", "base", "import", "import_style", "impl", "add_function", "remove_function", "move_function",
         "rename", "delete", "restore", "service", "from", "mention", "link", "supersedes",
     ]
 
