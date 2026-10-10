@@ -4,7 +4,9 @@ DevGraph ships the following third-party code in its package.
 
 ## Cytoscape.js 3.30.2
 
-- File: `devgraph/dashboard/static/vendor/cytoscape-3.30.2.min.js` (unmodified `dist/cytoscape.min.js` from the npm package `cytoscape@3.30.2`, integrity `sha512-oICxQsjW8uSaRmn4UK/jkczKOqTrVqt5/1WL0POiJUT2EKNc9STM4hYFHv917yu55aTBMFNRzymlJhVAiWPCxw==`)
+- File: `devgraph/dashboard/static/vendor/cytoscape-3.30.2.min.js`, unmodified `dist/cytoscape.min.js` from the npm package `cytoscape@3.30.2`
+  - File hash: sha256 `83e8c54a6bec655bfd81df07df605649c268af69aeca67a5ea2da54ea42dac81`
+  - npm tarball integrity (hash of the `cytoscape-3.30.2.tgz` it was extracted from, not of the file): `sha512-oICxQsjW8uSaRmn4UK/jkczKOqTrVqt5/1WL0POiJUT2EKNc9STM4hYFHv917yu55aTBMFNRzymlJhVAiWPCxw==`
 - Source: https://github.com/cytoscape/cytoscape.js
 - License: MIT
 

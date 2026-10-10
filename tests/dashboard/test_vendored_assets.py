@@ -39,3 +39,16 @@ def test_the_vendored_license_is_noted():
     notices = (ROOT / "THIRD_PARTY_NOTICES.md").read_text(encoding="utf-8")
     assert "Cytoscape.js 3.30.2" in notices and "The Cytoscape Consortium" in notices
     assert "devgraph/dashboard/static/vendor/cytoscape-3.30.2.min.js" in notices
+
+
+VENDORED_SHA256 = "83e8c54a6bec655bfd81df07df605649c268af69aeca67a5ea2da54ea42dac81"
+
+
+def test_the_vendored_file_is_the_pinned_build():
+    import hashlib
+
+    data = (STATIC / "vendor" / "cytoscape-3.30.2.min.js").read_bytes()
+    assert hashlib.sha256(data).hexdigest() == VENDORED_SHA256
+    notices = (ROOT / "THIRD_PARTY_NOTICES.md").read_text(encoding="utf-8")
+    assert f"sha256 `{VENDORED_SHA256}`" in notices
+    assert "npm tarball integrity" in notices
