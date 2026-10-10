@@ -376,14 +376,8 @@ def index_file(
     content = read_source(file_path)
     doc_name = _document_name(file_path, repo_root)
 
-    # Query all entity names/labels in this repo (or just `names`)
-    query = """
-    MATCH (n {repo_id: $repo_id})
-    WHERE n.name IS NOT NULL AND ($names IS NULL OR n.name IN $names)
-    RETURN DISTINCT n.name as name, labels(n)[0] as label
-    """
-    results = engine.run_cypher(query, {"repo_id": repo_id, "names": sorted(names) if names is not None else None})
-    known_entities = [(row["name"], row["label"]) for row in results]
+    # Every entity name/label in this repo (or just `names`)
+    known_entities = engine.entity_names(repo_id, sorted(names) if names is not None else None)
 
     # Extract mentions
     extractor = MentionsExtractor(repo_id, ambiguous_mode=ambiguous_mode)

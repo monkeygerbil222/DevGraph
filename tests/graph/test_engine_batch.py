@@ -287,3 +287,16 @@ class TestNameLookupIndexes:
         assert "USING INDEX SEEK b:Function(repo_id, name, file)" in pinned
         assert "USING INDEX SEEK b:Function(repo_id, name) " in bare
         assert "USING INDEX SEEK a:" not in bare
+
+
+def test_the_provenance_label_families_cover_every_extractor_label():
+    """A per-file re-index seeks a file's nodes label by label, so a label an
+    extractor writes with `source_file` or `source` must be in its family, or
+    its nodes would never be found again."""
+    from devgraph.graph.schema import CLAIMED_LABELS, NAMED_LABELS, SOURCE_FILE_LABELS
+    from devgraph.indexer.datastores.extractor import DatastoreType
+    from devgraph.indexer.docs.extractor import DOC_NOTE_LABELS
+
+    assert set(DOC_NOTE_LABELS) | {"Module", "Document"} <= set(SOURCE_FILE_LABELS)
+    assert {t.value for t in DatastoreType} | {"Container", "Endpoint", "Function"} <= set(CLAIMED_LABELS)
+    assert set(CLAIMED_LABELS) | set(SOURCE_FILE_LABELS) <= set(NAMED_LABELS)

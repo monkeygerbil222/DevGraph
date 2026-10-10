@@ -1298,6 +1298,148 @@ def test_name_ref_relink_benchmark(engine, repo_id, monkeypatch):
     assert db_hits < 200_000, ops
 
 
+# One file of each kind a save re-indexes, for the per-file cost guard below.
+_SAVE_COST_FIXTURE = {
+    "app/main.py": """\
+        import redis
+        import psycopg2
+        from flask import Flask
+        from app.util import helper
+
+        app = Flask(__name__)
+
+
+        @app.route("/items")
+        def list_items():
+            return helper()
+
+
+        class Store:
+            def get(self):
+                return helper()
+        """,
+    "app/util.py": "def helper():\n    return 1\n",
+    "docker-compose.yml": """\
+        services:
+          api:
+            build: ./app
+            image: python:3.12
+            volumes:
+              - data:/data
+        volumes:
+          data: {}
+        """,
+    "Dockerfile": "FROM python:3.12\n",
+    "src/a.rs": "pub struct Foo;\n",
+    "src/b.rs": "impl Clone for Foo {\n    fn clone(&self) -> Foo { Foo }\n}\n",
+    "web/a.ts": "import { b } from './b';\nexport function a() { return b(); }\n",
+    "web/b.ts": "export function b() { return 1; }\n",
+    "go/main.go": "package main\n\nfunc main() { helper() }\n",
+    "go/util.go": "package main\n\nfunc helper() {}\n",
+    "p/A.java": "package p;\n\nimport q.B;\n\npublic class A { void a() { new B().b(); } }\n",
+    "q/B.java": "package q;\n\npublic class B { public void b() {} }\n",
+    "docs/adr-1.md": "---\ntype: design_decision\nid: ADR-1\n---\n# Use Store\n\nSee `Store`.\n",
+    "README.md": "# Readme\n\nCalls `helper` and `Store`.\n",
+}
+
+
+def test_per_file_save_cost_ignores_other_repositories(engine, repo_id, tmp_path, monkeypatch):
+    """Re-indexing one file must cost what the file costs, not what the
+    database holds: every query a save runs is anchored on a label and an
+    indexed property (audit C9, where three `{repo_id}` matches scanned
+    every node and a full scan took twice as long on a 275k-node database).
+
+    Another repository of 40,000 nodes, of every label a save looks up, sits
+    beside a small one with a file of each kind. Locally the median save is
+    held to a wall-clock bound; in CI, where the clock is too noisy, every query a
+    save runs is PROFILEd instead and must neither scan a populated label
+    (or every node) nor touch the other repository's nodes. A save also re-indexes no
+    other file, except a Java file's direct importers."""
+    import os
+    import statistics
+    import time
+
+    from neo4j import ManagedTransaction, Session
+
+    for rel, text in _SAVE_COST_FIXTURE.items():
+        write(tmp_path, rel, text)
+    options = {"docs_path": "docs", "mentions_enabled": True}
+    scan(engine, repo_id, tmp_path, **options)
+
+    other = f"{repo_id}-other"
+    engine.run_cypher(
+        "UNWIND range(0, 3999) AS i CALL (i) { "
+        "  CREATE (:Module {repo_id: $r, name: 'm' + i + '.py', source_file: 'm' + i + '.py'}) "
+        "  CREATE (:Class {repo_id: $r, name: 'C' + i, file: 'm' + i + '.py'}) "
+        "  CREATE (:Function {repo_id: $r, name: 'f' + i, file: 'm' + i + '.py'}) "
+        "  CREATE (:Function {repo_id: $r, name: 'helper', file: 'm' + i + '.py'}) "
+        "  CREATE (:Function {repo_id: $r, name: 'stub' + i, source: 'm' + i + '.py', sources: ['m' + i + '.py']}) "
+        "  CREATE (:Service {repo_id: $r, name: 's' + i, file: 'c' + i + '.yml', source: 'c' + i + '.yml', "
+        "                    build_context: '.'}) "
+        "  CREATE (:Container {repo_id: $r, name: 'img' + i, source: 'D' + i, sources: ['D' + i]}) "
+        "  CREATE (:Endpoint {repo_id: $r, name: 'GET /' + i, source: 'm' + i + '.py'}) "
+        "  CREATE (:Cache {repo_id: $r, name: 'Redis' + i, source: 'm' + i + '.py'}) "
+        "  CREATE (:Document {repo_id: $r, name: 'd' + i + '.md', source_file: 'd' + i + '.md'}) "
+        "} IN TRANSACTIONS OF 1000 ROWS",
+        {"r": other},
+    )
+
+    profiles: list[tuple[str, dict]] = []
+    if os.environ.get("CI"):
+        def profiled(run):
+            def run_profiled(self, query, *args, **kwargs):
+                result = run(self, "PROFILE " + query, *args, **kwargs)
+                records = list(result)
+                profiles.append((query, result.consume().profile))
+                return records
+            return run_profiled
+
+        monkeypatch.setattr(Session, "run", profiled(Session.run))
+        monkeypatch.setattr(ManagedTransaction, "run", profiled(ManagedTransaction.run))
+
+    seen: list[str] = []
+    original = dispatch._index_single_path
+
+    def record(engine, repo_id, repo_root, resolved, rel_path, *args):
+        seen.append(rel_path)
+        return original(engine, repo_id, repo_root, resolved, rel_path, *args)
+
+    monkeypatch.setattr(dispatch, "_index_single_path", record)
+    elapsed = {}
+    for rel in _SAVE_COST_FIXTURE:
+        # Locally the fastest of three saves, to keep a busy machine's noise out.
+        for _ in range(1 if os.environ.get("CI") else 3):
+            seen.clear()
+            started = time.perf_counter()
+            index_paths(engine, repo_id, tmp_path, {tmp_path / rel}, **options)
+            elapsed[rel] = min(elapsed.get(rel, float("inf")), time.perf_counter() - started)
+            assert sorted(seen) == (["p/A.java", "q/B.java"] if rel == "q/B.java" else [rel])
+    monkeypatch.undo()
+
+    print("per-file save:", {rel: round(t, 3) for rel, t in elapsed.items()})
+    if not os.environ.get("CI"):
+        # About 0.03 s anchored; the old queries' scans made it 0.2 s.
+        assert statistics.median(elapsed.values()) < 0.1, elapsed
+        return
+
+    def operators(plan):
+        yield plan["operatorType"], plan.get("args", {}).get("DbHits", 0)
+        for child in plan.get("children", []):
+            yield from operators(child)
+
+    # A scan is allowed only where it reads nothing: the compose USES edge's
+    # Volume end, a label no node carries (and no index covers).
+    scans = [
+        (op, hits, " ".join(query.split())[:120])
+        for query, plan in profiles for op, hits in operators(plan)
+        if "Scan" in op and (op.startswith("AllNodesScan") or hits > 1)
+    ]
+    assert not scans, scans
+    worst = max((sum(hits for _op, hits in operators(plan)), query) for query, plan in profiles)
+    print(f"per-file save: {len(profiles)} queries, worst {worst[0]} db hits")
+    assert worst[0] < 5_000, worst
+
+
 def test_full_scan_stamps_index_format(engine, repo_id, tmp_path):
     app_and_worker(tmp_path)
     scan(engine, repo_id, tmp_path)

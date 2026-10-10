@@ -22,10 +22,15 @@ from neo4j.exceptions import ServiceUnavailable, SessionExpired, TransientError
 from neo4j.graph import Node, Relationship
 
 from devgraph.graph.schema import (
+    CLAIMED_LABELS,
+    FILE_LABELS,
     FILE_SCOPED_LABELS,
     NAME_REF_SEP,
+    NAMED_LABELS,
+    NODE_LABELS,
     RELATIONSHIP_TYPES,
     RESERVED_NODE_PROPERTIES,
+    SOURCE_FILE_LABELS,
     constraint_statements,
     lookup_index_statements,
 )
@@ -43,6 +48,39 @@ logger = logging.getLogger(__name__)
 # What identifies a provider-owned node: never cleared, whatever the schema keeps.
 _EXTRACTED_IDENTITY_PROPERTIES = RESERVED_NODE_PROPERTIES | {"path"}
 
+
+def _seek(label: str, prop: str, test: str) -> str:
+    """One branch of `_union`: the `label` nodes of `$repo_id` whose `prop`
+    passes `test`, through the label's `(repo_id, prop)` index. Hinted to
+    seek, for the reason _end_match gives."""
+    return (
+        f"MATCH (n:{label}) USING INDEX SEEK n:{label}(repo_id, {prop}) "
+        f"WHERE n.repo_id = $repo_id AND n.{prop} {test} RETURN n"
+    )
+
+
+def _union(branches: Iterable[str]) -> str:
+    """The distinct nodes `n` of every branch, as one CALL subquery."""
+    return "CALL () { " + " UNION ".join(branches) + " } "
+
+
+def _owned_branches(test: str) -> list[str]:
+    """The nodes whose file provenance passes `test` (a predicate such as
+    "= $f" or "IN $files"): `file` or `source_file`, or a Module named by its
+    path. Each label is sought through its own index, so the cost follows
+    the files, not the database (a match on `{repo_id}` alone scanned every
+    node)."""
+    return (
+        [_seek(label, "file", test) for label in FILE_LABELS]
+        + [_seek(label, "source_file", test) for label in SOURCE_FILE_LABELS]
+        + [_seek("Module", "name", test)]
+    )
+
+
+# Every shared node of the repository (see CLAIMED_LABELS): the candidates
+# for a file's claims, filtered by the caller.
+_CLAIMED_BRANCHES = [_seek(label, "source", "IS NOT NULL") for label in CLAIMED_LABELS]
+
 # Shared by delete_nodes_by_source_file and _replace_file_nodes_tx.
 #
 # `source_file` (Module) and `file` (Class/Function/...) both name exactly
@@ -54,12 +92,7 @@ _EXTRACTED_IDENTITY_PROPERTIES = RESERVED_NODE_PROPERTIES | {"path"}
 # producing file would destroy a node the other file still claims. For that
 # population we track every claiming file in `sources` and only delete once
 # the last one is unclaimed — see _unclaim_source_tx.
-_DELETE_BY_SOURCE_FILE_CYPHER = (
-    "MATCH (n {repo_id: $repo_id}) "
-    "WHERE n.source_file = $file_name OR n.file = $file_name "
-    "   OR (n:Module AND n.name = $file_name) "
-    "DETACH DELETE n"
-)
+_DELETE_BY_SOURCE_FILE_CYPHER = _union(_owned_branches("= $f")) + "DETACH DELETE n"
 
 # A shared node's claims are read under its write lock (the no-op SET takes
 # it), so concurrent claims and unclaims of one node run one after another
@@ -67,8 +100,8 @@ _DELETE_BY_SOURCE_FILE_CYPHER = (
 _LOCK_AND_READ = "SET n.name = n.name RETURN elementId(n) AS id, properties(n) AS props"
 
 _UNCLAIM_SOURCE_CYPHER = (
-    "MATCH (n {repo_id: $repo_id}) "
-    "WHERE n.file IS NULL AND n.source_file IS NULL "
+    _union(_CLAIMED_BRANCHES)
+    + "WITH n WHERE n.file IS NULL AND n.source_file IS NULL "
     "  AND (n.source = $file_name OR $file_name IN coalesce(n.sources, [])) "
     "  AND NOT any(p IN $keep WHERE labels(n)[0] = p[0] AND n.name = p[1]) "
     + _LOCK_AND_READ
@@ -176,7 +209,7 @@ def _delete_by_source_file_tx(tx, repo_id: str, file_name: str) -> None:
     _unclaim_foreign_sources_tx(tx, repo_id, file_name)
     if file_name.endswith(".py"):
         _unclaim_service_api_edges_tx(tx, repo_id, file_name)
-    tx.run(_DELETE_BY_SOURCE_FILE_CYPHER, repo_id=repo_id, file_name=file_name)
+    tx.run(_DELETE_BY_SOURCE_FILE_CYPHER, repo_id=repo_id, f=file_name)
     _unclaim_source_tx(tx, repo_id, file_name, [])
 
 
@@ -229,9 +262,8 @@ _UNCLAIM_EDGE = (
 # produces; an empty list (file now has no classes/functions) correctly
 # deletes them all.
 _REPLACE_OWNED_NODES_CYPHER = (
-    "MATCH (n {repo_id: $repo_id}) "
-    "WHERE n.file = $f OR n.source_file = $f OR (n:Module AND n.name = $f) "
-    "CALL (n) { MATCH (n)-[r]->() " + _UNCLAIM_EDGE + " } "
+    _union(_owned_branches("= $f"))
+    + "CALL (n) { MATCH (n)-[r]->() " + _UNCLAIM_EDGE + " } "
     "WITH n WHERE NOT n:Module "
     "  AND NOT any(pair IN $keep WHERE labels(n)[0] = pair[0] AND n.name = pair[1]) "
     "DETACH DELETE n"
@@ -255,8 +287,11 @@ _UNCLAIM_DOC_NOTE_EDGES_CYPHER = (
 _OLD_NAME_REF_SOURCES_CYPHER = (
     "MATCH (m:Module {repo_id: $repo_id, name: $f}) RETURN coalesce(m.name_ref_sources, []) AS sources"
 )
+# The sources are sought by name on every built-in label (NAMED_LABELS), not
+# on `{repo_id}` alone, which scanned every node.
 _UNCLAIM_FOREIGN_SOURCES_CYPHER = (
-    "MATCH (a {repo_id: $repo_id})-[r]->() WHERE a.name IN $sources AND $f IN r.origins " + _UNCLAIM_EDGE
+    _union(_seek(label, "name", "IN $sources") for label in NAMED_LABELS)
+    + "MATCH (n)-[r]->() WHERE $f IN r.origins " + _UNCLAIM_EDGE
 )
 
 
@@ -271,12 +306,16 @@ def _unclaim_foreign_sources_tx(tx, repo_id: str, file_name: str) -> None:
 # G2 set (c): the edges a Python file writes out of nodes it doesn't own,
 # the owning-service USES/CALLS and the API pass's Endpoint edges. Only the
 # edges that list the file (or list no writer) are touched.
+# The repository's Services and Endpoints are sought by repo_id on their
+# `(repo_id, name)` index (every node has a name); a plain `{repo_id}` match
+# scanned the label across every repository.
 _UNCLAIM_SERVICE_USES_CYPHER = (
-    "MATCH (:Service {repo_id: $repo_id})-[r:USES]->() WHERE $f IN coalesce(r.origins, [$f]) " + _UNCLAIM_EDGE
+    "MATCH (s:Service)-[r:USES]->() USING INDEX SEEK s:Service(repo_id, name) "
+    "WHERE s.repo_id = $repo_id AND s.name IS NOT NULL AND $f IN coalesce(r.origins, [$f]) " + _UNCLAIM_EDGE
 )
 _UNCLAIM_ENDPOINT_EDGES_CYPHER = (
-    "MATCH (:Endpoint {repo_id: $repo_id})-[r:CALLS|IMPLEMENTS]->() WHERE $f IN coalesce(r.origins, [$f]) "
-    + _UNCLAIM_EDGE
+    "MATCH (e:Endpoint)-[r:CALLS|IMPLEMENTS]->() USING INDEX SEEK e:Endpoint(repo_id, name) "
+    "WHERE e.repo_id = $repo_id AND e.name IS NOT NULL AND $f IN coalesce(r.origins, [$f]) " + _UNCLAIM_EDGE
 )
 
 
@@ -1378,6 +1417,37 @@ class GraphEngine:
             )
             return {record["path"] for record in result}
 
+    def _schema_labels(self, repo_id: str) -> list[str]:
+        """The user labels the repository's applied schema records: the only
+        labels a provider node of the repository can carry (applying a
+        schema deletes the nodes of a label it drops). Re-validated, since
+        they are interpolated."""
+        from devgraph.config.project_schema import LABEL_PATTERN  # runtime import: see TYPE_CHECKING above
+
+        applied = self.read_applied_schema(repo_id) or {}
+        return [
+            label for label in applied.get("labels") or []
+            if label not in NODE_LABELS and LABEL_PATTERN.fullmatch(label or "")
+        ]
+
+    def entity_names(self, repo_id: str, names: list[str] | None) -> list[tuple[str, str]]:
+        """(name, label) of every named node of the repository, or only of
+        those named one of `names`: the mentions extractor's known entities.
+        Each label is matched on its own (built-in ones through their
+        `(repo_id, name)` index), not on `{repo_id}` alone, which scanned
+        every node in the database."""
+        test = "IN $names" if names is not None else "IS NOT NULL"
+        query = _union(
+            [_seek(label, "name", test) for label in NAMED_LABELS]
+            + [f"MATCH (n:Repository {{repo_id: $repo_id}}) WHERE n.name {test} RETURN n"]
+            + [
+                f"MATCH (n:{label}) WHERE n.repo_id = $repo_id AND n.name {test} RETURN n"
+                for label in self._schema_labels(repo_id)
+            ]
+        ) + "RETURN DISTINCT n.name AS name, labels(n)[0] AS label"
+        records = self.run_cypher(query, {"repo_id": repo_id, "names": names})
+        return [(record["name"], record["label"]) for record in records]
+
     def list_file_nodes(self, repo_id: str, files: list[str]) -> set[tuple[str, str, str]]:
         """Return (label, name, file) for every node whose file provenance
         (`source_file`/`file`, a `Module` named by its path, or a schema
@@ -1391,12 +1461,25 @@ class GraphEngine:
         which nodes the batch *adds* -- only those can be the missing
         target of an edge from a file outside the batch. A node moving
         between two of the batch's files counts as added.
+
+        Each label is matched on its own: the built-in ones through their
+        provenance indexes, a provider's through the labels the repository's
+        applied schema records (provider nodes exist only for those).
         """
+        candidates = _union(
+            _owned_branches("IN $files")
+            + _CLAIMED_BRANCHES
+            + [
+                f"MATCH (n:{label}) WHERE n.repo_id = $repo_id AND n.extractor IS NOT NULL "
+                "AND n.path IN $files RETURN n"
+                for label in self._schema_labels(repo_id)
+            ]
+        )
         with self._driver.session() as session:
             result = _retry_transient(
                 session.run,
-                "MATCH (n {repo_id: $repo_id}) "
-                "WITH n, (n.source_file IN $files OR n.file IN $files "
+                candidates
+                + "WITH n, (n.source_file IN $files OR n.file IN $files "
                 "   OR (n:Module AND n.name IN $files) "
                 "   OR (n.extractor IS NOT NULL AND n.path IN $files)) AS owned, "
                 "   any(s IN coalesce(n.sources, []) WHERE s IN $files) AS claimed "
@@ -1447,12 +1530,24 @@ class GraphEngine:
         existing `get` is exactly the set that should also link a newly added
         `get`; pairs absent from the result are new to the whole graph.
         """
+        from devgraph.config.project_schema import LABEL_PATTERN  # runtime import: see TYPE_CHECKING above
+
+        # Matched label by label (a built-in one through its (repo_id, name)
+        # index), not on `{repo_id}` alone, which scanned every node.
+        labels = sorted({label for label, _name in pairs if LABEL_PATTERN.fullmatch(label)})
+        if not labels:
+            return {}
+        candidates = _union(
+            _seek(label, "name", "IN $names")
+            if label in NAMED_LABELS
+            else f"MATCH (n:{label}) WHERE n.repo_id = $repo_id AND n.name IN $names RETURN n"
+            for label in labels
+        )
         with self._driver.session() as session:
             result = _retry_transient(
                 session.run,
-                "MATCH (n {repo_id: $repo_id}) "
-                "WHERE n.name IN $names "
-                "  AND NOT coalesce(n.file, n.source_file, '') IN $batch_keys "
+                candidates
+                + "WITH n WHERE NOT coalesce(n.file, n.source_file, '') IN $batch_keys "
                 "  AND NOT (n:Module AND n.name IN $batch_keys) "
                 "  AND (coalesce(n.file, n.source_file) IS NOT NULL OR n.sources IS NULL "
                 "       OR any(s IN n.sources WHERE NOT s IN $batch_keys)) "

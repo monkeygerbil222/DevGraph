@@ -2105,8 +2105,8 @@ def _load_services_with_build_context(engine: GraphEngine, repo_id: str) -> dict
     branches, so the set can't change again mid-batch.
     """
     results = engine.run_cypher(
-        "MATCH (s:Service {repo_id: $repo_id}) "
-        "WHERE s.build_context IS NOT NULL "
+        "MATCH (s:Service) USING INDEX SEEK s:Service(repo_id, name) "
+        "WHERE s.repo_id = $repo_id AND s.name IS NOT NULL AND s.build_context IS NOT NULL "
         "RETURN s.name as name, s.build_context as build_context, s.file as file",
         {"repo_id": repo_id},
     )

@@ -96,6 +96,30 @@ _REPO_SCOPED_LABELS = tuple(l for l in NODE_LABELS if l != "Repository")
 # indexer/dispatch.py:_upsert_container_result).
 FILE_SCOPED_LABELS = ("Class", "Function", "Service")
 
+# The labels a file's own nodes can carry, by the property that names the
+# file. A per-file re-index finds them through one `(repo_id, <property>)`
+# index per label (see `lookup_index_statements`), never by scanning every
+# node: `file` is on the file-scoped labels; `source_file` on a code Module,
+# a docs note (Requirement, DesignDecision, ArchitectureNote), a mentions
+# Document, and on Class/Function/Service nodes an older index wrote.
+FILE_LABELS: tuple[str, ...] = FILE_SCOPED_LABELS
+SOURCE_FILE_LABELS: tuple[str, ...] = (
+    "Module", "Class", "Function", "Service", "Requirement", "DesignDecision", "ArchitectureNote", "Document",
+)
+# Shared nodes several files can claim through `source`/`sources` (see
+# graph/engine.py `_claim_nodes_tx`): Container, Endpoint, a route's
+# file-less handler-stub Function, every datastore type (Cache included,
+# though it is not in NODE_LABELS), and the file-less Service an older index
+# wrote. Every claimed node has a `source` (its first claim's).
+CLAIMED_LABELS: tuple[str, ...] = (
+    "Container", "Endpoint", "Function", "Service", "Database", "VectorStore", "Queue", "Cache",
+)
+# Every built-in label with a `(repo_id, name)` index: the uniqueness
+# constraints' and the file-scoped lookups', and Cache's own (it has no
+# constraint). A query over every node of a repository seeks these, never
+# `{repo_id}` alone.
+NAMED_LABELS: tuple[str, ...] = tuple(label for label in NODE_LABELS if label != "Repository") + ("Cache",)
+
 
 def constraint_statements() -> list[str]:
     """Cypher to create uniqueness constraints for every node label.
@@ -127,18 +151,31 @@ def constraint_statements() -> list[str]:
 
 
 def lookup_index_statements() -> list[str]:
-    """Cypher for a `(repo_id, name)` RANGE index on each file-scoped label.
+    """Cypher for the RANGE lookup indexes the built-in queries seek.
 
-    Their uniqueness constraint indexes `(repo_id, name, file)`, which a
-    bare-name match (an edge's target end, `describe_node`) can't seek, so
-    without these it scans every node of the label. Idempotent, like
+    A `(repo_id, name)` index on each file-scoped label: their uniqueness
+    constraint indexes `(repo_id, name, file)`, which a bare-name match (an
+    edge's target end, `describe_node`) can't seek, so without these it
+    scans every node of the label; the same on Cache, which has no
+    constraint (named so it never reads as a user type's generated index).
+    Then the provenance indexes a per-file re-index seeks (`(repo_id, file)`,
+    `(repo_id, source_file)`, `(repo_id, source)` on FILE_LABELS,
+    SOURCE_FILE_LABELS, CLAIMED_LABELS), so its cost follows the file, not
+    the whole database. Idempotent, like
     `constraint_statements`; the names never collide with a generated
     user-type constraint or index (built-in labels can't be redeclared).
     """
-    return [
+    statements = [
         f"CREATE INDEX {label.lower()}_repo_name_lookup IF NOT EXISTS FOR (n:{label}) ON (n.repo_id, n.name)"
         for label in FILE_SCOPED_LABELS
     ]
+    statements.append("CREATE INDEX cache_repo_name_index IF NOT EXISTS FOR (n:Cache) ON (n.repo_id, n.name)")
+    for prop, labels in (("file", FILE_LABELS), ("source_file", SOURCE_FILE_LABELS), ("source", CLAIMED_LABELS)):
+        statements += [
+            f"CREATE INDEX {label.lower()}_repo_{prop}_lookup IF NOT EXISTS FOR (n:{label}) ON (n.repo_id, n.{prop})"
+            for label in labels
+        ]
+    return statements
 
 
 # The `name_refs` entry encoding (see devgraph/indexer/common.py
