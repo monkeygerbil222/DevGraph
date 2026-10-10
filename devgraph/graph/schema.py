@@ -137,3 +137,14 @@ def lookup_index_statements() -> list[str]:
         f"CREATE INDEX {label.lower()}_repo_name_lookup IF NOT EXISTS FOR (n:{label}) ON (n.repo_id, n.name)"
         for label in FILE_SCOPED_LABELS
     ]
+
+
+# The `name_refs` entry encoding (see devgraph/indexer/common.py
+# `name_ref_properties`). Kept here, with no imports, so the graph engine and
+# the indexer read them without importing each other.
+#: Joins the fields of one `name_refs` entry.
+NAME_REF_SEP = "\x1f"
+#: Joins an entry's target pins.
+NAME_REF_PIN_SEP = "\x1e"
+#: A target pin to the file-less node ("" as a `to_file`).
+NAME_REF_FILELESS = "\x1d"

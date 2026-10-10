@@ -1553,3 +1553,21 @@ def test_edges_out_of_one_source_share_a_row():
         ("main", {"confidence": "package"}, ["h"]),
         ("other", {}, ["f"]),
     ]
+
+
+def test_a_source_end_pinned_to_a_package_directory_is_refused():
+    import pytest as _pytest
+
+    from devgraph.graph.engine import _group_rels_by_triple
+
+    with _pytest.raises(ValueError, match="source end"):
+        _group_rels_by_triple([{**_rel("f"), "from_file": "pkg/"}])
+
+
+@pytest.mark.parametrize("module", ["devgraph.indexer.python.extractor", "devgraph.indexer.common"])
+def test_an_indexer_module_imports_first_in_a_fresh_interpreter(module):
+    import subprocess
+    import sys
+
+    done = subprocess.run([sys.executable, "-c", f"import {module}"], capture_output=True, text=True)
+    assert done.returncode == 0, done.stderr

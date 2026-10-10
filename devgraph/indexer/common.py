@@ -9,7 +9,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from devgraph.graph.schema import FILE_SCOPED_LABELS
+from devgraph.graph.schema import FILE_SCOPED_LABELS, NAME_REF_FILELESS, NAME_REF_PIN_SEP, NAME_REF_SEP
+
+__all__ = [
+    "NAME_REF_FILELESS", "NAME_REF_PIN_SEP", "NAME_REF_SEP", "ExtractionResult", "GraphNode", "GraphRelationship",
+    "name_ref_properties", "own_edges", "parse_name_ref",
+]
 
 
 @dataclass
@@ -120,12 +125,6 @@ def own_edges(result: ExtractionResult, file_path: str) -> ExtractionResult:
     return result
 
 
-#: Joins the fields of one `name_refs` entry (see name_ref_properties).
-NAME_REF_SEP = "\x1f"
-#: Joins an entry's target pins.
-NAME_REF_PIN_SEP = "\x1e"
-#: A target pin to the file-less node ("" as a `to_file`).
-NAME_REF_FILELESS = "\x1d"
 
 
 def name_ref_properties(rels: list[dict]) -> dict:

@@ -22,12 +22,12 @@ from neo4j.graph import Node, Relationship
 
 from devgraph.graph.schema import (
     FILE_SCOPED_LABELS,
+    NAME_REF_SEP,
     RELATIONSHIP_TYPES,
     RESERVED_NODE_PROPERTIES,
     constraint_statements,
     lookup_index_statements,
 )
-from devgraph.indexer.common import NAME_REF_SEP
 from devgraph.indexer.docs.extractor import DOC_NOTE_LABELS
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -611,6 +611,8 @@ def _group_rels_by_triple(
         from_file = rel.get("from_file")
         to_file = rel.get("to_file")
         key = (rel["from_label"], rel["rel_type"], rel["to_label"], _pin(from_file), _pin(to_file))
+        if key[3] == "prefix":
+            raise ValueError(f"a source end can't be pinned to a package directory: {from_file!r}")
         properties = rel.get("properties") or {}
         origin = rel.get("origin")
         source = (
