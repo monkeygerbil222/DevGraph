@@ -13,6 +13,8 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from devgraph.indexer.source_text import read_source
+
 logger = logging.getLogger(__name__)
 
 _DECLARATION_KEYWORDS = (
@@ -333,7 +335,7 @@ def upsert_document_node(engine, repo_id: str, file_path: str | Path, repo_root:
     same node idempotently).
     """
     file_path = Path(file_path)
-    content = file_path.read_text(encoding="utf-8")
+    content = read_source(file_path)
     result = MentionsExtractor(repo_id).extract_from_source(content, _document_name(file_path, repo_root), [])
     _upsert_documents(engine, result)
 
@@ -371,7 +373,7 @@ def index_file(
     if not file_path.exists():
         raise FileNotFoundError(f"File not found: {file_path}")
 
-    content = file_path.read_text(encoding="utf-8")
+    content = read_source(file_path)
     doc_name = _document_name(file_path, repo_root)
 
     # Query all entity names/labels in this repo (or just `names`)

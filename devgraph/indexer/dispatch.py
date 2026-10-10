@@ -62,6 +62,7 @@ from devgraph.indexer.schema_constraints import (
     recorded_declarations,
     release_labels,
 )
+from devgraph.indexer.source_text import read_source
 # Re-exported under their pre-walk.py names for the watcher and existing callers.
 from devgraph.indexer.walk import IGNORED_DIR_NAMES as IGNORED_DIR_NAMES
 from devgraph.indexer.walk import RepoRootEmpty, RepoRootUnavailable, check_repo_root
@@ -1000,7 +1001,7 @@ def _index_single_path(
     indexed = 0
     routes = _routes(resolved, docs_root, mentions_enabled)
     if "py" in routes:
-        content = resolved.read_text(encoding="utf-8", errors="replace")
+        content = read_source(resolved)
         result = extract_python_file(content, rel_path, repo_id)
         # Datastore/API extraction reads the same content, so it runs
         # alongside the Python indexer rather than as a separate dispatch
@@ -1030,7 +1031,7 @@ def _index_single_path(
         # a Django urls.py naming a view from views.py).
         py_extractions[rel_path] = (nodes, rels)
     elif "js" in routes:
-        content = resolved.read_text(encoding="utf-8", errors="replace")
+        content = read_source(resolved)
         result = extract_js_file(content, rel_path, repo_id)
         nodes = [n.to_dict() for n in result.nodes]
         rels = [r.to_dict() for r in result.relationships]
@@ -1042,7 +1043,7 @@ def _index_single_path(
         js_files.append(rel_path)
         js_extractions[rel_path] = (nodes, rels)
     elif "cs" in routes:
-        content = resolved.read_text(encoding="utf-8", errors="replace")
+        content = read_source(resolved)
         result = extract_csharp_file(content, rel_path, repo_id)
         nodes = [n.to_dict() for n in result.nodes]
         rels = [r.to_dict() for r in result.relationships]
@@ -1054,7 +1055,7 @@ def _index_single_path(
         cs_files.append(rel_path)
         cs_extractions[rel_path] = (nodes, rels)
     elif "cpp" in routes:
-        content = resolved.read_text(encoding="utf-8", errors="replace")
+        content = read_source(resolved)
         result = extract_cpp_file(content, rel_path, repo_id)
         nodes = [n.to_dict() for n in result.nodes]
         rels = [r.to_dict() for r in result.relationships]
@@ -1063,7 +1064,7 @@ def _index_single_path(
         cpp_files.append(rel_path)
         cpp_extractions[rel_path] = (nodes, rels)
     elif "java" in routes:
-        content = resolved.read_text(encoding="utf-8", errors="replace")
+        content = read_source(resolved)
         result = extract_java_file(content, rel_path, repo_id)
         nodes = [n.to_dict() for n in result.nodes]
         rels = [r.to_dict() for r in result.relationships]
@@ -1075,7 +1076,7 @@ def _index_single_path(
         java_files.append((rel_path, content))
         java_extractions[rel_path] = (nodes, rels)
     elif "rs" in routes:
-        content = resolved.read_text(encoding="utf-8", errors="replace")
+        content = read_source(resolved)
         result = extract_rust_file(content, rel_path, repo_id)
         nodes = [n.to_dict() for n in result.nodes]
         rels = [r.to_dict() for r in result.relationships]
@@ -1087,7 +1088,7 @@ def _index_single_path(
         rs_files.append(rel_path)
         rs_extractions[rel_path] = (nodes, rels)
     elif "kt" in routes:
-        content = resolved.read_text(encoding="utf-8", errors="replace")
+        content = read_source(resolved)
         result = extract_kotlin_file(content, rel_path, repo_id)
         nodes = [n.to_dict() for n in result.nodes]
         rels = [r.to_dict() for r in result.relationships]
@@ -1099,7 +1100,7 @@ def _index_single_path(
         kt_files.append(rel_path)
         kt_extractions[rel_path] = (nodes, rels)
     elif "go" in routes:
-        content = resolved.read_text(encoding="utf-8", errors="replace")
+        content = read_source(resolved)
         result = extract_go_file(content, rel_path, repo_id, module_path)
         nodes = [n.to_dict() for n in result.nodes]
         rels = [r.to_dict() for r in result.relationships]
@@ -1417,7 +1418,7 @@ def _read_text(path: Path) -> str:
     """A referrer candidate's text, or "" if it can't be read (it is then
     simply not a referrer)."""
     try:
-        return path.read_text(encoding="utf-8", errors="replace")
+        return read_source(path)
     except OSError:
         return ""
 
@@ -1842,14 +1843,14 @@ def full_scan(
 
 
 def _index_containerfile(engine: GraphEngine, repo_id: str, path: Path, rel_path: str) -> ExtractionResult:
-    content = path.read_text(encoding="utf-8", errors="replace")
+    content = read_source(path)
     result = ContainerExtractor(repo_id).extract_from_containerfile(content, rel_path)
     _upsert_container_result(engine, repo_id, rel_path, result)
     return result
 
 
 def _index_compose_file(engine: GraphEngine, repo_id: str, path: Path, rel_path: str) -> ExtractionResult:
-    content = path.read_text(encoding="utf-8", errors="replace")
+    content = read_source(path)
     result = ContainerExtractor(repo_id).extract_from_compose_file(content, rel_path)
     _upsert_container_result(engine, repo_id, rel_path, result)
     return result

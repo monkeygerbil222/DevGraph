@@ -25,6 +25,7 @@ from pathlib import Path
 
 from devgraph.config.project_tools import YAML_LOAD_ERRORS
 from devgraph.config.yaml_bound import YAML_MAX_NODES, bounded_safe_load
+from devgraph.indexer.source_text import read_source
 
 _TYPE_TO_LABEL = {
     "requirement": "Requirement",
@@ -201,7 +202,7 @@ def index_file(engine, repo_id: str, file_path: str | Path, repo_root: str | Pat
     if not file_path.exists():
         raise FileNotFoundError(f"File not found: {file_path}")
 
-    content = file_path.read_text(encoding="utf-8")
+    content = read_source(file_path)
     origin = source_key(file_path, repo_root)
     result = DocsExtractor(repo_id).extract_from_source(content, origin)
 
