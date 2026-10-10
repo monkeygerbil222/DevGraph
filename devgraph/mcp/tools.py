@@ -26,7 +26,6 @@ from devgraph.config.project_schema import (
 from devgraph.config.project_tools import DEFAULT_TIMEOUT_S
 from devgraph.graph.engine import GraphEngine
 from devgraph.graph import schema
-from devgraph.indexer.git_history import open_repo
 from devgraph.indexer.source_text import decode_source_as, declared_encoding, is_python_path
 from devgraph.paths import is_within
 from devgraph.registry.store import RepoRegistry
@@ -108,7 +107,7 @@ def _impact_expansion(cross_repo: bool) -> str:
     CALL per hop collecting the distinct nodes with a CALLS/USES/DEPENDS_ON edge
     into the previous hop's nodes, never one seen at an earlier hop, then
     returning `direct_dependents` (hop 1), `transitive_dependents` (hops 2 to
-    `IMPACT_MAX_DEPTH`) and `direct_count`.
+    `IMPACT_MAX_DEPTH`), `direct_count` and `matched` (the changed nodes' names).
 
     Expanding distinct nodes hop by hop does work proportional to the nodes
     and edges within reach; a variable-length path enumerates every path, which
@@ -128,7 +127,7 @@ def _impact_expansion(cross_repo: bool) -> str:
     parts.append(
         "RETURN [d IN l1 | {name: d.name, type: labels(d)[0]}] AS direct_dependents, "
         f"[d IN {transitive} | {{name: d.name, type: labels(d)[0]}}] AS transitive_dependents, "
-        "size(l1) AS direct_count"
+        "size(l1) AS direct_count, [n IN l0 | n.name] AS matched"
     )
     return "\n".join(parts)
 
@@ -1397,6 +1396,34 @@ def _risk_level(direct_count: int) -> str:
     return "high" if direct_count > 10 else "medium" if direct_count > 3 else "low"
 
 
+_DIFF_TARGETS_CYPHER = """
+CALL () {
+  UNWIND $targets AS t
+  CALL (t) {
+    MATCH (n:Function {repo_id: $repo_id, name: t.name, file: t.file}) RETURN n
+    UNION
+    MATCH (n:Class {repo_id: $repo_id, name: t.name, file: t.file}) RETURN n
+  }
+  RETURN n
+  UNION
+  UNWIND $files AS f
+  CALL (f) {
+    MATCH (n:Function {repo_id: $repo_id, file: f}) RETURN n
+    UNION
+    MATCH (n:Class {repo_id: $repo_id, file: f}) RETURN n
+  }
+  RETURN n
+}
+WITH collect(DISTINCT n) AS l0
+"""
+
+
+def _diff_symbol(entry: dict[str, Any], path: str) -> dict[str, Any]:
+    return _sanitize_row(
+        {"name": entry["name"], "kind": entry["kind"], "container": entry["container"], "file": path}
+    )
+
+
 def impact_analysis_for_diff(
     engine: GraphEngine,
     registry: RepoRegistry,
@@ -1406,101 +1433,101 @@ def impact_analysis_for_diff(
     cross_repo: bool = False,
     max_results: int = 15,
 ) -> dict[str, Any]:
-    """Analyze the combined impact of every component changed between two git refs.
+    """Analyze the combined impact of the symbols changed between two git refs.
 
-    Composes a local git diff (GitPython, no network — same constraint as
-    index-history) with the same dependent-tracing Cypher impact_analysis
-    uses, across every component touched by the diff at once, then unions
-    and deduplicates the result. Both refs must already exist locally —
-    this never fetches from a remote.
+    Compares `head_ref` with its merge base with `base_ref` (like
+    `git diff base_ref...head_ref`, what a pull request shows) the way
+    compare_branches does: git objects read in memory, never fetched, under its
+    ref rules and caps. Functions and classes changed or removed are traced to
+    their dependents with impact_analysis's bounded hop expansion; added ones
+    are listed apart, since nothing depends on new code yet. A changed code file
+    whose symbols couldn't be read (too large, a cap, a parse error, a blob
+    missing from a partial clone) counts every graph symbol in it, with a notice.
 
     Args:
         engine: GraphEngine instance
         registry: RepoRegistry, used to resolve repo_id to its registered root path
         repo_id: Repository ID
-        base_ref: Git ref (branch/tag/sha) to diff from; must resolve locally
-        head_ref: Git ref (branch/tag/sha) to diff to; must resolve locally
+        base_ref: Git ref (branch/tag/sha) the change is based on; must resolve locally
+        head_ref: Git ref (branch/tag/sha) with the change; must resolve locally
         cross_repo: If True, include cross-repo impacts
         max_results: Maximum number of results per dependents list to return in the envelope
 
     Returns:
-        Dict with changed_files, changed_components, direct_dependents and
-        transitive_dependents (each {count, results, truncated} envelopes),
-        and risk_level. On an invalid ref or unregistered repo, returns an
-        empty result with an "error" key instead of raising.
+        Dict with changed_files; added_symbols, changed_symbols and
+        removed_symbols ({name, kind, container, file}); changed_components (the
+        names traced); direct_dependents and transitive_dependents ({count,
+        results, truncated} envelopes); risk_level; truncated and
+        truncated_reasons (compare_branches' caps); and notices. Dependents come
+        from the last index of the working tree, not from either ref.
+
+    Raises:
+        ToolError: an unknown repo_id, a bad or unknown ref, no common history,
+            or git failing.
     """
-    empty = {
-        "changed_files": [],
-        "changed_components": [],
-        "direct_dependents": _envelope([], max_results),
-        "transitive_dependents": _envelope([], max_results),
-        "risk_level": "low",
-    }
+    from devgraph.indexer.git_history import compare as git_compare
 
-    repo = registry.get(repo_id)
-    if repo is None:
-        return {**empty, "error": f"no such repo_id: {repo_id}"}
-
-    git_repo = None
+    record = _registered(registry, repo_id)
+    notices: list[str] = []
     try:
-        git_repo = open_repo(repo.path)
-        git_repo.commit(base_ref)
-        git_repo.commit(head_ref)
-        # No rename detection: it reads blobs a blobless partial clone lacks, and
-        # a rename's old and new paths are both changed files for impact.
-        diff_output = git_repo.git.diff("--name-only", "--no-renames", f"{base_ref}..{head_ref}")
-    except Exception as exc:
-        return {**empty, "error": f"could not diff {base_ref}..{head_ref}: {exc}"}
-    finally:
-        if git_repo is not None:
-            git_repo.close()
+        with git_compare.open_comparison(
+            record.path, repo_id, base_ref, head_ref,
+            arg_names=("base_ref", "head_ref"), tool="impact_analysis_for_diff",
+        ) as comparison:
+            try:
+                detailed = git_compare.symbol_detail(comparison)
+            except git_compare.CompareError as exc:
+                detailed = []
+                notices.append(f"{exc}; every indexed symbol in the changed files counts as changed")
+    except git_compare.CompareError as exc:
+        raise ToolError(str(exc)) from exc
 
-    changed_files = [line for line in diff_output.splitlines() if line]
-    if not changed_files:
-        return empty
+    changes = comparison.changes
+    changed_files = list(dict.fromkeys(p for c in changes for p in (c.old_path, c.path) if p is not None))
+    symbols: dict[str, list[dict[str, Any]]] = {"added": [], "changed": [], "removed": []}
+    targets: list[dict[str, str]] = []
+    unread: list[str] = []
+    detailed_paths = {c.path for c in detailed}
+    for change in changes:
+        if change.path not in detailed_paths:
+            if not detailed and change.kind == "blob" and change.status != "added":
+                unread.append(change.path)
+            continue
+        if change.symbols is None:
+            if change.symbols_skipped in ("too_large", "limit", "parse_error") and change.status != "added":
+                unread.append(change.path)
+            continue
+        for name in symbols:
+            symbols[name] += [_diff_symbol(entry, change.path) for entry in change.symbols[name]]
+        for name in ("changed", "removed"):
+            for entry in change.symbols[name]:
+                target = {"name": entry["name"], "file": change.path}
+                if target not in targets:
+                    targets.append(target)
+    if unread and detailed:
+        notices.append(
+            f"symbols of {len(unread)} changed file(s) could not be read; every indexed symbol in them counts as changed"
+        )
 
-    component_cypher = """
-    MATCH (m:Module {repo_id: $repo_id})
-    WHERE m.name IN $changed_files
-    OPTIONAL MATCH (m)-[:CONTAINS*1..2]->(comp)
-    WHERE comp:Function OR comp:Class
-    RETURN COLLECT(DISTINCT comp.name) as components
-    """
-    comp_results = _query(engine, component_cypher, {"repo_id": repo_id, "changed_files": changed_files})
-    changed_components = [c for c in (comp_results[0]["components"] if comp_results else []) if c is not None]
-
-    if not changed_components:
-        return {**empty, "changed_files": changed_files}
-
-    repo_filter = "" if cross_repo else "AND n.repo_id = $repo_id"
-    impact_cypher = f"""
-    MATCH (n)
-    WHERE n.name IN $changed_components
-    {repo_filter}
-    WITH collect(n) AS l0
-    {_impact_expansion(cross_repo)}
-    """
-    params: dict[str, Any] = {"changed_components": changed_components}
-    if not cross_repo:
-        params["repo_id"] = repo_id
-
-    impact_results = _query(engine, impact_cypher, params)
-    if not impact_results:
-        return {**empty, "changed_files": changed_files, "changed_components": changed_components}
-
-    row = impact_results[0]
-    risk_level = _risk_level(row["direct_count"])
-
+    row = {"direct_dependents": [], "transitive_dependents": [], "direct_count": 0, "matched": []}
+    if targets or unread:
+        cypher = _DIFF_TARGETS_CYPHER + _impact_expansion(cross_repo)
+        rows = _query(engine, cypher, {"repo_id": repo_id, "targets": targets, "files": unread})
+        if rows:
+            row = rows[0]
+    reasons = comparison.truncated_reasons
     return {
         "changed_files": changed_files,
-        "changed_components": changed_components,
-        "direct_dependents": _envelope(
-            [d for d in row["direct_dependents"] if d.get("name") is not None], max_results
-        ),
-        "transitive_dependents": _envelope(
-            [t for t in row["transitive_dependents"] if t.get("name") is not None], max_results
-        ),
-        "risk_level": risk_level,
+        "added_symbols": symbols["added"],
+        "changed_symbols": symbols["changed"],
+        "removed_symbols": symbols["removed"],
+        "changed_components": sorted({n for n in row["matched"] if n is not None}),
+        "direct_dependents": _envelope(row["direct_dependents"], max_results),
+        "transitive_dependents": _envelope(row["transitive_dependents"], max_results),
+        "risk_level": _risk_level(row["direct_count"]),
+        "truncated": bool(reasons),
+        "truncated_reasons": list(reasons),
+        "notices": notices,
     }
 
 

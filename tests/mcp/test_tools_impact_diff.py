@@ -7,6 +7,7 @@ import tempfile
 from pathlib import Path
 
 import pytest
+from mcp.server.mcpserver.exceptions import ToolError
 
 from devgraph.graph.engine import GraphEngine
 from devgraph.indexer.python.extractor import index_file
@@ -94,18 +95,15 @@ def test_impact_analysis_for_diff_end_to_end(graph_engine, registry, diff_repo):
         graph_engine.delete_repository(repo_id)
 
 
-def test_impact_analysis_for_diff_invalid_ref_returns_error(graph_engine, registry, diff_repo):
+def test_impact_analysis_for_diff_invalid_ref_is_a_tool_error(graph_engine, registry, diff_repo):
     repo_path, base_sha, _head_sha = diff_repo
     repo_id = "_smoketest_impact_diff_bad_ref"
     registry.add_repo(repo_path, repo_id=repo_id)
 
-    try:
-        result = impact_analysis_for_diff(graph_engine, registry, repo_id, base_sha, "not-a-real-ref-xyz")
-        assert "error" in result
-        assert result["changed_files"] == []
-        assert result["risk_level"] == "low"
-    finally:
-        graph_engine.delete_repository(repo_id)
+    with pytest.raises(ToolError, match="head_ref 'not-a-real-ref-xyz' is not a branch, tag or commit"):
+        impact_analysis_for_diff(graph_engine, registry, repo_id, base_sha, "not-a-real-ref-xyz")
+    with pytest.raises(ToolError, match="base_ref '--output=x' is not a valid ref"):
+        impact_analysis_for_diff(graph_engine, registry, repo_id, "--output=x", base_sha)
 
 
 def test_impact_analysis_for_diff_empty_diff_returns_empty(graph_engine, registry, diff_repo):
@@ -123,10 +121,56 @@ def test_impact_analysis_for_diff_empty_diff_returns_empty(graph_engine, registr
         graph_engine.delete_repository(repo_id)
 
 
-def test_impact_analysis_for_diff_unregistered_repo_returns_error(graph_engine, registry):
-    result = impact_analysis_for_diff(graph_engine, registry, "_no_such_repo", "HEAD", "HEAD")
-    assert "error" in result
-    assert result["changed_files"] == []
+def test_impact_analysis_for_diff_unregistered_repo_is_a_tool_error(graph_engine, registry):
+    with pytest.raises(ToolError, match="no such repo_id: '_no_such_repo'"):
+        impact_analysis_for_diff(graph_engine, registry, "_no_such_repo", "HEAD", "HEAD")
+
+
+@pytest.fixture
+def symbol_repo(tmp_path):
+    """Base: mod.py defines stable, edited and gone, each called from caller.py.
+    Head: edits edited, deletes gone, adds brand_new; stable is untouched."""
+    repo_path = tmp_path / "symbols"
+    repo_path.mkdir()
+    _run_git(repo_path, "init", "-q", "-b", "main")
+    _run_git(repo_path, "config", "user.email", "test@example.com")
+    _run_git(repo_path, "config", "user.name", "Test Author")
+    (repo_path / "mod.py").write_text(
+        "def stable():\n    return 1\n\n\ndef edited():\n    return 1\n\n\ndef gone():\n    return 1\n"
+    )
+    (repo_path / "caller.py").write_text(
+        "from mod import stable, edited, gone\n\n\n"
+        "def use_stable():\n    stable()\n\n\n"
+        "def use_edited():\n    edited()\n\n\n"
+        "def use_gone():\n    gone()\n"
+    )
+    _run_git(repo_path, "add", "-A")
+    _run_git(repo_path, "commit", "-q", "-m", "base")
+    return repo_path
+
+
+def test_only_changed_and_removed_symbols_are_traced_and_added_ones_are_listed(graph_engine, registry, symbol_repo):
+    repo_id = "_smoketest_impact_diff_symbols"
+    registry.add_repo(symbol_repo, repo_id=repo_id)
+    index_file(graph_engine, repo_id, symbol_repo / "mod.py", repo_root=symbol_repo)
+    index_file(graph_engine, repo_id, symbol_repo / "caller.py", repo_root=symbol_repo)
+    (symbol_repo / "mod.py").write_text(
+        "def stable():\n    return 1\n\n\ndef edited():\n    return 2\n\n\ndef brand_new():\n    return 3\n"
+    )
+    _run_git(symbol_repo, "commit", "-q", "-am", "head")
+
+    try:
+        result = impact_analysis_for_diff(graph_engine, registry, repo_id, "HEAD~1", "HEAD")
+    finally:
+        graph_engine.delete_repository(repo_id)
+
+    assert result["changed_files"] == ["mod.py"]
+    assert [(s["name"], s["file"]) for s in result["changed_symbols"]] == [("edited", "mod.py")]
+    assert [s["name"] for s in result["removed_symbols"]] == ["gone"]
+    assert [s["name"] for s in result["added_symbols"]] == ["brand_new"]
+    assert sorted(result["changed_components"]) == ["edited", "gone"]
+    direct = {d["name"] for d in result["direct_dependents"]["results"]}
+    assert direct == {"use_edited", "use_gone"}
 
 
 class _NoGraph:

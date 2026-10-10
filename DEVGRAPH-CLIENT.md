@@ -328,9 +328,12 @@ and never fetch. `compare_branches` compares from the merge base, like
 `git diff main...branch` (what a pull request shows), and names the functions
 and classes added, removed and changed in each file, with line numbers. Its
 `impacted_callers` come from the last index of the working tree, not from
-either ref, so read them as a hint. `impact_analysis_for_diff` compares the two
-refs directly (`base..head`) and traces dependents, direct and transitive, of
-every component in the changed files. Use `compare_branches` for "what did my
+either ref, so read them as a hint. `impact_analysis_for_diff` compares the same
+way and traces dependents, direct and transitive, of the functions and classes
+changed or removed; added ones are listed in `added_symbols`, since nothing
+depends on them yet. A changed file whose symbols can't be read (too large, a
+cap, a blob missing from a partial clone) counts every indexed symbol in it,
+and a notice says so. An unknown repository or ref is an error. Use `compare_branches` for "what did my
 branch change?" and `impact_analysis_for_diff` for "what could this diff
 break?".
 

@@ -20,7 +20,7 @@ TOOL_CATALOG: list[dict[str, Any]] = [
     {"name": "summarise_repository", "identifier_kind": None, "envelope": False, "phase": 1},
     {"name": "compare_branches", "identifier_kind": "two local git refs (branch_a = base, branch_b = head; compared from their merge base, like git diff a...b)", "envelope": False, "phase": 3, "note": "the response is not an envelope; files and impacted_callers inside it are {count, results, truncated}"},
     {"name": "impact_analysis", "identifier_kind": "function/class name (not a file path)", "envelope": True, "phase": 1, "note": "transitive dependents stop at 4 hops"},
-    {"name": "impact_analysis_for_diff", "identifier_kind": "two git refs (base_ref, head_ref), both must exist locally", "envelope": True, "phase": 3, "note": "transitive dependents stop at 4 hops"},
+    {"name": "impact_analysis_for_diff", "identifier_kind": "two local git refs (base_ref, head_ref; compared from their merge base, like git diff base...head)", "envelope": True, "phase": 3, "note": "traces dependents of the changed and removed functions/classes only; added ones are listed apart; transitive dependents stop at 4 hops"},
     {"name": "explain_architecture", "identifier_kind": None, "envelope": False, "phase": 1},
     {"name": "list_services", "identifier_kind": None, "envelope": True, "phase": 1},
     {"name": "explain_decision", "identifier_kind": "DesignDecision name/id", "envelope": False, "phase": 2},

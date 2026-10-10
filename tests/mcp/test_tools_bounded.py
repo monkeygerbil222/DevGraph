@@ -200,7 +200,7 @@ def test_impact_for_diff_on_a_hub_is_fast(engine, hub, tmp_path):
     (root / "hub.py").write_text("def get():\n    return 2\n")
     git("commit", "-q", "-am", "change")
     engine.run_cypher(
-        "MATCH (f:Function {repo_id: $r, name: 'get', file: 'get1.py'}) CREATE (:Module {repo_id: $r, name: 'hub.py'})-[:CONTAINS]->(f)",
+        "MATCH (f:Function {repo_id: $r, name: 'get', file: 'get1.py'}) SET f.file = 'hub.py'",
         {"r": repo_id},
     )
     registry = RepoRegistry(tmp_path / "registry.sqlite3")

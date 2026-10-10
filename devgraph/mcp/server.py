@@ -652,12 +652,16 @@ def build_server(
         cross_repo: bool = False,
         max_results: int = 15,
     ) -> dict[str, Any]:
-        """Analyze the combined impact of every component changed between two git refs
-        (e.g. a PR's base/head branches). Composes a local git diff with the same
-        dependent-tracing impact_analysis uses, across every changed component at once.
-        Both refs must already exist locally — never fetches from a remote. Transitive
-        dependents stop at four hops. Dependents wrapped in {count, results, truncated}
-        envelopes."""
+        """What a change between two local git refs could break. Compares head_ref with
+        its merge base with base_ref, like `git diff base_ref...head_ref` (what a pull
+        request shows), as compare_branches does, and lists the functions and classes
+        added, changed and removed (added_symbols, changed_symbols, removed_symbols).
+        Dependents of the changed and removed ones are traced, direct (one
+        CALLS/USES/DEPENDS_ON hop) and transitive (two to four hops); added ones have no
+        dependents yet. A changed file whose symbols can't be read counts every indexed
+        symbol in it, with a notice. Never fetches; same ref rules and caps as
+        compare_branches. Dependents come from the last index of the working tree and are
+        wrapped in {count, results, truncated} envelopes."""
         return devgraph_tools.impact_analysis_for_diff(
             engine, registry, repo_id, base_ref, head_ref, cross_repo, max_results
         )
