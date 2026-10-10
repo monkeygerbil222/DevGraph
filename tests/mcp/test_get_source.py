@@ -191,3 +191,12 @@ def test_find_callers_keeps_same_named_callers_in_different_files_apart(two_help
     result = find_callers(engine, repo_id, "target")
     rows = [(r["name"], r["file"]) for r in result["results"]]
     assert ("run", "a.py") in rows and ("run", "b.py") in rows
+
+
+def test_get_source_notes_when_a_declared_codec_did_not_decode_the_file(two_helpers):
+    engine, registry, repo_id, root = two_helpers
+    (root / "b.py").write_bytes("# coding: ascii\ndef helper():\n    return 'café'\n".encode())
+    index_paths(engine, repo_id, root, {root / "b.py"})
+    result = get_source(engine, registry, repo_id, "helper", file="b.py")
+    assert result["source"] == "def helper():\n    return 'café'"
+    assert "ascii" in result["notice"] and "utf-8" in result["notice"]

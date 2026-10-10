@@ -1726,7 +1726,8 @@ def get_source(
         ({label, name, file}; repo_id too when cross_repo): pass one's `file`.
         A file is decoded as the indexer decodes it (`source_text`): a
         Python coding line, else UTF-8, else cp1252 or Latin-1; when an
-        undeclared file is not valid UTF-8 the dict adds a `notice` saying so.
+        undeclared file is not valid UTF-8, or a file isn't valid in its
+        declared codec, the dict adds a `notice` saying how it was decoded.
     """
     repo_filter = "" if cross_repo else "AND n.repo_id = $repo_id"
     cypher = f"""
@@ -1796,7 +1797,10 @@ def get_source(
     # Decoded as the indexer decodes it, so the line range lines up.
     python = is_python_path(file_rel_path)
     text, encoding = decode_source_as(data, python=python)
-    if encoding != "utf-8" and not (python and declared_encoding(data)):
+    declared = declared_encoding(data) if python else None
+    if declared is not None and encoding != declared:
+        notice = f"the file declares {declared} but is not valid {declared}; decoded as {encoding}, as the indexer reads it"
+    elif declared is None and encoding != "utf-8":
         notice = f"the file is not valid UTF-8; decoded as {encoding}, as the indexer reads it"
     lines = text.splitlines()
 
