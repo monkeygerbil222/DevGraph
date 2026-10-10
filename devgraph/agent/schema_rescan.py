@@ -18,6 +18,7 @@ from typing import Any
 
 from devgraph.config.project_schema import ProjectSchemaError, resolve_effective_schema, schema_file_hash
 from devgraph.indexer.dispatch import full_scan, index_outdated, schema_pending
+from devgraph.indexer.walk import RepoRootUnavailable
 
 logger = logging.getLogger(__name__)
 
@@ -138,6 +139,11 @@ class SchemaRescanScheduler:
                         self._on_rescanned(repo.repo_id, count)
                     except Exception:
                         logger.debug("schema rescan callback failed for %s", repo.repo_id, exc_info=True)
+            except RepoRootUnavailable as exc:
+                # A missing or unmounted folder: one line, no traceback.
+                first = repo.repo_id not in self._failing
+                self._failing.add(repo.repo_id)
+                logger.log(logging.WARNING if first else logging.DEBUG, "schema rescan skipped for %s: %s", repo.repo_id, exc)
             except Exception:
                 first = repo.repo_id not in self._failing
                 self._failing.add(repo.repo_id)
