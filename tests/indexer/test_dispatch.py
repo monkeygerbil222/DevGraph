@@ -1480,3 +1480,58 @@ def test_name_refs_are_compact():
     shuffled = list(rels)
     random.Random(7).shuffle(shuffled)
     assert name_ref_properties(shuffled) == props
+
+
+def _rel(to_name, to_file=None, origin="app.py", **properties):
+    return {
+        "from_label": "Function", "from_name": "main", "from_file": "app.py", "rel_type": "CALLS",
+        "to_label": "Function", "to_name": to_name, "repo_id": "r", "to_file": to_file, "origin": origin,
+        "properties": properties or None,
+    }
+
+
+def test_name_refs_record_cross_file_pins_once_per_target_name():
+    from devgraph.indexer.common import name_ref_properties, parse_name_ref
+
+    refs = name_ref_properties([
+        _rel("f", "pkg/__init__.py", confidence="resolved", caller_class="C"),
+        _rel("f", "pkg/", confidence="package", caller_class="C"),
+        _rel("f", "pkg.py", confidence="resolved", caller_class="C"),
+        _rel("local", "app.py", confidence="resolved"),  # the writer's own file: nothing can add it
+        _rel("stub", ""),  # the file-less node, from a pinned source
+        _rel("g", confidence="name"),
+    ])["name_refs"]
+    parsed = sorted(parse_name_ref(entry) for entry in refs)
+    assert parsed == [
+        (["CALLS", "Function", "main", "app.py", "Function", "f", "C"], ["pkg.py", "pkg/", "pkg/__init__.py"],
+         "resolved"),
+        (["CALLS", "Function", "main", "app.py", "Function", "g", ""], None, "name"),
+    ]
+
+
+def test_name_refs_keep_a_fileless_pin_apart_from_unpinned():
+    from devgraph.indexer.common import name_ref_properties, parse_name_ref
+
+    unpinned_source = {**_rel("Display", ""), "from_label": "Class", "from_name": "Foo", "from_file": None}
+    (entry,) = name_ref_properties([unpinned_source])["name_refs"]
+    assert parse_name_ref(entry) == (["CALLS", "Class", "Foo", "", "Function", "Display", ""], [""], "")
+
+
+def test_a_legacy_name_ref_entry_parses_as_unpinned():
+    from devgraph.indexer.common import NAME_REF_SEP, parse_name_ref
+
+    legacy = NAME_REF_SEP.join(["CALLS", "Function", "main", "a.py", "Function", "helper", "Svc"])
+    assert parse_name_ref(legacy) == (["CALLS", "Function", "main", "a.py", "Function", "helper", "Svc"], None, "")
+
+
+def test_a_directory_pin_is_tested_before_the_fileless_pin():
+    from devgraph.graph.engine import _end_match, _group_rels_by_triple, _pin
+
+    assert [_pin(f) for f in (None, "", "pkg/", "pkg/a.py")] == ["name", "fileless", "prefix", "file"]
+    groups = _group_rels_by_triple([_rel("f", "pkg/a.py"), {**_rel("f", "pkg/"), "exact": ["pkg/a.py"]}])
+    assert {key[4] for key in groups} == {"file", "prefix"}
+    (prefix_row,) = groups[("Function", "CALLS", "Function", "file", "prefix")]
+    assert prefix_row["exact"] == ["pkg/a.py"]
+    match = _end_match("b", "Function", "to", "prefix")
+    assert "USING INDEX SEEK b:Function(repo_id, name)" in match
+    assert "b.file STARTS WITH row.to_file AND NOT b.file IN row.exact" in match

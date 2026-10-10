@@ -565,12 +565,19 @@ def identity_key(label: str, repo_id: str, name: str, file: str | None) -> str:
 
 
 def _pin(file: str | None) -> str:
-    """How an edge end matches its node: by bare name (`file` None), only the
+    """How an edge end matches its node: by bare name (`file` None), every
+    node of that name in a file under a package directory (`file` ending in
+    "/", e.g. "pkg/", but not one of the row's `exact` files), only the
     file-less node of that name (`file` "", a route's handler stub), or the
-    node in that one file. `file` "" is meant only for a file-scoped label
-    (`FILE_SCOPED_LABELS`); other labels never carry `file`, so it would match
-    every node of the name."""
-    return "name" if file is None else "fileless" if file == "" else "file"
+    node in that one file. A directory and "" are meant only for a
+    file-scoped label (`FILE_SCOPED_LABELS`); other labels never carry
+    `file`, so "" would match every node of the name and a directory none.
+    No file path ends in "/", so a directory is never mistaken for a file."""
+    if file is None:
+        return "name"
+    if file.endswith("/"):
+        return "prefix"
+    return "fileless" if file == "" else "file"
 
 
 def _group_rels_by_triple(
@@ -588,7 +595,8 @@ def _group_rels_by_triple(
     paper over.
 
     Each row carries its `origin`, the file that wrote it (None for a writer
-    that doesn't record one).
+    that doesn't record one), and `exact`, the files a "prefix" target pin
+    leaves out (empty for every other pin).
     """
     groups: dict[tuple[str, str, str, str, str], list[dict[str, Any]]] = {}
     for rel in rels:
@@ -604,6 +612,7 @@ def _group_rels_by_triple(
                 "to_file": to_file,
                 "properties": rel.get("properties") or {},
                 "origin": rel.get("origin"),
+                "exact": rel.get("exact") or [],
             }
         )
     return groups
@@ -655,12 +664,16 @@ def _end_match(var: str, label: str, end: str, pin: str) -> str:
     from index statistics sampled while the label was near-empty estimates 0
     rows, and can then scan a whole index per row (a plain USING INDEX allows
     that scan) after the label has filled; in CI that made a 5,000-module
-    relink take 20 s instead of under 1 s."""
+    relink take 20 s instead of under 1 s. A "prefix" end seeks by name and
+    keeps the nodes whose file is under the directory, less the row's
+    `exact` files."""
     pinned = pin == "file"
     keys = "repo_id, name, file" if pinned else "repo_id, name"
     hint = f"USING INDEX SEEK {var}:{label}({keys}) " if label in FILE_SCOPED_LABELS else ""
     if not pinned:
         match = f"MATCH ({var}:{label} {{repo_id: row.repo_id, name: row.{end}_name}}) " + hint
+        if pin == "prefix":
+            return match + f"WHERE {var}.file STARTS WITH row.{end}_file AND NOT {var}.file IN row.exact "
         return match + (f"WHERE {var}.file IS NULL " if pin == "fileless" else "")
     return f"MATCH ({var}:{label} {{repo_id: row.repo_id, name: row.{end}_name, file: row.{end}_file}}) " + hint
 
@@ -885,7 +898,8 @@ class GraphEngine:
         """Batched MATCH-MATCH-MERGE for many relationships in one transaction.
 
         Each dict needs `from_label`/`from_name`/`rel_type`/`to_label`/
-        `to_name`/`repo_id` (`properties`, `from_file`/`to_file` and
+        `to_name`/`repo_id` (`properties`, `from_file`/`to_file`, `exact`,
+        the files a directory `to_file` leaves out (see `_pin`), and
         `origin`, the writing file added to the edge's `origins`, optional). Grouped by
         `(from_label, rel_type, to_label)` — same reasoning as `upsert_nodes`,
         since label/rel-type can't be parameterized. An edge whose endpoint

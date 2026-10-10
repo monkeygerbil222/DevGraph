@@ -17,6 +17,7 @@ from devgraph.graph.engine import _UNCLAIM_EDGE, GraphEngine, provision_reposito
 from devgraph.indexer import dispatch
 from devgraph.indexer.apis import extractor as apis_extractor
 from devgraph.indexer.apis.extractor import Relationship
+from devgraph.indexer.common import GraphRelationship
 from devgraph.indexer.dispatch import full_scan, index_paths, remove_paths
 from tests.watcher.live_helpers import fresh_snapshot, graph_snapshot, snapshot_diff
 
@@ -1082,6 +1083,83 @@ def test_relink_reads_no_files(engine, repo_id, tmp_path, monkeypatch):
     )
 
 
+# Hand-built pinned CALLS out of app.py's `main` (no extractor writes them
+# yet): to one exact file, and to a package directory less its exact files.
+def _with_pinned_calls(monkeypatch, rows):
+    real = dispatch.extract_python_file
+
+    def extract(content, rel_path, repo_id):
+        result = real(content, rel_path, repo_id)
+        if rel_path == "app.py":
+            result.relationships += [
+                GraphRelationship(
+                    from_label="Function", from_name="main", rel_type="CALLS", to_label="Function",
+                    to_name=name, repo_id=repo_id, properties=properties, from_file="app.py", to_file=to_file,
+                    origin="app.py", exact=exact,
+                )
+                for name, to_file, properties, exact in rows
+            ]
+        return result
+
+    monkeypatch.setattr(dispatch, "extract_python_file", extract)
+
+
+def _call_props(engine, repo_id):
+    rows = engine.run_cypher(
+        "MATCH (:Function {repo_id: $r, name: 'main'})-[c:CALLS]->(b) "
+        "RETURN b.name AS name, b.file AS file, c.confidence AS confidence, c.caller_class AS caller_class",
+        {"r": repo_id},
+    )
+    return sorted((row["name"], row["file"], row["confidence"], row["caller_class"]) for row in rows)
+
+
+def test_a_pinned_call_relinks_when_its_file_is_restored(engine, repo_id, tmp_path, monkeypatch):
+    _with_pinned_calls(monkeypatch, [("helper", "pkg/b.py", {"confidence": "resolved", "caller_class": "C"}, None)])
+    write(tmp_path, "app.py", "def main():\n    return 0\n")
+    b = write(tmp_path, "pkg/b.py", "def helper():\n    return 1\n")
+    write(tmp_path, "other/b.py", "def helper():\n    return 2\n")
+    scan(engine, repo_id, tmp_path)
+    linked = [("helper", "pkg/b.py", "resolved", "C")]
+    assert _call_props(engine, repo_id) == linked
+
+    b.unlink()
+    remove_paths(engine, repo_id, tmp_path, {b})
+    assert _call_props(engine, repo_id) == []
+    write(tmp_path, "pkg/b.py", "def helper():\n    return 1\n")
+    index_paths(engine, repo_id, tmp_path, {b})
+    assert _call_props(engine, repo_id) == linked
+    incremental_equals_fresh(engine, repo_id, tmp_path)
+
+
+@pytest.mark.parametrize("one_batch", [True, False], ids=["one batch", "two batches"])
+def test_a_package_call_follows_its_function_within_the_package(engine, repo_id, tmp_path, monkeypatch, one_batch):
+    _with_pinned_calls(monkeypatch, [
+        ("f", "pkg/__init__.py", {"confidence": "resolved"}, None),
+        ("f", "pkg/", {"confidence": "package"}, ["app.py", "pkg/__init__.py"]),
+    ])
+    write(tmp_path, "app.py", "def main():\n    return 0\n")
+    write(tmp_path, "pkg/__init__.py", "def f():\n    return 0\n")
+    impl = write(tmp_path, "pkg/impl.py", "def f():\n    return 1\n")
+    write(tmp_path, "outside/x.py", "def f():\n    return 2\n")
+    write(tmp_path, "pkgextra/y.py", "def f():\n    return 3\n")
+    scan(engine, repo_id, tmp_path)
+    assert _call_props(engine, repo_id) == [
+        ("f", "pkg/__init__.py", "resolved", None), ("f", "pkg/impl.py", "package", None),
+    ]
+
+    write(tmp_path, "pkg/impl.py", "X = 1\n")
+    other = write(tmp_path, "pkg/sub/other.py", "def f():\n    return 1\n")
+    if one_batch:
+        index_paths(engine, repo_id, tmp_path, {impl, other})
+    else:
+        index_paths(engine, repo_id, tmp_path, {impl})
+        index_paths(engine, repo_id, tmp_path, {other})
+    assert _call_props(engine, repo_id) == [
+        ("f", "pkg/__init__.py", "resolved", None), ("f", "pkg/sub/other.py", "package", None),
+    ]
+    incremental_equals_fresh(engine, repo_id, tmp_path)
+
+
 def _spy(monkeypatch, cls, name):
     calls = []
     real = getattr(cls, name)
@@ -1121,7 +1199,7 @@ def test_pass_two_omits_name_refs(engine, repo_id, tmp_path, monkeypatch):
     index_paths(engine, repo_id, tmp_path, {a})
     modules = [n for (nodes,) in calls for n in nodes if n["label"] == "Module"]
     assert modules and not any("name_refs" in n["properties"] for n in modules)
-    assert _module_name_refs(engine, repo_id, "a.py")[0] == ["CALLS\x1fFunction\x1fmain\x1fa.py\x1fFunction\x1fhelper\x1f"]
+    assert _module_name_refs(engine, repo_id, "a.py")[0] == ["CALLS\x1fFunction\x1fmain\x1fa.py\x1fFunction\x1fhelper\x1f\x1f\x1f"]
 
 
 def test_name_refs_written_empty(engine, repo_id, tmp_path):

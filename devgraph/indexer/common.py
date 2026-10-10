@@ -54,6 +54,10 @@ class GraphRelationship:
     in the edge's sorted `origins` list, and a re-index of that file removes
     it from the edges it no longer writes, deleting an edge whose last writer
     is gone.
+
+    A `to_file` ending in "/" is a package directory: the edge goes to every
+    node of the name in a file under it, except the `exact` files (see
+    engine._pin).
     """
 
     from_label: str
@@ -66,6 +70,7 @@ class GraphRelationship:
     from_file: str | None = None
     to_file: str | None = None
     origin: str | None = None
+    exact: list[str] | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -79,6 +84,7 @@ class GraphRelationship:
             "from_file": self.from_file,
             "to_file": self.to_file,
             "origin": self.origin,
+            "exact": self.exact,
         }
 
 
@@ -116,33 +122,82 @@ def own_edges(result: ExtractionResult, file_path: str) -> ExtractionResult:
 
 #: Joins the fields of one `name_refs` entry (see name_ref_properties).
 NAME_REF_SEP = "\x1f"
+#: Joins an entry's target pins.
+NAME_REF_PIN_SEP = "\x1e"
+#: A target pin to the file-less node ("" as a `to_file`).
+NAME_REF_FILELESS = "\x1d"
 
 
 def name_ref_properties(rels: list[dict]) -> dict:
     """The Module properties that record a file's by-name edges, so a batch
     that later adds one of their endpoints can relink them from the graph.
 
-    An edge is by-name when its target has no `to_file`, or its source is
-    unpinned and not a Module. A pinned target's edge from an unpinned source
-    that is not a code symbol (a route's Endpoint, which the same file writes)
-    is not: neither end can be added by another file. `name_refs` holds each one once, sorted, as
+    An edge is recorded when another file can add its target: the target
+    has no `to_file`, or one that is neither "" nor the writing file (a
+    Python call resolved to an imported file, or to every file under a
+    package directory). It is also recorded when its source is unpinned and
+    not a Module (a Rust `impl Trait for Foo`, which another file's `Foo`
+    can add), unless that source is not a code symbol (a route's Endpoint,
+    which the same file writes).
+
+    `name_refs` holds one entry per edge source and target name, sorted, as
     `rel_type, from_label, from_name, from_file, to_label, to_name,
-    caller_class` joined by NAME_REF_SEP (an unset field is empty).
-    `name_ref_targets` is their sorted distinct `to_name`s and
-    `name_ref_sources` the sorted distinct `from_name`s of their unpinned
-    non-Module sources. All three are lists, empty when there is nothing.
+    caller_class, pins, confidence` joined by NAME_REF_SEP (an unset field is
+    empty). `pins` is empty for an unpinned target, else the target's
+    `to_file`s joined by NAME_REF_PIN_SEP, with NAME_REF_FILELESS for "";
+    a pinned and an unpinned edge of the same source and name are separate
+    entries. `confidence` is the edges' `confidence` property; a directory
+    pin's edges are always "package". `name_ref_targets` is their sorted
+    distinct `to_name`s and `name_ref_sources` the sorted distinct
+    `from_name`s of their unpinned non-Module sources. All three are lists,
+    empty when there is nothing.
     """
-    refs, targets, sources = set(), set(), set()
+    entries: dict[tuple, tuple[set, set]] = {}
+    targets, sources = set(), set()
     for rel in rels:
         unpinned_source = not rel.get("from_file") and rel["from_label"] != "Module"
-        if rel.get("to_file") is not None and not (unpinned_source and rel["from_label"] in FILE_SCOPED_LABELS):
+        to_file = rel.get("to_file")
+        if (
+            to_file is not None
+            and to_file in ("", rel.get("origin"))
+            and not (unpinned_source and rel["from_label"] in FILE_SCOPED_LABELS)
+        ):
             continue
-        caller_class = (rel.get("properties") or {}).get("caller_class") or ""
-        refs.add(NAME_REF_SEP.join((
+        properties = rel.get("properties") or {}
+        key = (
             rel["rel_type"], rel["from_label"], rel["from_name"], rel.get("from_file") or "",
-            rel["to_label"], rel["to_name"], caller_class,
-        )))
+            rel["to_label"], rel["to_name"], properties.get("caller_class") or "",
+            # Unpinned entries are kept apart by confidence; a pinned entry
+            # carries its exact pins' confidence.
+            None if to_file is not None else properties.get("confidence") or "",
+        )
+        pins, confidences = entries.setdefault(key, (set(), set()))
+        if to_file is not None:
+            pins.add(to_file)
+            if not to_file.endswith("/"):
+                confidences.add(properties.get("confidence") or "")
         targets.add(rel["to_name"])
         if unpinned_source:
             sources.add(rel["from_name"])
+    refs = set()
+    for key, (pins, confidences) in entries.items():
+        *fields, unpinned_confidence = key
+        encoded = NAME_REF_PIN_SEP.join(sorted(NAME_REF_FILELESS if pin == "" else pin for pin in pins))
+        confidence = unpinned_confidence if unpinned_confidence is not None else min(confidences, default="")
+        refs.add(NAME_REF_SEP.join((*fields, encoded, confidence)))
     return {"name_refs": sorted(refs), "name_ref_targets": sorted(targets), "name_ref_sources": sorted(sources)}
+
+
+def parse_name_ref(entry: str) -> tuple[list[str], list[str] | None, str]:
+    """An entry of `name_refs` as (its first seven fields, its target pins
+    (None when unpinned, "" for the file-less node), its confidence). An
+    entry written before pins (seven fields) is unpinned, with no
+    confidence."""
+    fields = entry.split(NAME_REF_SEP)
+    if len(fields) == 7:
+        return fields, None, ""
+    *head, encoded, confidence = fields
+    pins = [
+        "" if pin == NAME_REF_FILELESS else pin for pin in encoded.split(NAME_REF_PIN_SEP)
+    ] if encoded else None
+    return head, pins, confidence

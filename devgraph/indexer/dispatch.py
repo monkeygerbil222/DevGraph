@@ -39,7 +39,7 @@ from devgraph.config.project_schema import (
 from devgraph.graph.engine import EngineClosed, GraphEngine, provision_repository_schema
 from devgraph.graph.schema import FILE_SCOPED_LABELS, NODE_LABELS, RELATIONSHIP_TYPES
 from devgraph.indexer.apis.extractor import APIExtractor
-from devgraph.indexer.common import NAME_REF_SEP, name_ref_properties
+from devgraph.indexer.common import name_ref_properties, parse_name_ref
 from devgraph.indexer.containers.extractor import ContainerExtractor, ExtractionResult
 from devgraph.indexer.datastores.extractor import DatastoreExtractor
 from devgraph.indexer.docs.extractor import DocsExtractor
@@ -1232,7 +1232,11 @@ def _relink_name_refs(
     The end that met an added node is pinned to it when its label is keyed
     by file. Its edges to same-named nodes that were already there exist
     (they were written when the file was indexed, or relinked when that node
-    was added), and a bare-name match can't use the file-keyed index.
+    was added), and a bare-name match can't use the file-keyed index. An
+    entry with target pins relinks only an added node its pins name: one of
+    its files, or a file under one of its package directories that is not
+    one of its files or the origin's own (a "package" edge). Each edge gets
+    back the entry's `caller_class` and `confidence`.
     """
     if not added:
         return
@@ -1241,23 +1245,34 @@ def _relink_name_refs(
         pinned.setdefault((label, name), set()).add(file if label in FILE_SCOPED_LABELS else None)
     rels = []
 
-    def relink(origin, rel_type, from_label, from_name, from_file, to_label, to_name, to_file, caller_class):
+    def relink(origin, fields, from_file, to_file, confidence, exact=()):
+        rel_type, from_label, from_name, _from_file, to_label, to_name, caller_class = fields
+        properties = {key: value for key, value in (("caller_class", caller_class), ("confidence", confidence)) if value}
         rels.append({
             "from_label": from_label, "from_name": from_name, "rel_type": rel_type,
             "to_label": to_label, "to_name": to_name, "repo_id": repo_id,
-            "properties": {"caller_class": caller_class} if caller_class else None,
-            "from_file": from_file or None, "to_file": to_file, "origin": origin,
+            "properties": properties or None,
+            "from_file": from_file or None, "to_file": to_file, "origin": origin, "exact": sorted(exact),
         })
 
     names = sorted({name for _label, name in pinned})
     for origin, refs in engine.find_name_refs(repo_id, names, sorted(skip)):
         for entry in refs:
-            rel_type, from_label, from_name, from_file, to_label, to_name, caller_class = entry.split(NAME_REF_SEP)
+            fields, pins, confidence = parse_name_ref(entry)
+            _rel_type, from_label, from_name, from_file, to_label, to_name, _caller_class = fields
+            exact = {pin for pin in pins or () if not pin.endswith("/")}
+            prefixes = [pin for pin in pins or () if pin.endswith("/")]
             for to_file in pinned.get((to_label, to_name), ()):
-                relink(origin, rel_type, from_label, from_name, from_file, to_label, to_name, to_file, caller_class)
+                if pins is None or to_file in exact:
+                    relink(origin, fields, from_file, to_file, confidence)
+                elif to_file and to_file != origin and any(to_file.startswith(prefix) for prefix in prefixes):
+                    relink(origin, fields, from_file, to_file, "package")
             if not from_file and from_label != "Module":
                 for source_file in pinned.get((from_label, from_name), ()):
-                    relink(origin, rel_type, from_label, from_name, source_file, to_label, to_name, None, caller_class)
+                    for to_file in pins if pins is not None else [None]:
+                        prefix = to_file is not None and to_file.endswith("/")
+                        relink(origin, fields, source_file, to_file, "package" if prefix else confidence,
+                               exact | {origin} if prefix else ())
     if rels:
         engine.upsert_relationships(rels)
 
