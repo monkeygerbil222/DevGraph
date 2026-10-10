@@ -35,6 +35,9 @@ class _StubEngine:
         self.calls.append((cypher, params or {}))
         return self.rows
 
+    def run_read_cypher(self, query, params, *, timeout_s, max_rows):
+        return self.run_cypher(query, params), False
+
     @property
     def cypher(self) -> str:
         assert len(self.calls) == 1, f"expected exactly one query, got {len(self.calls)}"

@@ -48,6 +48,9 @@ class _Engine:
         self.queries.append(query)
         return []
 
+    def run_read_cypher(self, query, params, *, timeout_s, max_rows):
+        return self.run_cypher(query, params), False
+
     def read_insights_summary(self, repo_id):
         return None
 

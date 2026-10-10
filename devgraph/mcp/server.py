@@ -622,7 +622,9 @@ def build_server(
 
     @server.tool(annotations=_READ_ONLY)
     def impact_analysis(repo_id: str, component_name: str, cross_repo: bool = False, max_results: int = 15) -> dict[str, Any]:
-        """Analyze component impact; dependents wrapped in {count, results, truncated} envelopes."""
+        """Analyze component impact: direct dependents (one CALLS/USES/DEPENDS_ON hop) and
+        transitive ones (two to four hops; further ones are not followed). Dependents
+        wrapped in {count, results, truncated} envelopes."""
         return devgraph_tools.impact_analysis(engine, repo_id, component_name, cross_repo, max_results)
 
     @server.tool(annotations=_READ_ONLY)
@@ -636,8 +638,9 @@ def build_server(
         """Analyze the combined impact of every component changed between two git refs
         (e.g. a PR's base/head branches). Composes a local git diff with the same
         dependent-tracing impact_analysis uses, across every changed component at once.
-        Both refs must already exist locally — never fetches from a remote. Dependents
-        wrapped in {count, results, truncated} envelopes."""
+        Both refs must already exist locally — never fetches from a remote. Transitive
+        dependents stop at four hops. Dependents wrapped in {count, results, truncated}
+        envelopes."""
         return devgraph_tools.impact_analysis_for_diff(
             engine, registry, repo_id, base_ref, head_ref, cross_repo, max_results
         )

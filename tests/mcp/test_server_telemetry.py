@@ -31,6 +31,9 @@ class _StubEngine:
             raise self.raises
         return []
 
+    def run_read_cypher(self, query, params, *, timeout_s, max_rows):
+        return self.run_cypher(query, params), False
+
 
 class _StubRegistry:
     """build_server only stows the registry away for tools needing a repo root."""

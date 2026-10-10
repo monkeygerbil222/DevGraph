@@ -116,6 +116,36 @@ def _gh_issue_list(gh_repo: str, search: str, timeout: int = 10) -> list[dict]:
         return []
 
 
+#: How long a built-in tool's query may run before it is cancelled.
+BUILTIN_TIMEOUT_S = 30
+
+#: Rows a built-in tool's query may return; each already applies its own LIMIT
+#: or aggregates, so this only guards against an unbounded result.
+BUILTIN_MAX_ROWS = 100_000
+
+#: How many CALLS/USES/DEPENDS_ON hops `impact_analysis` and
+#: `impact_analysis_for_diff` follow for transitive dependents. An unbounded
+#: variable-length path hangs on a real repository's call graph, and a
+#: dependent further away than this says little about a change's impact.
+IMPACT_MAX_DEPTH = 4
+
+
+def _query(engine: GraphEngine, cypher: str, params: dict[str, Any]) -> list[dict]:
+    """Run a built-in tool's query read-only, bounded in time and rows. A
+    timeout or a row overflow becomes a ToolError the client can act on."""
+    from neo4j.exceptions import Neo4jError
+
+    try:
+        rows, more = engine.run_read_cypher(cypher, params, timeout_s=BUILTIN_TIMEOUT_S, max_rows=BUILTIN_MAX_ROWS)
+    except Neo4jError as exc:
+        if "TransactionTimedOut" in str(getattr(exc, "code", None) or ""):
+            raise ToolError(f"query timed out after {BUILTIN_TIMEOUT_S} s; narrow the request") from exc
+        raise
+    if more:
+        raise ToolError(f"query returned more than {BUILTIN_MAX_ROWS} rows; narrow the request")
+    return rows
+
+
 def _envelope(items: list[Any], max_results: int) -> dict[str, Any]:
     """Wrap a list result with count/truncation metadata so callers can see
     the full match count without paying token cost for every row.
@@ -147,7 +177,7 @@ def _resolve_recency_cutoff(engine: GraphEngine, repo_id: str, modified_within_c
     SKIP $skip
     LIMIT 1
     """
-    results = engine.run_cypher(cypher, {"repo_id": repo_id, "skip": skip})
+    results = _query(engine, cypher, {"repo_id": repo_id, "skip": skip})
     if not results:
         return None
     return results[0]["d"]
@@ -218,7 +248,7 @@ def search_component(
     if cutoff is not None:
         params["cutoff"] = cutoff
 
-    results = engine.run_cypher(cypher, params)
+    results = _query(engine, cypher, params)
     results = _rank_search_results(results, tokens)
     return _envelope(results, max_results)
 
@@ -550,7 +580,7 @@ def god_nodes(
     LIMIT 50
     """
     params = {} if cross_repo else {"repo_id": repo_id}
-    results = engine.run_cypher(cypher, params)
+    results = _query(engine, cypher, params)
     return _envelope(results, max_results)
 
 
@@ -672,7 +702,7 @@ def find_dependency_cycles(
     """
     params = {} if cross_repo else {"repo_id": repo_id}
 
-    results = engine.run_cypher(cypher, params)
+    results = _query(engine, cypher, params)
 
     cycles: dict[tuple, dict[str, Any]] = {}
     for row in results:
@@ -827,7 +857,7 @@ def trace_request_flow(
     if not cross_repo:
         params["repo_id"] = repo_id
 
-    results = engine.run_cypher(cypher, params)
+    results = _query(engine, cypher, params)
     if results:
         return results[0]
     return {"components": [], "edges": []}
@@ -864,7 +894,7 @@ def get_service_dependencies(
     if not cross_repo:
         params["repo_id"] = repo_id
 
-    results = engine.run_cypher(cypher, params)
+    results = _query(engine, cypher, params)
     if results:
         return results[0]
     return {"service": service_name, "dependencies": [], "calls": []}
@@ -931,7 +961,7 @@ def find_callers(
     if cutoff is not None:
         params["cutoff"] = cutoff
 
-    results = engine.run_cypher(cypher, params)
+    results = _query(engine, cypher, params)
     return _envelope(results, max_results)
 
 
@@ -971,7 +1001,7 @@ def find_related_files(
     if not cross_repo:
         params["repo_id"] = repo_id
 
-    results = engine.run_cypher(cypher, params)
+    results = _query(engine, cypher, params)
     if results:
         row = results[0]
         return {
@@ -1020,7 +1050,7 @@ def summarise_repository(
         service_count, module_count, class_count, function_count,
         endpoint_count, database_count, vectorstore_count, queue_count
     """
-    results = engine.run_cypher(count_cypher, {"repo_id": repo_id})
+    results = _query(engine, count_cypher, {"repo_id": repo_id})
     if results:
         return results[0]
     return {
@@ -1175,7 +1205,8 @@ def impact_analysis(
 
     Returns:
         Dict with direct_dependents and transitive_dependents wrapped as {count, results, truncated}
-        envelopes, plus risk_level (computed from true untruncated count)
+        envelopes, plus risk_level (computed from true untruncated count). Transitive
+        dependents are 2 to `IMPACT_MAX_DEPTH` hops away.
     """
     repo_filter = "" if cross_repo else "WHERE n.repo_id = $repo_id"
     dependent_filter = (
@@ -1189,7 +1220,7 @@ def impact_analysis(
     {repo_filter}
     OPTIONAL MATCH (dependent)-[:CALLS|USES|DEPENDS_ON]->(n)
     {dependent_filter}
-    OPTIONAL MATCH (transitive)-[:CALLS|USES|DEPENDS_ON*2..]->(n)
+    OPTIONAL MATCH (transitive)-[:CALLS|USES|DEPENDS_ON*2..{IMPACT_MAX_DEPTH}]->(n)
     {transitive_filter}
     RETURN
         COLLECT(DISTINCT {{name: dependent.name, type: labels(dependent)[0]}}) as direct_dependents,
@@ -1204,7 +1235,7 @@ def impact_analysis(
     if not cross_repo:
         params["repo_id"] = repo_id
 
-    results = engine.run_cypher(cypher, params)
+    results = _query(engine, cypher, params)
     if results:
         row = results[0]
         return {
@@ -1288,7 +1319,7 @@ def impact_analysis_for_diff(
     WHERE comp:Function OR comp:Class
     RETURN COLLECT(DISTINCT comp.name) as components
     """
-    comp_results = engine.run_cypher(component_cypher, {"repo_id": repo_id, "changed_files": changed_files})
+    comp_results = _query(engine, component_cypher, {"repo_id": repo_id, "changed_files": changed_files})
     changed_components = [c for c in (comp_results[0]["components"] if comp_results else []) if c is not None]
 
     if not changed_components:
@@ -1307,7 +1338,7 @@ def impact_analysis_for_diff(
     {repo_filter}
     OPTIONAL MATCH (dependent)-[:CALLS|USES|DEPENDS_ON]->(n)
     {dependent_filter}
-    OPTIONAL MATCH (transitive)-[:CALLS|USES|DEPENDS_ON*2..]->(n)
+    OPTIONAL MATCH (transitive)-[:CALLS|USES|DEPENDS_ON*2..{IMPACT_MAX_DEPTH}]->(n)
     {transitive_filter}
     RETURN
         COLLECT(DISTINCT {{name: dependent.name, type: labels(dependent)[0]}}) as direct_dependents,
@@ -1318,7 +1349,7 @@ def impact_analysis_for_diff(
     if not cross_repo:
         params["repo_id"] = repo_id
 
-    impact_results = engine.run_cypher(impact_cypher, params)
+    impact_results = _query(engine, impact_cypher, params)
     if not impact_results:
         return {**empty, "changed_files": changed_files, "changed_components": changed_components}
 
@@ -1363,7 +1394,7 @@ def explain_architecture(
         COLLECT(DISTINCT {endpoints: endpoint_names, calls: s.name}) as endpoints
     LIMIT 1
     """
-    results = engine.run_cypher(cypher, {"repo_id": repo_id})
+    results = _query(engine, cypher, {"repo_id": repo_id})
     if results:
         return {
             "services_and_datastores": results[0].get("services_and_datastores", []),
@@ -1405,7 +1436,7 @@ def list_services(
     """
     params = {"repo_id": repo_id}
 
-    results = engine.run_cypher(cypher, params)
+    results = _query(engine, cypher, params)
     return _envelope(results, max_results)
 
 
@@ -1443,7 +1474,7 @@ def explain_decision(
     if not cross_repo:
         params["repo_id"] = repo_id
 
-    results = engine.run_cypher(cypher, params)
+    results = _query(engine, cypher, params)
     if results:
         return results[0]
     return {"name": decision_name, "title": None, "body": None, "documents": [], "supersedes": [], "backed_by": []}
@@ -1478,7 +1509,7 @@ def find_requirements_for(
     if not cross_repo:
         params["repo_id"] = repo_id
 
-    results = engine.run_cypher(cypher, params)
+    results = _query(engine, cypher, params)
     return [_sanitize_row(r) for r in results]
 
 
@@ -1515,7 +1546,7 @@ def trace_design_rationale(
     if not cross_repo:
         params["repo_id"] = repo_id
 
-    results = engine.run_cypher(cypher, params)
+    results = _query(engine, cypher, params)
     if results:
         return _sanitize_row(results[0])
     return {"component": component_name, "requirements": [], "notes": []}
@@ -1552,7 +1583,7 @@ def blame_component(
     if not cross_repo:
         params["repo_id"] = repo_id
 
-    results = engine.run_cypher(cypher, params)
+    results = _query(engine, cypher, params)
     return [_sanitize_row(r) for r in results]
 
 
@@ -1608,7 +1639,7 @@ def find_related_prs(
     if not cross_repo:
         params["repo_id"] = repo_id
 
-    results = engine.run_cypher(cypher, params)
+    results = _query(engine, cypher, params)
     return _envelope(results, max_results)
 
 
@@ -1663,7 +1694,7 @@ def issue_history_for(
     if not cross_repo:
         params["repo_id"] = repo_id
 
-    results = engine.run_cypher(cypher, params)
+    results = _query(engine, cypher, params)
     return _envelope(results, max_results)
 
 
@@ -1706,7 +1737,7 @@ def get_source(
     if not cross_repo:
         params["repo_id"] = repo_id
 
-    results = engine.run_cypher(cypher, params)
+    results = _query(engine, cypher, params)
     empty = {
         "name": component_name, "label": None, "file": None,
         "start_line": None, "end_line": None, "source": None, "docstring_full": None,
@@ -1813,7 +1844,7 @@ def find_mentions(
     if not cross_repo:
         params["repo_id"] = repo_id
 
-    results = engine.run_cypher(cypher, params)
+    results = _query(engine, cypher, params)
     return _envelope(results, max_results)
 
 
@@ -1874,7 +1905,7 @@ def list_recent_changes(
     if entity_type is not None:
         params["entity_type"] = entity_type
 
-    results = engine.run_cypher(cypher, params)
+    results = _query(engine, cypher, params)
     return _envelope(results, max_results)
 
 
