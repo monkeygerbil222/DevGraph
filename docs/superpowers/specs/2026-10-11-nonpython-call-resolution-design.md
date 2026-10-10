@@ -167,13 +167,15 @@ anonymous function (a callback, an IIFE) are still not attributed to anyone.
 
 1. When the tree has errors, reparse a same-length patch that turns ` }`
    after a member on the same line into `;}`, and keep whichever tree has fewer
-   bytes under error nodes (the original on a tie: the blind patch can break a
-   string template).
+   bytes under error nodes, then fewer invented tokens (the original on a
+   tie: the blind patch can break a string template). An invented member
+   terminator is hidden: it shows only as an error flag on the class body
+   with no erroneous child, and counts as one.
 2. Each remaining top-level error node is split at column-0 declaration starts
    (a declaration keyword, a modifier such as `data`, `private`, `sealed`, or an
    annotation); each chunk is parsed with every other byte blanked to spaces
-   (newlines kept), so offsets stay the same, and its top-level declarations are
-   visited.
+   (newlines kept), so offsets stay the same, patched as in 1. when that
+   helps, and its top-level declarations are visited.
 3. Text is always read from the original bytes.
 
 ## Later slices

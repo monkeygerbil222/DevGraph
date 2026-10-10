@@ -236,3 +236,77 @@ fun outer() {
     # `deep` is attributed to `nested`, not `outer`.
     assert ("nested", "deep") in calls
     assert ("outer", "deep") not in calls
+
+
+# --- parse recovery (audit item 11; tree-sitter-kotlin 1.1.0) ---------------------
+
+
+def _symbols(source):
+    from devgraph.indexer.kotlin.extractor import extract_kotlin_file
+
+    result = extract_kotlin_file(source, "p/F.kt", "repo")
+    return [
+        (n.label, n.name, n.properties["start_line"], n.properties["end_line"])
+        for n in result.nodes if n.label != "Module"
+    ]
+
+
+def test_adjacent_one_line_classes_and_objects_are_all_extracted():
+    source = (
+        "package p\n\n"
+        "class Clock { fun now(): Long = System.currentTimeMillis() }\n"
+        "internal class Stopwatch { fun elapsed(start: Long) = Clock().now() - start }\n"
+        "object Reg { fun get() = 1 }\n"
+        "data class Tag(val name: String) { fun label() = \"#$name\" }\n"
+        "@Suppress(\"x\") private fun top() = Reg.get()\n"
+    )
+    assert _symbols(source) == [
+        ("Class", "Clock", 3, 3), ("Function", "now", 3, 3),
+        ("Class", "Stopwatch", 4, 4), ("Function", "elapsed", 4, 4),
+        ("Class", "Reg", 5, 5), ("Function", "get", 5, 5),
+        ("Class", "Tag", 6, 6), ("Function", "label", 6, 6),
+        ("Function", "top", 7, 7),
+    ]
+
+
+def test_a_string_template_the_patch_would_break_keeps_the_original_parse():
+    """`"${ x }"` beside one-line classes: the original tree has fewer error
+    bytes, and each class after it is recovered from its own piece, at its
+    own lines."""
+    source = (
+        "package p\n\n"
+        "fun greet(x: String) = \"hi ${ x }\"\n"
+        "class A { fun a() = 1 }\n"
+        "class B { fun b() = 2 }\n"
+        "fun top() = greet(\"y\")\n"
+    )
+    assert _symbols(source) == [
+        ("Function", "greet", 3, 3), ("Class", "A", 4, 4), ("Function", "a", 4, 4),
+        ("Class", "B", 5, 5), ("Function", "b", 5, 5), ("Function", "top", 6, 6),
+    ]
+
+
+def test_recovered_text_is_read_from_the_original_bytes():
+    from devgraph.indexer.kotlin.extractor import extract_kotlin_file
+
+    source = "package p\n\n/** Doc. */\nclass A { fun a() = b() }\nclass B { fun b() = 1 }\n"
+    result = extract_kotlin_file(source, "p/F.kt", "repo")
+    calls = {(r.from_name, r.to_name) for r in result.relationships if r.rel_type == "CALLS"}
+    assert ("a", "b") in calls
+    assert {n.name for n in result.nodes} == {"p/F.kt", "A", "a", "B", "b"}
+
+
+def test_every_kotlin_fixture_symbol_is_extracted():
+    import json
+    from pathlib import Path
+
+    from devgraph.indexer.kotlin.extractor import extract_kotlin_file
+
+    root = Path(__file__).resolve().parent.parent / "fixtures" / "callgraph" / "kotlin"
+    expected = json.loads((root / "expected.json").read_text())
+    found = set()
+    for path in root.rglob("*.kt"):
+        rel = path.relative_to(root).as_posix()
+        result = extract_kotlin_file(path.read_text(), rel, "repo")
+        found |= {(n.name, rel) for n in result.nodes if n.label in ("Class", "Function")}
+    assert {(s["name"], s["file"]) for s in expected["symbols"]} <= found

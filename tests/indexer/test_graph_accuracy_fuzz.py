@@ -18,7 +18,8 @@ changes under them: the tsconfig is rewritten (its own `paths`, `extends` to
 an odd-named base, `references`), its base is edited or its folder deleted, a
 root or nested go.mod comes and goes, and a config under an ignored folder is
 edited. After every batch the fuzz runs what a live batch does,
-`sync_resolver_config`.
+`sync_resolver_config`. Kotlin files hold adjacent one-line classes, which
+the extractor recovers from tree-sitter-kotlin's error nodes.
 
 Path pins (docs/superpowers/specs/2026-10-11-nonpython-call-resolution-design.md)
 are fuzzed ahead of the resolvers that write them: a Python file's
@@ -159,6 +160,15 @@ def render(f: File) -> str:
             for name, calls in f.funcs.items()
         ]
         return "".join(parts) + "}\n"
+    if f.kind == "kt":
+        # One-line class bodies, which tree-sitter-kotlin 1.1.0 needs recovered.
+        parts = [f"package {f.head}\n\n"]
+        parts += [f"class {c} {{ fun {c.lower()}Run() = helper() }}\n" for c in f.bases]
+        parts += [
+            f"\nfun {name}() {{\n" + "".join(f"    {g}()\n" for g in calls) + "}\n"
+            for name, calls in f.funcs.items()
+        ]
+        return "".join(parts)
     if f.kind == "ts":
         parts = [f"{m}\n" for m in f.imports]
         parts += [
@@ -238,6 +248,8 @@ def initial_repo() -> dict:
         "ts/src/lib.ts": File("ts", funcs={"f": []}),
         "ts/src/util.ts": File("ts", imports=["import { f } from './lib';"], funcs={"g": ["f"]}),
         "ts/other/lib.ts": File("ts", funcs={"f": [], "g": []}),
+        "kt/Models.kt": File("kt", head="kt", bases={"Clock": None, "Stopwatch": None}, funcs={"helper": []}),
+        "kt/Main.kt": File("kt", head="kt", funcs={"main": ["helper", "clockRun"]}),
         ".gitignore": File("static", head="ignored/\n"),
         "ignored/tsconfig.json": File("static", head=TS_CONFIGS["ignored/tsconfig.json"][0]),
         "go/a/a.go": File("go", head="a", imports=["example.com/fz/b"], funcs={"Start": ["Serve"]}),
@@ -274,8 +286,9 @@ TS_CALLS = ["{n}", "u.{n}", "this.{n}", "obj.{n}"]
 SERVICES = ["api", "web", "worker", "db"]
 IMAGES = ["python:3.12", "nginx:1.27", "postgres:16", "alpine:3.20"]
 EXTRA_NAMES = ["Foo", "Display", "Server", "K", "Child", "python", "postgres", "py/b.py", "missing"]
-CODE = ("py", "rs", "go", "java", "ts")
-MOVABLE = ("py", "rs", "go", "ts")  # free functions only: a Java method stays in its class
+CODE = ("py", "rs", "go", "java", "ts", "kt")
+MOVABLE = ("py", "rs", "go", "ts", "kt")  # free functions only: a Java method stays in its class
+KT_CLASSES = ["Clock", "Stopwatch", "Tag", "Index"]
 
 
 class Fuzz:
@@ -423,6 +436,19 @@ class Fuzz:
             self.moved_notes.append((path, new))
         return f"rename {path} to {new}", {path, new}
 
+    def op_kt_class(self):
+        """Add or remove a one-line Kotlin class."""
+        path = self._pick(lambda f: f.kind == "kt")
+        if not path:
+            return None
+        bases = self.files[path].bases
+        name = self.rng.choice(KT_CLASSES)
+        if name in bases:
+            del bases[name]
+            return f"remove one-line class {name} in {path}", {path}
+        bases[name] = None
+        return f"add one-line class {name} in {path}", {path}
+
     def op_config(self):
         """Rewrite, create or delete a resolver configuration file."""
         path = self.rng.choice(sorted(TS_CONFIGS))
@@ -518,7 +544,7 @@ class Fuzz:
     OPS = [
         "call", "base", "import", "import_style", "impl", "add_function", "remove_function", "move_function",
         "rename", "delete", "restore", "service", "from", "mention", "link", "supersedes", "pin", "pin",
-        "config", "config", "delete_dir",
+        "config", "config", "delete_dir", "kt_class",
     ]
 
     def draw(self):
