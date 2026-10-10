@@ -170,6 +170,29 @@ def _query(engine: GraphEngine, cypher: str, params: dict[str, Any]) -> list[dic
     return rows
 
 
+#: Rows a list-style built-in (find_callers, find_mentions, list_recent_changes,
+#: blame_component) reads at most; past it the envelope is truncated, with a notice.
+LIST_ROW_LIMIT = 10_000
+
+
+def _list_query(engine: GraphEngine, cypher: str, params: dict[str, Any]) -> tuple[list[dict], bool]:
+    """A list-style built-in's query (ending in `LIMIT LIST_ROW_LIMIT + 1`), read
+    only, with a timeout: its first `LIST_ROW_LIMIT` rows and whether more exist."""
+    with _timeouts_as_tool_errors():
+        return engine.run_read_cypher(cypher, params, timeout_s=BUILTIN_TIMEOUT_S, max_rows=LIST_ROW_LIMIT)
+
+
+def _capped_envelope(rows: list[Any], more: bool, max_results: int) -> dict[str, Any]:
+    """`_envelope`, marked truncated with a notice when the row cap cut the read short."""
+    envelope = _envelope(rows, max_results)
+    if more:
+        envelope["truncated"] = True
+        envelope["notice"] = (
+            f"more than {LIST_ROW_LIMIT} matches; count covers the first {LIST_ROW_LIMIT}. Narrow the request"
+        )
+    return envelope
+
+
 def _envelope(items: list[Any], max_results: int) -> dict[str, Any]:
     """Wrap a list result with count/truncation metadata so callers can see
     the full match count without paying token cost for every row.
@@ -981,6 +1004,7 @@ def find_callers(
     RETURN DISTINCT caller.name as name, labels(caller) as type, caller.repo_id as repo_id,
            coalesce(caller.file, caller.source_file) as file
     ORDER BY name, file
+    LIMIT {LIST_ROW_LIMIT + 1}
     """
     params = {"target_name": target_name}
     if not cross_repo:
@@ -990,8 +1014,8 @@ def find_callers(
     if cutoff is not None:
         params["cutoff"] = cutoff
 
-    results = _query(engine, cypher, params)
-    return _envelope(results, max_results)
+    results, more = _list_query(engine, cypher, params)
+    return _capped_envelope(results, more, max_results)
 
 
 def find_related_files(
@@ -1577,12 +1601,13 @@ def blame_component(
     RETURN c.name as sha, c.message as message, c.author as author,
            c.authored_date as authored_date
     ORDER BY c.authored_date DESC
+    LIMIT {LIST_ROW_LIMIT + 1}
     """
     params = {"component_name": component_name}
     if not cross_repo:
         params["repo_id"] = repo_id
 
-    results = _query(engine, cypher, params)
+    results, _more = _list_query(engine, cypher, params)  # at most LIST_ROW_LIMIT commits
     return [_sanitize_row(r) for r in results]
 
 
@@ -1845,6 +1870,7 @@ def find_mentions(
         {label_filter}
         RETURN target.name as name, labels(target) as type, target.repo_id as repo_id
         ORDER BY target.name
+        LIMIT {LIST_ROW_LIMIT + 1}
         """
     else:
         # Mentioned by: (d:Document)-[:MENTIONS]->(target {name: $name})
@@ -1856,6 +1882,7 @@ def find_mentions(
         {label_filter}
         RETURN d.name as name, labels(d) as type, d.repo_id as repo_id
         ORDER BY d.name
+        LIMIT {LIST_ROW_LIMIT + 1}
         """
 
     params = {"name": name}
@@ -1864,8 +1891,8 @@ def find_mentions(
     if not cross_repo:
         params["repo_id"] = repo_id
 
-    results = _query(engine, cypher, params)
-    return _envelope(results, max_results)
+    results, more = _list_query(engine, cypher, params)
+    return _capped_envelope(results, more, max_results)
 
 
 def list_recent_changes(
@@ -1916,6 +1943,7 @@ def list_recent_changes(
     RETURN n.name as name, labels(n) as type, n.repo_id as repo_id,
            n.last_modified_at as last_modified_at
     ORDER BY n.last_modified_at DESC
+    LIMIT {LIST_ROW_LIMIT + 1}
     """
     params = {}
     if cutoff is not None:
@@ -1925,8 +1953,8 @@ def list_recent_changes(
     if entity_type is not None:
         params["entity_type"] = entity_type
 
-    results = _query(engine, cypher, params)
-    return _envelope(results, max_results)
+    results, more = _list_query(engine, cypher, params)
+    return _capped_envelope(results, more, max_results)
 
 
 def run_cypher(
