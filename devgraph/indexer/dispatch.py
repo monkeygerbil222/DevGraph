@@ -1442,8 +1442,10 @@ def _same_package_subtype_referrers(
     """Java/Kotlin files in the same directory (package) as an added Class
     that name it -- a same-package subtype needs no import, so there is no
     IMPORTS edge for _expand_with_reverse_dependents to follow. A word
-    match over sibling files with the same extension."""
+    match over sibling files with the same extension. A sibling a .gitignore
+    ignores or over the size limit is not read: index_paths would skip it."""
     found = set()
+    max_bytes = _max_file_bytes()
     for rel_path, (nodes, _rels) in jvm_extractions.items():
         classes = {node["name"] for node in nodes if node["label"] == "Class" and ("Class", node["name"]) in added}
         if not classes:
@@ -1454,9 +1456,19 @@ def _same_package_subtype_referrers(
             sibling_rel = sibling.relative_to(root).as_posix()
             if sibling.suffix != source.suffix or sibling_rel in batch or not _is_indexable_file(sibling):
                 continue
+            if is_gitignored(root, sibling_rel) or _too_large(sibling, max_bytes):
+                continue
             if pattern.search(_read_text(sibling)):
                 found.add(sibling_rel)
     return found
+
+
+def _too_large(path: Path, max_bytes: int) -> bool:
+    """Whether the file is over the size limit (or can't be stat'ed)."""
+    try:
+        return os.stat(path).st_size > max_bytes
+    except OSError:
+        return True
 
 
 def _read_text(path: Path) -> str:

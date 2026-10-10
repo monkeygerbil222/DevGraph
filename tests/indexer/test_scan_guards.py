@@ -421,3 +421,21 @@ def test_raising_the_limit_lets_catch_up_index_a_file_with_a_provider_node(engin
     finally:
         engine.run_cypher(f"DROP CONSTRAINT {label.lower()}_repo_key IF EXISTS")
         engine.run_cypher(f"DROP INDEX {label.lower()}_repo_name IF EXISTS")
+
+
+def test_same_package_referrer_scan_skips_ignored_and_oversized_siblings(tmp_path, monkeypatch, small_limit):
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    (tmp_path / ".gitignore").write_text("Ignored.java\n")
+    (pkg / "Base.java").write_text("class Base {}\n")
+    (pkg / "Sub.java").write_text("class Sub extends Base {}\n")
+    (pkg / "Ignored.java").write_text("class Ignored extends Base {}\n")
+    (pkg / "Big.java").write_text("class Big extends Base {}\n" + "// pad\n" * 1000)
+    read = []
+    real = dispatch._read_text
+    monkeypatch.setattr(dispatch, "_read_text", lambda path: read.append(path.name) or real(path))
+    nodes = [{"label": "Class", "name": "Base"}]
+    found = dispatch._same_package_subtype_referrers(tmp_path, {("Class", "Base")}, {"pkg/Base.java"},
+                                                    {"pkg/Base.java": (nodes, [])})
+    assert found == {"pkg/Sub.java"}
+    assert read == ["Sub.java"]
