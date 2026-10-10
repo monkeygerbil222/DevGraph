@@ -128,16 +128,25 @@ class RepoRootUnavailable(Exception):
 class RepoRootEmpty(RepoRootUnavailable):
     """The root folder exists but holds no indexable file while the graph has
     files for it: what a mount point with nothing mounted looks like. Refused
-    unless the caller forces it."""
+    unless the caller forces it.
 
-    def __init__(self, path: Path, repo_id: str, graph_files: int) -> None:
-        super().__init__(
-            path,
-            "empty",
-            f"repository folder has no indexable files but the graph has {graph_files} for it "
-            f"(an unmounted drive?): {path}; nothing was changed. If the files really are gone, "
-            f"run `devgraph rescan {repo_id} --force`",
-        )
+    `gitignored`: the folder does hold files, but its .gitignore files ignore
+    every one, so the message says that instead of suggesting an unmount."""
+
+    def __init__(self, path: Path, repo_id: str, graph_files: int, gitignored: bool = False) -> None:
+        if gitignored:
+            message = (
+                f"repository folder has files but every file is ignored by .gitignore, while the graph has "
+                f"{graph_files} for it: {path}; nothing was changed. Run `devgraph rescan {repo_id} --force` "
+                f"to clear the graph"
+            )
+        else:
+            message = (
+                f"repository folder has no indexable files but the graph has {graph_files} for it "
+                f"(an unmounted drive?): {path}; nothing was changed. If the files really are gone, "
+                f"run `devgraph rescan {repo_id} --force`"
+            )
+        super().__init__(path, "empty", message)
 
 
 def repo_root_problem(repo_root: Path) -> str | None:
@@ -228,7 +237,7 @@ def keyed_indexable_paths(
 
 
 def _walk(
-    repo_root: Path, start: Path | None = None, unreadable: list[str] | None = None
+    repo_root: Path, start: Path | None = None, unreadable: list[str] | None = None, honour_gitignore: bool = True
 ) -> Iterator[tuple[Path, str, bool]]:
     """(path, lexical repo-relative POSIX path, whether a link is on the way)
     for every indexable file: what `repo_root.rglob("*")` filtered by
@@ -246,6 +255,8 @@ def _walk(
     A folder that can't be listed is skipped; when `unreadable` is given, its
     lexical repo-relative prefix (`pkg/`, or "" for the root) is appended, so a
     caller can tell "no files here" from "couldn't look".
+
+    `honour_gitignore=False` walks as if there were no .gitignore files.
     """
     if is_ignored_path(repo_root):
         return
@@ -277,7 +288,7 @@ def _walk(
             if unreadable is not None:
                 unreadable.append(prefix)
             continue
-        if any(entry.name == gitignore.GITIGNORE for entry in entries):
+        if honour_gitignore and any(entry.name == gitignore.GITIGNORE for entry in entries):
             rules = gitignore.rules_in(directory)
             if rules:
                 chain = (*chain, (prefix, rules))
@@ -302,6 +313,13 @@ def _walk(
             if not is_indexable_file(path) or (entry.is_symlink() and links_outside(path, repo_root)):
                 continue
             yield path, prefix + entry.name, linked or entry.is_symlink()
+
+
+def gitignore_hides_files(repo_root: Path) -> bool:
+    """Whether the walk would find a file if no .gitignore applied: for a root
+    whose walk found nothing, that .gitignore files, not an empty or
+    unmounted folder, are why."""
+    return next(_walk(repo_root, honour_gitignore=False), None) is not None
 
 
 def _junction_inside(path: Path, root: Path) -> bool:

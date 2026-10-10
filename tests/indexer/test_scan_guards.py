@@ -293,3 +293,38 @@ def test_a_gitignore_that_ignores_itself_reaches_the_catch_up(engine, tmp_path, 
 
     assert not (gone & _files(engine, live))
     _matches_fresh(engine, live, fresh, root)
+
+
+def test_a_root_gitignore_ignoring_everything_says_so_instead_of_unmounted(engine, tmp_path):
+    from devgraph.indexer.dispatch import prune_stale_files
+    from devgraph.indexer.walk import RepoRootEmpty
+
+    engine, (live, _fresh) = engine
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "a.py").write_text("def alpha():\n    return 1\n")
+    engine.upsert_repository(live, live, str(root))
+    full_scan(engine, live, root)
+
+    (root / ".gitignore").write_text("*\n")
+    with pytest.raises(RepoRootEmpty) as raised:
+        prune_stale_files(engine, live, root)
+    message = str(raised.value)
+    assert "every file is ignored by .gitignore" in message
+    assert f"devgraph rescan {live} --force" in message and "unmounted" not in message
+    assert "a.py" in _files(engine, live)  # nothing was changed
+
+
+def test_an_empty_root_still_reads_as_unmounted(engine, tmp_path):
+    from devgraph.indexer.dispatch import prune_stale_files
+    from devgraph.indexer.walk import RepoRootEmpty
+
+    engine, (live, _fresh) = engine
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "a.py").write_text("x = 1\n")
+    engine.upsert_repository(live, live, str(root))
+    full_scan(engine, live, root)
+    (root / "a.py").unlink()
+    with pytest.raises(RepoRootEmpty, match="unmounted"):
+        prune_stale_files(engine, live, root)

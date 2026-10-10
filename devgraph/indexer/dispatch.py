@@ -69,7 +69,7 @@ from devgraph.indexer.source_text import read_source
 from devgraph.indexer.walk import IGNORED_DIR_NAMES as IGNORED_DIR_NAMES
 from devgraph.indexer.walk import GITIGNORED, RepoRootEmpty, RepoRootUnavailable, check_repo_root, content_skip_reason
 from devgraph.indexer.walk import indexable_paths as _indexable_paths
-from devgraph.indexer.walk import indexable_paths_under
+from devgraph.indexer.walk import gitignore_hides_files, indexable_paths_under
 from devgraph.indexer.walk import is_ignored_dir_name as is_ignored_dir_name
 from devgraph.indexer.walk import is_ignored_path as is_ignored_path
 from devgraph.indexer.walk import is_indexable_file as _is_indexable_file
@@ -1677,7 +1677,7 @@ def prune_stale_files(
     if not on_disk and not force:
         graph_files = _graph_files(engine, repo_id, repo_root)
         if graph_files:
-            raise RepoRootEmpty(repo_root, repo_id, len(graph_files))
+            raise RepoRootEmpty(repo_root, repo_id, len(graph_files), gitignored=gitignore_hides_files(repo_root))
     bare = engine.delete_bare_modules(repo_id)
     if bare:
         logger.info("removed %d leftover module nodes with no file behind them from %s", bare, repo_id)
