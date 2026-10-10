@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 from collections.abc import Sequence
 from pathlib import Path
 from typing import NamedTuple
@@ -39,38 +40,90 @@ Chain = Sequence[tuple[str, Sequence[Rule]]]
 _cache: dict[str, tuple[tuple[int, int, int], list[Rule]]] = {}
 
 
-def parse(text: str) -> list[Rule]:
-    """The rules of one .gitignore file's text."""
+#: Whether patterns match case-insensitively: git's default `core.ignorecase`
+#: on the platforms whose filesystems usually ignore case.
+IGNORECASE = sys.platform in ("win32", "darwin")
+
+#: The POSIX classes wildmatch knows, as regex character classes.
+_POSIX_CLASSES = {
+    "alnum": "[A-Za-z0-9]",
+    "alpha": "[A-Za-z]",
+    "blank": "[ \\t]",
+    "cntrl": "[\\x00-\\x1f\\x7f]",
+    "digit": "[0-9]",
+    "graph": "[!-~]",
+    "lower": "[a-z]",
+    "print": "[ -~]",
+    "punct": "[!-/:-@\\[-`{-~]",
+    "space": "[ \\t\\n\\r\\f\\v]",
+    "upper": "[A-Z]",
+    "xdigit": "[0-9A-Fa-f]",
+}
+
+
+class _NoMatch(Exception):
+    """The pattern can match nothing (git's wildmatch aborts on it)."""
+
+
+def parse(text: str, ignorecase: bool = IGNORECASE) -> list[Rule]:
+    """The rules of one .gitignore file's text. Lines are split on `\\n`
+    only, each losing one trailing `\\r`, as git reads them. A rule that can
+    match nothing (an unclosed `[`, a trailing backslash, an unknown POSIX
+    class) is dropped, as is any that would not compile."""
     rules = []
-    for line in text.splitlines():
-        rule = _rule(line)
+    for line in text.removeprefix("\ufeff").split("\n"):
+        try:
+            rule = _rule(line.removesuffix("\r"), ignorecase)
+        except (_NoMatch, re.error):
+            continue
         if rule is not None:
             rules.append(rule)
     return rules
 
 
-def _rule(line: str) -> Rule | None:
-    # Trailing spaces are dropped unless escaped with a backslash.
-    while line.endswith(" ") and not line.endswith("\\ "):
-        line = line[:-1]
+def _trim_trailing_spaces(line: str) -> str:
+    """git's `trim_trailing_spaces`: drop the run of spaces at the end unless
+    a backslash escapes its first one, walking the escapes from the start."""
+    last_space = None
+    i = 0
+    while i < len(line):
+        c = line[i]
+        if c == " ":
+            if last_space is None:
+                last_space = i
+        elif c == "\\":
+            i += 1
+            if i >= len(line):
+                return line
+            last_space = None
+        else:
+            last_space = None
+        i += 1
+    return line if last_space is None else line[:last_space]
+
+
+def _rule(line: str, ignorecase: bool) -> Rule | None:
+    line = _trim_trailing_spaces(line)
     if not line or line.startswith("#"):
         return None
     negated = line.startswith("!")
     if negated:
         line = line[1:]
-    dir_only = line.endswith("/") and not line.endswith("\\/")
+    dir_only = line.endswith("/")
     if dir_only:
-        line = line.rstrip("/")
+        line = line[:-1]
     if not line:
         return None
     anchored = "/" in line
     line = line.removeprefix("/")
     body = _translate(line)
-    return Rule(re.compile(body if anchored else f"(?:.*/)?{body}", re.DOTALL), negated, dir_only)
+    flags = re.DOTALL | (re.IGNORECASE if ignorecase else 0)
+    return Rule(re.compile(body if anchored else f"(?:.*/)?{body}", flags), negated, dir_only)
 
 
 def _translate(pattern: str) -> str:
-    """The regex for a pattern matched against a path relative to its .gitignore's folder."""
+    """The regex for a pattern matched against a path relative to its
+    .gitignore's folder. Raises `_NoMatch` for a pattern that matches nothing."""
     out = []
     i, n = 0, len(pattern)
     while i < n:
@@ -96,14 +149,13 @@ def _translate(pattern: str) -> str:
         elif c == "?":
             out.append("[^/]")
         elif c == "[":
-            end = _class_end(pattern, i)
-            if end is None:
-                out.append(re.escape(c))
-            else:
-                out.append(_char_class(pattern[i + 1:end]))
-                i = end
-        elif c == "\\" and i + 1 < n:
+            regex, i = _char_class(pattern, i)
+            out.append(regex)
+            continue
+        elif c == "\\":
             i += 1
+            if i >= n:
+                raise _NoMatch  # a trailing backslash
             out.append(re.escape(pattern[i]))
         else:
             out.append(re.escape(c))
@@ -111,39 +163,71 @@ def _translate(pattern: str) -> str:
     return "".join(out)
 
 
-def _class_end(pattern: str, start: int) -> int | None:
-    """Index of the `]` closing the class opened at `start`, or None."""
+def _char_class(pattern: str, start: int) -> tuple[str, int]:
+    """(regex, index after the class) for the `[...]` opening at `start`,
+    parsed as git's wildmatch parses it: a leading `!` or `^` negates, a
+    first `]` is literal, `\\` escapes, `a-z` is a range (a reversed one
+    matches nothing), `[:name:]` a POSIX class. Never matches `/`. Raises
+    `_NoMatch` for an unclosed class or an unknown POSIX class."""
+    n = len(pattern)
     i = start + 1
-    if i < len(pattern) and pattern[i] in "!^":
-        i += 1
-    if i < len(pattern) and pattern[i] == "]":
-        i += 1  # a leading ] is literal
-    while i < len(pattern):
-        if pattern[i] == "\\":
-            i += 2
-            continue
-        if pattern[i] == "]":
-            return i
-        i += 1
-    return None
-
-
-def _char_class(inner: str) -> str:
-    negated = inner[:1] in ("!", "^")
+    negated = i < n and pattern[i] in "!^"
     if negated:
-        inner = inner[1:]
-    parts = []
-    i = 0
-    while i < len(inner):
-        c = inner[i]
-        if c == "\\" and i + 1 < len(inner):
-            i += 1
-            parts.append(re.escape(inner[i]))
-        else:
-            parts.append("-" if c == "-" else re.escape(c))
         i += 1
-    body = "".join(parts)
-    return f"[^/{body}]" if negated else f"(?!/)[{body}]"
+    members: list[str] = []
+    prev: str | None = None
+    first = True
+    while True:
+        if i >= n:
+            raise _NoMatch  # unclosed
+        c = pattern[i]
+        if c == "]" and not first:
+            i += 1
+            break
+        first = False
+        if c == "\\":
+            i += 1
+            if i >= n:
+                raise _NoMatch
+            c = pattern[i]
+            members.append(re.escape(c))
+            prev = c
+        elif c == "-" and prev is not None and i + 1 < n and pattern[i + 1] != "]":
+            i += 1
+            hi = pattern[i]
+            if hi == "\\":
+                i += 1
+                if i >= n:
+                    raise _NoMatch
+                hi = pattern[i]
+            members.pop()  # prev itself is matched by the range
+            if prev <= hi:
+                members.append(f"[{re.escape(prev)}-{re.escape(hi)}]")
+            prev = None
+        elif c == "[" and pattern.startswith("[:", i):
+            end = pattern.find("]", i + 2)
+            if end == -1:
+                raise _NoMatch
+            if pattern[end - 1] != ":" or end - 1 < i + 2:
+                members.append(re.escape(c))  # not a POSIX class: a literal [
+                prev = c
+            else:
+                name = pattern[i + 2:end - 1]
+                if name not in _POSIX_CLASSES:
+                    raise _NoMatch
+                members.append(_POSIX_CLASSES[name])
+                prev = None
+                i = end
+        else:
+            members.append(re.escape(c))
+            prev = c
+        i += 1
+    alternatives = "|".join(members)
+    if negated:
+        return (f"(?!{alternatives})[^/]" if members else "[^/]"), i
+    if not members:
+        raise _NoMatch
+    return f"(?!/)(?:{alternatives})", i
 
 
 def matches(chain: Chain, rel: str, is_dir: bool) -> bool:
