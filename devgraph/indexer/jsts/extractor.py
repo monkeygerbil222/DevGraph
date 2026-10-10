@@ -343,7 +343,10 @@ def _resolve_module_specifier(specifier: str, current_dir: str) -> list[str]:
     A relative specifier with an explicit JS/TS extension (`./x.js`,
     `./y.mjs`) resolves to the sources that emit it: `.js` to `.ts`/`.tsx`/
     `.js`, `.jsx` to `.tsx`/`.jsx`, `.mjs` to `.mts`/`.mjs`, `.cjs` to
-    `.cts`/`.cjs`; a TypeScript extension to itself.
+    `.cts`/`.cjs`; a TypeScript extension to itself; then `{path}/index.{ext}`
+    in case it names a directory. Like every candidate list here this is not
+    checked against the disk: `./x.js` links both `x.ts` and `x.js` when both
+    exist. A `?query` or `#fragment` is dropped first.
 
     Other relative specifiers (`./foo`, `../bar/baz`) resolve to `{dir}/{path}.
     {ext}` candidates against the importing file's directory, across each of
@@ -356,12 +359,15 @@ def _resolve_module_specifier(specifier: str, current_dir: str) -> list[str]:
     `node_modules/{name}` guess - no package.json/tsconfig 'paths' mapping is
     consulted (out of scope, see module docstring).
     """
+    # A bundler query or fragment (`./worker.js?worker`, `./x#frag`) names no file.
+    specifier = specifier.split("?", 1)[0].split("#", 1)[0]
     if specifier.startswith("."):
         base = _resolve_relative_base(current_dir, specifier)
         stem, dot, ext = base.rpartition(".")
         mapped = _EXPLICIT_EXTENSIONS.get(f".{ext}") if dot and "/" not in ext else None
         if mapped and stem and not stem.endswith("/"):
-            return [f"{stem}.{each}" for each in mapped]
+            # Then the specifier as a directory, for a folder named like a file.
+            return [f"{stem}.{each}" for each in mapped] + [f"{base}/index.{each}" for each in _EXTENSIONS]
         if base:
             candidates = [f"{base}.{ext}" for ext in _EXTENSIONS]
             candidates += [f"{base}/index.{ext}" for ext in _EXTENSIONS]

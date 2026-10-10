@@ -447,9 +447,18 @@ def test_explicit_module_extensions_map_to_their_typescript_twins():
     assert {"view.tsx", "view.jsx"} <= _import_targets("import V from './view.jsx';\n", "a.tsx")
 
 
-def test_explicit_extension_keeps_only_mapped_candidates():
-    targets = _import_targets("import { a } from './util.js';\n", "main.ts")
-    assert targets == {"util.ts", "util.tsx", "util.js"}
+def test_explicit_extension_lists_mapped_candidates_then_directory_index():
+    """A directory named like a file (`./lib.js/`) still resolves through its index."""
+    result = extract_js_file("import { a } from './util.js';\n", "main.ts", "test_repo")
+    targets = [r.to_name for r in result.relationships if r.rel_type == "IMPORTS"]
+    assert targets[:3] == ["util.ts", "util.tsx", "util.js"]
+    assert set(targets[3:]) == {f"util.js/index.{ext}" for ext in ("js", "jsx", "ts", "tsx")}
+
+
+def test_query_and_hash_are_stripped_before_resolving():
+    assert {"src/worker.ts", "src/worker.js"} <= _import_targets("import W from './worker.js?worker';\n", "src/a.ts")
+    assert "src/util.ts" in _import_targets("import u from './util#frag';\n", "src/a.ts")
+    assert not any("?" in t or "#" in t for t in _import_targets("import s from './s.css?inline';\n", "a.ts"))
 
 
 def test_a_dotted_basename_without_a_known_extension_still_gets_extensions():
