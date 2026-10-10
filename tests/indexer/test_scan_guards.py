@@ -617,3 +617,9 @@ def test_skip_marks_follow_deletes_renames_and_files_that_shrink(engine, tmp_pat
     (root / "offline.py").unlink()
     catch_up(engine, live, root, datetime.now(UTC) + LATER)
     assert set(engine.read_skipped_files(live)) == {"renamed.py", "kept.py"}
+
+
+def test_skip_marks_are_hidden_from_the_node_inspectors():
+    from devgraph.graph.schema import INTERNAL_NODE_PROPERTIES
+
+    assert "skipped_files" in INTERNAL_NODE_PROPERTIES
