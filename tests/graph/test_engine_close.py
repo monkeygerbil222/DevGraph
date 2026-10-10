@@ -16,6 +16,11 @@ from devgraph.graph import engine as engine_module
 from devgraph.graph.engine import EngineClosed, GraphEngine
 
 
+# Captured at import: without a local Neo4j, conftest's `_fail_fast_without_neo4j`
+# replaces GraphEngine.verify_connectivity for each test, bypassing the fence.
+_REAL_VERIFY_CONNECTIVITY = GraphEngine.verify_connectivity
+
+
 class FakeDriver:
     """Records the order of queries and the close. A query blocks while
     `gate` is set and not yet released; `inside` is set once one is running."""
@@ -73,6 +78,7 @@ class FakeSession:
 def fake_engine(monkeypatch) -> tuple[GraphEngine, FakeDriver]:
     driver = FakeDriver()
     monkeypatch.setattr(engine_module.GraphDatabase, "driver", lambda *a, **k: driver)
+    monkeypatch.setattr(GraphEngine, "verify_connectivity", _REAL_VERIFY_CONNECTIVITY)
     return GraphEngine("bolt://example.invalid:7687", "neo4j", "secret"), driver
 
 
