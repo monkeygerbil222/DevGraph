@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from devgraph.graph.engine import GraphEngine
+from devgraph.indexer.dispatch import index_paths
 from devgraph.indexer.python.extractor import index_file
 from devgraph.mcp.tools import get_source
 from devgraph.registry.store import RepoRegistry
@@ -170,8 +171,17 @@ def test_a_file_that_is_not_utf8_is_decoded_not_raised(two_helpers):
     engine, registry, repo_id, root = two_helpers
     (root / "b.py").write_bytes(b"def helper():\n    return 'caf\xe9'\n")  # Latin-1, as on disk
     result = get_source(engine, registry, repo_id, "helper", file="b.py")
-    assert result["source"] == "def helper():\n    return 'caf�'"
-    assert "UTF-8" in result["notice"]
+    assert result["source"] == "def helper():\n    return 'café'"  # as the indexer decodes it
+    assert "UTF-8" in result["notice"] and "cp1252" in result["notice"]
+
+
+def test_get_source_honours_a_pep_263_declaration(two_helpers):
+    engine, registry, repo_id, root = two_helpers
+    (root / "b.py").write_bytes("# -*- coding: latin-1 -*-\ndef helper():\n    return 'café'\n".encode("latin-1"))
+    index_paths(engine, repo_id, root, {root / "b.py"})  # the def moved down a line
+    result = get_source(engine, registry, repo_id, "helper", file="b.py")
+    assert result["source"] == "def helper():\n    return 'café'"
+    assert "notice" not in result  # declared, so read as intended
 
 
 def test_find_callers_keeps_same_named_callers_in_different_files_apart(two_helpers):

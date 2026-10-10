@@ -27,6 +27,7 @@ from devgraph.config.project_tools import DEFAULT_TIMEOUT_S
 from devgraph.graph.engine import GraphEngine
 from devgraph.graph import schema
 from devgraph.indexer.git_history import open_repo
+from devgraph.indexer.source_text import decode_source_as, declared_encoding, is_python_path
 from devgraph.paths import is_within
 from devgraph.registry.store import RepoRegistry
 from devgraph.analytics.insights import INSIGHT_METRICS, community_members, read_insights, top_nodes
@@ -1723,8 +1724,9 @@ def get_source(
         When several nodes match, `source` is None and the dict adds
         `status: "ambiguous"`, `count`, `truncated` and `candidates`
         ({label, name, file}; repo_id too when cross_repo): pass one's `file`.
-        A file that is not valid UTF-8 is decoded with replacement characters
-        and the dict adds a `notice` saying so.
+        A file is decoded as the indexer decodes it (`source_text`): a
+        Python coding line, else UTF-8, else cp1252 or Latin-1; when an
+        undeclared file is not valid UTF-8 the dict adds a `notice` saying so.
     """
     repo_filter = "" if cross_repo else "AND n.repo_id = $repo_id"
     cypher = f"""
@@ -1791,11 +1793,11 @@ def get_source(
     except OSError:
         return empty
     notice = None
-    try:
-        text = data.decode("utf-8")
-    except UnicodeDecodeError:
-        text = data.decode("utf-8", errors="replace")
-        notice = "the file is not valid UTF-8; undecodable bytes are shown as U+FFFD"
+    # Decoded as the indexer decodes it, so the line range lines up.
+    python = is_python_path(file_rel_path)
+    text, encoding = decode_source_as(data, python=python)
+    if encoding != "utf-8" and not (python and declared_encoding(data)):
+        notice = f"the file is not valid UTF-8; decoded as {encoding}, as the indexer reads it"
     lines = text.splitlines()
 
     source_text = "\n".join(lines[start_line - 1 : end_line])

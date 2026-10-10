@@ -34,7 +34,16 @@ def test_language_for_routes_by_suffix():
 
 
 def test_decode_source_normalises_crlf_only():
-    assert decode_source(b"a\r\nb\rc\n\xff") == "a\nb\rc\n\ufffd"
+    assert decode_source(b"a\r\nb\rc\n\xff") == "a\nb\rc\n\xff".replace("\xff", "ÿ")
+
+
+def test_decode_source_agrees_with_the_indexer():
+    from devgraph.indexer.source_text import decode_source as indexer_decode
+
+    latin = "# coding: latin-1\ndef café():\n    pass\n".encode("latin-1")
+    assert decode_source(latin, "pkg/a.py") == indexer_decode(latin, python=True)
+    cp1252 = "class Café {}\r\n".encode("cp1252")
+    assert decode_source(cp1252, "A.java") == "class Café {}\n"
 
 
 def test_body_slicing_ignores_form_feeds():
