@@ -26,6 +26,7 @@ import tree_sitter_python as tspython
 from tree_sitter import Language, Node, Parser
 
 from devgraph.indexer.common import ExtractionResult, GraphNode, GraphRelationship, own_edges
+from devgraph.indexer.python.resolve import Bindings, absolute_module, relative_module
 
 logger = logging.getLogger(__name__)
 
@@ -193,159 +194,66 @@ def _extract_base_class_names(superclasses_node: Node | None, source: bytes) -> 
     return names
 
 
-def _extract_imports(root: Node, source: bytes, current_dir: str = "") -> list[tuple[str, list[str]]]:
-    """Extract import statements from the parse tree.
+def _extract_imports(root: Node, source: bytes, file_path: str) -> Bindings:
+    """Every import statement in the file, function-local ones included, as
+    its bindings and IMPORTS targets (see resolve.py).
 
-    Args:
-        current_dir: The importing file's directory, relative to the repo
-            root, using forward slashes ('' for repo-root files, 'services/api'
-            for a nested file). Needed to resolve relative imports to a
-            repo-relative Module path — Module nodes are keyed by full
-            repo-relative path (e.g. 'services/api/main.py'), not bare
-            filename, specifically so multi-level relative imports and
-            same-named files in different directories both resolve/key
-            correctly.
-
-    Returns:
-        A list of (import_target, [imported_names]) tuples, where
-        import_target is the graph-node name IMPORTS should point at:
-
-        - 'import X.Y.Z' / 'from X.Y import Z' (dotted, not relative) ->
-          TWO targets are emitted: the bare dotted name 'X.Y.Z' (kept for
-          compatibility/introspection) AND 'X/Y/Z.py' (the dotted path
-          reinterpreted as a same-repo file path, e.g.
-          'services.api_gateway.clients' -> 'services/api_gateway/clients.py').
-          This is the common real-world style (absolute intra-repo imports
-          like 'from services.api_gateway.clients import X', not dot-relative
-          'from .clients import X') — without this second candidate, imports
-          written this way could never resolve to a same-repo Module node at
-          all. Emitting a same-repo-shaped guess is safe even when the
-          import is genuinely external/third-party (e.g. 'from google.cloud
-          import storage'): upsert_relationship only MATCHes an edge into
-          existence when both endpoints already exist as real nodes, so a
-          guessed target that happens not to correspond to any indexed file
-          simply never materializes an edge — same as any other import
-          DevGraph can't resolve.
-        - 'import X' (single segment, no dots) -> target 'X' only (no file-
-          path guess to make beyond what index_file already does for a
-          repo-root single-file module).
-        - 'from . import Y' (bare relative) -> each imported name IS a
-          sibling module in the *same directory* as the importing file:
-          target is '{current_dir}/{name}.py' (or '{name}.py' at repo root).
-        - 'from .pkg import Y' / 'from .sub.pkg import Y' (relative with a
-          named module) -> the module being imported from is a file at
-          '{current_dir}/{dots-adjusted}/{pkg/sub/pkg}.py'; Y is a name
-          *inside* it, not a module itself.
-        - 'from ..other import Y' (multiple leading dots) -> each extra dot
-          beyond the first walks up one directory level from current_dir
-          before resolving the module name, per Python's relative-import
-          semantics (one dot = same package/dir, each additional dot = one
-          parent up).
+    `file_path` is the importing file's repo-relative path with forward
+    slashes ('services/api/main.py', or 'main.py' at the repo root): absolute
+    imports are tried under each of its ancestor directories and relative
+    ones against its own directory. Each import targets every candidate
+    file, `p.py` and `p/__init__.py`; only the ones that exist as Modules
+    ever become edges. `from P import n` also targets the submodule `P.n`.
     """
-    imports: list[tuple[str, list[str]]] = []
+    bindings = Bindings()
+    current_dir = file_path.rsplit("/", 1)[0] if "/" in file_path else ""
 
     def walk(node: Node) -> None:
         if node.type == "import_statement":
             # import X [as Y] [, Z [as W]]
             for child in node.named_children:
                 if child.type == "dotted_name":
-                    mod_name = _text(child, source)
-                    imports.append((mod_name, [mod_name]))
-                    file_guess = _dotted_to_file_path(mod_name)
-                    if file_guess:
-                        imports.append((file_guess, [mod_name]))
+                    bindings.add_import(_text(child, source), None, file_path)
                 elif child.type == "aliased_import":
                     name_node = child.child_by_field_name("name")
                     alias_node = child.child_by_field_name("alias")
                     if name_node is not None:
-                        mod_name = _text(name_node, source)
-                        alias = _text(alias_node, source) if alias_node else mod_name
-                        imports.append((mod_name, [alias]))
-                        file_guess = _dotted_to_file_path(mod_name)
-                        if file_guess:
-                            imports.append((file_guess, [alias]))
+                        alias = _text(alias_node, source) if alias_node else None
+                        bindings.add_import(_text(name_node, source), alias, file_path)
         elif node.type == "import_from_statement":
             # from X import Y [as Z][, ...] | from . import Y | from X import *
             module_node = node.child_by_field_name("module_name")
             module_name = _text(module_node, source) if module_node else ""
-            is_relative = module_name.startswith(".")
             # tree_sitter's Python bindings hand back a fresh Node wrapper
             # object on every accessor call, so `child is module_node`
             # never matches even for the same underlying tree node —
-            # compare byte spans instead to actually exclude the module-name
-            # dotted_name from the imported-names list (without this, 'from
-            # typing import List' produced imported_names=['typing', 'List']
-            # instead of ['List'], corrupting every from-import's name list).
+            # compare byte spans instead to keep the module-name
+            # dotted_name out of the imported names.
             module_span = (module_node.start_byte, module_node.end_byte) if module_node else None
 
-            imported_names: list[str] = []
+            names: list[tuple[str, str | None]] = []
+            star = False
             for child in node.named_children:
                 if child.type == "dotted_name" and (child.start_byte, child.end_byte) != module_span:
-                    imported_names.append(_text(child, source))
+                    names.append((_text(child, source), None))
                 elif child.type == "aliased_import":
                     name_node = child.child_by_field_name("name")
                     alias_node = child.child_by_field_name("alias")
                     if name_node is not None:
-                        imported_names.append(_text(name_node, source))
+                        names.append((_text(name_node, source), _text(alias_node, source) if alias_node else None))
                 elif child.type == "wildcard_import":
-                    imported_names.append("*")
+                    star = True
 
-            if is_relative:
-                dot_count = len(module_name) - len(module_name.lstrip("."))
-                remainder = module_name[dot_count:]  # e.g. 'sub.pkg' in '..sub.pkg'
-                base_dir = _resolve_relative_dir(current_dir, dot_count)
-
-                if remainder:
-                    # 'from .pkg import Y' / 'from ..sub.pkg import Y' — the
-                    # sibling module is the named path itself.
-                    sub_path = remainder.replace(".", "/")
-                    target = f"{base_dir}/{sub_path}.py" if base_dir else f"{sub_path}.py"
-                    imports.append((target, imported_names))
-                else:
-                    # 'from . import utils[, helpers]' / 'from .. import x' —
-                    # each imported name IS a sibling module in base_dir.
-                    for name in imported_names:
-                        if name != "*":
-                            target = f"{base_dir}/{name}.py" if base_dir else f"{name}.py"
-                            imports.append((target, [name]))
+            if module_name.startswith("."):
+                bindings.add_from(relative_module(module_name, current_dir), names, star)
             elif module_name:
-                imports.append((module_name, imported_names))
-                file_guess = _dotted_to_file_path(module_name)
-                if file_guess:
-                    imports.append((file_guess, imported_names))
+                bindings.add_from(absolute_module(module_name, file_path), names, star)
 
         for child in node.children:
             walk(child)
 
     walk(root)
-    return imports
-
-
-def _dotted_to_file_path(dotted_name: str) -> str | None:
-    """Reinterpret a dotted import name as a same-repo file path guess.
-
-    'services.api_gateway.clients' -> 'services/api_gateway/clients.py'.
-    Returns None for a single-segment name ('os', 'requests') — no
-    additional guess beyond the bare name is useful there; a real absolute
-    intra-repo import is meaningfully dotted (package.module), while a
-    single bare name importing a same-repo file is already handled by
-    module_name being used directly.
-    """
-    if "." not in dotted_name:
-        return None
-    return dotted_name.replace(".", "/") + ".py"
-
-
-def _resolve_relative_dir(current_dir: str, dot_count: int) -> str:
-    """Resolve a relative import's leading-dot count against the importing
-    file's directory. One dot = current_dir itself; each additional dot
-    walks up one parent directory, matching Python's relative-import rules.
-    """
-    parts = [p for p in current_dir.split("/") if p]
-    levels_up = dot_count - 1
-    if levels_up > 0:
-        parts = parts[:-levels_up] if levels_up <= len(parts) else []
-    return "/".join(parts)
+    return bindings
 
 
 def extract_python_file(source_code: str, file_path: str, repo_id: str) -> ExtractionResult:
@@ -394,24 +302,22 @@ def extract_python_file(source_code: str, file_path: str, repo_id: str) -> Extra
     )
     result.nodes.append(module_node)
 
-    # Extract imports at the module level. file_path is expected to be the
-    # repo-relative path with forward slashes (e.g. 'services/api/main.py');
-    # current_dir is everything but the filename, needed to resolve relative
-    # imports against this file's actual location in the repo.
-    current_dir = file_path.rsplit("/", 1)[0] if "/" in file_path else ""
-    imports = _extract_imports(root, source_bytes, current_dir)
-    for module_name, imported_names in imports:
-        for _imp_name in imported_names:
-            result.relationships.append(
-                GraphRelationship(
-                    from_label="Module",
-                    from_name=file_path,
-                    rel_type="IMPORTS",
-                    to_label="Module",
-                    to_name=module_name,
-                    repo_id=repo_id,
-                )
+    # IMPORTS edges to every candidate file of every import (see resolve.py).
+    # file_path is expected to be the repo-relative path with forward
+    # slashes (e.g. 'services/api/main.py'), which the candidates hang off.
+    # A package's `from . import x` names its own __init__.py, never an edge.
+    bindings = _extract_imports(root, source_bytes, file_path)
+    for target in sorted(bindings.targets - {file_path}):
+        result.relationships.append(
+            GraphRelationship(
+                from_label="Module",
+                from_name=file_path,
+                rel_type="IMPORTS",
+                to_label="Module",
+                to_name=target,
+                repo_id=repo_id,
             )
+        )
 
     def _emit_call(
         caller_name: str, caller_label: str, target_name: str, caller_class: str | None = None
