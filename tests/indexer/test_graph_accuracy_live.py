@@ -502,6 +502,54 @@ def test_full_scan_drops_a_removed_service(engine, repo_id, tmp_path):
     incremental_equals_fresh(engine, repo_id, tmp_path)
 
 
+DEPENDENT_SERVICES = """\
+    services:
+      web:
+        image: nginx
+        depends_on: [api]
+        links: ["cache:redis"]
+      api:
+        image: python:3.12
+        depends_on:
+          db:
+            condition: service_healthy
+      db:
+        image: postgres:16
+        depends_on: [api]
+      cache:
+        image: redis
+"""
+
+
+def test_compose_service_dependencies_reach_the_tools(engine, repo_id, tmp_path):
+    from devgraph.mcp.tools import find_dependency_cycles, get_service_dependencies, impact_analysis
+
+    compose = write(tmp_path, "compose.yaml", DEPENDENT_SERVICES)
+    scan(engine, repo_id, tmp_path)
+    pinned = ("compose.yaml",)
+    assert sorted(e for e in edges(engine, repo_id, "DEPENDS_ON")) == [
+        ("Service", "api", "compose.yaml", "DEPENDS_ON", "Service", "db", "compose.yaml", pinned),
+        ("Service", "db", "compose.yaml", "DEPENDS_ON", "Service", "api", "compose.yaml", pinned),
+        ("Service", "web", "compose.yaml", "DEPENDS_ON", "Service", "api", "compose.yaml", pinned),
+        ("Service", "web", "compose.yaml", "DEPENDS_ON", "Service", "cache", "compose.yaml", pinned),
+    ]
+
+    deps = get_service_dependencies(engine, repo_id, "web")["dependencies"]
+    assert {(d["name"], d["type"]) for d in deps} >= {("api", "Service"), ("cache", "Service")}
+    impact = impact_analysis(engine, repo_id, "db")
+    assert "api" in {d["name"] for d in impact["direct_dependents"]["results"]}
+    assert "web" in {d["name"] for d in impact["transitive_dependents"]["results"]}
+    cycles = find_dependency_cycles(engine, repo_id, "DEPENDS_ON")
+    assert cycles["count"] == 1
+    incremental_equals_fresh(engine, repo_id, tmp_path)
+
+    write(tmp_path, "compose.yaml", DEPENDENT_SERVICES.replace("        depends_on: [api]\n      cache", "      cache"))
+    index_paths(engine, repo_id, tmp_path, {compose})
+    assert ("db", "api") not in {(e[1], e[5]) for e in edges(engine, repo_id, "DEPENDS_ON")}
+    assert find_dependency_cycles(engine, repo_id, "DEPENDS_ON")["count"] == 0
+    incremental_equals_fresh(engine, repo_id, tmp_path)
+
+
 def test_removed_service_unclaims_its_image(engine, repo_id, tmp_path):
     # `compose.override.yaml` is not a compose name the indexer routes, so
     # the second claimant is a compose file in another folder.

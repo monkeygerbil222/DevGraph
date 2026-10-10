@@ -106,8 +106,9 @@ def _provider_specs(repo_root: Path) -> tuple[bool, filesystem.FilesystemSpec | 
 #: 3: FastAPI/Flask IMPLEMENTS pinned to the route's file; 4: Python IMPORTS
 #: to every candidate file and CALLS resolved through scope and imports; 5: JS/TS
 #: `.mjs`/`.cjs`/`.mts`/`.cts` files, explicit-extension imports such as `./x.js`
-#: resolved to their TypeScript source). An index stamped lower, or not at all,
-#: is rescanned automatically.
+#: resolved to their TypeScript source, compose `depends_on`/`links` as Service
+#: DEPENDS_ON edges). An index stamped lower, or not at all, is rescanned
+#: automatically.
 INDEX_FORMAT = 5
 
 
