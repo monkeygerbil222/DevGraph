@@ -1115,6 +1115,31 @@ class GraphEngine:
                 repo_id=repo_id, version=version,
             )
 
+    def read_skipped_files(self, repo_id: str) -> dict[str, list]:
+        """The files the indexer left out of extraction, by repo-relative path:
+        [reason, the size limit it was judged under, the file's change stamp]
+        (see dispatch.index_paths). Empty when none are recorded."""
+        with self._driver.session() as session:
+            result = _retry_transient(
+                session.run,
+                "MATCH (r:Repository {repo_id: $repo_id}) RETURN r.skipped_files AS skipped",
+                repo_id=repo_id,
+            )
+            records = [record.data() for record in result or []]
+        raw = records[0]["skipped"] if records else None
+        return json.loads(raw) if raw else {}
+
+    def record_skipped_files(self, repo_id: str, entries: dict[str, list], replace: bool = False) -> None:
+        """Add (or, with `replace`, set exactly) `read_skipped_files` entries."""
+        skipped = {} if replace else self.read_skipped_files(repo_id)
+        skipped.update(entries)
+        with self._driver.session() as session:
+            _retry_transient(
+                session.run,
+                "MERGE (r:Repository {repo_id: $repo_id}) SET r.skipped_files = $skipped",
+                repo_id=repo_id, skipped=json.dumps(skipped, sort_keys=True),
+            )
+
     def index_format(self, repo_id: str) -> int | None:
         """The index format stamped by the last full scan, or None for an older index."""
         with self._driver.session() as session:

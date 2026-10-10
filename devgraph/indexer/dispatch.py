@@ -712,6 +712,8 @@ def index_paths(
         by_rel_path[resolved.relative_to(root_resolved).as_posix()] = resolved
 
     max_bytes = _max_file_bytes()
+    # Files left out by their content, for catch_up (see `_skip_marks`).
+    judged: dict[str, list] = {}
 
     def index_one(rel_path: str, resolved: Path) -> None:
         nonlocal indexed
@@ -727,6 +729,8 @@ def index_paths(
                 logger.debug("%s: skipping %s (%s)", repo_id, rel_path, reason)
                 if skipped is not None:
                     skipped[rel_path] = reason
+                if reason != GITIGNORED:
+                    judged[rel_path] = [reason, max_bytes, _change_stamp_ns(os.stat(resolved))]
                 engine.delete_nodes_by_source_file(repo_id, rel_path)
                 return
             indexed += _index_single_path(
@@ -804,6 +808,8 @@ def index_paths(
     )
     for rel_path in sorted(referrers):
         index_one(rel_path, root_resolved / rel_path)
+    if judged:
+        engine.record_skipped_files(repo_id, judged)
     # Markdown that only mentions an added name is unchanged itself, so it
     # just gains edges to the added names (in the mentions pass below)
     # instead of a full re-index that re-matches every name in the repo.
@@ -1748,13 +1754,26 @@ def _provider_represents(
     return ok and docs_spec is not None and any(docs.selects(t, rel) for t in docs_spec.types)
 
 
-def _content_skipped(path: Path, max_bytes: int) -> bool:
-    """Whether `walk.content_skip_reason` leaves the file out; one that can't
-    be read is left for `index_paths` to report."""
+def _extracted_files(engine: GraphEngine, repo_id: str) -> set[str]:
+    """The files the graph has extraction nodes for: `_graph_files` without the
+    schema providers' paths."""
+    return engine.list_indexed_files(repo_id) | engine.list_claim_sources(repo_id)
+
+
+def _skip_marks(engine: GraphEngine, repo_id: str) -> dict[str, list]:
+    """The files `index_paths` left out for their content, by repo-relative
+    path: [reason, the size limit, the file's change stamp]. A full scan sets
+    them afresh; a batch adds the ones it skips. Catch-up does not offer such
+    a file again (nor read it) until the limit or the stamp differs."""
+    return engine.read_skipped_files(repo_id)
+
+
+def _stamp_or_none(path: Path) -> int | None:
+    """`_change_stamp_ns` of the file, or None when it can't be stat'ed."""
     try:
-        return content_skip_reason(path, max_bytes) is not None
+        return _change_stamp_ns(os.stat(path))
     except OSError:
-        return False
+        return None
 
 
 def _docs_note_files(engine: GraphEngine, repo_id: str) -> set[str]:
@@ -1828,19 +1847,27 @@ def catch_up(
     walked = _keyed_indexable_paths(repo_root)
     due: set[Path] = set()
     unknown = 0
+    # A file an extractor reads is known only through extraction nodes, not a
+    # provider's File node: one skipped for its content keeps that node. It is
+    # not offered again while its skip mark still holds (see `_skip_marks`).
+    extracted = _extracted_files(engine, repo_id)
+    marks = _skip_marks(engine, repo_id)
     max_bytes = _max_file_bytes()
     for path, rel in walked:
         if not _would_index(path, rel, docs_root, mentions_enabled, specs):
             continue
-        if rel not in known and not _provider_represents(rel, specs) and _content_skipped(path, max_bytes):
-            continue  # index_paths would leave it out again
-        if rel not in known or (rel not in notes and _is_unindexed_note(path, docs_root, mentions_enabled)):
+        routed = bool(_routes(path.resolve(), docs_root, mentions_enabled))
+        if (rel not in extracted if routed else rel not in known) or (
+            rel not in notes and _is_unindexed_note(path, docs_root, mentions_enabled)
+        ):
+            mark = marks.get(rel)
+            if mark is not None and mark[1] == max_bytes and _stamp_or_none(path) == mark[2]:
+                continue  # left out under this limit, and unchanged since
             due.add(path)
             unknown += 1
             continue
-        try:
-            stamp = _change_stamp_ns(os.stat(path))
-        except OSError:
+        stamp = _stamp_or_none(path)
+        if stamp is None:
             continue  # gone since the walk; the next catch-up prunes it
         if stamp >= cutoff:
             due.add(path)
@@ -1896,6 +1923,7 @@ def full_scan(
     all_files = _indexable_paths(repo_root)
     applied, applied_docs = _apply_project_schema(engine, repo_id, repo_root)
     left_out: dict[str, str] = {} if skipped is None else skipped
+    engine.record_skipped_files(repo_id, {}, replace=True)  # every file is judged again below
     indexed = index_paths(
         engine, repo_id, repo_root, all_files, docs_path=docs_path, mentions_enabled=mentions_enabled,
         sync_provider=False,  # applied just above

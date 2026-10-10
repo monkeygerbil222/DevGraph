@@ -5,7 +5,7 @@ The unit tests stub the graph; the live ones run against Neo4j.
 """
 
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -91,6 +91,9 @@ class _Engine:
     def delete_nodes_by_source_file(self, repo_id, rel):
         self.deleted.append(rel)
 
+    def record_skipped_files(self, repo_id, entries, replace=False):
+        self.marks = entries
+
 
 @pytest.fixture
 def small_limit(monkeypatch):
@@ -117,6 +120,7 @@ def test_index_paths_skips_and_reports_filtered_files_and_clears_their_nodes(tmp
     assert seen == ["a.py"] and count == 1
     assert skipped == {"big.py": TOO_LARGE, "blob.js": BINARY, "out/gen.py": walk.GITIGNORED}
     assert sorted(engine.deleted) == ["big.py", "blob.js", "out/gen.py"]
+    assert {rel: mark[:2] for rel, mark in engine.marks.items()} == {"big.py": [TOO_LARGE, LIMIT], "blob.js": [BINARY, LIMIT]}
 
 
 def test_a_file_no_extractor_reads_is_not_judged_by_its_content(tmp_path, monkeypatch, small_limit):
@@ -127,21 +131,69 @@ def test_a_file_no_extractor_reads_is_not_judged_by_its_content(tmp_path, monkey
     assert skipped == {}
 
 
-def test_catch_up_does_not_offer_a_skipped_file_the_graph_does_not_have(tmp_path, monkeypatch, small_limit):
-    (tmp_path / "a.py").write_text("x = 1\n")
-    (tmp_path / "big.py").write_text("x = 1\n" * 1000)
-    offered = []
+class _CatchUpEngine:
+    def __init__(self, extracted=(), skips=None):
+        self.extracted = set(extracted)
+        self.skips = skips or {}
+
+    def list_indexed_files(self, repo_id):
+        return set(self.extracted)
+
+    def list_claim_sources(self, repo_id):
+        return set()
+
+    def read_skipped_files(self, repo_id):
+        return dict(self.skips)
+
+
+@pytest.fixture
+def caught_up(monkeypatch, small_limit):
+    """catch_up with the graph stubbed; returns the files offered to index_paths."""
+    offered: list = []
     monkeypatch.setattr(dispatch, "prune_stale_files", lambda *a, **k: 0)
     monkeypatch.setattr(dispatch, "schema_pending", lambda *a, **k: False)
     monkeypatch.setattr(dispatch, "index_outdated", lambda *a, **k: False)
-    monkeypatch.setattr(dispatch, "_graph_files", lambda *a, **k: set())
     monkeypatch.setattr(dispatch, "_docs_note_files", lambda *a, **k: set())
     monkeypatch.setattr(dispatch, "index_paths", lambda e, r, root, paths, **k: offered.append(paths) or len(paths))
+    return offered
 
-    result = catch_up(object(), "_unit_guards", tmp_path, datetime.now(UTC))
 
-    assert offered == [{tmp_path / "a.py"}]
+def _stamp(path):
+    return dispatch._change_stamp_ns(path.stat())
+
+
+def test_catch_up_does_not_re_judge_a_file_skipped_under_the_same_limit(tmp_path, monkeypatch, caught_up):
+    (tmp_path / "a.py").write_text("x = 1\n")
+    (tmp_path / "big.py").write_text("x = 1\n" * 1000)
+    engine = _CatchUpEngine(skips={"big.py": [TOO_LARGE, LIMIT, _stamp(tmp_path / "big.py")]})
+    monkeypatch.setattr(dispatch, "_graph_files", lambda *a, **k: set())
+    monkeypatch.setattr(dispatch, "content_skip_reason", lambda *a: pytest.fail("re-read a skipped file"))
+
+    result = catch_up(engine, "_unit_guards", tmp_path, datetime.now(UTC))
+
+    assert caught_up == [{tmp_path / "a.py"}]
     assert result.unknown == 1
+
+
+@pytest.mark.parametrize("change", ["limit", "stamp", "unmarked"])
+def test_catch_up_offers_a_skipped_file_again_when_its_judgement_may_change(tmp_path, monkeypatch, caught_up, change):
+    (tmp_path / "big.py").write_text("x = 1\n" * 1000)
+    mark = [TOO_LARGE, LIMIT * 2 if change == "limit" else LIMIT, _stamp(tmp_path / "big.py") - (change == "stamp")]
+    engine = _CatchUpEngine(skips={} if change == "unmarked" else {"big.py": mark})
+    monkeypatch.setattr(dispatch, "_graph_files", lambda *a, **k: set())
+    catch_up(engine, "_unit_guards", tmp_path, datetime.now(UTC))
+    assert caught_up == [{tmp_path / "big.py"}]
+
+
+def test_a_provider_file_node_does_not_make_a_code_file_known(tmp_path, monkeypatch, caught_up):
+    """A skipped file keeps its filesystem File node; after the limit is
+    raised it must still be offered, so only extraction nodes count."""
+    (tmp_path / "big.py").write_text("x = 1\n" * 1000)
+    engine = _CatchUpEngine(skips={"big.py": [TOO_LARGE, LIMIT // 2, 0]})
+    monkeypatch.setattr(dispatch, "_graph_files", lambda *a, **k: {"big.py"})  # its File node
+    monkeypatch.setattr(dispatch, "_change_stamp_ns", lambda st: 0)  # older than `since`
+    catch_up(engine, "_unit_guards", tmp_path, datetime.now(UTC))
+    assert caught_up == [{tmp_path / "big.py"}]
 
 
 # --- live: incremental equals fresh ------------------------------------------
@@ -328,3 +380,44 @@ def test_an_empty_root_still_reads_as_unmounted(engine, tmp_path):
     (root / "a.py").unlink()
     with pytest.raises(RepoRootEmpty, match="unmounted"):
         prune_stale_files(engine, live, root)
+
+
+def test_raising_the_limit_lets_catch_up_index_a_file_with_a_provider_node(engine, tmp_path, monkeypatch):
+    import textwrap
+
+    from devgraph.graph.engine import provision_repository_schema
+
+    engine, (live, fresh) = engine
+    label = f"ZzGuardFile{uuid.uuid4().hex[:8]}"
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "devgraph.schema.yaml").write_text(textwrap.dedent(f"""
+        version: 1
+        node_types:
+          - label: {label}
+            key: [path]
+            metadata: [{{name: path}}]
+            source: {{provider: filesystem, kind: file}}
+    """))
+    (root / "a.py").write_text("def alpha():\n    return 1\n")
+    (root / "big.py").write_text("def big():\n    return 2\n" + "# padding\n" * 600)
+    try:
+        monkeypatch.setattr(dispatch, "_max_file_bytes", lambda: LIMIT)
+        provision_repository_schema(engine, root)
+        engine.upsert_repository(live, live, str(root))
+        full_scan(engine, live, root)
+        assert ("Function", "big", "big.py") not in _graph(engine, live)
+        assert (label, "big.py", "big.py") in _graph(engine, live)
+        assert engine.read_skipped_files(live)["big.py"][:2] == [TOO_LARGE, LIMIT]
+
+        later = datetime.now(UTC) + timedelta(minutes=1)  # nothing is due by its stamps
+        assert catch_up(engine, live, root, later).offered == 0  # judged under this limit, unchanged
+
+        monkeypatch.setattr(dispatch, "_max_file_bytes", lambda: 1024 * 1024)
+        result = catch_up(engine, live, root, later)
+        assert (result.offered, result.unknown) == (1, 1)
+        assert ("Function", "big", "big.py") in _graph(engine, live)
+        _matches_fresh(engine, live, fresh, root)
+    finally:
+        engine.run_cypher(f"DROP CONSTRAINT {label.lower()}_repo_key IF EXISTS")
+        engine.run_cypher(f"DROP INDEX {label.lower()}_repo_name IF EXISTS")

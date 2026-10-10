@@ -39,6 +39,8 @@ def stubbed(monkeypatch):
     monkeypatch.setattr(dispatch, "index_outdated", lambda *a, **k: False)
     monkeypatch.setattr(dispatch, "_graph_files", lambda *a, **k: set(state["known"]))
     monkeypatch.setattr(dispatch, "_docs_note_files", lambda *a, **k: set(state["known"]))
+    monkeypatch.setattr(dispatch, "_extracted_files", lambda *a, **k: set(state["known"]))
+    monkeypatch.setattr(dispatch, "_skip_marks", lambda *a, **k: {})
 
     def index(engine, repo_id, root, paths, docs_path=None, mentions_enabled=False):
         state["offered"].append({p.relative_to(root).as_posix() for p in paths})
