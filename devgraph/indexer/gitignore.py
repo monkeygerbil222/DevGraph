@@ -9,7 +9,10 @@ an ignored folder stays ignored whatever a later rule says, as in git.
 
 Applied to any registered folder, git checkout or not. `.git/info/exclude`
 and the user's global excludes file are not read: they are per-clone, so two
-clones of one repository would index differently.
+clones of one repository would index differently. Only the .gitignore files
+count, never git's index: a file added with `git add -f` that a pattern
+matches stays ignored. Patterns are matched as git's wildmatch matches them
+(a malformed one matches nothing), ignoring case on Windows and macOS.
 
 Parsed files are cached by path and re-read when their stat changes, so an
 edited `.gitignore` takes effect on the next check.
