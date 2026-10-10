@@ -166,6 +166,74 @@ def test_a_parameter_named_after_a_fixture_in_the_file_is_typed_by_it():
     assert targets(source, "test_it", "work", "test_x.py") == {(None, "name")}  # not a fixture
 
 
+@pytest.mark.parametrize("annotation", ["Any", "typing.Any", "t.Any", "object", '"Any"', "Any | None"])
+def test_an_any_or_object_annotation_is_an_untyped_receiver(annotation):
+    source = f"import typing\nimport typing as t\nfrom typing import Any\n\n\ndef f(engine: {annotation}):\n    engine.upsert_nodes()\n"
+    assert targets(source, "f", "upsert_nodes", "main.py") == {(None, "name")}
+
+
+def test_an_in_file_subclass_receiver_walks_its_bases():
+    source = """\
+        from engine import GraphEngine
+
+
+        class Fake(GraphEngine):
+            pass
+
+
+        class Local:
+            def own(self):
+                pass
+
+
+        def f(fake: Fake):
+            Fake().run_cypher()
+            fake.close_all()
+            Local().own()
+            Local().missing()
+        """
+    expected = {("engine.py", "resolved"), ("engine/__init__.py", "resolved"), ("engine/", "package")}
+    assert targets(source, "f", "run_cypher", "main.py") == expected
+    assert targets(source, "f", "close_all", "main.py") == expected
+    assert targets(source, "f", "own", "main.py") == {("main.py", "resolved")}
+    # Nothing in the file or its imports defines it: an untyped call by name.
+    assert targets(source, "f", "missing", "main.py") == {(None, "name")}
+
+
+def test_a_parameter_shadows_an_import_of_its_name():
+    source = """\
+        import os
+        from pkg import helper
+
+
+        def go(helper, os):
+            helper()
+            os.getcwd()
+        """
+    assert targets(source, "go", "helper", "main.py") == set()
+    assert targets(source, "go", "getcwd", "main.py") == {(None, "name")}
+
+
+def test_importing_a_submodule_binds_its_top_package():
+    source = "import os.path\n\n\ndef f():\n    os.getcwd()\n"
+    assert targets(source, "f", "getcwd", "main.py") == {
+        ("os.py", "resolved"), ("os/__init__.py", "resolved"), ("os/", "package"),
+    }
+
+
+def test_builtin_names_are_a_fixed_set():
+    from devgraph.indexer.python import extractor
+
+    assert "print" in extractor._BUILTIN_NAMES and "len" in extractor._BUILTIN_NAMES
+    assert "breakpoint" in extractor._BUILTIN_NAMES and "helper" not in extractor._BUILTIN_NAMES
+    import ast
+    import inspect
+
+    tree = ast.parse(inspect.getsource(extractor))
+    (assign,) = [n for n in tree.body if isinstance(n, ast.Assign) and n.targets[0].id == "_BUILTIN_NAMES"]
+    assert isinstance(assign.value, ast.Call) and isinstance(assign.value.args[0], ast.Set)
+
+
 def test_an_unknown_receiver_keeps_a_bare_name_edge():
     assert targets("def f(obj):\n    obj.work()\n", "f", "work") == {(None, "name")}
 

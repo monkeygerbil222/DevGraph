@@ -109,9 +109,14 @@ class Bindings:
     targets: set[str] = field(default_factory=set)
 
     def add_import(self, dotted: str, alias: str | None, file_path: str) -> None:
-        """`import a.b [as x]`: binds the receiver `a.b` (or `x`)."""
+        """`import a.b [as x]`: binds the receiver `a.b` (or `x`). Without an
+        alias it also binds the top package `a`, as Python does; only `a.b`
+        is an import target."""
         ref = absolute_module(dotted, file_path)
         self.modules[alias or dotted] = ref
+        if alias is None and "." in dotted:
+            top = dotted.split(".", 1)[0]
+            self.modules.setdefault(top, absolute_module(top, file_path))
         self.targets.update(ref.files())
 
     def add_from(self, module: ModuleRef, names: list[tuple[str, str | None]], star: bool) -> None:

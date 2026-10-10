@@ -19,7 +19,6 @@ GraphEngine.upsert_node/upsert_relationship. All nodes are keyed on
 
 from __future__ import annotations
 
-import builtins
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -138,9 +137,41 @@ _LITERAL_RECEIVERS = frozenset({
     "tuple", "list_comprehension", "dictionary_comprehension", "set_comprehension", "generator_expression",
 })
 
-_BUILTIN_NAMES = frozenset(dir(builtins))
+#: Python's builtin names (3.13), as a fixed set so an edge never depends on
+#: the interpreter that indexed it. A bare call of one links nothing.
+_BUILTIN_NAMES = frozenset({
+    "ArithmeticError", "AssertionError", "AttributeError", "BaseException", "BaseExceptionGroup",
+    "BlockingIOError", "BrokenPipeError", "BufferError", "BytesWarning", "ChildProcessError",
+    "ConnectionAbortedError", "ConnectionError", "ConnectionRefusedError", "ConnectionResetError",
+    "DeprecationWarning", "EOFError", "Ellipsis", "EncodingWarning", "EnvironmentError", "Exception",
+    "ExceptionGroup", "False", "FileExistsError", "FileNotFoundError", "FloatingPointError", "FutureWarning",
+    "GeneratorExit", "IOError", "ImportError", "ImportWarning", "IndentationError", "IndexError",
+    "InterruptedError", "IsADirectoryError", "KeyError", "KeyboardInterrupt", "LookupError", "MemoryError",
+    "ModuleNotFoundError", "NameError", "None", "NotADirectoryError", "NotImplemented", "NotImplementedError",
+    "OSError", "OverflowError", "PendingDeprecationWarning", "PermissionError", "ProcessLookupError",
+    "PythonFinalizationError", "RecursionError", "ReferenceError", "ResourceWarning", "RuntimeError",
+    "RuntimeWarning", "StopAsyncIteration", "StopIteration", "SyntaxError", "SyntaxWarning", "SystemError",
+    "SystemExit", "TabError", "TimeoutError", "True", "TypeError", "UnboundLocalError", "UnicodeDecodeError",
+    "UnicodeEncodeError", "UnicodeError", "UnicodeTranslateError", "UnicodeWarning", "UserWarning",
+    "ValueError", "Warning", "ZeroDivisionError", "__build_class__", "__import__", "abs", "aiter", "all",
+    "anext", "any", "ascii", "bin", "bool", "breakpoint", "bytearray", "bytes", "callable", "chr",
+    "classmethod", "compile", "complex", "copyright", "credits", "delattr", "dict", "dir", "divmod",
+    "enumerate", "eval", "exec", "exit", "filter", "float", "format", "frozenset", "getattr", "globals",
+    "hasattr", "hash", "help", "hex", "id", "input", "int", "isinstance", "issubclass", "iter", "len",
+    "license", "list", "locals", "map", "max", "memoryview", "min", "next", "object", "oct", "open", "ord",
+    "pow", "print", "property", "quit", "range", "repr", "reversed", "round", "set", "setattr", "slice",
+    "sorted", "staticmethod", "str", "sum", "super", "tuple", "type", "vars", "zip",
+})
 
 _TYPE_WRAPPERS = frozenset({"Optional", "typing.Optional", "Union", "typing.Union"})
+
+#: Annotations that type nothing: a receiver annotated with one is untyped.
+_UNTYPED_ANNOTATIONS = frozenset({"None", "Any", "object"})
+
+
+def _types_something(name: str) -> bool:
+    """False for `None`, `Any`, `typing.Any`, `t.Any` and `object`."""
+    return name.rsplit(".", 1)[-1] not in _UNTYPED_ANNOTATIONS
 
 
 def _type_names(node: Node | None, source: bytes) -> list[str]:
@@ -153,7 +184,7 @@ def _type_names(node: Node | None, source: bytes) -> list[str]:
         return [name for child in node.named_children for name in _type_names(child, source)]
     if node.type in ("identifier", "attribute"):
         text = _pure_dotted(node, source)
-        return [text] if text and text != "None" else []
+        return [text] if text and _types_something(text) else []
     if node.type == "binary_operator":
         return _type_names(node.child_by_field_name("left"), source) + _type_names(
             node.child_by_field_name("right"), source
@@ -174,7 +205,7 @@ def _type_names(node: Node | None, source: bytes) -> list[str]:
         parts = [part.strip() for part in content.split("|")]
         return [
             part for part in parts
-            if part and part != "None" and all(seg.isidentifier() for seg in part.split("."))
+            if part and _types_something(part) and all(seg.isidentifier() for seg in part.split("."))
         ]
     return []
 
@@ -227,6 +258,22 @@ def _local_types(
 
     walk(body)
     return {name: sorted(found) for name, found in types.items() if found}
+
+
+def _parameter_names(func: Node, source: bytes) -> set[str]:
+    """Every parameter name of a function (`*args`/`**kwargs` included)."""
+    names = set()
+    params = func.child_by_field_name("parameters")
+    for param in params.named_children if params is not None else []:
+        if param.type == "identifier":
+            names.add(_text(param, source))
+            continue
+        name_node = param.child_by_field_name("name")
+        if name_node is None:
+            name_node = next((c for c in param.named_children if c.type == "identifier"), None)
+        if name_node is not None:
+            names.add(_text(name_node, source))
+    return names
 
 
 def _fixture_types(root: Node, source: bytes) -> dict[str, list[str]]:
@@ -313,11 +360,24 @@ class _Scope:
     types: dict[str, list[str]]
     cls: str | None
     parent: _Scope | None = None
+    params: set[str] = field(default_factory=set)
 
     def defines(self, name: str) -> bool:
         scope: _Scope | None = self
         while scope is not None:
             if name in scope.defs:
+                return True
+            scope = scope.parent
+        return False
+
+    def is_parameter(self, name: str) -> bool:
+        """A parameter of this or an enclosing function, not redefined by a
+        nearer def."""
+        scope: _Scope | None = self
+        while scope is not None:
+            if name in scope.defs:
+                return False
+            if name in scope.params:
                 return True
             scope = scope.parent
         return False
@@ -354,10 +414,11 @@ class _CallResolver:
             )
         return None
 
-    def _class_pins(self, type_name: str) -> list[str] | None:
-        """Where the methods of the class `type_name` (as written) can be."""
+    def _class_pins(self, type_name: str, method: str) -> list[str] | None:
+        """Where `method` of the class `type_name` (as written) can be. An
+        in-file class is walked like `self.method()` (see _method_pins)."""
         if type_name in self.classes:
-            return [self.file_path]
+            return self._method_pins(type_name, method, own=True)
         if "." in type_name:
             return self._module_pins(type_name.rsplit(".", 1)[0])
         symbol = self.bindings.symbols.get(type_name)
@@ -387,22 +448,24 @@ class _CallResolver:
                         found = True
                     else:
                         bases_of(base)
-                elif (base_pins := self._class_pins(base)) is not None:
+                elif (base_pins := self._class_pins(base, method)) is not None:
                     pins.update(base_pins)
                     found = True
 
         bases_of(cls)
         return sorted(pins) if found else None
 
-    def _receiver_pins(self, receiver: str, scope: _Scope) -> list[str] | None:
+    def _receiver_pins(self, receiver: str, method: str, scope: _Scope) -> list[str] | None:
         if "." not in receiver:
             types = scope.types_of(receiver)
             if types:
-                found = [pins for name in types if (pins := self._class_pins(name)) is not None]
+                found = [pins for name in types if (pins := self._class_pins(name, method)) is not None]
                 if found:
                     return sorted({pin for pins in found for pin in pins})
             if receiver in self.classes:
-                return [self.file_path]
+                return self._class_pins(receiver, method)
+        if scope.is_parameter(receiver.split(".", 1)[0]):
+            return None  # a parameter shadows the import of its name
         return self._module_pins(receiver)
 
     def resolve(self, func: Node, scope: _Scope) -> list[tuple[str, str | None]]:
@@ -411,6 +474,8 @@ class _CallResolver:
             name = _text(func, source)
             if scope.defines(name):
                 return [(name, self.file_path)]
+            if scope.is_parameter(name):
+                return []  # calling a parameter: nothing to resolve, and it shadows any import
             symbol = self.bindings.symbols.get(name)
             if symbol is not None:
                 return [(symbol.name, pin) for pin in symbol.module.files() + symbol.module.dirs()]
@@ -436,7 +501,11 @@ class _CallResolver:
             if pins is not None:
                 return [(attr, pin) for pin in pins]
         elif (receiver := _pure_dotted(obj, source)) is not None:
-            pins = self._receiver_pins(receiver, scope)
+            pins = self._receiver_pins(receiver, attr, scope)
+            if pins is not None:
+                return [(attr, pin) for pin in pins]
+        elif (constructor := _constructed(obj, source)) is not None:
+            pins = self._class_pins(constructor, attr)  # `Fake().run()`
             if pins is not None:
                 return [(attr, pin) for pin in pins]
         if obj.type in _LITERAL_RECEIVERS or attr in _BUILTIN_TYPE_METHODS:
@@ -816,7 +885,7 @@ def extract_python_file(source_code: str, file_path: str, repo_id: str) -> Extra
         if body_node is not None:
             scope = _Scope(
                 _direct_defs(body_node, source_bytes), _local_types(node, body_node, source_bytes, fixtures), cls,
-                enclosing,
+                enclosing, _parameter_names(node, source_bytes),
             )
             caller_class = parent_name if parent_label == "Class" else None
             record_calls("Function", func_name, body_node, scope, caller_class)

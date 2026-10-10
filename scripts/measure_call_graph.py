@@ -80,7 +80,9 @@ _SITES = [
     ("stoplisted untyped receiver", "fetch", "devgraph/indexer/pr_issues/extractor.py", "get",
      "devgraph/registry/store.py", None),
 ]
-_RECALL_NAMES = ["upsert_nodes", "get_settings", "index_paths", "run_cypher", "full_scan"]
+_RECALL_NAMES = [
+    "upsert_nodes", "upsert_relationships", "get_settings", "index_paths", "run_cypher", "full_scan", "list_repos",
+]
 _PAGERANK_WANTED = {"GraphEngine", "run_cypher", "get_settings", "upsert_relationships", "devgraph/graph/engine.py"}
 _STOPLIST_PROBE = {"get", "items", "keys", "values", "join", "append", "extend", "split", "strip", "format", "update",
                    "pop", "read", "write"}

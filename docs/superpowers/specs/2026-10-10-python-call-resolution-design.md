@@ -51,8 +51,8 @@ filesystem check in the extractor). A removed target goes with the
    enclosing function: pinned to this file.
 2. **Imported name.** `f()` bound by `from P import f`: P's files, plus P's
    prefix. A bare name nothing defines or imports falls to a star import's
-   module when the file has one (Python builtins excepted; chained star
-   imports are not followed), and otherwise links nothing.
+   module when the file has one (Python builtins, a fixed list, excepted;
+   chained star imports are not followed), and otherwise links nothing.
 3. **`self`/`cls`/`super()`.** The enclosing class defines the method: this
    file. Otherwise its bases: an in-file base is walked recursively, an
    imported base (or `module.Base`) gives that module's files and prefix and
@@ -61,9 +61,12 @@ filesystem check in the extractor). A removed target goes with the
 4. **Module attribute or typed receiver.** `mod.f()` / `a.b.f()` on an imported
    module, `Name.f()` on a from-imported name or an in-file class, and a
    variable typed by a parameter annotation (`X`, `X | None`, `Optional[X]`,
-   quoted), by `x = X(...)` (a capitalised callable), or by being a parameter
-   named after a pytest fixture defined in the same file (its return
-   annotation, or the `X(...)` it returns or yields).
+   quoted; `Any` and `object` type nothing), by `x = X(...)` (a capitalised
+   callable), or by being a parameter named after a pytest fixture defined in
+   the same file (its return annotation, or the `X(...)` it returns or
+   yields); also `X().f()`. An in-file class is walked like `self` (tier 3),
+   so `class Fake(GraphEngine): pass` reaches `GraphEngine`'s module. A
+   parameter shadows an import of its name, and `import a.b` also binds `a`.
 5. **Unknown receiver.** `obj.m()` keeps one bare-name row, except on a literal
    receiver (`"".join`, `{}.get`) or when `m` is a dict/list/str/set/bytes/io
    method (`get`, `items`, `join`, `append`, `read`, `close`, ...).
@@ -165,16 +168,16 @@ worktree.
 
 | | Target | BEFORE | AFTER | |
 |---|---|---|---|---|
-| M1 multi-target CALLS | resolved < 2 %; total < 25 % of 23,159 | 26,028 (all bare) | 3,759 (resolved 12 = 0.15 %, name 3,480, other languages 267): 16 % | met |
-| M2 resolved cross-file without import | 0 | 22,534 (all bare) | 0 (name 2,679 and other languages 263 reported apart) | met |
+| M1 multi-target CALLS | resolved < 2 %; total < 25 % of 23,159 | 26,028 (all bare) | 3,791 (resolved 14 = 0.17 %, name 3,510, other languages 267): 16 % | met |
+| M2 resolved cross-file without import | 0 | 22,534 (all bare) | 0 (name 2,744 and other languages 263 reported apart) | met |
 | M3 IMPORTS vs ground truth | recall ≥ 99 %, precision ≥ 98 % | recall 72 %, precision 100 % | recall 100 %, precision 100 %, none resolving under two roots | met |
 | M3 importers of `config/__init__.py`, `lifecycle.py` | ≥ 33; = grep | 0; 0 | 31 (= grep in this tree); 5 (= grep) | see below |
 | M4 PageRank top ten | no `tests/`, no stoplisted, ≥ 3 wanted | 7 under `tests/`, 2 stoplisted, 1 wanted | 0, 0, 2 wanted (`run_cypher`, `get_settings`) | partly, see below |
 | M5 call-site sample | 21/21 | 0/21 (no confidence; the 3 alias sites absent) | 21/21 | met |
-| M5 `find_callers` vs `ast` | ≥ 95 % each | 98-100 % | 97-100 % | met |
-| M6 `full_scan` | ≤ +25 % | 42.8 s | 51.2 s (+20 %; +7-13 % in alternating back-to-back runs) | met |
-| M6 save of `config/__init__.py` | | 0.43 s | 0.18 s, one file re-indexed | |
-| M6 largest `name_refs` | < 1 MiB | 89 KB | 223 KB (`devgraph/cli/main.py`) | met |
+| M5 `find_callers` vs `ast` | ≥ 95 % each | 98-100 % | 98-100 % (also `upsert_relationships` 26/26, `list_repos` 45/45) | met |
+| M6 `full_scan` | ≤ +25 % | 42.8 s | 50.9 s (+19 %; +7-13 % in alternating back-to-back runs) | met |
+| M6 save of `config/__init__.py` | | 0.43 s | 0.16 s, one file re-indexed | |
+| M6 largest `name_refs` | < 1 MiB | 89 KB | 224 KB (`devgraph/cli/main.py`) | met |
 
 - **M3 importers of `devgraph/config/__init__.py`.** The graph links all 31
   files that import `devgraph.config` in this tree, exactly what a grep and
@@ -363,24 +366,24 @@ AFTER:
 {
  "M1": {
   "calls_by_confidence": {
-   "name": 3778,
-   "resolved": 8144,
-   "package": 39,
-   "None": 327
+   "resolved": 8175,
+   "None": 327,
+   "name": 3806,
+   "package": 39
   },
   "multi_target_by_confidence": {
-   "name": 3480,
-   "resolved": 12,
-   "None": 267
+   "None": 267,
+   "name": 3510,
+   "resolved": 14
   },
-  "multi_target_total": 3759,
-  "resolved_multi_share": 0.0015,
-  "total_vs_baseline": 0.1623
+  "multi_target_total": 3791,
+  "resolved_multi_share": 0.0017,
+  "total_vs_baseline": 0.1637
  },
  "M2": {
   "cross_file_without_import_by_confidence": {
-   "name": 2679,
-   "None": 263
+   "None": 263,
+   "name": 2744
   }
  },
  "M3": {
@@ -412,13 +415,13 @@ AFTER:
    ],
    [
     "Function",
-    "add_repo",
-    "devgraph/registry/store.py"
+    "bounded_safe_load",
+    "devgraph/config/yaml_bound.py"
    ],
    [
     "Function",
-    "bounded_safe_load",
-    "devgraph/config/yaml_bound.py"
+    "add_repo",
+    "devgraph/registry/store.py"
    ],
    [
     "Function",
@@ -432,13 +435,13 @@ AFTER:
    ],
    [
     "Function",
-    "load_project_schema",
-    "devgraph/config/project_schema.py"
+    "extract_python_file",
+    "devgraph/indexer/python/extractor.py"
    ],
    [
     "Function",
-    "extract_python_file",
-    "devgraph/indexer/python/extractor.py"
+    "load_project_schema",
+    "devgraph/config/project_schema.py"
    ],
    [
     "Function",
@@ -482,8 +485,13 @@ AFTER:
   "find_callers_recall": {
    "upsert_nodes": {
     "sites": 38,
-    "found": 37,
-    "recall": 0.9737
+    "found": 38,
+    "recall": 1.0
+   },
+   "upsert_relationships": {
+    "sites": 26,
+    "found": 26,
+    "recall": 1.0
    },
    "get_settings": {
     "sites": 51,
@@ -497,23 +505,28 @@ AFTER:
    },
    "run_cypher": {
     "sites": 189,
-    "found": 186,
-    "recall": 0.9841
+    "found": 188,
+    "recall": 0.9947
    },
    "full_scan": {
     "sites": 60,
     "found": 59,
     "recall": 0.9833
+   },
+   "list_repos": {
+    "sites": 45,
+    "found": 45,
+    "recall": 1.0
    }
   }
  },
  "M6": {
-  "full_scan_s": 51.18,
+  "full_scan_s": 50.85,
   "config_init_save_files": 1,
-  "config_init_save_s": 0.18,
+  "config_init_save_s": 0.16,
   "largest_name_refs_module": "devgraph/cli/main.py",
-  "largest_name_refs_bytes": 223059,
-  "total_name_refs_bytes": 5231722
+  "largest_name_refs_bytes": 224445,
+  "total_name_refs_bytes": 5251492
  }
 }
 ```
@@ -527,7 +540,7 @@ AFTER:
   that name goes, even if the resolved target is outside the repository
   (`subprocess.run()` beside `runner.run()` in one function leaves no edge to
   the repository's `run`). Kept for determinism; no DevGraph site hits it
-  (searched), so it is covered by a unit test rather than an M5 site.
+  (searched; nor is there an in-repo cross-file inherited `self.m()`), so it is covered by a unit test rather than an M5 site.
 - Constructor calls `Foo()` stay unlinked (`CALLS` targets `Function`).
 - An ancestor root can link a stdlib-named module next to the importer
   (`json.py`); M3 found none on DevGraph.
