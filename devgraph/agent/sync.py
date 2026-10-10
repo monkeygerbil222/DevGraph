@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from devgraph.indexer.dispatch import catch_up, index_paths, remove_paths
+from devgraph.indexer.walk import RepoRootUnavailable
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +56,8 @@ class RepoSync:
         self._now = now
         self._lock = threading.Lock()  # guards _floors and _running
         self._floors: dict[str, datetime] = {}
+        # Repositories whose root folder is missing or looks unmounted, warned about once.
+        self._root_warned: set[str] = set()
         # repo_id -> when the current failure streak last warned
         self._warned: dict[str, datetime] = {}
         self._running = 0
@@ -90,6 +93,8 @@ class RepoSync:
                 removed = remove_paths(self._engine, repo_id, repo.path, deleted_paths)
             self._registry.mark_indexed(repo_id, at=self._held_back(repo_id, started))
             self._publish({"type": "reindexed", "repo_id": repo_id, "changed": indexed, "deleted": removed})
+        except RepoRootUnavailable as exc:
+            self._skip_unavailable_root(repo_id, exc)
         except Exception as exc:
             # The batch's events can predate `started` by as long as it waited
             # on the batch lock (a catch-up or schema rescan can hold it for
@@ -132,6 +137,8 @@ class RepoSync:
                     del self._floors[repo_id]
                     self._warned.pop(repo_id, None)
             self._registry.mark_indexed(repo_id, at=self._held_back(repo_id, started))
+            with self._lock:
+                self._root_warned.discard(repo_id)
         except Exception as exc:
             error: Exception | None = exc
         else:
@@ -142,7 +149,10 @@ class RepoSync:
                 self._running -= 1
         if error is not None:
             self._publish({"type": "catch_up", "repo_id": repo_id, "state": "failed", "changed": 0, "deleted": 0})
-            self._failed(repo_id, since, error)
+            if isinstance(error, RepoRootUnavailable):
+                self._skip_unavailable_root(repo_id, error)
+            else:
+                self._failed(repo_id, since, error)
             return False
         elapsed = time.monotonic() - clock
         self._publish({
@@ -167,6 +177,16 @@ class RepoSync:
         with self._lock:
             floor = self._floors.get(repo_id)
         return started if floor is None or started <= floor else floor
+
+    def _skip_unavailable_root(self, repo_id: str, error: RepoRootUnavailable) -> None:
+        """Skip a repository whose root folder is missing, unreadable or looks
+        unmounted: nothing was changed, and nothing is retried (the next
+        start, or `devgraph rescan`, tries again). Warns once per repository."""
+        with self._lock:
+            first = repo_id not in self._root_warned
+            self._root_warned.add(repo_id)
+        level = logging.WARNING if first and not self.stopping else logging.DEBUG
+        logger.log(level, "Skipping %s: %s", repo_id, error)
 
     def _failed(self, repo_id: str, start: datetime, error: Exception) -> None:
         """Hold the repository's stamps back to `start`, warn (unless

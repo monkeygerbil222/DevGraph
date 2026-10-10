@@ -68,6 +68,7 @@ from devgraph.graph.schema import (
     RELATIONSHIP_TYPES,
 )
 from devgraph.indexer.dispatch import full_scan
+from devgraph.indexer.walk import repo_root_problem
 from devgraph.mcp import tools as devgraph_tools
 from devgraph.registry.store import RepoRegistry
 
@@ -282,19 +283,26 @@ def build_router(
     @router.get("/repos")
     def list_repos() -> dict[str, Any]:
         repo_issues = _get_repo_issues()
+        repos = []
+        for repo in registry.list_repos():
+            # A missing or unreadable folder (an unmounted drive, a moved
+            # repo): every scan refuses it, so its graph is kept but stale.
+            problem = repo_root_problem(repo.path)
+            issue = repo_issues.get(repo.repo_id)
+            if problem is not None:
+                issue = repo_issues[repo.repo_id] = f"path missing: repository folder {problem}: {repo.path}"
+            repos.append({
+                "repo_id": repo.repo_id,
+                "path": str(repo.path),
+                "active": repo.active,
+                "watch_enabled": repo.watch_enabled,
+                "last_indexed": repo.last_indexed,
+                "node_count": queries.count_nodes(engine, repo.repo_id),
+                "path_missing": problem is not None,
+                "issue": issue,  # Include issue if any
+            })
         return {
-            "repos": [
-                {
-                    "repo_id": repo.repo_id,
-                    "path": str(repo.path),
-                    "active": repo.active,
-                    "watch_enabled": repo.watch_enabled,
-                    "last_indexed": repo.last_indexed,
-                    "node_count": queries.count_nodes(engine, repo.repo_id),
-                    "issue": repo_issues.get(repo.repo_id),  # Include issue if any
-                }
-                for repo in registry.list_repos()
-            ],
+            "repos": repos,
             "issues": repo_issues,  # Also return all issues as a summary
         }
 

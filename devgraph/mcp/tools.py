@@ -8,11 +8,11 @@ All Cypher is parameterized — user input never concatenates directly into
 query strings.
 """
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any
 
-import json
 import os
-import subprocess
 
 # The SDK passes a ToolError's text to the client and hides any other exception's.
 from mcp.server.mcpserver.exceptions import ToolError
@@ -73,47 +73,109 @@ def _sanitize_row(row: dict) -> dict:
     return {k: _sanitize_value(v) for k, v in row.items()}
 
 
-def _resolve_gh_repo(repo_path: str) -> str | None:
-    """Resolve a local repo path to its 'owner/name' GitHub slug via git remote.
-    Returns None if no 'origin' remote exists or parsing fails."""
-    try:
-        repo = open_repo(repo_path)
-        remote_url = repo.remote("origin").url
-        repo.close()
-        if "github.com" not in remote_url:
-            return None
-        slug = remote_url.rstrip(".git").split("github.com")[-1].lstrip(":/")
-        return slug if "/" in slug else None
-    except Exception:
-        return None
+def _source_off(registry: RepoRegistry | None, repo_id: str, flag: str) -> bool:
+    """Whether `repo_id` is registered with its PR or issue source (`flag`) off."""
+    repo = registry.get(repo_id) if registry is not None else None
+    return repo is not None and not getattr(repo, flag)
 
-def _gh_pr_list(gh_repo: str, search: str, timeout: int = 10) -> list[dict]:
-    """Shell out to gh CLI to list PRs matching a search term.
-    Returns empty list on any failure (gh missing, not authenticated, timeout)."""
-    try:
-        result = subprocess.run(
-            ["gh", "pr", "list", "--repo", gh_repo, "--json", "number,title,state,url", "--search", search],
-            capture_output=True, text=True, timeout=timeout,
-        )
-        if result.returncode != 0:
-            return []
-        return json.loads(result.stdout)
-    except (subprocess.TimeoutExpired, FileNotFoundError, json.JSONDecodeError):
-        return []
 
-def _gh_issue_list(gh_repo: str, search: str, timeout: int = 10) -> list[dict]:
-    """Shell out to gh CLI to list issues matching a search term.
-    Returns empty list on any failure."""
-    try:
-        result = subprocess.run(
-            ["gh", "issue", "list", "--repo", gh_repo, "--json", "number,title,state,url", "--search", search],
-            capture_output=True, text=True, timeout=timeout,
+def _source_off_notice(max_results: int, what: str, command: str, repo_id: str) -> dict[str, Any]:
+    """An empty envelope saying how to turn the repository's source on. Never
+    falls back to the network (no `gh`, no API call)."""
+    return {
+        **_envelope([], max_results),
+        "notice": f"{what} ingestion is off for {repo_id}; enable it with `devgraph {command} {repo_id} enable`",
+    }
+
+
+#: How long a built-in tool's query may run before it is cancelled.
+BUILTIN_TIMEOUT_S = 30
+
+#: Rows a built-in tool's query may return; each already applies its own LIMIT
+#: or aggregates, so this only guards against an unbounded result.
+BUILTIN_MAX_ROWS = 100_000
+
+#: How many CALLS/USES/DEPENDS_ON hops `impact_analysis` and
+#: `impact_analysis_for_diff` follow for transitive dependents. An unbounded
+#: variable-length path hangs on a real repository's call graph, and a
+#: dependent further away than this says little about a change's impact.
+IMPACT_MAX_DEPTH = 4
+
+
+def _impact_expansion(cross_repo: bool) -> str:
+    """Cypher continuing from `WITH collect(n) AS l0` (the changed nodes): one
+    CALL per hop collecting the distinct nodes with a CALLS/USES/DEPENDS_ON edge
+    into the previous hop's nodes, never one seen at an earlier hop, then
+    returning `direct_dependents` (hop 1), `transitive_dependents` (hops 2 to
+    `IMPACT_MAX_DEPTH`) and `direct_count`.
+
+    Expanding distinct nodes hop by hop does work proportional to the nodes
+    and edges within reach; a variable-length path enumerates every path, which
+    times out on a common name like `get` in a real repository.
+    """
+    scope = "" if cross_repo else "AND d.repo_id = $repo_id"
+    parts = []
+    for hop in range(1, IMPACT_MAX_DEPTH + 1):
+        seen = [f"l{k}" for k in range(hop)]
+        parts.append(
+            f"CALL ({', '.join(seen)}) {{ UNWIND l{hop - 1} AS m "
+            f"MATCH (d)-[:CALLS|USES|DEPENDS_ON]->(m) WHERE true {scope} "
+            f"AND {' AND '.join(f'NOT d IN {s}' for s in seen)} "
+            f"RETURN collect(DISTINCT d) AS l{hop} }}"
         )
-        if result.returncode != 0:
-            return []
-        return json.loads(result.stdout)
-    except (subprocess.TimeoutExpired, FileNotFoundError, json.JSONDecodeError):
-        return []
+    transitive = " + ".join(f"l{k}" for k in range(2, IMPACT_MAX_DEPTH + 1))
+    parts.append(
+        "RETURN [d IN l1 | {name: d.name, type: labels(d)[0]}] AS direct_dependents, "
+        f"[d IN {transitive} | {{name: d.name, type: labels(d)[0]}}] AS transitive_dependents, "
+        "size(l1) AS direct_count"
+    )
+    return "\n".join(parts)
+
+
+@contextmanager
+def _timeouts_as_tool_errors() -> Iterator[None]:
+    """Turn a Neo4j transaction timeout into a ToolError the client can act on."""
+    from neo4j.exceptions import Neo4jError
+
+    try:
+        yield
+    except Neo4jError as exc:
+        if "TransactionTimedOut" in str(getattr(exc, "code", None) or ""):
+            raise ToolError(f"query timed out after {BUILTIN_TIMEOUT_S} s; narrow the request") from exc
+        raise
+
+
+def _query(engine: GraphEngine, cypher: str, params: dict[str, Any]) -> list[dict]:
+    """Run a built-in tool's query read-only, bounded in time and rows. A
+    timeout or a row overflow becomes a ToolError the client can act on."""
+    with _timeouts_as_tool_errors():
+        rows, more = engine.run_read_cypher(cypher, params, timeout_s=BUILTIN_TIMEOUT_S, max_rows=BUILTIN_MAX_ROWS)
+    if more:
+        raise ToolError(f"query returned more than {BUILTIN_MAX_ROWS} rows; narrow the request")
+    return rows
+
+
+#: Rows a list-style built-in (find_callers, find_mentions, list_recent_changes,
+#: blame_component) reads at most; past it the envelope is truncated, with a notice.
+LIST_ROW_LIMIT = 10_000
+
+
+def _list_query(engine: GraphEngine, cypher: str, params: dict[str, Any]) -> tuple[list[dict], bool]:
+    """A list-style built-in's query (ending in `LIMIT LIST_ROW_LIMIT + 1`), read
+    only, with a timeout: its first `LIST_ROW_LIMIT` rows and whether more exist."""
+    with _timeouts_as_tool_errors():
+        return engine.run_read_cypher(cypher, params, timeout_s=BUILTIN_TIMEOUT_S, max_rows=LIST_ROW_LIMIT)
+
+
+def _capped_envelope(rows: list[Any], more: bool, max_results: int) -> dict[str, Any]:
+    """`_envelope`, marked truncated with a notice when the row cap cut the read short."""
+    envelope = _envelope(rows, max_results)
+    if more:
+        envelope["truncated"] = True
+        envelope["notice"] = (
+            f"more than {LIST_ROW_LIMIT} matches; count covers the first {LIST_ROW_LIMIT}. Narrow the request"
+        )
+    return envelope
 
 
 def _envelope(items: list[Any], max_results: int) -> dict[str, Any]:
@@ -147,7 +209,7 @@ def _resolve_recency_cutoff(engine: GraphEngine, repo_id: str, modified_within_c
     SKIP $skip
     LIMIT 1
     """
-    results = engine.run_cypher(cypher, {"repo_id": repo_id, "skip": skip})
+    results = _query(engine, cypher, {"repo_id": repo_id, "skip": skip})
     if not results:
         return None
     return results[0]["d"]
@@ -218,7 +280,7 @@ def search_component(
     if cutoff is not None:
         params["cutoff"] = cutoff
 
-    results = engine.run_cypher(cypher, params)
+    results = _query(engine, cypher, params)
     results = _rank_search_results(results, tokens)
     return _envelope(results, max_results)
 
@@ -550,7 +612,7 @@ def god_nodes(
     LIMIT 50
     """
     params = {} if cross_repo else {"repo_id": repo_id}
-    results = engine.run_cypher(cypher, params)
+    results = _query(engine, cypher, params)
     return _envelope(results, max_results)
 
 
@@ -672,7 +734,7 @@ def find_dependency_cycles(
     """
     params = {} if cross_repo else {"repo_id": repo_id}
 
-    results = engine.run_cypher(cypher, params)
+    results = _query(engine, cypher, params)
 
     cycles: dict[tuple, dict[str, Any]] = {}
     for row in results:
@@ -748,7 +810,8 @@ def find_communities(
     communities = summary["communities"]
     shown = [c["community"] for c in communities[:max(0, max_results)]]
     k = max(1, min(members_per_community, _MAX_MEMBERS_PER_COMMUNITY))
-    members = community_members(engine, repo_id, shown, k) if shown else {}
+    with _timeouts_as_tool_errors():
+        members = community_members(engine, repo_id, shown, k, timeout_s=BUILTIN_TIMEOUT_S) if shown else {}
     # Members are nested dicts, which _envelope's per-row sanitizing doesn't
     # reach, so they are sanitized here.
     rows = [
@@ -786,7 +849,9 @@ def key_nodes(
         raise ToolError(f"metric must be {' or '.join(INSIGHT_METRICS)}, not {_echo(metric)}")
     if read_insights(engine, repo_id) is None:
         raise ToolError(_INSIGHTS_NOT_COMPUTED)
-    return _envelope(top_nodes(engine, repo_id, metric_key, _KEY_NODES_LIMIT), max_results)
+    with _timeouts_as_tool_errors():
+        rows = top_nodes(engine, repo_id, metric_key, _KEY_NODES_LIMIT, timeout_s=BUILTIN_TIMEOUT_S)
+    return _envelope(rows, max_results)
 
 
 def trace_request_flow(
@@ -827,7 +892,7 @@ def trace_request_flow(
     if not cross_repo:
         params["repo_id"] = repo_id
 
-    results = engine.run_cypher(cypher, params)
+    results = _query(engine, cypher, params)
     if results:
         return results[0]
     return {"components": [], "edges": []}
@@ -864,7 +929,7 @@ def get_service_dependencies(
     if not cross_repo:
         params["repo_id"] = repo_id
 
-    results = engine.run_cypher(cypher, params)
+    results = _query(engine, cypher, params)
     if results:
         return results[0]
     return {"service": service_name, "dependencies": [], "calls": []}
@@ -905,7 +970,8 @@ def find_callers(
             filter is a no-op.
 
     Returns:
-        Dict with count, results, and truncated flag containing callers with their types and locations
+        Dict with count, results, and truncated flag containing callers with their
+        types, repo_id and file (same-named callers in different files are separate rows)
     """
     cutoff = None
     if modified_within_commits is not None:
@@ -920,8 +986,10 @@ def find_callers(
     {repo_filter}
     {class_filter}
     {recency_filter}
-    RETURN DISTINCT caller.name as name, labels(caller) as type, caller.repo_id as repo_id
-    ORDER BY caller.name
+    RETURN DISTINCT caller.name as name, labels(caller) as type, caller.repo_id as repo_id,
+           coalesce(caller.file, caller.source_file) as file
+    ORDER BY name, file
+    LIMIT {LIST_ROW_LIMIT + 1}
     """
     params = {"target_name": target_name}
     if not cross_repo:
@@ -931,8 +999,8 @@ def find_callers(
     if cutoff is not None:
         params["cutoff"] = cutoff
 
-    results = engine.run_cypher(cypher, params)
-    return _envelope(results, max_results)
+    results, more = _list_query(engine, cypher, params)
+    return _capped_envelope(results, more, max_results)
 
 
 def find_related_files(
@@ -971,7 +1039,7 @@ def find_related_files(
     if not cross_repo:
         params["repo_id"] = repo_id
 
-    results = engine.run_cypher(cypher, params)
+    results = _query(engine, cypher, params)
     if results:
         row = results[0]
         return {
@@ -1020,7 +1088,7 @@ def summarise_repository(
         service_count, module_count, class_count, function_count,
         endpoint_count, database_count, vectorstore_count, queue_count
     """
-    results = engine.run_cypher(count_cypher, {"repo_id": repo_id})
+    results = _query(engine, count_cypher, {"repo_id": repo_id})
     if results:
         return results[0]
     return {
@@ -1175,48 +1243,32 @@ def impact_analysis(
 
     Returns:
         Dict with direct_dependents and transitive_dependents wrapped as {count, results, truncated}
-        envelopes, plus risk_level (computed from true untruncated count)
+        envelopes, plus risk_level (computed from true untruncated count). Transitive
+        dependents are 2 to `IMPACT_MAX_DEPTH` hops away; a node is listed at its
+        nearest hop only, so a direct dependent is never also transitive.
     """
     repo_filter = "" if cross_repo else "WHERE n.repo_id = $repo_id"
-    dependent_filter = (
-        "" if cross_repo else "WHERE dependent IS NULL OR dependent.repo_id = $repo_id"
-    )
-    transitive_filter = (
-        "" if cross_repo else "WHERE transitive IS NULL OR transitive.repo_id = $repo_id"
-    )
     cypher = f"""
     MATCH (n {{name: $component_name}})
     {repo_filter}
-    OPTIONAL MATCH (dependent)-[:CALLS|USES|DEPENDS_ON]->(n)
-    {dependent_filter}
-    OPTIONAL MATCH (transitive)-[:CALLS|USES|DEPENDS_ON*2..]->(n)
-    {transitive_filter}
-    RETURN
-        COLLECT(DISTINCT {{name: dependent.name, type: labels(dependent)[0]}}) as direct_dependents,
-        COLLECT(DISTINCT {{name: transitive.name, type: labels(transitive)[0]}}) as transitive_dependents,
-        CASE
-            WHEN COUNT(DISTINCT dependent) > 10 THEN 'high'
-            WHEN COUNT(DISTINCT dependent) > 3 THEN 'medium'
-            ELSE 'low'
-        END as risk_level
+    WITH collect(n) AS l0
+    {_impact_expansion(cross_repo)}
     """
     params = {"component_name": component_name}
     if not cross_repo:
         params["repo_id"] = repo_id
 
-    results = engine.run_cypher(cypher, params)
-    if results:
-        row = results[0]
-        return {
-            "direct_dependents": _envelope(row["direct_dependents"], max_results),
-            "transitive_dependents": _envelope(row["transitive_dependents"], max_results),
-            "risk_level": row["risk_level"],
-        }
+    results = _query(engine, cypher, params)
+    row = results[0] if results else {"direct_dependents": [], "transitive_dependents": [], "direct_count": 0}
     return {
-        "direct_dependents": _envelope([], max_results),
-        "transitive_dependents": _envelope([], max_results),
-        "risk_level": "low",
+        "direct_dependents": _envelope(row["direct_dependents"], max_results),
+        "transitive_dependents": _envelope(row["transitive_dependents"], max_results),
+        "risk_level": _risk_level(row["direct_count"]),
     }
+
+
+def _risk_level(direct_count: int) -> str:
+    return "high" if direct_count > 10 else "medium" if direct_count > 3 else "low"
 
 
 def impact_analysis_for_diff(
@@ -1288,43 +1340,30 @@ def impact_analysis_for_diff(
     WHERE comp:Function OR comp:Class
     RETURN COLLECT(DISTINCT comp.name) as components
     """
-    comp_results = engine.run_cypher(component_cypher, {"repo_id": repo_id, "changed_files": changed_files})
+    comp_results = _query(engine, component_cypher, {"repo_id": repo_id, "changed_files": changed_files})
     changed_components = [c for c in (comp_results[0]["components"] if comp_results else []) if c is not None]
 
     if not changed_components:
         return {**empty, "changed_files": changed_files}
 
     repo_filter = "" if cross_repo else "AND n.repo_id = $repo_id"
-    dependent_filter = (
-        "" if cross_repo else "WHERE dependent IS NULL OR dependent.repo_id = $repo_id"
-    )
-    transitive_filter = (
-        "" if cross_repo else "WHERE transitive IS NULL OR transitive.repo_id = $repo_id"
-    )
     impact_cypher = f"""
     MATCH (n)
     WHERE n.name IN $changed_components
     {repo_filter}
-    OPTIONAL MATCH (dependent)-[:CALLS|USES|DEPENDS_ON]->(n)
-    {dependent_filter}
-    OPTIONAL MATCH (transitive)-[:CALLS|USES|DEPENDS_ON*2..]->(n)
-    {transitive_filter}
-    RETURN
-        COLLECT(DISTINCT {{name: dependent.name, type: labels(dependent)[0]}}) as direct_dependents,
-        COLLECT(DISTINCT {{name: transitive.name, type: labels(transitive)[0]}}) as transitive_dependents,
-        COUNT(DISTINCT dependent) as direct_count
+    WITH collect(n) AS l0
+    {_impact_expansion(cross_repo)}
     """
     params: dict[str, Any] = {"changed_components": changed_components}
     if not cross_repo:
         params["repo_id"] = repo_id
 
-    impact_results = engine.run_cypher(impact_cypher, params)
+    impact_results = _query(engine, impact_cypher, params)
     if not impact_results:
         return {**empty, "changed_files": changed_files, "changed_components": changed_components}
 
     row = impact_results[0]
-    direct_count = row["direct_count"]
-    risk_level = "high" if direct_count > 10 else "medium" if direct_count > 3 else "low"
+    risk_level = _risk_level(row["direct_count"])
 
     return {
         "changed_files": changed_files,
@@ -1363,7 +1402,7 @@ def explain_architecture(
         COLLECT(DISTINCT {endpoints: endpoint_names, calls: s.name}) as endpoints
     LIMIT 1
     """
-    results = engine.run_cypher(cypher, {"repo_id": repo_id})
+    results = _query(engine, cypher, {"repo_id": repo_id})
     if results:
         return {
             "services_and_datastores": results[0].get("services_and_datastores", []),
@@ -1405,7 +1444,7 @@ def list_services(
     """
     params = {"repo_id": repo_id}
 
-    results = engine.run_cypher(cypher, params)
+    results = _query(engine, cypher, params)
     return _envelope(results, max_results)
 
 
@@ -1443,7 +1482,7 @@ def explain_decision(
     if not cross_repo:
         params["repo_id"] = repo_id
 
-    results = engine.run_cypher(cypher, params)
+    results = _query(engine, cypher, params)
     if results:
         return results[0]
     return {"name": decision_name, "title": None, "body": None, "documents": [], "supersedes": [], "backed_by": []}
@@ -1478,7 +1517,7 @@ def find_requirements_for(
     if not cross_repo:
         params["repo_id"] = repo_id
 
-    results = engine.run_cypher(cypher, params)
+    results = _query(engine, cypher, params)
     return [_sanitize_row(r) for r in results]
 
 
@@ -1515,7 +1554,7 @@ def trace_design_rationale(
     if not cross_repo:
         params["repo_id"] = repo_id
 
-    results = engine.run_cypher(cypher, params)
+    results = _query(engine, cypher, params)
     if results:
         return _sanitize_row(results[0])
     return {"component": component_name, "requirements": [], "notes": []}
@@ -1547,12 +1586,13 @@ def blame_component(
     RETURN c.name as sha, c.message as message, c.author as author,
            c.authored_date as authored_date
     ORDER BY c.authored_date DESC
+    LIMIT {LIST_ROW_LIMIT + 1}
     """
     params = {"component_name": component_name}
     if not cross_repo:
         params["repo_id"] = repo_id
 
-    results = engine.run_cypher(cypher, params)
+    results, _more = _list_query(engine, cypher, params)  # at most LIST_ROW_LIMIT commits
     return [_sanitize_row(r) for r in results]
 
 
@@ -1566,9 +1606,9 @@ def find_related_prs(
 ) -> dict[str, Any]:
     """Find pull requests related to a component via commits that resolved issues touching it.
 
-    When the repo has PR ingestion enabled (pr_source_enabled=True), queries the
-    graph's PullRequest nodes. Otherwise, falls back to the local `gh` CLI
-    (requires `gh` on PATH and authenticated).
+    Reads the graph's PullRequest nodes. When the repository's PR ingestion is
+    off (pr_source_enabled=False) the envelope is empty, with a `notice` saying
+    how to enable it; nothing reaches the network.
 
     Args:
         engine: GraphEngine instance
@@ -1576,23 +1616,16 @@ def find_related_prs(
         component_name: Name of the Module (file) to find related PRs for
         cross_repo: If True, search across repos
         max_results: Maximum number of results to return in the envelope
-        registry: RepoRegistry, used to resolve repo_id for gh CLI fallback
+        registry: RepoRegistry, used to check whether the repository's source is on
 
     Returns:
         Dict with count, results, and truncated flag containing PullRequests linked
         (via RESOLVES on an Issue referenced by a commit that touched this component)
         to the component.
     """
-    # Try gh CLI fallback when PR ingestion is not enabled
-    if registry is not None:
-        repo = registry.get(repo_id)
-        if repo is not None and not repo.pr_source_enabled:
-            gh_repo = _resolve_gh_repo(str(repo.path))
-            if gh_repo is not None:
-                results = _gh_pr_list(gh_repo, component_name)
-                return _envelope(results, max_results)
+    if _source_off(registry, repo_id, "pr_source_enabled"):
+        return _source_off_notice(max_results, "PR", "pr-source", repo_id)
 
-    # Existing Cypher path (for repos with PR ingestion enabled)
     repo_filter = "" if cross_repo else "AND m.repo_id = $repo_id"
     cypher = f"""
     MATCH (m:Module {{name: $component_name}})
@@ -1608,7 +1641,7 @@ def find_related_prs(
     if not cross_repo:
         params["repo_id"] = repo_id
 
-    results = engine.run_cypher(cypher, params)
+    results = _query(engine, cypher, params)
     return _envelope(results, max_results)
 
 
@@ -1622,9 +1655,9 @@ def issue_history_for(
 ) -> dict[str, Any]:
     """Find issues referenced by commits that touched a component.
 
-    When the repo has issue ingestion enabled (issue_source_enabled=True), queries
-    the graph's Issue nodes. Otherwise, falls back to the local `gh` CLI
-    (requires `gh` on PATH and authenticated).
+    Reads the graph's Issue nodes. When the repository's issue ingestion is off
+    (issue_source_enabled=False) the envelope is empty, with a `notice` saying
+    how to enable it; nothing reaches the network.
 
     Args:
         engine: GraphEngine instance
@@ -1632,22 +1665,15 @@ def issue_history_for(
         component_name: Name of the Module (file) to find issue history for
         cross_repo: If True, search across repos
         max_results: Maximum number of results to return in the envelope
-        registry: RepoRegistry, used to resolve repo_id for gh CLI fallback
+        registry: RepoRegistry, used to check whether the repository's source is on
 
     Returns:
         Dict with count, results, and truncated flag containing Issues referenced
         by commits that modified this component.
     """
-    # Try gh CLI fallback when issue ingestion is not enabled
-    if registry is not None:
-        repo = registry.get(repo_id)
-        if repo is not None and not repo.issue_source_enabled:
-            gh_repo = _resolve_gh_repo(str(repo.path))
-            if gh_repo is not None:
-                results = _gh_issue_list(gh_repo, component_name)
-                return _envelope(results, max_results)
+    if _source_off(registry, repo_id, "issue_source_enabled"):
+        return _source_off_notice(max_results, "Issue", "issue-source", repo_id)
 
-    # Existing Cypher path (for repos with issue ingestion enabled)
     repo_filter = "" if cross_repo else "AND m.repo_id = $repo_id"
     cypher = f"""
     MATCH (m:Module {{name: $component_name}})
@@ -1663,7 +1689,7 @@ def issue_history_for(
     if not cross_repo:
         params["repo_id"] = repo_id
 
-    results = engine.run_cypher(cypher, params)
+    results = _query(engine, cypher, params)
     return _envelope(results, max_results)
 
 
@@ -1673,6 +1699,7 @@ def get_source(
     repo_id: str,
     component_name: str,
     cross_repo: bool = False,
+    file: str | None = None,
 ) -> dict[str, Any]:
     """Fetch a Function or Class's actual source text by reading its last-indexed line range.
 
@@ -1687,32 +1714,57 @@ def get_source(
         component_name: Name of the Function or Class to fetch source for
         cross_repo: If True, search across repos (the file is still read from
             whichever repo actually owns the matched node, via its own registry entry)
+        file: Repo-relative path of the defining file, to pick one of several
+            same-named Functions or Classes
 
     Returns:
         Dict with name, label, file, start_line, end_line, source, and
         docstring_full (when present). Empty/None fields if no match found.
+        When several nodes match, `source` is None and the dict adds
+        `status: "ambiguous"`, `count`, `truncated` and `candidates`
+        ({label, name, file}; repo_id too when cross_repo): pass one's `file`.
+        A file that is not valid UTF-8 is decoded with replacement characters
+        and the dict adds a `notice` saying so.
     """
     repo_filter = "" if cross_repo else "AND n.repo_id = $repo_id"
     cypher = f"""
     MATCH (n)
     WHERE (n:Function OR n:Class) AND n.name = $component_name
     {repo_filter}
+    AND ($file IS NULL OR n.file = $file)
     RETURN n.name as name, labels(n) as labels, n.repo_id as repo_id,
            n.file as file, n.start_line as start_line, n.end_line as end_line,
            n.docstring_full as docstring_full
-    LIMIT 1
+    ORDER BY n.repo_id, n.file, n.start_line
+    LIMIT {_DESCRIBE_MAX_CANDIDATES + 1}
     """
-    params = {"component_name": component_name}
+    params: dict[str, Any] = {"component_name": component_name, "file": file}
     if not cross_repo:
         params["repo_id"] = repo_id
 
-    results = engine.run_cypher(cypher, params)
+    results = _query(engine, cypher, params)
     empty = {
         "name": component_name, "label": None, "file": None,
         "start_line": None, "end_line": None, "source": None, "docstring_full": None,
     }
     if not results:
         return empty
+
+    def label_of(row: dict[str, Any]) -> str:
+        return next((l for l in row["labels"] if l in ("Function", "Class")), row["labels"][0])
+
+    if len(results) > 1:
+        candidates = [
+            {"label": label_of(r), "name": r["name"], "file": r["file"], **({"repo_id": r["repo_id"]} if cross_repo else {})}
+            for r in results[:_DESCRIBE_MAX_CANDIDATES]
+        ]
+        return {
+            **empty,
+            "status": "ambiguous",
+            "count": len(results),
+            "candidates": [_sanitize_row(c) for c in candidates],
+            "truncated": len(results) > _DESCRIBE_MAX_CANDIDATES,
+        }
 
     row = results[0]
     node_repo_id = row["repo_id"]
@@ -1734,23 +1786,32 @@ def get_source(
     # check above; platforms without it fall back to a plain open.
     try:
         fd = os.open(file_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-        with open(fd, encoding="utf-8") as handle:
-            lines = handle.read().splitlines()
+        with open(fd, "rb") as handle:
+            data = handle.read()
     except OSError:
         return empty
+    notice = None
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        text = data.decode("utf-8", errors="replace")
+        notice = "the file is not valid UTF-8; undecodable bytes are shown as U+FFFD"
+    lines = text.splitlines()
 
     source_text = "\n".join(lines[start_line - 1 : end_line])
-    label = next((l for l in row["labels"] if l in ("Function", "Class")), row["labels"][0])
 
-    return {
+    result = {
         "name": row["name"],
-        "label": label,
+        "label": label_of(row),
         "file": file_rel_path,
         "start_line": start_line,
         "end_line": end_line,
         "source": source_text,
         "docstring_full": row.get("docstring_full"),
     }
+    if notice is not None:
+        result["notice"] = notice
+    return result
 
 
 def find_mentions(
@@ -1794,6 +1855,7 @@ def find_mentions(
         {label_filter}
         RETURN target.name as name, labels(target) as type, target.repo_id as repo_id
         ORDER BY target.name
+        LIMIT {LIST_ROW_LIMIT + 1}
         """
     else:
         # Mentioned by: (d:Document)-[:MENTIONS]->(target {name: $name})
@@ -1805,6 +1867,7 @@ def find_mentions(
         {label_filter}
         RETURN d.name as name, labels(d) as type, d.repo_id as repo_id
         ORDER BY d.name
+        LIMIT {LIST_ROW_LIMIT + 1}
         """
 
     params = {"name": name}
@@ -1813,8 +1876,8 @@ def find_mentions(
     if not cross_repo:
         params["repo_id"] = repo_id
 
-    results = engine.run_cypher(cypher, params)
-    return _envelope(results, max_results)
+    results, more = _list_query(engine, cypher, params)
+    return _capped_envelope(results, more, max_results)
 
 
 def list_recent_changes(
@@ -1865,6 +1928,7 @@ def list_recent_changes(
     RETURN n.name as name, labels(n) as type, n.repo_id as repo_id,
            n.last_modified_at as last_modified_at
     ORDER BY n.last_modified_at DESC
+    LIMIT {LIST_ROW_LIMIT + 1}
     """
     params = {}
     if cutoff is not None:
@@ -1874,8 +1938,8 @@ def list_recent_changes(
     if entity_type is not None:
         params["entity_type"] = entity_type
 
-    results = engine.run_cypher(cypher, params)
-    return _envelope(results, max_results)
+    results, more = _list_query(engine, cypher, params)
+    return _capped_envelope(results, more, max_results)
 
 
 def run_cypher(

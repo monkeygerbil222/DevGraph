@@ -133,6 +133,9 @@ class _NoGraph:
     def run_cypher(self, query, params=None):
         return []
 
+    def run_read_cypher(self, query, params, *, timeout_s, max_rows):
+        return self.run_cypher(query, params), False
+
 
 @pytest.mark.skipif(sys.platform == "win32", reason="the fake ssh command is a POSIX shell script")
 @pytest.mark.skipif(_git_version() < (2, 44), reason="GIT_NO_LAZY_FETCH needs git 2.44 or later")

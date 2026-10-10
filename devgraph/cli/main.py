@@ -36,6 +36,7 @@ from devgraph.graph.engine import GraphEngine, provision_repository_schema
 from devgraph.indexer.dispatch import full_scan
 from devgraph.indexer.docs.extractor import index_file as index_doc_file
 from devgraph.indexer.git_history.extractor import sync_git_history
+from devgraph.indexer.walk import RepoRootUnavailable, check_repo_root, repo_root_problem
 from devgraph.paths import is_within, read_bounded
 from devgraph.registry.store import RepoRegistry
 
@@ -238,6 +239,12 @@ def rescan(
         help="Apply a changed devgraph.schema.yaml right away instead of waiting for the agent's "
         "5-minute quiet period. A CLI rescan always applies immediately; this states it explicitly.",
     ),
+    force: bool = typer.Option(
+        False, "--force",
+        help="Rescan even though the repository folder has no indexable files while the graph has files "
+        "for it, pruning them all. Without it such a rescan is refused, since that is what an unmounted "
+        "drive looks like.",
+    ),
 ) -> None:
     """Run a full re-index of a registered repository.
 
@@ -255,6 +262,10 @@ def rescan(
     A changed devgraph.schema.yaml is applied by this command immediately;
     --now says so explicitly (the agent applies it only after a quiet period).
 
+    A repository folder that is missing or unreadable is refused with a
+    non-zero exit and nothing changed; so is one with no indexable files
+    while the graph has files for it, unless --force.
+
     Args:
         repo_id: The repository ID to rescan.
     """
@@ -265,6 +276,7 @@ def rescan(
             if not repo:
                 console.print(f"[red][X] Error:[/red] no such repo_id: {escape(repo_id)}")
                 raise typer.Exit(code=1)
+            check_repo_root(repo.path)
 
             settings = get_settings()
             engine = GraphEngine(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password)
@@ -272,7 +284,10 @@ def rescan(
                 provision_repository_schema(engine, repo.path)
                 engine.upsert_repository(repo_id, repo_id, str(repo.path))
                 started = datetime.now(timezone.utc)
-                count = full_scan(engine, repo_id, repo.path, docs_path=repo.docs_path, mentions_enabled=repo.mentions_enabled)
+                count = full_scan(
+                    engine, repo_id, repo.path, docs_path=repo.docs_path, mentions_enabled=repo.mentions_enabled,
+                    force=force,
+                )
                 registry.mark_indexed(repo_id, at=started)
                 console.print(f"[green][OK][/green] Rescanned {escape(repo_id)}: {count} file(s) indexed")
 
@@ -302,6 +317,9 @@ def rescan(
             registry.close()
     except typer.Exit:
         raise
+    except RepoRootUnavailable as e:
+        console.print(f"[red][X] Error:[/red] {escape(str(e))}", soft_wrap=True)
+        raise typer.Exit(code=1)
     except Exception as e:
         console.print(f"[red][X] Error:[/red] {escape(str(e))}")
         raise typer.Exit(code=1)
@@ -952,7 +970,8 @@ def doctor() -> None:
 
     Checks Python version, the installed `mcp` package, MCP server
     importability, Neo4j reachability + schema, Podman container state, the
-    repo registry, each repository's optional `devgraph.schema.yaml`, and tray
+    repo registry, each registered repository's folder (present and
+    readable), each repository's optional `devgraph.schema.yaml`, and tray
     liveness — continuing past non-fatal failures so one run surfaces
     everything at once. Intended for bootstrap/troubleshooting moments;
     `status` stays the fast/lightweight command for quick glances.
@@ -1056,13 +1075,36 @@ def doctor() -> None:
         console.print(f"  [red][X] Registry error:[/red] {escape(str(e))}")
         any_failed = True
 
+    # 7a. Every registered repository's folder must exist and be readable: a
+    # missing one (an unmounted drive, a moved folder) is refused by every scan.
+    console.print("[bold]Repository folders[/bold]")
+    if not registered_repos:
+        console.print("  [green][OK][/green] no registered repositories to check")
+    missing_ids: set[str] = set()
+    for repo in sorted(registered_repos, key=lambda r: r.repo_id):
+        problem = repo_root_problem(repo.path)
+        subject = escape(str(repo.repo_id))
+        if problem is None:
+            console.print(f"  [green][OK][/green] {subject}: {escape(str(repo.path))}", soft_wrap=True)
+            continue
+        missing_ids.add(repo.repo_id)
+        console.print(
+            f"  [red][X] {subject}:[/red] path missing: repository folder {escape(problem)}: {escape(str(repo.path))}",
+            soft_wrap=True,
+        )
+        any_failed = True
+    # The file-based checks below would misreport a missing folder as having no
+    # schema or tools file, so they look only at the folders that are there.
+    present_repos = [r for r in registered_repos if r.repo_id not in missing_ids]
+    nothing_to_check = "no reachable repositories to check" if registered_repos else "no registered repositories to check"
+
     # 7b. Per-repository project schemas. Filesystem-only, and reuses the list
     # section 7 already read: an unreadable registry is reported once, there,
     # and leaves this section with nothing to check rather than crashing.
     console.print("[bold]Project schemas[/bold]")
-    schema_findings = _project_schema_findings(registered_repos)
+    schema_findings = _project_schema_findings(present_repos)
     if not schema_findings:
-        console.print("  [green][OK][/green] no registered repositories to check")
+        console.print(f"  [green][OK][/green] {escape(nothing_to_check)}")
     for finding in schema_findings:
         subject = escape(str(finding["repo_id"] or "conflict"))
         if finding["status"] == "disabled":
@@ -1075,7 +1117,7 @@ def doctor() -> None:
     # Markdown front-matter sources: links are checked against the graph only when it is up.
     docs_engine = GraphEngine(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password) if neo4j_reachable else None
     try:
-        docs_findings = _docs_source_findings(registered_repos, docs_engine)
+        docs_findings = _docs_source_findings(present_repos, docs_engine)
     finally:
         if docs_engine is not None:
             docs_engine.close()
@@ -1089,9 +1131,9 @@ def doctor() -> None:
             console.print(f"  [yellow][!] {subject}:[/yellow] {detail}", soft_wrap=True)
 
     console.print("[bold]Project tools[/bold]")
-    tools_findings = _project_tools_findings(registered_repos)
+    tools_findings = _project_tools_findings(present_repos)
     if not tools_findings:
-        console.print("  [green][OK][/green] no registered repositories to check")
+        console.print(f"  [green][OK][/green] {escape(nothing_to_check)}")
     for finding in tools_findings:
         subject = escape(str(finding["repo_id"]))
         if finding["failed"]:
@@ -1103,7 +1145,7 @@ def doctor() -> None:
             console.print(f"  [green][OK][/green] {subject}: {escape(finding['detail'])}")
 
     console.print("[bold]Global tools[/bold]")
-    global_findings = _global_tools_findings(registered_repos)
+    global_findings = _global_tools_findings(present_repos)
     if not global_findings:
         console.print("  [green][OK][/green] no global tools")
     for finding in global_findings:
@@ -1123,7 +1165,7 @@ def doctor() -> None:
     else:
         drift_engine = GraphEngine(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password)
         try:
-            drift = _schema_drift_findings(drift_engine, registered_repos)
+            drift = _schema_drift_findings(drift_engine, present_repos)
         finally:
             drift_engine.close()
         if not drift:
@@ -1549,8 +1591,8 @@ def info(
             console.print(f"[red][X] Error:[/red] no such repo_id: {escape(repo_id)}")
             raise typer.Exit(code=1)
 
-        # Node count from Neo4j
-        node_count = 0
+        # Node count from Neo4j; None (shown as unknown, never 0) when it can't be read.
+        node_count: int | None = None
         engine = GraphEngine(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password)
         try:
             node_count = dashboard_queries.count_nodes(engine, repo_id)
@@ -1558,6 +1600,7 @@ def info(
             pass
         finally:
             engine.close()
+        path_problem = repo_root_problem(repo.path)
 
         # Git status
         git_status: dict[str, Any] = {}
@@ -1589,6 +1632,7 @@ def info(
                 "pr_source_enabled": repo.pr_source_enabled,
                 "issue_source_enabled": repo.issue_source_enabled,
                 "node_count": node_count,
+                "path_missing": path_problem is not None,
                 "git_branch": git_status.get("branch"),
                 "uncommitted_changes": len(git_status.get("uncommitted", [])),
                 "issue": repo_issues.get(repo_id),
@@ -1596,6 +1640,8 @@ def info(
         else:
             console.print(f"\n[bold]Repository: {escape(repo.repo_id, before_tag=True)}[/bold]")
             console.print(f"  Path: {escape(str(repo.path))}")
+            if path_problem:
+                console.print(f"  [red]Path missing:[/red] repository folder {escape(path_problem)}")
             console.print(f"  Active: {'[OK]' if repo.active else '[X]'}")
             console.print(f"  Watch: {'[OK]' if repo.watch_enabled else '[X]'}")
             console.print(f"  Last indexed: {escape(str(repo.last_indexed or '-'))}")
@@ -1604,7 +1650,7 @@ def info(
             console.print(f"  Mentions: {'[OK]' if repo.mentions_enabled else '[X]'}")
             console.print(f"  PR source: {'[OK]' if repo.pr_source_enabled else '[X]'}")
             console.print(f"  Issue source: {'[OK]' if repo.issue_source_enabled else '[X]'}")
-            console.print(f"  Nodes in graph: {node_count}")
+            console.print(f"  Nodes in graph: {'unknown (Neo4j unreachable)' if node_count is None else node_count}")
             console.print(f"  Git branch: {escape(str(git_status.get('branch', '-')))}")
             uncommitted = git_status.get("uncommitted", [])
             console.print(f"  Uncommitted changes: {len(uncommitted)}")

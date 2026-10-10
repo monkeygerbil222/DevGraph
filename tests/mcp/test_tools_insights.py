@@ -33,6 +33,9 @@ class StubEngine:
         self.queries.append((query, params or {}))
         return self.rows
 
+    def run_read_cypher(self, query, params, *, timeout_s, max_rows):
+        return self.run_cypher(query, params), False
+
 
 class _Known:
     def get(self, repo_id):

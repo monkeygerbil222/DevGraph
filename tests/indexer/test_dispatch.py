@@ -1432,7 +1432,7 @@ def test_prune_skips_walked_paths_outside_the_repository(tmp_path, monkeypatch):
     outside = tmp_path / "outside.py"
     outside.write_text("y = 2\n")
     # As a junction to `outside` would be walked: linked, so keyed by its resolved target.
-    monkeypatch.setattr(walk, "_walk", lambda root: iter([(repo / "a.py", "a.py", False), (outside, "j/outside.py", True)]))
+    monkeypatch.setattr(walk, "_walk", lambda root, unreadable=None: iter([(repo / "a.py", "a.py", False), (outside, "j/outside.py", True)]))
     removed = []
     monkeypatch.setattr(dispatch, "remove_paths", lambda engine, repo_id, root, paths: removed.append(paths) or len(paths))
 

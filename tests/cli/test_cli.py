@@ -1976,3 +1976,132 @@ def test_generated_mcp_command_ignores_devgraph_package_in_working_directory(tmp
     assert safe.returncode != 0
     assert "ServiceUnavailable" in safe.stderr  # reached the real server
     assert str(workdir) not in safe.stderr
+
+
+def test_cli_rescan_refuses_a_missing_or_empty_repo_folder(runner, temp_registry_db, tmp_path, purge_registered_repos):
+    """A missing folder (a moved repo, an unmounted drive) or an empty one (a
+    mount point with nothing mounted) never wipes the repository's graph."""
+    import shutil
+
+    from devgraph.cli import main as cli_main
+    from devgraph.graph.engine import GraphEngine
+
+    db_path, registry = temp_registry_db
+    root = tmp_path / "widget"
+    root.mkdir()
+    subprocess.run(["git", "init"], cwd=root, capture_output=True, check=True)
+    (root / "widget.py").write_text("class Widget:\n    pass\n")
+    record = registry.add_repo(root)
+    repo_id, root = record.repo_id, record.path  # the registry's own (resolved) spelling
+    registry.close()
+
+    def rescan(*args):
+        with patch.object(config_module, "get_settings", return_value=_mock_settings(db_path)), \
+             patch.object(cli_main, "get_settings", return_value=_mock_settings(db_path)):
+            return runner.invoke(app, ["rescan", repo_id, *args])
+
+    engine = GraphEngine("bolt://127.0.0.1:7687", "neo4j", "devgraph-local-dev")
+
+    def nodes():
+        return engine.run_cypher("MATCH (n {repo_id: $r}) RETURN count(n) AS c", {"r": repo_id})[0]["c"]
+
+    try:
+        config_module.get_settings.cache_clear()
+        assert rescan().exit_code == 0
+        before = nodes()
+        assert before > 1
+
+        shutil.rmtree(root)
+        missing = rescan()
+        assert missing.exit_code == 1
+        assert f"repository folder not found: {root}; nothing was changed" in " ".join(missing.stdout.split())
+        assert "[OK]" not in missing.stdout
+        assert nodes() == before
+
+        root.mkdir()
+        empty = rescan()
+        assert empty.exit_code == 1
+        assert "no indexable files" in empty.stdout and "--force" in empty.stdout
+        assert nodes() == before
+
+        forced = rescan("--force")
+        assert forced.exit_code == 0, forced.stdout
+        assert nodes() < before
+    finally:
+        engine.close()
+
+
+def test_cli_doctor_fails_a_missing_repository_folder(runner, temp_registry_db, tmp_path, monkeypatch):
+    import shutil
+
+    from devgraph.config import project_switch
+
+    db_path, registry = temp_registry_db
+    monkeypatch.setattr(project_switch, "_registry_db_path", lambda: db_path)
+    present = registry.add_repo(_repo_with_schema(tmp_path, "present")).repo_id
+    gone_root = _repo_with_schema(tmp_path, "gone")
+    gone_record = registry.add_repo(gone_root)
+    gone, gone_root = gone_record.repo_id, gone_record.path  # the registry's own (resolved) spelling
+    registry.close()
+    shutil.rmtree(gone_root)
+
+    result = _doctor_with_engine(runner, db_path, _stub_engine(None))
+    collapsed = _collapsed(result.stdout)
+    assert result.exit_code == 1
+    assert f"[X] {gone}: path missing: repository folder not found: {gone_root}" in collapsed
+    assert f"[OK] {present}:" in collapsed
+    # Not misreported as a repository without a schema file, or as pending drift.
+    assert f"{gone}: no devgraph.schema.yaml" not in collapsed
+    assert f"{gone}: no devgraph.tools.yaml" not in collapsed
+    assert f"devgraph rescan {gone} --now" not in collapsed
+
+
+def _info_with_neo4j_down(runner, db_path, *args):
+    from devgraph.cli import main as cli_main
+
+    class DownEngine:
+        def __init__(self, *a, **k):
+            pass
+
+        def run_cypher(self, *a, **k):
+            from neo4j.exceptions import ServiceUnavailable
+
+            raise ServiceUnavailable("connection refused")
+
+        def close(self):
+            pass
+
+    config_module.get_settings.cache_clear()
+    with patch.object(config_module, "get_settings", return_value=_mock_settings(db_path)), \
+         patch.object(cli_main, "get_settings", return_value=_mock_settings(db_path)), \
+         patch.object(cli_main, "GraphEngine", DownEngine):
+        return runner.invoke(app, ["info", *args])
+
+
+def test_cli_info_with_neo4j_down_says_the_node_count_is_unknown(runner, temp_registry_db, temp_git_repo):
+    db_path, registry = temp_registry_db
+    repo_id = registry.add_repo(temp_git_repo).repo_id
+    registry.close()
+
+    table = _info_with_neo4j_down(runner, db_path, repo_id)
+    assert table.exit_code == 0, table.stdout
+    assert "Nodes in graph: unknown (Neo4j unreachable)" in table.stdout
+    as_json = _info_with_neo4j_down(runner, db_path, repo_id, "--json")
+    assert json.loads(as_json.stdout)["node_count"] is None
+
+
+def test_cli_doctor_with_every_repository_folder_missing_says_none_are_reachable(
+    runner, temp_registry_db, tmp_path, monkeypatch
+):
+    import shutil
+
+    from devgraph.config import project_switch
+
+    db_path, registry = temp_registry_db
+    monkeypatch.setattr(project_switch, "_registry_db_path", lambda: db_path)
+    shutil.rmtree(registry.add_repo(_repo_with_schema(tmp_path, "gone")).path)
+    registry.close()
+
+    collapsed = _collapsed(_doctor_with_engine(runner, db_path, _stub_engine(None)).stdout)
+    assert "no registered repositories to check" not in collapsed
+    assert collapsed.count("[OK] no reachable repositories to check") >= 2

@@ -46,7 +46,7 @@ Run `devgraph --help` or `devgraph <command> --help` for the complete, current i
 | Task | Command |
 |---|---|
 | Register and initially index a repository | `devgraph register [path] [--full]` |
-| Refresh source and reconcile git history | `devgraph rescan <repo_id> [--full]` |
+| Refresh source and reconcile git history | `devgraph rescan <repo_id> [--full] [--force]` |
 | Inspect registered repositories | `devgraph list`, `devgraph info <repo_id>`, `devgraph stats [repo_id]` |
 | Check installation and graph health | `devgraph status`, `devgraph doctor`, `devgraph self-test [repo_id]` |
 | Recompute communities, key nodes and bridges | `devgraph insights <repo_id>` |
@@ -65,7 +65,7 @@ Run `devgraph --help` or `devgraph <command> --help` for the complete, current i
 - **Repository isolation.** Every graph object carries a `repo_id`. MCP queries stay within that repository unless the caller explicitly opts into a cross-repository query.
 - **Session repository.** Each MCP session has a repository: `DEVGRAPH_MCP_REPO` (a repo id, or an absolute path inside a registered repository), else the registered repository containing the server's working directory. Built-in MCP tools use it when `repo_id` is omitted, and a dict response then says which repository answered. With no session repository, a call without `repo_id` fails and lists the active registered repositories; DevGraph never picks one for you. A repository registered later needs an MCP server restart. One limitation: `devgraph client-config` starts VS Code's server in the DevGraph checkout, so if that checkout is registered, an unpinned VS Code session defaults to it. Set `DEVGRAPH_MCP_REPO` to avoid that.
 - **Live updates.** Connecting an MCP client starts the tray app when needed. The watcher reindexes file and git-state changes; manual rescans remain safe and idempotent. See [Keeping up with changes](#keeping-up-with-changes).
-- **Purpose-built queries.** MCP clients should use the registered tools and the live `devgraph://tool-catalog` resource rather than relying on a hand-maintained tool count.
+- **Purpose-built queries.** MCP clients should use the registered tools and the live `devgraph://tool-catalog` resource rather than relying on a hand-maintained tool count. Built-in tools run their queries read-only with a 30-second timeout; a query that runs longer comes back as `query timed out after 30 s; narrow the request`. `impact_analysis` and `impact_analysis_for_diff` follow transitive dependents at most four hops.
 
 ### Keeping up with changes
 
@@ -77,6 +77,8 @@ While the DevGraph agent (the tray app, or the headless agent in a container) is
 - **After a git operation** (checkout, pull, merge, reset, stash), DevGraph checks the repository again a couple of seconds later, in case the operating system dropped some of the change notifications for a large checkout.
 - **Git history** (commits, the files each one changed, and each module's recency) is brought up to date right after each of those checks: after a git operation, on start or resume, and on a retry. So a commit made while DevGraph was off, or just before it was stopped or paused, is picked up when it starts again. A repository registered without `--full` gets its history the first time the agent checks it, and live updates wait until that read finishes: about a minute and a half for 400 commits, several minutes for thousands. The log says so when it starts (`Reading the git history of <repo> for the first time (N commits); live updates resume when it finishes`); registering with `--full` reads it up front instead.
 - **If an update fails** (for example Neo4j is down), DevGraph logs `Couldn't update <repo>; DevGraph will retry, or run "devgraph rescan <repo>"`, tries again 30 seconds later, and again as soon as Neo4j comes back. While it keeps failing, the warning is repeated every few minutes rather than on every attempt.
+
+- **If a repository's folder is missing or unreadable** (an unmounted drive, a moved folder), nothing in the graph is changed: `devgraph rescan` exits non-zero with `repository folder not found: <path>; nothing was changed`, the agent logs one warning and skips that repository until it restarts, and the dashboard's repository list and `devgraph doctor` mark it as path missing. A folder that exists but has no indexable files while the graph still has files for it (what a mount point with nothing mounted looks like) is refused the same way; if the files really are gone, `devgraph rescan <repo_id> --force` prunes them.
 
 While a check like this runs, the tray icon's tooltip reads `DevGraph (catching up)` and the dashboard's Entities card shows `Catching up…` instead of `Live`. The log says what it found, for example `Caught up on myrepo: 12 files updated, 3 removed (4.1 s)`. A dashboard opened in the middle of a check doesn't show it.
 
@@ -339,6 +341,8 @@ The tray app serves the dashboard at `http://127.0.0.1:8765`. It shows registere
 
 The Communities card shows each repository's subsystems (Louvain communities over dependency and containment edges), with modularity and the bridges between them; the god-node list ranks by PageRank over dependency edges once these are computed (CALLS edges are resolved by name, so widely used generic method names such as get or close can rank high). A canvas toggle colors nodes by community. DevGraph computes all of this itself — no Neo4j plugin — and the agent refreshes it after indexing; `devgraph insights <repo_id>` recomputes on demand.
 
+The page loads no script from the network: Cytoscape.js is vendored in the package (see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)), so the dashboard works offline.
+
 The service binds to loopback and has no authentication because it is intended as a single-user local tool. The browser never receives Neo4j credentials; graph queries run through the FastAPI backend. Use `DEVGRAPH_DASHBOARD_ENABLED=false` to disable it or `DEVGRAPH_DASHBOARD_PORT` to choose another port.
 
 Because there is no authentication, the dashboard answers only requests addressed to the local machine: the `Host` header must name `127.0.0.1`, `localhost`, `[::1]`, or the configured `DEVGRAPH_DASHBOARD_HOST`; anything else gets `403 host not allowed`. This stops a web page from reaching the dashboard through DNS rebinding (re-pointing its own domain at 127.0.0.1). A wildcard bind (`0.0.0.0` or `::`) does not widen this list; to reach the dashboard by a LAN address, set `DEVGRAPH_DASHBOARD_HOST` to that address rather than a wildcard. Registering a repository, saving a layout, running console Cypher, and Config page writes additionally refuse cross-origin browser requests. The tray menu and `devgraph dashboard` link a wildcard bind to its loopback address (`http://127.0.0.1:<port>`, or `http://[::1]:<port>` for `::`, which binds IPv6-only).
@@ -388,7 +392,7 @@ The Database & memory card samples Neo4j every 15 seconds and keeps the last hou
 - `devgraph pr-source` and `devgraph issue-source` control the explicit opt-ins for external PR and issue ingestion.
 - `devgraph index-history` initializes or manually refreshes local commit history; after initialization, the watcher reconciles history automatically when git state changes.
 
-External PR and issue ingestion remains opt-in and requires a configured source. Enabling its registry flag does not itself contact a remote service.
+External PR and issue ingestion remains opt-in and requires a configured source. Enabling its registry flag does not itself contact a remote service. While a repository's source is off, `find_related_prs` and `issue_history_for` return an empty result with a `notice` naming the command that enables it; they never fall back to `gh` or any other network call.
 
 ## Containerized deployment
 

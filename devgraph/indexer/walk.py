@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import os
+import stat
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -62,6 +63,59 @@ IGNORED_DIR_NAMES = {
 }
 
 
+class RepoRootUnavailable(Exception):
+    """A repository's root folder is missing, not a folder, or unreadable (an
+    unmounted drive, a moved folder). Every scan entry point raises it before
+    changing anything: walking such a root finds no files, and pruning
+    against that would wipe the repository's graph."""
+
+    def __init__(self, path: Path, problem: str, message: str | None = None) -> None:
+        self.path = Path(path)
+        self.problem = problem
+        super().__init__(message or f"repository folder {problem}: {path}; nothing was changed")
+
+
+class RepoRootEmpty(RepoRootUnavailable):
+    """The root folder exists but holds no indexable file while the graph has
+    files for it: what a mount point with nothing mounted looks like. Refused
+    unless the caller forces it."""
+
+    def __init__(self, path: Path, repo_id: str, graph_files: int) -> None:
+        super().__init__(
+            path,
+            "empty",
+            f"repository folder has no indexable files but the graph has {graph_files} for it "
+            f"(an unmounted drive?): {path}; nothing was changed. If the files really are gone, "
+            f"run `devgraph rescan {repo_id} --force`",
+        )
+
+
+def repo_root_problem(repo_root: Path) -> str | None:
+    """Why `repo_root` can't be scanned ("not found", "not a folder", "not
+    readable"), or None when it is a readable folder."""
+    try:
+        is_dir = stat.S_ISDIR(os.stat(repo_root).st_mode)
+    except (FileNotFoundError, NotADirectoryError):
+        return "not found"
+    except OSError:
+        return "not readable"
+    if not is_dir:
+        return "not a folder"
+    try:
+        with os.scandir(repo_root) as entries:
+            next(entries, None)
+    except OSError:
+        return "not readable"
+    return None
+
+
+def check_repo_root(repo_root: Path) -> None:
+    """Raise `RepoRootUnavailable` unless `repo_root` is a readable folder."""
+    problem = repo_root_problem(repo_root)
+    if problem is not None:
+        raise RepoRootUnavailable(repo_root, problem)
+
+
 def is_ignored_dir_name(name: str) -> bool:
     return name in IGNORED_DIR_NAMES or name.endswith(".egg-info")
 
@@ -94,7 +148,9 @@ def indexable_paths_under(repo_root: Path, directory: Path) -> set[Path]:
     return {path for path, _, _ in _walk(repo_root, directory)}
 
 
-def keyed_indexable_paths(repo_root: Path, *, keep_ignored_targets: bool = False) -> list[tuple[Path, str]]:
+def keyed_indexable_paths(
+    repo_root: Path, *, keep_ignored_targets: bool = False, unreadable: list[str] | None = None
+) -> list[tuple[Path, str]]:
     """Each of `indexable_paths` with its `repo_relative` key, leaving out one
     whose key is under an ignored directory (a symlink into one) unless
     `keep_ignored_targets`, as `prune_stale_files` needs: `index_paths` keys
@@ -103,10 +159,13 @@ def keyed_indexable_paths(repo_root: Path, *, keep_ignored_targets: bool = False
     The root is resolved once. A file is keyed lexically unless it, or a
     directory above it, is a link; only those are resolved, so a symlink is
     still keyed by its target.
+
+    `unreadable`, when given, collects each folder that could not be listed,
+    as `_walk` reports it.
     """
     root = repo_root.resolve()
     keyed = []
-    for path, rel, linked in _walk(repo_root):
+    for path, rel, linked in _walk(repo_root, unreadable=unreadable):
         if linked:
             try:
                 rel = path.resolve().relative_to(root).as_posix()
@@ -118,7 +177,9 @@ def keyed_indexable_paths(repo_root: Path, *, keep_ignored_targets: bool = False
     return keyed
 
 
-def _walk(repo_root: Path, start: Path | None = None) -> Iterator[tuple[Path, str, bool]]:
+def _walk(
+    repo_root: Path, start: Path | None = None, unreadable: list[str] | None = None
+) -> Iterator[tuple[Path, str, bool]]:
     """(path, lexical repo-relative POSIX path, whether a link is on the way)
     for every indexable file: what `repo_root.rglob("*")` filtered by
     `is_indexable_file`, `is_ignored_path` and `links_outside` gives, without
@@ -130,6 +191,10 @@ def _walk(repo_root: Path, start: Path | None = None) -> Iterator[tuple[Path, st
 
     `start`, a directory lexically under repo_root, walks only that subtree
     under the same rules, judged relative to repo_root.
+
+    A folder that can't be listed is skipped; when `unreadable` is given, its
+    lexical repo-relative prefix (`pkg/`, or "" for the root) is appended, so a
+    caller can tell "no files here" from "couldn't look".
     """
     if is_ignored_path(repo_root):
         return
@@ -154,6 +219,8 @@ def _walk(repo_root: Path, start: Path | None = None) -> Iterator[tuple[Path, st
             with os.scandir(directory) as it:
                 entries = list(it)
         except OSError:
+            if unreadable is not None:
+                unreadable.append(prefix)
             continue
         for entry in entries:
             if is_ignored_dir_name(entry.name):

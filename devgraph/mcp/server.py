@@ -583,7 +583,8 @@ def build_server(
         scope_to_class: str | None = None,
         modified_within_commits: int | None = None,
     ) -> dict[str, Any]:
-        """Find all callers of a target; returns {count, results, truncated}. CALLS is
+        """Find all callers of a target; returns {count, results, truncated}, each caller
+        with its name, type, repo_id and file. CALLS is
         name-based, not type-resolved — pass scope_to_class to narrow to callers made
         from within a specific class's own methods and cut noise from unrelated
         same-named methods elsewhere in the repo. Pass modified_within_commits to
@@ -622,7 +623,9 @@ def build_server(
 
     @server.tool(annotations=_READ_ONLY)
     def impact_analysis(repo_id: str, component_name: str, cross_repo: bool = False, max_results: int = 15) -> dict[str, Any]:
-        """Analyze component impact; dependents wrapped in {count, results, truncated} envelopes."""
+        """Analyze component impact: direct dependents (one CALLS/USES/DEPENDS_ON hop) and
+        transitive ones (two to four hops; further ones are not followed). Dependents
+        wrapped in {count, results, truncated} envelopes."""
         return devgraph_tools.impact_analysis(engine, repo_id, component_name, cross_repo, max_results)
 
     @server.tool(annotations=_READ_ONLY)
@@ -636,8 +639,9 @@ def build_server(
         """Analyze the combined impact of every component changed between two git refs
         (e.g. a PR's base/head branches). Composes a local git diff with the same
         dependent-tracing impact_analysis uses, across every changed component at once.
-        Both refs must already exist locally — never fetches from a remote. Dependents
-        wrapped in {count, results, truncated} envelopes."""
+        Both refs must already exist locally — never fetches from a remote. Transitive
+        dependents stop at four hops. Dependents wrapped in {count, results, truncated}
+        envelopes."""
         return devgraph_tools.impact_analysis_for_diff(
             engine, registry, repo_id, base_ref, head_ref, cross_repo, max_results
         )
@@ -689,22 +693,29 @@ def build_server(
 
     @server.tool(annotations=_READ_ONLY)
     def find_related_prs(repo_id: str, component_name: str, cross_repo: bool = False, max_results: int = 15) -> dict[str, Any]:
-        """Find related PRs; returns {count, results, truncated}. Falls back to gh CLI
-        when PR ingestion is not configured."""
+        """Find related PRs; returns {count, results, truncated}. With the repository's PR
+        ingestion off, the envelope is empty and a `notice` says how to enable it (never
+        contacts the network)."""
         return devgraph_tools.find_related_prs(engine, repo_id, component_name, cross_repo, max_results, registry)
 
     @server.tool(annotations=_READ_ONLY)
     def issue_history_for(repo_id: str, component_name: str, cross_repo: bool = False, max_results: int = 15) -> dict[str, Any]:
-        """Find issue history; returns {count, results, truncated}. Falls back to gh CLI
-        when issue ingestion is not configured."""
+        """Find issue history; returns {count, results, truncated}. With the repository's
+        issue ingestion off, the envelope is empty and a `notice` says how to enable it
+        (never contacts the network)."""
         return devgraph_tools.issue_history_for(engine, repo_id, component_name, cross_repo, max_results, registry)
 
     @server.tool(annotations=_READ_ONLY)
-    def get_source(repo_id: str, component_name: str, cross_repo: bool = False) -> dict[str, Any]:
+    def get_source(
+        repo_id: str, component_name: str, cross_repo: bool = False, file: str | None = None
+    ) -> dict[str, Any]:
         """Fetch a Function or Class's actual source text and full docstring (when present),
         using the graph's last-indexed line range. Reads live from disk — rescan first if
-        the file may have changed since the last index."""
-        return devgraph_tools.get_source(engine, registry, repo_id, component_name, cross_repo)
+        the file may have changed since the last index. When several nodes share the name,
+        returns status "ambiguous" with candidates ({label, name, file}) instead of
+        picking one: pass file (repo-relative path) to choose. A file that is not valid
+        UTF-8 is decoded with replacement characters, and a notice says so."""
+        return devgraph_tools.get_source(engine, registry, repo_id, component_name, cross_repo, file)
 
     @server.tool(annotations=_READ_ONLY)
     def describe_node(

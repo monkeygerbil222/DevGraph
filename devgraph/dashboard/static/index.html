@@ -1,6 +1,6 @@
 <!doctype html>
 <html lang="en">
-<head><script type="application/json" data-od-external-dependencies>["https://unpkg.com/cytoscape@3.30.2/dist/cytoscape.min.js"]</script>
+<head><script type="application/json" data-od-external-dependencies>[]</script>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>DevGraph · Live Dashboard</title>
@@ -844,7 +844,7 @@ table.dstable input[type="text"] { width: 100%; }
 <div id="tooltipBubble"></div>
 <div id="gitHoverCard"></div>
 
-<script src="https://unpkg.com/cytoscape@3.30.2/dist/cytoscape.min.js"></script>
+<script src="/static/vendor/cytoscape-3.30.2.min.js"></script>
 <script>
 /* ── global fixed tooltip (not clipped by scroll containers) ─────── */
 const tip = document.getElementById("tooltipBubble");
@@ -2777,13 +2777,16 @@ async function populateRealRepos(fireChangeEvent) {
   const json = await resp.json();
   const ids = (json.repos || []).filter(r => r.active).map(r => r.repo_id).sort();
   if (!ids.length) return;
+  // A repo whose folder is missing (an unmounted drive, a moved folder)
+  // keeps its graph -- every scan refuses it -- so it stays selectable, flagged.
+  const missing = new Set((json.repos || []).filter(r => r.path_missing).map(r => r.repo_id));
   const select = document.getElementById("repoSelect");
   // A saved repo (from a prior reload) wins over whatever the select's
   // current value happens to be -- on first boot that's just the static
   // markup's default option, not a real user choice.
   const saved = localStorage.getItem(SELECTED_REPO_KEY);
   const current = saved || select.value;
-  select.innerHTML = '<option value="__all__">All Repos</option>' + ids.map(id => `<option value="${escapeHtmlVal(id)}">${escapeHtmlVal(id)}</option>`).join("");
+  select.innerHTML = '<option value="__all__">All Repos</option>' + ids.map(id => `<option value="${escapeHtmlVal(id)}">${escapeHtmlVal(id)}${missing.has(id) ? " (path missing)" : ""}</option>`).join("");
   select.value = (current === "__all__" || ids.includes(current)) ? current : (ids.includes("devgraph") ? "devgraph" : ids[0]);
   select.themeRefresh?.();
   // Boot passes fireChangeEvent:false and does its own explicit, awaited

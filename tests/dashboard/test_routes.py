@@ -99,6 +99,23 @@ def test_list_repos(client):
     assert repo_a["node_count"] >= 4  # 2 services + 1 module + 1 class
 
 
+def test_list_repos_marks_a_missing_repository_folder(seeded_graph, registry, tmp_path):
+    present, gone = tmp_path / "a", tmp_path / "b"
+    for path in (present, gone):
+        path.mkdir()
+        _init_git_repo(path)
+    registry.add_repo(present, repo_id="dash_repo_a")
+    gone = registry.add_repo(gone, repo_id="dash_repo_b").path  # the registry's own (resolved) spelling
+    import shutil
+
+    shutil.rmtree(gone)
+    client = TestClient(build_app(seeded_graph, registry, EventBroadcaster()), base_url="http://127.0.0.1")
+    repos = {r["repo_id"]: r for r in client.get("/api/repos").json()["repos"]}
+    assert repos["dash_repo_a"]["path_missing"] is False
+    assert repos["dash_repo_b"]["path_missing"] is True
+    assert repos["dash_repo_b"]["issue"] == f"path missing: repository folder not found: {gone}"
+
+
 def test_summary_counts_known_seeded_data(client):
     res = client.get("/api/repos/dash_repo_a/summary")
     assert res.status_code == 200
