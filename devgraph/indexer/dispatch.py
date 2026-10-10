@@ -700,10 +700,8 @@ def index_paths(
             )
         except EngineClosed:
             raise  # shutdown: leave the work, and its stamp, for the next start
-        except Exception:
-            logger.warning(
-                "indexing failed for %s (%s); skipping file", repo_id, rel_path, exc_info=True
-            )
+        except Exception as exc:
+            _log_file_failure("indexing failed", repo_id, rel_path, exc)
 
     # What the batch's files produced before this run, so the referrer step
     # below can tell which nodes the batch adds.
@@ -880,8 +878,8 @@ def index_paths(
             index_doc_file(engine, repo_id, path, repo_root)
         except EngineClosed:
             raise  # shutdown: leave the work, and its stamp, for the next start
-        except Exception:
-            logger.warning("docs edge pass failed for %s (%s); skipping file", repo_id, path, exc_info=True)
+        except Exception as exc:
+            _log_file_failure("docs edge pass failed", repo_id, path, exc)
 
     # Mentions run last: unlike every other extractor, mention extraction
     # reads the graph (the set of known entity names) to decide what a
@@ -893,8 +891,8 @@ def index_paths(
             index_mentions_file(engine, repo_id, path, repo_root, ambiguous_mode=get_settings().mentions_ambiguous_mode)
         except EngineClosed:
             raise  # shutdown: leave the work, and its stamp, for the next start
-        except Exception:
-            logger.warning("mentions pass failed for %s (%s); skipping file", repo_id, path, exc_info=True)
+        except Exception as exc:
+            _log_file_failure("mentions pass failed", repo_id, path, exc)
     added_names = {name for _label, name in added_nodes}
     for path in mention_relinks:
         try:
@@ -903,10 +901,17 @@ def index_paths(
             )
         except EngineClosed:
             raise  # shutdown: leave the work, and its stamp, for the next start
-        except Exception:
-            logger.warning("mentions relink failed for %s (%s); skipping file", repo_id, path, exc_info=True)
+        except Exception as exc:
+            _log_file_failure("mentions relink failed", repo_id, path, exc)
 
     return indexed
+
+
+def _log_file_failure(what: str, repo_id: str, path: object, exc: Exception) -> None:
+    """One line for a file the batch skips (a locked or unparseable file is
+    not a crash); the traceback only at debug level."""
+    logger.warning("%s for %s (%s); skipping file: %s: %s", what, repo_id, path, type(exc).__name__, exc)
+    logger.debug("%s for %s (%s)", what, repo_id, path, exc_info=exc)
 
 
 _MARKDOWN_SUFFIXES = (".md", ".markdown")
