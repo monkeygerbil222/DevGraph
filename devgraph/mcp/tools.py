@@ -10,9 +10,7 @@ query strings.
 
 from typing import Any
 
-import json
 import os
-import subprocess
 
 # The SDK passes a ToolError's text to the client and hides any other exception's.
 from mcp.server.mcpserver.exceptions import ToolError
@@ -82,38 +80,25 @@ def _resolve_gh_repo(repo_path: str) -> str | None:
         repo.close()
         if "github.com" not in remote_url:
             return None
-        slug = remote_url.rstrip(".git").split("github.com")[-1].lstrip(":/")
+        slug = remote_url.removesuffix(".git").split("github.com")[-1].lstrip(":/")
         return slug if "/" in slug else None
     except Exception:
         return None
 
-def _gh_pr_list(gh_repo: str, search: str, timeout: int = 10) -> list[dict]:
-    """Shell out to gh CLI to list PRs matching a search term.
-    Returns empty list on any failure (gh missing, not authenticated, timeout)."""
-    try:
-        result = subprocess.run(
-            ["gh", "pr", "list", "--repo", gh_repo, "--json", "number,title,state,url", "--search", search],
-            capture_output=True, text=True, timeout=timeout,
-        )
-        if result.returncode != 0:
-            return []
-        return json.loads(result.stdout)
-    except (subprocess.TimeoutExpired, FileNotFoundError, json.JSONDecodeError):
-        return []
 
-def _gh_issue_list(gh_repo: str, search: str, timeout: int = 10) -> list[dict]:
-    """Shell out to gh CLI to list issues matching a search term.
-    Returns empty list on any failure."""
-    try:
-        result = subprocess.run(
-            ["gh", "issue", "list", "--repo", gh_repo, "--json", "number,title,state,url", "--search", search],
-            capture_output=True, text=True, timeout=timeout,
-        )
-        if result.returncode != 0:
-            return []
-        return json.loads(result.stdout)
-    except (subprocess.TimeoutExpired, FileNotFoundError, json.JSONDecodeError):
-        return []
+def _source_off(registry: RepoRegistry | None, repo_id: str, flag: str) -> bool:
+    """Whether `repo_id` is registered with its PR or issue source (`flag`) off."""
+    repo = registry.get(repo_id) if registry is not None else None
+    return repo is not None and not getattr(repo, flag)
+
+
+def _source_off_notice(max_results: int, what: str, command: str, repo_id: str) -> dict[str, Any]:
+    """An empty envelope saying how to turn the repository's source on. Never
+    falls back to the network (no `gh`, no API call)."""
+    return {
+        **_envelope([], max_results),
+        "notice": f"{what} ingestion is off for {repo_id}; enable it with `devgraph {command} {repo_id} enable`",
+    }
 
 
 #: How long a built-in tool's query may run before it is cancelled.
@@ -1597,9 +1582,9 @@ def find_related_prs(
 ) -> dict[str, Any]:
     """Find pull requests related to a component via commits that resolved issues touching it.
 
-    When the repo has PR ingestion enabled (pr_source_enabled=True), queries the
-    graph's PullRequest nodes. Otherwise, falls back to the local `gh` CLI
-    (requires `gh` on PATH and authenticated).
+    Reads the graph's PullRequest nodes. When the repository's PR ingestion is
+    off (pr_source_enabled=False) the envelope is empty, with a `notice` saying
+    how to enable it; nothing reaches the network.
 
     Args:
         engine: GraphEngine instance
@@ -1607,23 +1592,16 @@ def find_related_prs(
         component_name: Name of the Module (file) to find related PRs for
         cross_repo: If True, search across repos
         max_results: Maximum number of results to return in the envelope
-        registry: RepoRegistry, used to resolve repo_id for gh CLI fallback
+        registry: RepoRegistry, used to check whether the repository's source is on
 
     Returns:
         Dict with count, results, and truncated flag containing PullRequests linked
         (via RESOLVES on an Issue referenced by a commit that touched this component)
         to the component.
     """
-    # Try gh CLI fallback when PR ingestion is not enabled
-    if registry is not None:
-        repo = registry.get(repo_id)
-        if repo is not None and not repo.pr_source_enabled:
-            gh_repo = _resolve_gh_repo(str(repo.path))
-            if gh_repo is not None:
-                results = _gh_pr_list(gh_repo, component_name)
-                return _envelope(results, max_results)
+    if _source_off(registry, repo_id, "pr_source_enabled"):
+        return _source_off_notice(max_results, "PR", "pr-source", repo_id)
 
-    # Existing Cypher path (for repos with PR ingestion enabled)
     repo_filter = "" if cross_repo else "AND m.repo_id = $repo_id"
     cypher = f"""
     MATCH (m:Module {{name: $component_name}})
@@ -1653,9 +1631,9 @@ def issue_history_for(
 ) -> dict[str, Any]:
     """Find issues referenced by commits that touched a component.
 
-    When the repo has issue ingestion enabled (issue_source_enabled=True), queries
-    the graph's Issue nodes. Otherwise, falls back to the local `gh` CLI
-    (requires `gh` on PATH and authenticated).
+    Reads the graph's Issue nodes. When the repository's issue ingestion is off
+    (issue_source_enabled=False) the envelope is empty, with a `notice` saying
+    how to enable it; nothing reaches the network.
 
     Args:
         engine: GraphEngine instance
@@ -1663,22 +1641,15 @@ def issue_history_for(
         component_name: Name of the Module (file) to find issue history for
         cross_repo: If True, search across repos
         max_results: Maximum number of results to return in the envelope
-        registry: RepoRegistry, used to resolve repo_id for gh CLI fallback
+        registry: RepoRegistry, used to check whether the repository's source is on
 
     Returns:
         Dict with count, results, and truncated flag containing Issues referenced
         by commits that modified this component.
     """
-    # Try gh CLI fallback when issue ingestion is not enabled
-    if registry is not None:
-        repo = registry.get(repo_id)
-        if repo is not None and not repo.issue_source_enabled:
-            gh_repo = _resolve_gh_repo(str(repo.path))
-            if gh_repo is not None:
-                results = _gh_issue_list(gh_repo, component_name)
-                return _envelope(results, max_results)
+    if _source_off(registry, repo_id, "issue_source_enabled"):
+        return _source_off_notice(max_results, "Issue", "issue-source", repo_id)
 
-    # Existing Cypher path (for repos with issue ingestion enabled)
     repo_filter = "" if cross_repo else "AND m.repo_id = $repo_id"
     cypher = f"""
     MATCH (m:Module {{name: $component_name}})

@@ -692,14 +692,16 @@ def build_server(
 
     @server.tool(annotations=_READ_ONLY)
     def find_related_prs(repo_id: str, component_name: str, cross_repo: bool = False, max_results: int = 15) -> dict[str, Any]:
-        """Find related PRs; returns {count, results, truncated}. Falls back to gh CLI
-        when PR ingestion is not configured."""
+        """Find related PRs; returns {count, results, truncated}. With the repository's PR
+        ingestion off, the envelope is empty and a `notice` says how to enable it (never
+        contacts the network)."""
         return devgraph_tools.find_related_prs(engine, repo_id, component_name, cross_repo, max_results, registry)
 
     @server.tool(annotations=_READ_ONLY)
     def issue_history_for(repo_id: str, component_name: str, cross_repo: bool = False, max_results: int = 15) -> dict[str, Any]:
-        """Find issue history; returns {count, results, truncated}. Falls back to gh CLI
-        when issue ingestion is not configured."""
+        """Find issue history; returns {count, results, truncated}. With the repository's
+        issue ingestion off, the envelope is empty and a `notice` says how to enable it
+        (never contacts the network)."""
         return devgraph_tools.issue_history_for(engine, repo_id, component_name, cross_repo, max_results, registry)
 
     @server.tool(annotations=_READ_ONLY)

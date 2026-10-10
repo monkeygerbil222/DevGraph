@@ -390,7 +390,7 @@ The Database & memory card samples Neo4j every 15 seconds and keeps the last hou
 - `devgraph pr-source` and `devgraph issue-source` control the explicit opt-ins for external PR and issue ingestion.
 - `devgraph index-history` initializes or manually refreshes local commit history; after initialization, the watcher reconciles history automatically when git state changes.
 
-External PR and issue ingestion remains opt-in and requires a configured source. Enabling its registry flag does not itself contact a remote service.
+External PR and issue ingestion remains opt-in and requires a configured source. Enabling its registry flag does not itself contact a remote service. While a repository's source is off, `find_related_prs` and `issue_history_for` return an empty result with a `notice` naming the command that enables it; they never fall back to `gh` or any other network call.
 
 ## Containerized deployment
 
