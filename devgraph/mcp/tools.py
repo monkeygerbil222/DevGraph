@@ -115,6 +115,36 @@ BUILTIN_MAX_ROWS = 100_000
 IMPACT_MAX_DEPTH = 4
 
 
+def _impact_expansion(cross_repo: bool) -> str:
+    """Cypher continuing from `WITH collect(n) AS l0` (the changed nodes): one
+    CALL per hop collecting the distinct nodes with a CALLS/USES/DEPENDS_ON edge
+    into the previous hop's nodes, never one seen at an earlier hop, then
+    returning `direct_dependents` (hop 1), `transitive_dependents` (hops 2 to
+    `IMPACT_MAX_DEPTH`) and `direct_count`.
+
+    Expanding distinct nodes hop by hop does work proportional to the nodes
+    and edges within reach; a variable-length path enumerates every path, which
+    times out on a common name like `get` in a real repository.
+    """
+    scope = "" if cross_repo else "AND d.repo_id = $repo_id"
+    parts = []
+    for hop in range(1, IMPACT_MAX_DEPTH + 1):
+        seen = [f"l{k}" for k in range(hop)]
+        parts.append(
+            f"CALL ({', '.join(seen)}) {{ UNWIND l{hop - 1} AS m "
+            f"MATCH (d)-[:CALLS|USES|DEPENDS_ON]->(m) WHERE true {scope} "
+            f"AND {' AND '.join(f'NOT d IN {s}' for s in seen)} "
+            f"RETURN collect(DISTINCT d) AS l{hop} }}"
+        )
+    transitive = " + ".join(f"l{k}" for k in range(2, IMPACT_MAX_DEPTH + 1))
+    parts.append(
+        "RETURN [d IN l1 | {name: d.name, type: labels(d)[0]}] AS direct_dependents, "
+        f"[d IN {transitive} | {{name: d.name, type: labels(d)[0]}}] AS transitive_dependents, "
+        "size(l1) AS direct_count"
+    )
+    return "\n".join(parts)
+
+
 def _query(engine: GraphEngine, cypher: str, params: dict[str, Any]) -> list[dict]:
     """Run a built-in tool's query read-only, bounded in time and rows. A
     timeout or a row overflow becomes a ToolError the client can act on."""
@@ -1193,48 +1223,31 @@ def impact_analysis(
     Returns:
         Dict with direct_dependents and transitive_dependents wrapped as {count, results, truncated}
         envelopes, plus risk_level (computed from true untruncated count). Transitive
-        dependents are 2 to `IMPACT_MAX_DEPTH` hops away.
+        dependents are 2 to `IMPACT_MAX_DEPTH` hops away; a node is listed at its
+        nearest hop only, so a direct dependent is never also transitive.
     """
     repo_filter = "" if cross_repo else "WHERE n.repo_id = $repo_id"
-    dependent_filter = (
-        "" if cross_repo else "WHERE dependent IS NULL OR dependent.repo_id = $repo_id"
-    )
-    transitive_filter = (
-        "" if cross_repo else "WHERE transitive IS NULL OR transitive.repo_id = $repo_id"
-    )
     cypher = f"""
     MATCH (n {{name: $component_name}})
     {repo_filter}
-    OPTIONAL MATCH (dependent)-[:CALLS|USES|DEPENDS_ON]->(n)
-    {dependent_filter}
-    OPTIONAL MATCH (transitive)-[:CALLS|USES|DEPENDS_ON*2..{IMPACT_MAX_DEPTH}]->(n)
-    {transitive_filter}
-    RETURN
-        COLLECT(DISTINCT {{name: dependent.name, type: labels(dependent)[0]}}) as direct_dependents,
-        COLLECT(DISTINCT {{name: transitive.name, type: labels(transitive)[0]}}) as transitive_dependents,
-        CASE
-            WHEN COUNT(DISTINCT dependent) > 10 THEN 'high'
-            WHEN COUNT(DISTINCT dependent) > 3 THEN 'medium'
-            ELSE 'low'
-        END as risk_level
+    WITH collect(n) AS l0
+    {_impact_expansion(cross_repo)}
     """
     params = {"component_name": component_name}
     if not cross_repo:
         params["repo_id"] = repo_id
 
     results = _query(engine, cypher, params)
-    if results:
-        row = results[0]
-        return {
-            "direct_dependents": _envelope(row["direct_dependents"], max_results),
-            "transitive_dependents": _envelope(row["transitive_dependents"], max_results),
-            "risk_level": row["risk_level"],
-        }
+    row = results[0] if results else {"direct_dependents": [], "transitive_dependents": [], "direct_count": 0}
     return {
-        "direct_dependents": _envelope([], max_results),
-        "transitive_dependents": _envelope([], max_results),
-        "risk_level": "low",
+        "direct_dependents": _envelope(row["direct_dependents"], max_results),
+        "transitive_dependents": _envelope(row["transitive_dependents"], max_results),
+        "risk_level": _risk_level(row["direct_count"]),
     }
+
+
+def _risk_level(direct_count: int) -> str:
+    return "high" if direct_count > 10 else "medium" if direct_count > 3 else "low"
 
 
 def impact_analysis_for_diff(
@@ -1313,24 +1326,12 @@ def impact_analysis_for_diff(
         return {**empty, "changed_files": changed_files}
 
     repo_filter = "" if cross_repo else "AND n.repo_id = $repo_id"
-    dependent_filter = (
-        "" if cross_repo else "WHERE dependent IS NULL OR dependent.repo_id = $repo_id"
-    )
-    transitive_filter = (
-        "" if cross_repo else "WHERE transitive IS NULL OR transitive.repo_id = $repo_id"
-    )
     impact_cypher = f"""
     MATCH (n)
     WHERE n.name IN $changed_components
     {repo_filter}
-    OPTIONAL MATCH (dependent)-[:CALLS|USES|DEPENDS_ON]->(n)
-    {dependent_filter}
-    OPTIONAL MATCH (transitive)-[:CALLS|USES|DEPENDS_ON*2..{IMPACT_MAX_DEPTH}]->(n)
-    {transitive_filter}
-    RETURN
-        COLLECT(DISTINCT {{name: dependent.name, type: labels(dependent)[0]}}) as direct_dependents,
-        COLLECT(DISTINCT {{name: transitive.name, type: labels(transitive)[0]}}) as transitive_dependents,
-        COUNT(DISTINCT dependent) as direct_count
+    WITH collect(n) AS l0
+    {_impact_expansion(cross_repo)}
     """
     params: dict[str, Any] = {"changed_components": changed_components}
     if not cross_repo:
@@ -1341,8 +1342,7 @@ def impact_analysis_for_diff(
         return {**empty, "changed_files": changed_files, "changed_components": changed_components}
 
     row = impact_results[0]
-    direct_count = row["direct_count"]
-    risk_level = "high" if direct_count > 10 else "medium" if direct_count > 3 else "low"
+    risk_level = _risk_level(row["direct_count"])
 
     return {
         "changed_files": changed_files,

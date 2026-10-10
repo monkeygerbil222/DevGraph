@@ -114,3 +114,104 @@ def test_a_timeout_reaches_the_client_as_a_tool_error(tmp_path, monkeypatch):
     assert content.text == (
         f"Error executing tool impact_analysis: query timed out after {tools.BUILTIN_TIMEOUT_S} s; narrow the request"
     )
+
+
+#: The hub fixture: layers of callers above `HUBS` same-named `get` functions.
+WIDTH, DEPTH, HUBS, FAN = 200, 5, 20, 5
+
+
+@pytest.fixture
+def hub(engine):
+    """`HUBS` functions all named `get`, each called by every node of layer 1;
+    every node of layer k+1 calls `FAN` random nodes of layer k (seeded). The
+    shape of a common name in a real repository: few distinct dependents, very
+    many paths to them. Yields the repo id and each dependent's hop distance."""
+    import random
+
+    repo_id = f"zz-impact-hub-{uuid.uuid4().hex[:8]}"
+    rnd = random.Random(7)
+    layers = [[f"l{k}_{i}" for i in range(WIDTH)] for k in range(1, DEPTH + 1)]
+    edges = sorted({(a, rnd.choice(below)) for below, above in zip(layers, layers[1:]) for a in above for _ in range(FAN)})
+    engine.run_cypher(
+        "UNWIND $names AS name CREATE (:Function {repo_id: $r, name: name, file: name + '.py'})",
+        {"r": repo_id, "names": [n for layer in layers for n in layer]},
+    )
+    engine.run_cypher(
+        "UNWIND range(1, $hubs) AS i CREATE (:Function {repo_id: $r, name: 'get', file: 'get' + i + '.py'})",
+        {"r": repo_id, "hubs": HUBS},
+    )
+    engine.run_cypher(
+        "MATCH (a:Function {repo_id: $r}), (g:Function {repo_id: $r, name: 'get'}) "
+        "WHERE a.name STARTS WITH 'l1_' CREATE (a)-[:CALLS]->(g)",
+        {"r": repo_id},
+    )
+    engine.run_cypher(
+        "UNWIND $edges AS e MATCH (a:Function {repo_id: $r, name: e[0]}), (b:Function {repo_id: $r, name: e[1]}) "
+        "CREATE (a)-[:CALLS]->(b)",
+        {"r": repo_id, "edges": edges},
+    )
+    distance = {n: 1 for n in layers[0]}
+    callers: dict[str, set[str]] = {}
+    for a, b in edges:
+        callers.setdefault(b, set()).add(a)
+    frontier = set(layers[0])
+    for hop in range(2, IMPACT_MAX_DEPTH + 1):
+        frontier = {a for b in frontier for a in callers.get(b, ())} - distance.keys()
+        distance.update(dict.fromkeys(frontier, hop))
+    yield repo_id, distance
+    engine.delete_repository(repo_id)
+
+
+def test_impact_on_a_hub_is_fast_and_counts_distinct_dependents(engine, hub):
+    import time
+
+    repo_id, distance = hub
+    started = time.monotonic()
+    result = impact_analysis(engine, repo_id, "get", max_results=5000)
+    elapsed = time.monotonic() - started
+    assert elapsed < 3.0, f"impact_analysis took {elapsed:.2f}s on the hub fixture"
+    assert result["direct_dependents"]["count"] == WIDTH
+    assert result["risk_level"] == "high"
+    transitive = {d["name"] for d in result["transitive_dependents"]["results"]}
+    assert transitive == {n for n, hop in distance.items() if hop >= 2}
+    assert not any(n.startswith("l5_") for n in transitive)  # five hops away
+
+
+def test_impact_for_diff_on_a_hub_is_fast(engine, hub, tmp_path):
+    import subprocess
+    import time
+
+    from devgraph.mcp.tools import impact_analysis_for_diff
+    from devgraph.registry.store import RepoRegistry
+
+    root = tmp_path / "repo"
+    root.mkdir()
+
+    def git(*args):
+        subprocess.run(["git", *args], cwd=root, check=True, capture_output=True)
+
+    git("init", "-q", "-b", "main")
+    git("config", "user.email", "dev@example.com")
+    git("config", "user.name", "Dev")
+    repo_id, distance = hub
+    (root / "hub.py").write_text("def get():\n    return 1\n")
+    git("add", "-A")
+    git("commit", "-q", "-m", "base")
+    (root / "hub.py").write_text("def get():\n    return 2\n")
+    git("commit", "-q", "-am", "change")
+    engine.run_cypher(
+        "MATCH (f:Function {repo_id: $r, name: 'get', file: 'get1.py'}) CREATE (:Module {repo_id: $r, name: 'hub.py'})-[:CONTAINS]->(f)",
+        {"r": repo_id},
+    )
+    registry = RepoRegistry(tmp_path / "registry.sqlite3")
+    try:
+        registry.add_repo(root, repo_id=repo_id)
+        started = time.monotonic()
+        result = impact_analysis_for_diff(engine, registry, repo_id, "HEAD~1", "HEAD", max_results=5000)
+        elapsed = time.monotonic() - started
+    finally:
+        registry.close()
+    assert elapsed < 3.0, f"impact_analysis_for_diff took {elapsed:.2f}s on the hub fixture"
+    assert result["changed_components"] == ["get"]
+    assert result["direct_dependents"]["count"] == WIDTH
+    assert result["transitive_dependents"]["count"] == sum(1 for hop in distance.values() if hop >= 2)
