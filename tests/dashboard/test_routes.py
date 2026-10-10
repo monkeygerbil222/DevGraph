@@ -105,7 +105,7 @@ def test_list_repos_marks_a_missing_repository_folder(seeded_graph, registry, tm
         path.mkdir()
         _init_git_repo(path)
     registry.add_repo(present, repo_id="dash_repo_a")
-    registry.add_repo(gone, repo_id="dash_repo_b")
+    gone = registry.add_repo(gone, repo_id="dash_repo_b").path  # the registry's own (resolved) spelling
     import shutil
 
     shutil.rmtree(gone)

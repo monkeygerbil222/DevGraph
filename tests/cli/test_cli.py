@@ -1991,7 +1991,8 @@ def test_cli_rescan_refuses_a_missing_or_empty_repo_folder(runner, temp_registry
     root.mkdir()
     subprocess.run(["git", "init"], cwd=root, capture_output=True, check=True)
     (root / "widget.py").write_text("class Widget:\n    pass\n")
-    repo_id = registry.add_repo(root).repo_id
+    record = registry.add_repo(root)
+    repo_id, root = record.repo_id, record.path  # the registry's own (resolved) spelling
     registry.close()
 
     def rescan(*args):
@@ -2039,7 +2040,8 @@ def test_cli_doctor_fails_a_missing_repository_folder(runner, temp_registry_db, 
     monkeypatch.setattr(project_switch, "_registry_db_path", lambda: db_path)
     present = registry.add_repo(_repo_with_schema(tmp_path, "present")).repo_id
     gone_root = _repo_with_schema(tmp_path, "gone")
-    gone = registry.add_repo(gone_root).repo_id
+    gone_record = registry.add_repo(gone_root)
+    gone, gone_root = gone_record.repo_id, gone_record.path  # the registry's own (resolved) spelling
     registry.close()
     shutil.rmtree(gone_root)
 
