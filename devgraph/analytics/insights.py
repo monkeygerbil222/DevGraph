@@ -295,7 +295,12 @@ class InsightsScheduler:
                 if refresh_insights(self._engine, repo.repo_id, blocking=False) is None:
                     continue  # another caller is computing it right now
             except Exception:
-                logger.warning("graph insights refresh failed for %s", repo.repo_id, exc_info=True)
+                # Interrupted by shutdown (the engine refuses new sessions
+                # once it closes): not a failure worth a warning.
+                logger.log(
+                    logging.DEBUG if self._stop.is_set() else logging.WARNING,
+                    "graph insights refresh failed for %s", repo.repo_id, exc_info=True,
+                )
                 continue
             refreshed.append(repo.repo_id)
             if self._on_refreshed is not None:
@@ -312,13 +317,13 @@ class InsightsScheduler:
         self._thread = threading.Thread(target=self._run, name="devgraph-insights", daemon=True)
         self._thread.start()
 
-    def stop(self) -> None:
+    def stop(self, timeout: float = 5.0) -> None:
         self._stop.set()
         thread, self._thread = self._thread, None
         if thread is not None:
             # A refresh blocked on a slow database can outlast this; the
             # thread is a daemon, so shutdown is never held hostage.
-            thread.join(timeout=5)
+            thread.join(timeout=timeout)
 
     def _run(self) -> None:
         while not self._stop.is_set():

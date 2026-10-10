@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -396,6 +398,75 @@ _MAX_RETRIES = 3
 _BASE_DELAY_S = 0.5
 
 
+#: How long `GraphEngine.close` waits, by default, for open sessions to end.
+CLOSE_WAIT_S = 5.0
+
+
+class EngineClosed(ServiceUnavailable):
+    """A session was requested after `GraphEngine.close` began.
+
+    A `ServiceUnavailable`, so callers already treating the database as
+    unavailable handle it; never retried as a transient blip.
+    """
+
+
+class _GatedDriver:
+    """The driver behind a gate that closes it only once no session is open.
+
+    Closing the neo4j driver under a running query closes that query's
+    connection mid-read, which breaks it in its thread (a BufferError). So
+    once a close is requested, new sessions are refused with `EngineClosed`
+    and the close waits, up to its timeout, for the open ones to end. A query
+    still running then is abandoned: the driver is left open under it (the
+    process is exiting) rather than closed under it.
+    """
+
+    def __init__(self, driver: Driver) -> None:
+        self._driver = driver
+        self._cond = threading.Condition()
+        self._active = 0
+        self._closing = False
+
+    def _enter(self) -> None:
+        with self._cond:
+            if self._closing:
+                raise EngineClosed("the graph engine is closed")
+            self._active += 1
+
+    def _exit(self) -> None:
+        with self._cond:
+            self._active -= 1
+            self._cond.notify_all()
+
+    @contextmanager
+    def session(self, **kwargs: Any):
+        self._enter()
+        try:
+            with self._driver.session(**kwargs) as session:
+                yield session
+        finally:
+            self._exit()
+
+    def verify_connectivity(self) -> None:
+        self._enter()
+        try:
+            self._driver.verify_connectivity()
+        finally:
+            self._exit()
+
+    def close(self, timeout: float) -> None:
+        with self._cond:
+            self._closing = True
+            if not self._cond.wait_for(lambda: self._active == 0, timeout=timeout):
+                logger.warning(
+                    "%d graph queries still running %.1f s after shutdown began; abandoning them",
+                    self._active,
+                    timeout,
+                )
+                return
+        self._driver.close()
+
+
 def _retry_transient(fn, *args, **kwargs):
     """Run `fn` with bounded exponential-backoff retry on transient Neo4j errors.
 
@@ -409,6 +480,8 @@ def _retry_transient(fn, *args, **kwargs):
     for attempt in range(_MAX_RETRIES + 1):
         try:
             return fn(*args, **kwargs)
+        except EngineClosed:
+            raise
         except _RETRYABLE_EXCEPTIONS:
             if attempt >= _MAX_RETRIES:
                 raise
@@ -712,10 +785,12 @@ def repository_constraint_statements(effective: EffectiveSchema | None = None) -
 
 class GraphEngine:
     def __init__(self, uri: str, user: str, password: str) -> None:
-        self._driver: Driver = GraphDatabase.driver(uri, auth=(user, password))
+        self._driver = _GatedDriver(GraphDatabase.driver(uri, auth=(user, password)))
 
-    def close(self) -> None:
-        self._driver.close()
+    def close(self, timeout: float = CLOSE_WAIT_S) -> None:
+        """Refuse new sessions, wait up to `timeout` for open ones, then close
+        the driver (see `_GatedDriver`). Safe to call again after a timeout."""
+        self._driver.close(timeout)
 
     def verify_connectivity(self) -> None:
         _retry_transient(self._driver.verify_connectivity)

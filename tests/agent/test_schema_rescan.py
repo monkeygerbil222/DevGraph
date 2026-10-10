@@ -352,3 +352,27 @@ def test_a_never_indexed_repo_is_left_to_its_first_scan(monkeypatch, tmp_path):
     sched = SchemaRescanScheduler(None, registry, clock=Clock())
     assert sched.run_once() == []
     assert state["scans"] == []
+
+
+def test_a_rescan_waiting_on_the_batch_lock_at_stop_never_starts(monkeypatch, tmp_path):
+    """A pass that passed its stop check but still waits on the batch lock
+    (a watcher batch holds it) skips its scan once it gets the lock: the agent
+    closes the graph engine right after stop."""
+    state = setup(monkeypatch, tmp_path)
+    lock, waiting = threading.Lock(), threading.Event()
+    lock.acquire()
+
+    def run_exclusive(repo_id, fn):
+        waiting.set()
+        with lock:
+            return fn()
+
+    sched = SchemaRescanScheduler(
+        None, Registry([Repo("r", tmp_path)]), quiet_s=0, interval_s=0.01, clock=Clock(),
+        run_exclusive=run_exclusive,
+    )
+    sched.start()
+    assert waiting.wait(5)
+    threading.Timer(0.3, lock.release).start()
+    sched.stop()
+    assert state["scans"] == []

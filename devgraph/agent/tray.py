@@ -30,6 +30,7 @@ import uvicorn
 from PIL import Image, ImageDraw
 
 from devgraph.agent.schema_rescan import SchemaRescanScheduler
+from devgraph.agent.shutdown import shutdown
 from devgraph.agent.sync import RepoSync
 from devgraph.analytics.insights import InsightsScheduler
 from devgraph.config import get_settings
@@ -179,8 +180,12 @@ class TrayApp:
                 if recovered:
                     self._sync.retry_failed()
             except Exception:
+                if self._stop_event.is_set():
+                    break  # the engine refuses new sessions once shutdown closes it
                 logger.warning("Neo4j health check failed", exc_info=True)
                 self._healthy = False
+            if self._stop_event.is_set():
+                break
             # Each of these is individually guarded: a failure in any one
             # (e.g. a registry read race, a watcher issue-scan error, or a
             # pystray icon mutation) must not escape this daemon thread and
@@ -354,19 +359,15 @@ class TrayApp:
     def _quit(self, icon: pystray.Icon, item: pystray.MenuItem) -> None:  # type: ignore[valid-type]
         self._stop_event.set()
         self._sync.stopping = True
-        self._watcher.stop()
-        self._schema_rescans.stop()
-        self._insights.stop()
-        if self._dashboard_server is not None:
-            self._dashboard_server.should_exit = True
-            if self._dashboard_thread is not None:
-                self._dashboard_thread.join(timeout=5)
         # Best-effort teardown: a failure closing the engine/registry must
         # not prevent the tray icon from stopping (which would leave a
         # zombie tray process the PID file still points at). Each close is
         # guarded so one failure doesn't mask the others.
         try:
-            self._engine.close()
+            shutdown(
+                self._engine, self._watcher, self._schema_rescans, self._insights,
+                dashboard_server=self._dashboard_server, dashboard_thread=self._dashboard_thread,
+            )
         except Exception:
             logger.warning("error closing graph engine on quit", exc_info=True)
         try:
@@ -401,11 +402,11 @@ class TrayApp:
         except Exception:
             logger.critical("pystray event loop crashed", exc_info=True)
             self._sync.stopping = True
-            self._watcher.stop()
-            self._schema_rescans.stop()
-            self._insights.stop()
             try:
-                self._engine.close()
+                shutdown(
+                    self._engine, self._watcher, self._schema_rescans, self._insights,
+                    dashboard_server=self._dashboard_server, dashboard_thread=self._dashboard_thread,
+                )
             except Exception:
                 logger.warning("error closing graph engine after crash", exc_info=True)
             try:

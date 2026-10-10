@@ -86,7 +86,7 @@ class SchemaRescanScheduler:
                     if backoff is not None and now < backoff[0]:
                         continue
                     try:
-                        result = self._run_exclusive(repo.repo_id, lambda: self._upgrade(repo))
+                        result = self._exclusive(repo.repo_id, lambda: self._upgrade(repo))
                     except Exception:
                         delay = min(backoff[1] * 2, UPGRADE_BACKOFF_MAX_S) if backoff else self._interval_s
                         self._upgrade_backoff[repo.repo_id] = (now + delay, delay)
@@ -122,7 +122,10 @@ class SchemaRescanScheduler:
                     self._invalid[repo.repo_id] = current
                     logger.warning("project schema for %s is invalid; rescan skipped until it changes: %s", repo.repo_id, exc)
                     continue
-                count, applied = self._run_exclusive(repo.repo_id, lambda: self._rescan(repo))
+                result = self._exclusive(repo.repo_id, lambda: self._rescan(repo))
+                if result is None:
+                    continue
+                count, applied = result
                 self._failing.discard(repo.repo_id)
                 if not applied:
                     self._invalid[repo.repo_id] = current
@@ -139,13 +142,20 @@ class SchemaRescanScheduler:
                     except Exception:
                         logger.debug("schema rescan callback failed for %s", repo.repo_id, exc_info=True)
             except Exception:
-                first = repo.repo_id not in self._failing
+                # A scan interrupted by shutdown (the engine refuses new
+                # sessions once it closes) is not a failure worth a warning.
+                first = repo.repo_id not in self._failing and not self._stop.is_set()
                 self._failing.add(repo.repo_id)
                 logger.log(
                     logging.WARNING if first else logging.DEBUG,
                     "schema rescan check failed for %s", repo.repo_id, exc_info=True,
                 )
         return rescanned
+
+    def _exclusive(self, repo_id: str, fn: Callable[[], Any]) -> Any:
+        """`fn` under the batch lock, or None if stop came while waiting for it:
+        the agent closes the graph engine right after stop."""
+        return self._run_exclusive(repo_id, lambda: None if self._stop.is_set() else fn())
 
     def _upgrade(self, repo: Any) -> tuple[int, bool] | None:
         """`_rescan` unless the index got upgraded while this pass waited on
@@ -174,11 +184,11 @@ class SchemaRescanScheduler:
         self._thread = threading.Thread(target=self._run, name="devgraph-schema-rescan", daemon=True)
         self._thread.start()
 
-    def stop(self) -> None:
+    def stop(self, timeout: float = 5.0) -> None:
         self._stop.set()
         thread, self._thread = self._thread, None
         if thread is not None:
-            thread.join(timeout=5)
+            thread.join(timeout=timeout)
 
     def _run(self) -> None:
         while not self._stop.is_set():

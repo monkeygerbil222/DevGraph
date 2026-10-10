@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 import uvicorn
 
 from devgraph.agent.schema_rescan import SchemaRescanScheduler
+from devgraph.agent.shutdown import shutdown
 from devgraph.agent.sync import RepoSync
 from devgraph.analytics.insights import InsightsScheduler
 from devgraph.config import get_settings
@@ -139,8 +140,12 @@ class HeadlessAgent:
                 if recovered:
                     self._sync.retry_failed()
             except Exception:
+                if self._stop_event.is_set():
+                    break  # the engine refuses new sessions once shutdown closes it
                 logger.warning("Neo4j health check failed", exc_info=True)
                 self._healthy = False
+            if self._stop_event.is_set():
+                break
             self._check_registry_changes()
             self._write_heartbeat()
             self._stop_event.wait(self._settings.health_check_interval_s)
@@ -196,14 +201,10 @@ class HeadlessAgent:
     def stop(self) -> None:
         self._stop_event.set()
         self._sync.stopping = True
-        self._watcher.stop()
-        self._schema_rescans.stop()
-        self._insights.stop()
-        if self._dashboard_server is not None:
-            self._dashboard_server.should_exit = True
-            if self._dashboard_thread is not None:
-                self._dashboard_thread.join(timeout=5)
-        self._engine.close()
+        shutdown(
+            self._engine, self._watcher, self._schema_rescans, self._insights,
+            dashboard_server=self._dashboard_server, dashboard_thread=self._dashboard_thread,
+        )
         self._registry.close()
 
     def start(self) -> None:

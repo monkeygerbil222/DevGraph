@@ -50,7 +50,7 @@ MAX_SCHEDULE_FAILURES_PER_RECONCILE = 3
 #: counts as part of the same git operation (W6).
 GIT_LOCK_WINDOW_S = 5.0
 
-#: How long `WatcherManager.stop` waits for a batch, catch-up or git-history
+#: How long `WatcherManager.stop` waits, by default, for a batch, catch-up or git-history
 #: sync already running. The timer threads are daemons, so a job slower than
 #: this (a hung database) cannot hold shutdown hostage.
 STOP_WAIT_S = 3.0
@@ -310,19 +310,18 @@ class WatcherManager:
             for repo in repos_to_watch:
                 self._start_single(repo)
 
-    def stop(self) -> None:
+    def stop(self, timeout: float = STOP_WAIT_S) -> None:
         """Stop all watchers and clean up.
 
         Pending reconciles are cancelled, and one that is running finishes
         without queueing anything. Pending debounces and catch-ups are
         cancelled; the changes they held are left for the next start's
         catch-up. A batch or catch-up (and its git-history sync) that is
-        running is waited for, up to `STOP_WAIT_S`: callers close the graph
-        engine next, and closing the driver under a running query breaks the
-        connection mid-write. A job still running after `STOP_WAIT_S` (say the
-        first git-history sync of a large repository, which reads its whole
-        history in one job) is abandoned: stop returns, and that job may
-        still race the driver close.
+        running is waited for, up to `timeout`: callers close the graph
+        engine next. A job still running then (say the first git-history sync
+        of a large repository, which reads its whole history in one job) is
+        left running: stop returns, and the engine's close refuses that job
+        new sessions and waits, within its own bound, for its open one.
         """
         with self._reconcile_lock:
             self._stopping = True
@@ -355,12 +354,12 @@ class WatcherManager:
         # Every job that writes the graph runs under its repo's batch lock and,
         # once there, checks the flags set above, so holding each lock once
         # means no watcher job is still running and none will start.
-        deadline = time.monotonic() + STOP_WAIT_S
+        deadline = time.monotonic() + timeout
         for lock in batch_locks:
             if lock.acquire(timeout=max(0.0, deadline - time.monotonic())):
                 lock.release()
             else:
-                logger.info("a watcher job was still running %.0f s after stop", STOP_WAIT_S)
+                logger.info("a watcher job was still running %.1f s after stop", timeout)
                 break
 
     def run_exclusive(self, repo_id: str, fn: Callable[[], Any]) -> Any:
