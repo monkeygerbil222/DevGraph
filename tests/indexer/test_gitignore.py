@@ -7,7 +7,9 @@ from devgraph.indexer.gitignore import is_gitignored, parse
 
 
 def _ignored(text: str, rel: str, is_dir: bool = False) -> bool:
-    return gitignore.matches((("", parse(text)),), rel, is_dir)
+    """Case-sensitively, so the cases hold on Windows and macOS too (where
+    git, like DevGraph, folds case: `[![:upper:]]` then matches no letter)."""
+    return gitignore.matches((("", parse(text, ignorecase=False)),), rel, is_dir)
 
 
 @pytest.mark.parametrize(
@@ -178,7 +180,7 @@ def test_trailing_spaces_are_trimmed_by_walking_escapes_as_git_does():
 
 
 def test_lines_split_on_newline_only_and_lose_a_trailing_carriage_return():
-    rules = parse("one\r\ntwo\x0bthree\n")
+    rules = parse("one\r\ntwo\x0bthree\n", ignorecase=False)
     assert _ignored("one\r\ntwo\x0bthree\n", "one")
     assert _ignored("one\r\ntwo\x0bthree\n", "two\x0bthree")
     assert not _ignored("one\r\ntwo\x0bthree\n", "two")
