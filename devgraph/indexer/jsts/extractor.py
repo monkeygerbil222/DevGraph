@@ -5,7 +5,7 @@ Mirrors `devgraph/indexer/python/extractor.py`'s shape (Implementation Plan
 `ExtractionResult` dataclasses from `devgraph.indexer.common` rather than
 redefining them.
 
-Parses a .js/.jsx/.ts/.tsx file and extracts:
+Parses a .js/.jsx/.mjs/.cjs/.ts/.tsx/.mts/.cts file and extracts:
   - Module (the file itself)
   - Classes (ES6 `class`), with `extends` -> EXTENDS (an `implements` clause
     on a TS class is intentionally NOT an EXTENDS edge - it's an interface
@@ -26,10 +26,10 @@ Parses a .js/.jsx/.ts/.tsx file and extracts:
     JSDoc is not extracted - out of scope, the brief only asks for
     class/function docstrings).
 
-Grammar routing is purely by file extension: '.ts' uses the TypeScript
-grammar, '.tsx' uses the TSX grammar (JSX + TS types), and everything else
-('.js', '.jsx', and any unrecognized extension) uses the plain JavaScript
-grammar. One function (`extract_js_file`) handles all four extensions rather
+Grammar routing is purely by file extension: '.ts', '.mts' and '.cts' use
+the TypeScript grammar, '.tsx' uses the TSX grammar (JSX + TS types), and
+everything else ('.js', '.jsx', '.mjs', '.cjs', and any unrecognized
+extension) uses the plain JavaScript grammar. One function (`extract_js_file`) handles every extension rather
 than exposing one function per grammar, since the tree-walking logic
 downstream of the parse is identical across all three grammars - only the
 `Language` handed to the Tree-sitter `Parser` differs.
@@ -46,7 +46,8 @@ Known limitations (v1 scope cuts, documented per Implementation Plan #8):
   - IMPORTS resolution: relative specifiers (`./x`, `../x`) are resolved
     against the importing file's directory with a same-repo-file-path guess
     across `.js/.jsx/.ts/.tsx` (plus `/index.<ext>` directory-import
-    candidates) - the same non-materializing-guess pattern the Python
+    candidates), or, for an explicit `.js`/`.jsx`/`.mjs`/`.cjs` extension,
+    across the TypeScript sources that emit it - the same non-materializing-guess pattern the Python
     extractor uses (a guessed target that doesn't match a real indexed file
     simply never produces an edge, since upsert_relationship only
     MATCH-links real existing nodes). Bare specifiers (`import x from
@@ -89,6 +90,18 @@ _NESTED_SCOPE_TYPES = frozenset(
     }
 )
 _EXTENSIONS = ("js", "jsx", "ts", "tsx")
+# An explicit extension in a specifier names the emitted file; TypeScript's
+# NodeNext/Bundler resolution maps it back to the source that emits it.
+_EXPLICIT_EXTENSIONS = {
+    ".js": ("ts", "tsx", "js"),
+    ".jsx": ("tsx", "jsx"),
+    ".mjs": ("mts", "mjs"),
+    ".cjs": ("cts", "cjs"),
+    ".ts": ("ts",),
+    ".tsx": ("tsx",),
+    ".mts": ("mts",),
+    ".cts": ("cts",),
+}
 
 
 def _make_parser(language: Language) -> Parser:
@@ -97,11 +110,11 @@ def _make_parser(language: Language) -> Parser:
 
 def _language_for_extension(suffix: str) -> Language:
     suffix = suffix.lower()
-    if suffix == ".ts":
+    if suffix in (".ts", ".mts", ".cts"):
         return _TS_LANGUAGE
     if suffix == ".tsx":
         return _TSX_LANGUAGE
-    return _JS_LANGUAGE  # '.js', '.jsx', and any unrecognized extension
+    return _JS_LANGUAGE  # '.js', '.jsx', '.mjs', '.cjs', and any unrecognized extension
 
 
 def _text(node: Node, source: bytes) -> str:
@@ -327,7 +340,15 @@ def _resolve_relative_base(current_dir: str, specifier: str) -> str:
 def _resolve_module_specifier(specifier: str, current_dir: str) -> list[str]:
     """Return candidate Module-node target names for an import specifier.
 
-    Relative specifiers (`./foo`, `../bar/baz`) resolve to `{dir}/{path}.
+    A relative specifier with an explicit JS/TS extension (`./x.js`,
+    `./y.mjs`) resolves to the sources that emit it: `.js` to `.ts`/`.tsx`/
+    `.js`, `.jsx` to `.tsx`/`.jsx`, `.mjs` to `.mts`/`.mjs`, `.cjs` to
+    `.cts`/`.cjs`; a TypeScript extension to itself; then `{path}/index.{ext}`
+    in case it names a directory. Like every candidate list here this is not
+    checked against the disk: `./x.js` links both `x.ts` and `x.js` when both
+    exist. A `?query` or `#fragment` is dropped first.
+
+    Other relative specifiers (`./foo`, `../bar/baz`) resolve to `{dir}/{path}.
     {ext}` candidates against the importing file's directory, across each of
     `.js/.jsx/.ts/.tsx`, plus `{dir}/{path}/index.{ext}` directory-import
     candidates - the same non-materializing-guess pattern the Python
@@ -338,8 +359,15 @@ def _resolve_module_specifier(specifier: str, current_dir: str) -> list[str]:
     `node_modules/{name}` guess - no package.json/tsconfig 'paths' mapping is
     consulted (out of scope, see module docstring).
     """
+    # A bundler query or fragment (`./worker.js?worker`, `./x#frag`) names no file.
+    specifier = specifier.split("?", 1)[0].split("#", 1)[0]
     if specifier.startswith("."):
         base = _resolve_relative_base(current_dir, specifier)
+        stem, dot, ext = base.rpartition(".")
+        mapped = _EXPLICIT_EXTENSIONS.get(f".{ext}") if dot and "/" not in ext else None
+        if mapped and stem and not stem.endswith("/"):
+            # Then the specifier as a directory, for a folder named like a file.
+            return [f"{stem}.{each}" for each in mapped] + [f"{base}/index.{each}" for each in _EXTENSIONS]
         if base:
             candidates = [f"{base}.{ext}" for ext in _EXTENSIONS]
             candidates += [f"{base}/index.{ext}" for ext in _EXTENSIONS]

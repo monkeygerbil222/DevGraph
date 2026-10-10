@@ -49,12 +49,15 @@ Run `devgraph --help` or `devgraph <command> --help` for the complete, current i
 | Refresh source and reconcile git history | `devgraph rescan <repo_id> [--full] [--force]` |
 | Inspect registered repositories | `devgraph list`, `devgraph info <repo_id>`, `devgraph stats [repo_id]` |
 | Check installation and graph health | `devgraph status`, `devgraph doctor`, `devgraph self-test [repo_id]` |
+| Unregister a repository and delete its graph | `devgraph remove <repo_id> [--keep-graph]` |
 | Recompute communities, key nodes and bridges | `devgraph insights <repo_id>` |
 | Open the dashboard | `devgraph dashboard` |
 | Configure an MCP client | `devgraph client-config`, `devgraph mcp add`, `devgraph mcp doctor` |
 | View settings, project schema, or tray logs | `devgraph config`, `devgraph config show / validate / eject / enable / disable`, `devgraph config schema list / add / edit / delete / reset`, `devgraph config tools list / add / edit / delete / reset`, `devgraph logs` |
 | Export a repository graph | `devgraph export <repo_id> --format json|cypher|dot` |
 | Update DevGraph | `devgraph update` |
+
+`devgraph status` exits non-zero when Neo4j is unreachable or the registry cannot be read, and `devgraph register` when its initial scan fails (the repository stays registered; `devgraph rescan <repo_id>` indexes it once the cause is fixed). A refused Neo4j password names the settings file to fix (`~/.devgraph/.env`, or the folder holding `DEVGRAPH_REGISTRY_DB_PATH`; an environment variable works too). `devgraph remove` needs Neo4j to delete the graph data; with Neo4j down it stops and keeps the repository registered, and `--keep-graph` unregisters it without touching the graph (`devgraph prune` deletes that data once Neo4j is up).
 
 `devgraph update` is the normal update path. It fast-forwards the configured branch, reinstalls DevGraph, runs `doctor`, and restarts the tray app if it was running. Commit or stash local changes first; `--force` only suppresses the dirty-tree guard. The older `scripts/update.ps1` entry point remains available for existing Windows installations.
 
@@ -355,7 +358,7 @@ The Communities card shows each repository's subsystems (Louvain communities ove
 
 The page loads no script from the network: Cytoscape.js is vendored in the package (see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)), so the dashboard works offline.
 
-The service binds to loopback and has no authentication because it is intended as a single-user local tool. The browser never receives Neo4j credentials; graph queries run through the FastAPI backend. Use `DEVGRAPH_DASHBOARD_ENABLED=false` to disable it or `DEVGRAPH_DASHBOARD_PORT` to choose another port.
+The service binds to loopback and has no authentication because it is intended as a single-user local tool. The browser never receives Neo4j credentials; graph queries run through the FastAPI backend. Use `DEVGRAPH_DASHBOARD_ENABLED=false` to disable it or `DEVGRAPH_DASHBOARD_PORT` to choose another port. If another program already holds the port, the agent keeps running without the dashboard and says so: a warning in its log naming the port, `dashboard port <port> in use` in the tray tooltip, and a line under `Dashboard` in `devgraph status`. `devgraph dashboard` checks the port answers as DevGraph (`GET /api/health`) and will not open a browser on another program's page.
 
 Because there is no authentication, the dashboard answers only requests addressed to the local machine: the `Host` header must name `127.0.0.1`, `localhost`, `[::1]`, or the configured `DEVGRAPH_DASHBOARD_HOST`; anything else gets `403 host not allowed`. This stops a web page from reaching the dashboard through DNS rebinding (re-pointing its own domain at 127.0.0.1). A wildcard bind (`0.0.0.0` or `::`) does not widen this list; to reach the dashboard by a LAN address, set `DEVGRAPH_DASHBOARD_HOST` to that address rather than a wildcard. Registering a repository, saving a layout, running console Cypher, and Config page writes additionally refuse cross-origin browser requests. The tray menu and `devgraph dashboard` link a wildcard bind to its loopback address (`http://127.0.0.1:<port>`, or `http://[::1]:<port>` for `::`, which binds IPv6-only).
 

@@ -31,7 +31,7 @@ from devgraph.config.edits import project_config_notes as _project_config_notes
 from devgraph.config.edits import removed_types as _removed_types  # noqa: F401  (kept importable from here)
 from devgraph.config.schema_findings import project_schema_findings as _project_schema_findings
 from devgraph.dashboard import queries as dashboard_queries
-from devgraph.dashboard.url import dashboard_url
+from devgraph.dashboard.url import dashboard_url, probe_dashboard
 from devgraph.graph.engine import GraphEngine, provision_repository_schema
 from devgraph.indexer.dispatch import full_scan
 from devgraph.indexer.docs.extractor import index_file as index_doc_file
@@ -51,10 +51,38 @@ app.add_typer(tray_app, name="tray")
 console = Console(emoji=False)
 
 
+@app.callback()
+def _cli() -> None:
+    # A command reports a Neo4j failure as one line; each retry before it is detail.
+    from devgraph.graph import engine as engine_module
+
+    engine_module.RETRY_LOG_LEVEL = logging.INFO
+
+
 def _get_registry() -> RepoRegistry:
     """Get or create the registry from configured path."""
     settings = get_settings()
     return RepoRegistry(settings.registry_db_path)
+
+
+def _neo4j_problem(exc: Exception, settings) -> str:
+    """One line for a failed Neo4j call, naming the setting to check and the file it lives in."""
+    from neo4j.exceptions import AuthError, ServiceUnavailable
+
+    from devgraph.config.settings import devgraph_home
+
+    env_file = devgraph_home() / ".env"
+    if isinstance(exc, AuthError):
+        return (
+            f"Neo4j at {settings.neo4j_uri} refused the username or password; check "
+            f"DEVGRAPH_NEO4J_USER and DEVGRAPH_NEO4J_PASSWORD in {env_file} (or the environment)"
+        )
+    if isinstance(exc, ServiceUnavailable):
+        return (
+            f"nothing answers at {settings.neo4j_uri}; start Neo4j, or set DEVGRAPH_NEO4J_URI in {env_file} "
+            "(or the environment)"
+        )
+    return " ".join(str(exc).split())
 
 
 @app.command()
@@ -117,11 +145,15 @@ def add(
                 # indexing failure (e.g. Neo4j unreachable) shouldn't undo that.
                 # `devgraph rescan <repo_id>` retries the scan once Neo4j is up.
                 console.print(
-                    f"[yellow]Registered but initial scan failed:[/yellow] {escape(str(e))}\n"
-                    f"  Run 'devgraph rescan {escape(record.repo_id)}' once Neo4j is reachable."
+                    f"[yellow]Registered but initial scan failed:[/yellow] {escape(_neo4j_problem(e, settings))}\n"
+                    f"  Fix that, then run 'devgraph rescan {escape(record.repo_id)}' to index it.",
+                    soft_wrap=True,
                 )
+                raise typer.Exit(code=1)
         finally:
             registry.close()
+    except typer.Exit:
+        raise
     except ValueError as e:
         console.print(f"[red][X] Error:[/red] {escape(str(e))}")
         raise typer.Exit(code=1)
@@ -149,8 +181,14 @@ def _print_skipped(skipped: dict[str, str]) -> None:
 
 
 @app.command()
-def remove(repo_id: str) -> None:
-    """Unregister a repository.
+def remove(
+    repo_id: str,
+    keep_graph: bool = typer.Option(
+        False, "--keep-graph",
+        help="Only unregister: leave the repository's graph data in Neo4j (for when Neo4j is down).",
+    ),
+) -> None:
+    """Unregister a repository and delete its graph data.
 
     Args:
         repo_id: The repository ID (shown by 'devgraph list').
@@ -161,19 +199,41 @@ def remove(repo_id: str) -> None:
             if registry.get(repo_id) is None:
                 raise ValueError(f"no such repo_id: {repo_id}")
 
+            if keep_graph:
+                registry.remove_repo(repo_id)
+                console.print(
+                    f"[green][OK][/green] Removed: {escape(repo_id)} (registry entry; graph data kept). "
+                    "Run 'devgraph prune' once Neo4j is up to delete its graph data.",
+                    soft_wrap=True,
+                )
+                return
+
             settings = get_settings()
-            engine = GraphEngine(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password)
+            engine = None
             try:
+                engine = GraphEngine(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password)
                 recorded = engine.read_applied_schema(repo_id) or {}
                 engine.delete_repository(repo_id)
                 _release_labels(engine, recorded.get("labels") or [])
+            except Exception as e:
+                console.print(
+                    f"[red][X] Could not delete the graph data of {escape(repo_id)}:[/red] "
+                    f"{escape(_neo4j_problem(e, settings))}\n"
+                    f"  {escape(repo_id)} is still registered. To unregister it and leave its graph data, "
+                    f"run 'devgraph remove {escape(repo_id)} --keep-graph'.",
+                    soft_wrap=True,
+                )
+                raise typer.Exit(code=1)
             finally:
-                engine.close()
+                if engine is not None:
+                    engine.close()
 
             registry.remove_repo(repo_id)
             console.print(f"[green][OK][/green] Removed: {escape(repo_id)} (registry entry and graph data)")
         finally:
             registry.close()
+    except typer.Exit:
+        raise
     except ValueError as e:
         console.print(f"[red][X] Error:[/red] {escape(str(e))}")
         raise typer.Exit(code=1)
@@ -681,7 +741,10 @@ def _tray_liveness_text(settings) -> str:
 
 @app.command()
 def status() -> None:
-    """Check DevGraph status: Neo4j connectivity and repository counts."""
+    """Check DevGraph status: Neo4j connectivity and repository counts.
+
+    Exits non-zero when Neo4j is unreachable or the registry cannot be read.
+    """
     settings = get_settings()
     console.print()
 
@@ -693,7 +756,7 @@ def status() -> None:
         console.print(f"  [green][OK] Reachable[/green] at {escape(str(settings.neo4j_uri))}")
         reachable = True
     except Exception as e:
-        console.print(f"  [red][X] Not reachable:[/red] {escape(str(e))}")
+        console.print(f"  [red][X] Not reachable:[/red] {escape(_neo4j_problem(e, settings))}", soft_wrap=True)
         reachable = False
     try:
         if reachable:
@@ -703,6 +766,7 @@ def status() -> None:
 
     # Repository counts
     console.print("[bold]Registered Repositories[/bold]")
+    registry_ok = True
     try:
         registry = _get_registry()
         try:
@@ -713,7 +777,8 @@ def status() -> None:
         finally:
             registry.close()
     except Exception as e:
-        console.print(f"  [red]Error:[/red] {escape(str(e))}")
+        console.print(f"  [red]Error:[/red] {escape(str(e))}", soft_wrap=True)
+        registry_ok = False
 
     # Live watcher (tray app) liveness
     console.print("[bold]Live Watcher[/bold]")
@@ -724,6 +789,8 @@ def status() -> None:
         console.print("  [yellow]not running[/yellow] (no heartbeat file — start with 'devgraph tray start')")
     else:
         console.print(f"  [red]{liveness}[/red]")
+
+    _print_dashboard_status(settings)
 
     # Repo issues (missing paths, etc.)
     issues_path = settings.registry_db_path.parent / "repo_issues.json"
@@ -739,6 +806,39 @@ def status() -> None:
             pass
 
     console.print()
+    # Non-zero when DevGraph cannot work: Neo4j or the registry is unusable.
+    if not (reachable and registry_ok):
+        raise typer.Exit(code=1)
+
+
+def _dashboard_port_hint(settings) -> str:
+    from devgraph.config.settings import devgraph_home
+
+    return f"set DEVGRAPH_DASHBOARD_PORT in {devgraph_home() / '.env'} and restart the agent"
+
+
+_OUTDATED_AGENT_HINT = "restart it to update it ('devgraph tray stop', then 'devgraph tray start')"
+
+
+def _print_dashboard_status(settings) -> None:
+    """The `status` "Dashboard" section: whether DevGraph's dashboard answers on its port."""
+    console.print("[bold]Dashboard[/bold]")
+    if not settings.dashboard_enabled:
+        console.print("  disabled (DEVGRAPH_DASHBOARD_ENABLED)")
+        return
+    url = dashboard_url(settings)
+    found = probe_dashboard(url)
+    if found == "devgraph":
+        console.print(f"  [green][OK] serving[/green] at {escape(url)}")
+    elif found == "outdated":
+        console.print(f"  [yellow]an older DevGraph agent is serving[/yellow] at {escape(url)}; {escape(_OUTDATED_AGENT_HINT)}")
+    elif found == "other":
+        console.print(
+            f"  [red][X] port {escape(str(settings.dashboard_port))} is held by another program[/red]; "
+            f"{escape(_dashboard_port_hint(settings))}"
+        )
+    else:
+        console.print(f"  [yellow]not serving[/yellow] at {escape(url)} (it runs inside the agent: 'devgraph tray start')")
 
 
 def _print_graph_index(engine: GraphEngine) -> None:
@@ -1528,6 +1628,15 @@ def dashboard(
     if url_only:
         console.print(escape(url))
     elif open_browser:
+        found = probe_dashboard(url)
+        if found == "outdated":
+            console.print(f"[yellow]An older DevGraph agent is serving the dashboard;[/yellow] {escape(_OUTDATED_AGENT_HINT)}")
+        if found == "other":
+            console.print(
+                f"[red][X] Port {escape(str(settings.dashboard_port))} is held by another program,[/red] not DevGraph's "
+                f"dashboard; not opening it. {escape(_dashboard_port_hint(settings))}."
+            )
+            raise typer.Exit(code=1)
         console.print(f"Opening {escape(url)} ...")
         webbrowser.open(url)
     else:

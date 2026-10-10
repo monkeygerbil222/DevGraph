@@ -85,7 +85,7 @@ _CPP_SUFFIXES = {".cpp", ".cc", ".cxx", ".h", ".hpp"}
 _COMPOSE_NAMES = {"docker-compose.yml", "docker-compose.yaml", "podman-compose.yml", "podman-compose.yaml", "compose.yml", "compose.yaml"}
 _CONTAINERFILE_NAMES = {"containerfile", "dockerfile"}
 
-_JS_SUFFIXES = {".js", ".jsx", ".ts", ".tsx"}
+_JS_SUFFIXES = {".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts"}
 
 
 def _provider_specs(repo_root: Path) -> tuple[bool, filesystem.FilesystemSpec | None, docs.DocsSpec | None]:
@@ -104,9 +104,12 @@ def _provider_specs(repo_root: Path) -> tuple[bool, filesystem.FilesystemSpec | 
 
 #: The graph index format a full scan produces (2: edge `origins`, `name_refs`;
 #: 3: FastAPI/Flask IMPLEMENTS pinned to the route's file; 4: Python IMPORTS
-#: to every candidate file and CALLS resolved through scope and imports).
-#: An index stamped lower, or not at all, is rescanned automatically.
-INDEX_FORMAT = 4
+#: to every candidate file and CALLS resolved through scope and imports; 5: JS/TS
+#: `.mjs`/`.cjs`/`.mts`/`.cts` files, explicit-extension imports such as `./x.js`
+#: resolved to their TypeScript source, compose `depends_on`/`links` as Service
+#: DEPENDS_ON edges). An index stamped lower, or not at all, is rescanned
+#: automatically.
+INDEX_FORMAT = 5
 
 
 def index_outdated(engine: GraphEngine, repo_id: str) -> bool:

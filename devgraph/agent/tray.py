@@ -35,6 +35,7 @@ from devgraph.agent.sync import RepoSync
 from devgraph.analytics.insights import InsightsScheduler
 from devgraph.config import get_settings
 from devgraph.dashboard.app import build_app
+from devgraph.dashboard.serving import DashboardFailure, serve_dashboard
 from devgraph.dashboard.url import dashboard_url
 from devgraph.dashboard.events import EventBroadcaster
 from devgraph.graph.engine import GraphEngine
@@ -117,6 +118,7 @@ class TrayApp:
         self._insights = InsightsScheduler(self._engine, self._registry, on_refreshed=self._on_insights_refreshed)
         self._dashboard_loop: asyncio.AbstractEventLoop | None = None
         self._dashboard_server: uvicorn.Server | None = None
+        self._dashboard_problem: DashboardFailure | None = None
         self._dashboard_thread: threading.Thread | None = None
 
     def _on_schema_rescanned(self, repo_id: str, files: int) -> None:
@@ -298,6 +300,8 @@ class TrayApp:
             state = "warning"
         else:
             state = "catching up" if self._sync.running else "ok"
+        if self._dashboard_problem is not None:
+            state = f"{state}; {self._dashboard_problem.summary}"
         return f"DevGraph ({state})"
 
     def _toggle_pause(self, icon: pystray.Icon, item: pystray.MenuItem) -> None:  # type: ignore[valid-type]
@@ -361,7 +365,11 @@ class TrayApp:
         self._dashboard_server = server
         try:
             logger.info("dashboard on %s", dashboard_url(self._settings))
-            loop.run_until_complete(server.serve())
+            self._dashboard_problem = serve_dashboard(server, loop)
+            if self._dashboard_problem is not None:
+                # A port another program holds: said once, and shown on the icon.
+                logger.warning("%s", self._dashboard_problem.detail)
+                self._refresh_icon()
         except Exception:
             # Additive feature: a bind failure (port already in use, another
             # instance already running, etc.) must not take down the

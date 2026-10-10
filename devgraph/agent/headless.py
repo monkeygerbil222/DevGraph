@@ -25,6 +25,7 @@ from devgraph.analytics.insights import InsightsScheduler
 from devgraph.config import get_settings
 from devgraph.dashboard.app import build_app
 from devgraph.dashboard.events import EventBroadcaster
+from devgraph.dashboard.serving import DashboardFailure, serve_dashboard
 from devgraph.dashboard.url import dashboard_url
 from devgraph.graph.engine import GraphEngine
 from devgraph.indexer.git_history.extractor import sync_git_history
@@ -86,6 +87,7 @@ class HeadlessAgent:
         )
         self._insights = InsightsScheduler(self._engine, self._registry, on_refreshed=self._on_insights_refreshed)
         self._dashboard_server: uvicorn.Server | None = None
+        self._dashboard_problem: DashboardFailure | None = None
         self._dashboard_thread: threading.Thread | None = None
 
     def _on_schema_rescanned(self, repo_id: str, files: int) -> None:
@@ -211,7 +213,9 @@ class HeadlessAgent:
         self._dashboard_server = server
         try:
             logger.info("dashboard on %s", dashboard_url(self._settings))
-            loop.run_until_complete(server.serve())
+            self._dashboard_problem = serve_dashboard(server, loop)
+            if self._dashboard_problem is not None:
+                logger.warning("%s", self._dashboard_problem.detail)
         except Exception:
             logger.warning("dashboard failed to start; continuing without it", exc_info=True)
         finally:

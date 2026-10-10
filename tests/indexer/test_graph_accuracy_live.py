@@ -502,6 +502,54 @@ def test_full_scan_drops_a_removed_service(engine, repo_id, tmp_path):
     incremental_equals_fresh(engine, repo_id, tmp_path)
 
 
+DEPENDENT_SERVICES = """\
+    services:
+      web:
+        image: nginx
+        depends_on: [api]
+        links: ["cache:redis"]
+      api:
+        image: python:3.12
+        depends_on:
+          db:
+            condition: service_healthy
+      db:
+        image: postgres:16
+        depends_on: [api]
+      cache:
+        image: redis
+"""
+
+
+def test_compose_service_dependencies_reach_the_tools(engine, repo_id, tmp_path):
+    from devgraph.mcp.tools import find_dependency_cycles, get_service_dependencies, impact_analysis
+
+    compose = write(tmp_path, "compose.yaml", DEPENDENT_SERVICES)
+    scan(engine, repo_id, tmp_path)
+    pinned = ("compose.yaml",)
+    assert sorted(e for e in edges(engine, repo_id, "DEPENDS_ON")) == [
+        ("Service", "api", "compose.yaml", "DEPENDS_ON", "Service", "db", "compose.yaml", pinned),
+        ("Service", "db", "compose.yaml", "DEPENDS_ON", "Service", "api", "compose.yaml", pinned),
+        ("Service", "web", "compose.yaml", "DEPENDS_ON", "Service", "api", "compose.yaml", pinned),
+        ("Service", "web", "compose.yaml", "DEPENDS_ON", "Service", "cache", "compose.yaml", pinned),
+    ]
+
+    deps = get_service_dependencies(engine, repo_id, "web")["dependencies"]
+    assert {(d["name"], d["type"]) for d in deps} >= {("api", "Service"), ("cache", "Service")}
+    impact = impact_analysis(engine, repo_id, "db")
+    assert "api" in {d["name"] for d in impact["direct_dependents"]["results"]}
+    assert "web" in {d["name"] for d in impact["transitive_dependents"]["results"]}
+    cycles = find_dependency_cycles(engine, repo_id, "DEPENDS_ON")
+    assert cycles["count"] == 1
+    incremental_equals_fresh(engine, repo_id, tmp_path)
+
+    write(tmp_path, "compose.yaml", DEPENDENT_SERVICES.replace("        depends_on: [api]\n      cache", "      cache"))
+    index_paths(engine, repo_id, tmp_path, {compose})
+    assert ("db", "api") not in {(e[1], e[5]) for e in edges(engine, repo_id, "DEPENDS_ON")}
+    assert find_dependency_cycles(engine, repo_id, "DEPENDS_ON")["count"] == 0
+    incremental_equals_fresh(engine, repo_id, tmp_path)
+
+
 def test_removed_service_unclaims_its_image(engine, repo_id, tmp_path):
     # `compose.override.yaml` is not a compose name the indexer routes, so
     # the second claimant is a compose file in another folder.
@@ -950,6 +998,22 @@ def test_module_added_after_its_importer(engine, repo_id, tmp_path):
     added = write(tmp_path, "lib/b.py", "X = 1\n")
     index_paths(engine, repo_id, tmp_path, {added})
     assert [e for e in edges(engine, repo_id, "IMPORTS") if e[5] == "lib/b.py"]
+    incremental_equals_fresh(engine, repo_id, tmp_path)
+
+
+@pytest.mark.parametrize("importer, specifier, target", [
+    ("src/main.ts", "import { util } from './util.js';", "src/util.ts"),
+    ("src/main.mts", "import { util } from './util.mjs';", "src/util.mts"),
+    ("src/main.cjs", "const util = require('./util.cjs');", "src/util.cts"),
+], ids=["js-to-ts", "mjs-to-mts", "cjs-to-cts"])
+def test_explicit_extension_import_reaches_its_typescript_source(engine, repo_id, tmp_path, importer, specifier, target):
+    write(tmp_path, importer, specifier + "\n")
+    scan(engine, repo_id, tmp_path)
+    assert not [e for e in edges(engine, repo_id, "IMPORTS") if e[5] == target]
+
+    added = write(tmp_path, target, "export function util() {\n  return 1;\n}\n")
+    index_paths(engine, repo_id, tmp_path, {added})
+    assert [e for e in edges(engine, repo_id, "IMPORTS") if (e[1], e[5]) == (importer, target)]
     incremental_equals_fresh(engine, repo_id, tmp_path)
 
 
