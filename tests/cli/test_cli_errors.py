@@ -68,10 +68,23 @@ def test_status_with_neo4j_down_exits_non_zero_with_one_clean_line(settings, mon
     assert "Traceback" not in result.output
     line = _line(result.output, "Not reachable")
     assert "127.0.0.1:9" in line
+    assert all(r.exc_info is None for r in caplog.records if "transient Neo4j error" in r.getMessage())
+
+
+def test_a_retry_warning_counts_tries_and_carries_no_traceback(monkeypatch, caplog):
+    monkeypatch.setattr(engine_module, "_BASE_DELAY_S", 0.001)
+    caplog.set_level(logging.WARNING)
+
+    def refuse():
+        raise ServiceUnavailable("Couldn't connect to 127.0.0.1:9")
+
+    with pytest.raises(ServiceUnavailable):
+        engine_module._retry_transient(refuse)
     retries = [r for r in caplog.records if "transient Neo4j error" in r.getMessage()]
-    assert retries and all(r.exc_info is None for r in retries)
-    assert [r.getMessage().split(",")[0] for r in retries] == [
-        f"transient Neo4j error on try {n} of 4" for n in (1, 2, 3)
+    assert all(r.exc_info is None for r in retries)
+    assert [r.getMessage() for r in retries] == [
+        f"transient Neo4j error on try {n} of 4, retrying in {d}s: Couldn't connect to 127.0.0.1:9"
+        for n, d in ((1, "0.0"), (2, "0.0"), (3, "0.0"))
     ]
 
 

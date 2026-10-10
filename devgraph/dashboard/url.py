@@ -36,23 +36,36 @@ def dashboard_url(settings: Settings) -> str:
 DASHBOARD_IDENTITY = {"service": "devgraph-dashboard"}
 
 
-def probe_dashboard(url: str, timeout_s: float = 1.0) -> str:
+def probe_dashboard(url: str, timeout_s: float = 3.0) -> str:
     """Who answers at `url`: "devgraph", "other" (another program holds the
-    port) or "none" (nothing listens there)."""
+    port) or "none" (nothing listens there).
+
+    The connect is tried apart from the request: a refused or unanswered
+    connect is "none" (Windows retries a refused connect for about two
+    seconds), while a listener that then misbehaves is "other".
+    """
     import http.client
     import json
-    import urllib.error
-    import urllib.request
+    from urllib.parse import urlsplit
 
-    # No proxy: the dashboard is local, and a proxy would answer for it.
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
-        with opener.open(f"{url}/api/health", timeout=timeout_s) as response:
-            body = json.loads(response.read(4096))
-    except urllib.error.URLError as exc:
-        return "none" if isinstance(exc.reason, ConnectionRefusedError) else "other"
-    except ConnectionRefusedError:
+        parts = urlsplit(url)
+        connection = http.client.HTTPConnection(parts.hostname, parts.port, timeout=timeout_s)
+    except ValueError:  # not an address anything could listen on
         return "none"
-    except (OSError, ValueError, http.client.HTTPException):
-        return "other"
+    try:
+        try:
+            connection.connect()
+        except OSError:
+            return "none"
+        try:
+            connection.request("GET", "/api/health")
+            response = connection.getresponse()
+            if response.status != 200:
+                return "other"
+            body = json.loads(response.read(4096))
+        except (OSError, ValueError, http.client.HTTPException):
+            return "other"
+    finally:
+        connection.close()
     return "devgraph" if body == DASHBOARD_IDENTITY else "other"
