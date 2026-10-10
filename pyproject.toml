@@ -46,5 +46,9 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 include = ["devgraph*"]
 
+[tool.setuptools.package-data]
+# The dashboard's page and its vendored scripts (no CDN at runtime).
+"devgraph.dashboard" = ["static/*.html", "static/vendor/*.js"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
