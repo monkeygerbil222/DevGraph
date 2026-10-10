@@ -266,14 +266,18 @@ def open_comparison(
     head_ref: str,
     *,
     clock: Callable[[], float] = time.monotonic,
+    arg_names: tuple[str, str] = ("branch_a", "branch_b"),
+    tool: str = "compare_branches",
 ) -> Iterator[RefComparison]:
     """Yield the `RefComparison` of `head_ref` against its merge base with `base_ref`.
 
     The repository stays open (its blobs readable) until the block exits. Every
-    failure is a `CompareError` with the C7 message."""
+    failure is a `CompareError` with the C7 message, naming the refs by
+    `arg_names` and the calling tool by `tool`."""
     deadline = clock() + _COMPARE_DEADLINE_S
-    validate_ref("branch_a", base_ref)
-    validate_ref("branch_b", head_ref)
+    base_arg, head_arg = arg_names
+    validate_ref(base_arg, base_ref)
+    validate_ref(head_arg, head_ref)
     pair = f"{_echo(base_ref)} and {_echo(head_ref)}"
     repo = None
     try:
@@ -282,17 +286,17 @@ def open_comparison(
         except (NoSuchPathError, InvalidGitRepositoryError) as exc:
             raise CompareError(
                 f"repository {_echo(repo_id)} is not a git repository at its registered root; "
-                "compare_branches needs the repository's own .git"
+                f"{tool} needs the repository's own .git"
             ) from exc
-        base = _resolve(repo, repo_id, "branch_a", base_ref)
-        head = _resolve(repo, repo_id, "branch_b", head_ref)
+        base = _resolve(repo, repo_id, base_arg, base_ref)
+        head = _resolve(repo, repo_id, head_arg, head_ref)
 
         timeout_kw = {} if sys.platform == "win32" else {"kill_after_timeout": max(deadline - clock(), 1)}
         try:
             bases = repo.merge_base(base.hexsha, head.hexsha, **timeout_kw)
         except GitCommandError as exc:
             if _stderr_text(exc).startswith("Timeout:"):
-                raise CompareError(f"compare_branches timed out finding the merge base of {pair}") from exc
+                raise CompareError(f"{tool} timed out finding the merge base of {pair}") from exc
             raise
         if not bases:
             raise CompareError(f"{pair} share no history in repository {_echo(repo_id)}{_shallow_hint(repo)}")
@@ -320,7 +324,7 @@ def open_comparison(
     except CompareError:
         raise
     except (CommandError, OSError) as exc:
-        log.warning("compare_branches: git failed for %s in %s: %s", pair, repo_id, exc)
+        log.warning("%s: git failed for %s in %s: %s", tool, pair, repo_id, exc)
         raise CompareError(
             f"git failed while comparing {pair} in repository {_echo(repo_id)}: {type(exc).__name__}"
         ) from exc

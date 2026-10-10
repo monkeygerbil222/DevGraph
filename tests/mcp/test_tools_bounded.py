@@ -8,6 +8,7 @@ from pathlib import Path
 import anyio
 import pytest
 from mcp.client import Client
+from mcp.server.mcpserver.exceptions import ToolError
 from neo4j.exceptions import ClientError
 
 from devgraph.config.settings import Settings
@@ -68,7 +69,8 @@ def test_builtin_queries_run_read_only_with_a_timeout():
         def run_cypher(self, query, params=None):
             raise AssertionError("built-in tools must not use the unbounded run_cypher")
 
-    impact_analysis(Engine(), "demo", "f0")
+    with pytest.raises(ToolError, match="no component named 'f0'"):
+        impact_analysis(Engine(), "demo", "f0")
     assert seen["timeout_s"] == tools.BUILTIN_TIMEOUT_S
 
 
@@ -200,7 +202,7 @@ def test_impact_for_diff_on_a_hub_is_fast(engine, hub, tmp_path):
     (root / "hub.py").write_text("def get():\n    return 2\n")
     git("commit", "-q", "-am", "change")
     engine.run_cypher(
-        "MATCH (f:Function {repo_id: $r, name: 'get', file: 'get1.py'}) CREATE (:Module {repo_id: $r, name: 'hub.py'})-[:CONTAINS]->(f)",
+        "MATCH (f:Function {repo_id: $r, name: 'get', file: 'get1.py'}) SET f.file = 'hub.py'",
         {"r": repo_id},
     )
     registry = RepoRegistry(tmp_path / "registry.sqlite3")

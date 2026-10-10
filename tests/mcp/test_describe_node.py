@@ -278,8 +278,8 @@ def test_groups_query_is_top_n_with_separate_count():
     assert "collect(" not in query[:subquery]
 
 
-@pytest.mark.parametrize("given, sent", [(0, 1), (500, 50), (10, 10)])
-def test_max_per_type_is_clamped(given, sent):
+@pytest.mark.parametrize("given, sent", [(1, 1), (500, 50), (10, 10)])
+def test_max_per_type_is_capped(given, sent):
     engine = StubEngine(([LOOKUP_ROW], False), ([], False))
     _found(engine, max_per_type=given)
     assert engine.calls[1]["params"]["cap"] == sent
@@ -396,7 +396,8 @@ def served(tmp_path, monkeypatch):
             store.parent.mkdir(exist_ok=True)
             store.write_text(json.dumps({"version": 1, "tools": global_list}))
         record = _Repo("demo", repo)
-        return mcp_server.build_server(_ServerEngine(), _Registry([record]), session_repo=record, session_source="env")
+        registry = _Registry([record, _Repo("other", tmp_path / "other")])
+        return mcp_server.build_server(_ServerEngine(), registry, session_repo=record, session_source="env")
 
     return build
 

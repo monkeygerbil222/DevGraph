@@ -50,7 +50,10 @@ class _StubEngine:
 
 
 class _StubRegistry:
-    """build_server only stows the registry away for tools needing a repo root."""
+    """Knows repository `demo`; no tool here needs its root."""
+
+    def get(self, repo_id):
+        return object() if repo_id == "demo" else None
 
 
 def _node(name, *, repo_id="demo", file="src/app.py", labels=("Module",)):
@@ -117,7 +120,7 @@ class TestQueryConstruction:
 
     @pytest.mark.parametrize(
         "requested,expected",
-        [(0, 2), (1, 2), (2, 2), (5, 5), (8, 8), (9, 8), (500, 8), (-3, 2)],
+        [(2, 2), (5, 5), (8, 8), (9, 8), (500, 8)],
     )
     def test_max_length_is_clamped_to_2_through_8(self, requested, expected):
         engine = _StubEngine()
@@ -332,13 +335,14 @@ class TestEnvelope:
         assert len(result["results"]) == 3
         assert result["truncated"] is True
 
-    def test_max_results_is_clamped_to_at_least_one(self):
-        engine = _StubEngine([_closed_path("a", "b"), _closed_path("c", "d")])
+    @pytest.mark.parametrize("max_length", [1, 0, -3])
+    def test_a_max_length_below_two_is_an_error(self, max_length):
+        with pytest.raises(ToolError, match=f"max_length must be at least 2, not {max_length}"):
+            find_dependency_cycles(_StubEngine(), "demo", max_length=max_length)
 
-        result = find_dependency_cycles(engine, "demo", max_results=0)
-
-        assert result["count"] == 2
-        assert len(result["results"]) == 1
+    def test_a_max_results_below_one_is_an_error(self):
+        with pytest.raises(ToolError, match="max_results must be at least 1, not 0"):
+            find_dependency_cycles(_StubEngine(), "demo", max_results=0)
 
     def test_hitting_the_raw_path_cap_reports_truncated_even_when_count_is_small(self):
         """All 500 raw paths are rotations of one cycle, so the deduplicated

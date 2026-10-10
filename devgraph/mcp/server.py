@@ -340,7 +340,8 @@ def _with_repo_default(
     the wrapper's signature is `fn`'s with every parameter keyword-only (MCP always calls by
     keyword) and `repo_id: str | None = None`; nothing else in the tool's schema changes.
 
-    An explicit `repo_id` (anything but None) calls `fn` untouched and returns its result as is.
+    An explicit `repo_id` (anything but None) must be registered (else the ToolError
+    "no such repo_id"); `fn` is then called untouched and its result returned as is.
     Omitted or None: one `list_repos(active_only=True)` read; if the session repository is in
     it, `fn` runs against it and a dict result gains `repo_id` and a notice. With no session
     repository `unscoped_error(active_repos)` is raised, and with one no longer active
@@ -359,6 +360,7 @@ def _with_repo_default(
     @functools.wraps(fn)
     def wrapper(**kwargs: Any) -> Any:
         if kwargs.get("repo_id") is not None:
+            devgraph_tools._registered(registry, kwargs["repo_id"])
             return fn(**kwargs)
         active = registry.list_repos(active_only=True)
         if session_repo is None:
@@ -479,8 +481,15 @@ def build_server(
         max_results: int = 15,
         modified_within_commits: int | None = None,
     ) -> dict[str, Any]:
-        """Search for components by name/description; returns {count, results, truncated}.
-        Pass modified_within_commits to restrict to components touched within the last
+        """Search for components by name/description; returns {count, results, truncated},
+        each result with name, labels, repo_id, description and file. Ranked: exact name,
+        then name prefix, then name substring, then description only. count is the true
+        number of matches, unless count_is_lower_bound is true (exact and prefix matches
+        alone filled max_results). max_results is capped at 200. A snake_case query such as
+        user_service also matches as a whole word. An exact name in unusual case (gEt for
+        get) is found by the substring scan, so it can be missed when exact and prefix
+        matches alone fill max_results. A route's file-less handler stub is left out when a
+        real node has its name. Pass modified_within_commits to restrict to components touched within the last
         N commits repo-wide (requires git-history recency staging; entities never staged
         are excluded, not silently included).
         Also searches node types the repository's devgraph.schema.yaml declares (for
@@ -566,19 +575,24 @@ def build_server(
         """List entities touched within the last N commits repo-wide, most-recently-modified
         first; returns {count, results, truncated}. Requires git-history recency staging —
         entities never staged with last_modified_at are excluded. entity_type optionally
-        restricts to one node label (validated against NODE_LABELS)."""
+        restricts to one node label (validated against NODE_LABELS). within_commits must
+        be at least 1."""
         return devgraph_tools.list_recent_changes(
             engine, repo_id, within_commits, entity_type, cross_repo, max_results
         )
 
     @server.tool(annotations=_READ_ONLY)
     def trace_request_flow(repo_id: str, start_endpoint: str, cross_repo: bool = False) -> dict[str, Any]:
-        """Trace the request flow from an endpoint through services, datastores, and queues."""
+        """Trace the request flow from an endpoint through services, datastores, and queues
+        (every node within five hops). start_endpoint is an endpoint name like
+        "GET /users/<id>", or a bare path like "/users/<id>" to start from that path's
+        endpoint for every method. An unknown endpoint is an error with similar names."""
         return devgraph_tools.trace_request_flow(engine, repo_id, start_endpoint, cross_repo)
 
     @server.tool(annotations=_READ_ONLY)
     def get_service_dependencies(repo_id: str, service_name: str, cross_repo: bool = False) -> dict[str, Any]:
-        """Get all dependencies (services, datastores, queues) for a given service."""
+        """Get all dependencies (services, datastores, queues) for a given service. An
+        unknown service is an error with similar names."""
         return devgraph_tools.get_service_dependencies(engine, repo_id, service_name, cross_repo)
 
     @server.tool(annotations=_READ_ONLY)
@@ -637,7 +651,8 @@ def build_server(
     def impact_analysis(repo_id: str, component_name: str, cross_repo: bool = False, max_results: int = 15) -> dict[str, Any]:
         """Analyze component impact: direct dependents (one CALLS/USES/DEPENDS_ON hop) and
         transitive ones (two to four hops; further ones are not followed). Dependents
-        wrapped in {count, results, truncated} envelopes."""
+        wrapped in {count, results, truncated} envelopes. An unknown component is an
+        error with similar names."""
         return devgraph_tools.impact_analysis(engine, repo_id, component_name, cross_repo, max_results)
 
     @server.tool(annotations=_READ_ONLY)
@@ -648,12 +663,17 @@ def build_server(
         cross_repo: bool = False,
         max_results: int = 15,
     ) -> dict[str, Any]:
-        """Analyze the combined impact of every component changed between two git refs
-        (e.g. a PR's base/head branches). Composes a local git diff with the same
-        dependent-tracing impact_analysis uses, across every changed component at once.
-        Both refs must already exist locally — never fetches from a remote. Transitive
-        dependents stop at four hops. Dependents wrapped in {count, results, truncated}
-        envelopes."""
+        """What a change between two local git refs could break. Compares head_ref with
+        its merge base with base_ref, like `git diff base_ref...head_ref` (what a pull
+        request shows), as compare_branches does, and lists the functions and classes
+        added, changed and removed (added_symbols, changed_symbols, removed_symbols).
+        Dependents of the changed and removed ones are traced, direct (one
+        CALLS/USES/DEPENDS_ON hop) and transitive (two to four hops); added ones have no
+        dependents yet. A changed code file whose symbols weren't diffed (past the
+        200-file cap, unreadable, or renamed) counts every indexed symbol in it, with a
+        notice; a changed symbol the index doesn't have is named in a notice. Never fetches; same ref rules and caps as
+        compare_branches. Dependents come from the last index of the working tree and are
+        wrapped in {count, results, truncated} envelopes."""
         return devgraph_tools.impact_analysis_for_diff(
             engine, registry, repo_id, base_ref, head_ref, cross_repo, max_results
         )
@@ -670,7 +690,8 @@ def build_server(
 
     @server.tool(annotations=_READ_ONLY)
     def explain_decision(repo_id: str, decision_name: str, cross_repo: bool = False) -> dict[str, Any]:
-        """Explain a design decision: its rationale, what it documents, and what it supersedes."""
+        """Explain a design decision: its rationale, what it documents, and what it supersedes.
+        An unknown decision name is an error with similar names."""
         return devgraph_tools.explain_decision(engine, repo_id, decision_name, cross_repo)
 
     @server.tool(annotations=_READ_ONLY)
@@ -694,8 +715,12 @@ def build_server(
     ) -> dict[str, Any]:
         """Find Documents mentioning an entity or what a Document mentions; returns {count, results, truncated}.
         direction="mentioned_by" (default): find Documents mentioning the entity named name.
-        direction="mentions": find what the Document at repo-relative path name mentions."""
-        return devgraph_tools.find_mentions(engine, repo_id, name, label, direction, cross_repo, max_results)
+        direction="mentions": find what the Document at repo-relative path name mentions.
+        With the repository's mentions indexing off, the envelope is empty and a `notice`
+        says how to enable it."""
+        return devgraph_tools.find_mentions(
+            engine, repo_id, name, label, direction, cross_repo, max_results, registry
+        )
 
     @server.tool(annotations=_READ_ONLY)
     def blame_component(repo_id: str, component_name: str, cross_repo: bool = False) -> list[dict[str, Any]]:
