@@ -800,6 +800,9 @@ def _dashboard_port_hint(settings) -> str:
     return f"set DEVGRAPH_DASHBOARD_PORT in {devgraph_home() / '.env'} and restart the agent"
 
 
+_OUTDATED_AGENT_HINT = "restart it to update it ('devgraph tray stop', then 'devgraph tray start')"
+
+
 def _print_dashboard_status(settings) -> None:
     """The `status` "Dashboard" section: whether DevGraph's dashboard answers on its port."""
     console.print("[bold]Dashboard[/bold]")
@@ -810,6 +813,8 @@ def _print_dashboard_status(settings) -> None:
     found = probe_dashboard(url)
     if found == "devgraph":
         console.print(f"  [green][OK] serving[/green] at {escape(url)}")
+    elif found == "outdated":
+        console.print(f"  [yellow]an older DevGraph agent is serving[/yellow] at {escape(url)}; {escape(_OUTDATED_AGENT_HINT)}")
     elif found == "other":
         console.print(
             f"  [red][X] port {escape(str(settings.dashboard_port))} is held by another program[/red]; "
@@ -1606,7 +1611,10 @@ def dashboard(
     if url_only:
         console.print(escape(url))
     elif open_browser:
-        if probe_dashboard(url) == "other":
+        found = probe_dashboard(url)
+        if found == "outdated":
+            console.print(f"[yellow]An older DevGraph agent is serving the dashboard;[/yellow] {escape(_OUTDATED_AGENT_HINT)}")
+        if found == "other":
             console.print(
                 f"[red][X] Port {escape(str(settings.dashboard_port))} is held by another program,[/red] not DevGraph's "
                 f"dashboard; not opening it. {escape(_dashboard_port_hint(settings))}."

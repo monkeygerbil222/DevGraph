@@ -5,8 +5,10 @@ never opens a browser on a port DevGraph doesn't serve."""
 import http.server
 import logging
 import socket
+import sys
 import threading
 import time
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -15,7 +17,7 @@ from typer.testing import CliRunner
 from devgraph.cli import main as cli_main
 from devgraph.config.settings import Settings
 from devgraph.dashboard.serving import DashboardFailure
-from devgraph.dashboard.url import probe_dashboard
+from devgraph.dashboard.url import DASHBOARD_PAGE_MARKER, probe_dashboard
 from tests.graph.test_engine_close import fake_engine
 
 
@@ -119,3 +121,108 @@ def test_devgraph_status_names_a_held_dashboard_port(tmp_path, held_port):
         result = CliRunner().invoke(cli_main.app, ["status"])
     assert "Dashboard" in result.stdout
     assert f"port {held_port} is held by another program" in result.stdout
+
+
+@pytest.fixture
+def old_devgraph_port():
+    """An older DevGraph agent: its page at `/`, but no `/api/health` (a 404)."""
+    page = (Path(__file__).resolve().parents[2] / "devgraph" / "dashboard" / "static" / "index.html").read_bytes()
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/":
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html")
+                self.end_headers()
+                self.wfile.write(page)
+            else:
+                self.send_error(404)
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    yield server.server_address[1]
+    server.shutdown()
+    server.server_close()
+
+
+def test_probe_recognises_an_older_devgraph_without_the_health_route(old_devgraph_port):
+    assert DASHBOARD_PAGE_MARKER.encode() in (
+        Path(__file__).resolve().parents[2] / "devgraph" / "dashboard" / "static" / "index.html"
+    ).read_bytes()
+    assert probe_dashboard(f"http://127.0.0.1:{old_devgraph_port}") == "outdated"
+
+
+def test_status_says_to_restart_an_older_devgraph_not_to_change_the_port(tmp_path, old_devgraph_port):
+    with patch.object(cli_main, "get_settings", return_value=_settings(tmp_path, old_devgraph_port)), \
+         patch.object(cli_main, "GraphEngine") as engine_cls:
+        engine_cls.return_value.index_format.return_value = None
+        result = CliRunner().invoke(cli_main.app, ["status"], terminal_width=400)
+    dashboard = result.stdout.split("Dashboard", 1)[1]
+    assert "older DevGraph" in dashboard and "restart" in dashboard
+    assert "DEVGRAPH_DASHBOARD_PORT" not in dashboard
+
+
+def test_devgraph_dashboard_opens_an_older_devgraph_and_says_to_restart(tmp_path, old_devgraph_port):
+    with patch.object(cli_main, "get_settings", return_value=_settings(tmp_path, old_devgraph_port)), \
+         patch.object(cli_main, "_tray_liveness_text", return_value="running"), \
+         patch.object(cli_main.webbrowser, "open") as browser:
+        result = CliRunner().invoke(cli_main.app, ["dashboard"], terminal_width=400)
+    assert result.exit_code == 0, result.output
+    browser.assert_called_once()
+    assert "older DevGraph" in result.output and "DEVGRAPH_DASHBOARD_PORT" not in result.output
+
+
+def test_a_second_agent_on_the_same_port_gets_the_port_in_use_failure(monkeypatch):
+    """SO_REUSEADDR lets two binds succeed on Linux; only one may listen."""
+    port = _free_port()
+    first = _headless(monkeypatch, port)
+    thread = threading.Thread(target=first._run_dashboard, daemon=True)
+    thread.start()
+    try:
+        deadline = time.monotonic() + 10
+        while probe_dashboard(f"http://127.0.0.1:{port}") != "devgraph" and time.monotonic() < deadline:
+            time.sleep(0.05)
+        second = _headless(monkeypatch, port)
+        second._run_dashboard()
+        assert second._dashboard_problem is not None
+        assert second._dashboard_problem.summary == f"dashboard port {port} in use"
+    finally:
+        first._dashboard_server.should_exit = True
+        thread.join(5)
+
+
+def test_bind_listens_and_matches_asyncio_address_rules():
+    from devgraph.dashboard.serving import _bind
+
+    sockets = _bind("localhost", 0)
+    try:
+        assert all(_is_listening(s) for s in sockets)
+        assert {s.family for s in sockets} <= {socket.AF_INET, socket.AF_INET6}
+        assert socket.AF_INET in {s.family for s in sockets}
+        assert len({s.getsockname()[1] for s in sockets}) == 1  # one port for every address
+    finally:
+        for s in sockets:
+            s.close()
+    if socket.has_ipv6:
+        try:
+            (wildcard,) = _bind("::", 0)
+        except OSError:
+            pytest.skip("no IPv6 on this host")
+        with wildcard:
+            assert wildcard.getsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY) == 1
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows-only socket option")
+def test_bind_takes_the_port_exclusively_on_windows():
+    from devgraph.dashboard.serving import _bind
+
+    (sock,) = _bind("127.0.0.1", 0)
+    with sock:
+        assert sock.getsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE) == 1
+
+
+def _is_listening(sock) -> bool:
+    return bool(sock.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN)) if hasattr(socket, "SO_ACCEPTCONN") else True

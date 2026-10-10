@@ -31,18 +31,39 @@ class DashboardFailure:
     detail: str
 
 
-def _bind(host: str, port: int) -> socket.socket:
-    """The listening socket uvicorn would bind (its `Config.bind_socket` rules)."""
-    sock = socket.socket(family=socket.AF_INET6 if ":" in host else socket.AF_INET)
+def _bind(host: str, port: int, backlog: int = 2048) -> list[socket.socket]:
+    """Listening sockets for every address `host` resolves to, by asyncio's
+    `create_server` rules (which uvicorn used): `localhost` gets ::1 and
+    127.0.0.1, the empty host every address, and an IPv6 socket is IPv6-only.
+
+    Each socket listens before the next is made, so a port another server
+    already listens on fails here even where SO_REUSEADDR let the bind through.
+    """
+    infos = socket.getaddrinfo(host or None, port, type=socket.SOCK_STREAM, flags=socket.AI_PASSIVE)
+    sockets: list[socket.socket] = []
     try:
-        if sys.platform != "win32":  # on Windows SO_REUSEADDR lets two servers share a port
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.bind((host, port))
+        for family, kind, proto, _name, address in dict.fromkeys(infos):
+            # Port 0 (tests): every address on the one port the first was given.
+            address = (address[0], port, *address[2:])
+            sock = socket.socket(family, kind, proto)
+            sockets.append(sock)
+            if sys.platform == "win32":
+                # SO_REUSEADDR on Windows lets two servers share a port; this refuses any sharing.
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            else:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            if family == socket.AF_INET6:
+                sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+            sock.bind(address)
+            sock.listen(backlog)
+            port = sock.getsockname()[1]
     except OSError:
-        sock.close()
+        for sock in sockets:
+            sock.close()
         raise
-    sock.set_inheritable(True)
-    return sock
+    for sock in sockets:
+        sock.set_inheritable(True)
+    return sockets
 
 
 def _fix_hint() -> str:
@@ -56,7 +77,7 @@ def serve_dashboard(server: uvicorn.Server, loop: asyncio.AbstractEventLoop) -> 
     """Serve until the server exits; the failure when it could not start, else None."""
     host, port = server.config.host, server.config.port
     try:
-        sock = _bind(host, port)
+        sockets = _bind(host, port, server.config.backlog)
     except OSError as exc:
         if exc.errno in _ADDRESS_IN_USE:
             return DashboardFailure(
@@ -69,11 +90,12 @@ def serve_dashboard(server: uvicorn.Server, loop: asyncio.AbstractEventLoop) -> 
             f"dashboard cannot listen on {host}:{port} ({exc.strerror or exc}), so it is off; {_fix_hint()}",
         )
     try:
-        loop.run_until_complete(server.serve(sockets=[sock]))
+        loop.run_until_complete(server.serve(sockets=sockets))
     except SystemExit:
         return DashboardFailure(
             "dashboard failed to start", f"dashboard on {host}:{port} failed to start, so it is off"
         )
     finally:
-        sock.close()
+        for sock in sockets:
+            sock.close()
     return None
