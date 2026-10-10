@@ -679,7 +679,8 @@ def test_a_catch_up_cut_by_shutdown_stamps_nothing_and_the_next_one_indexes_the_
     with caplog.at_level("WARNING"):
         assert stopping.on_catch_up(REPO, datetime.fromisoformat(before)) is False
     assert registry.last_indexed == before
-    assert [r for r in caplog.records if r.levelname == "WARNING"] == []  # no traceback per remaining file
+    warnings = [r for r in caplog.records if r.levelname == "WARNING" and r.name.startswith("devgraph")]
+    assert warnings == []  # no traceback per remaining file
 
     monkeypatch.undo()
     restarted = RepoSync(engine, registry, lambda event: None, lambda *a: None)

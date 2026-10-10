@@ -543,8 +543,10 @@ def test_watcher_manager_stop_keeps_a_waiting_never_indexed_git_sync_from_starti
     registry = temp_registry_db
     repo_id = registry.add_repo(temp_git_repo).repo_id
     syncs: list[str] = []
+    # The start catch-up of a never-indexed repo "fails", so it syncs nothing
+    # itself: only the burst's sync is under test.
     watcher = WatcherManager(
-        registry, lambda *a: None, on_git_state_changed=syncs.append, on_catch_up=lambda *a: True
+        registry, lambda *a: None, on_git_state_changed=syncs.append, on_catch_up=lambda *a: False
     )
     watcher.start()
     holding, release, past_check = threading.Event(), threading.Event(), threading.Event()
