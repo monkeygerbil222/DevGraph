@@ -551,6 +551,7 @@ class WatcherManager:
                 timer_factory=self._timer_factory,
                 batch_lock=self._batch_locks.setdefault(repo.repo_id, threading.Lock()),
                 request_reconcile=self._request_reconcile,
+                request_catch_up=self.request_catch_up,
             )
             observer = Observer()
             # Don't hand watchdog a single recursive watch on repo.path: that
@@ -832,6 +833,13 @@ class WatcherManager:
             return dict(self._repo_issues.items())
 
 
+#: How often a watcher that keeps dropping events warns again (RepoSync's
+#: FAILURE_WARNING_INTERVAL).
+DISPATCH_WARNING_INTERVAL_S = 300.0
+#: How soon after a dropped event its catch-up runs.
+DISPATCH_CATCH_UP_DELAY_S = 5.0
+
+
 class _RepoEventHandler(FileSystemEventHandler):
     """Collects one repo's file events and hands them to `on_changes` in
     debounced batches.
@@ -862,6 +870,8 @@ class _RepoEventHandler(FileSystemEventHandler):
         timer_factory: TimerFactory = threading.Timer,
         batch_lock: threading.Lock | None = None,
         request_reconcile: Callable[..., None] | None = None,
+        request_catch_up: Callable[[str, datetime, float, str], None] | None = None,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._repo_id = repo_id
         self._repo_root = repo_root
@@ -877,22 +887,43 @@ class _RepoEventHandler(FileSystemEventHandler):
         self._debounce_timer: Any = None
         self._closed = False
         self._lock = threading.Lock()
-        self._dispatch_warned = False
+        self._request_catch_up = request_catch_up
+        self._clock = clock
+        # When the last dropped-event warning was logged, and how many events
+        # were dropped since.
+        self._dispatch_warned_at: float | None = None
+        self._dispatch_dropped = 0
 
     # --- watchdog callbacks -------------------------------------------------
 
     def dispatch(self, event: FileSystemEvent) -> None:
         """watchdog's entry point. An exception here would end the observer
-        thread, which serves every watched repository, so one event that
-        raises is logged (a warning the first time, then at debug level) and
-        dropped."""
+        thread, which serves every watched repository, so an event that raises
+        is dropped and a catch-up is requested to recover what it carried. The
+        first drop warns with the traceback; while drops continue, a warning
+        with their count follows every `DISPATCH_WARNING_INTERVAL_S` (others
+        are logged at debug level)."""
         try:
             super().dispatch(event)
-        except Exception:
-            level = logging.DEBUG if self._dispatch_warned else logging.WARNING
-            self._dispatch_warned = True
-            logger.log(level, "Dropped a file event for %s that could not be handled: %r",
-                       self._repo_id, event, exc_info=True)
+        except Exception as exc:
+            self._dropped_event(event, exc)
+
+    def _dropped_event(self, event: FileSystemEvent, exc: Exception) -> None:
+        now = self._clock()
+        if self._dispatch_warned_at is None:
+            self._dispatch_warned_at = now
+            logger.warning("Dropped a file event for %s that could not be handled (%r); catching up",
+                           self._repo_id, event, exc_info=exc)
+        elif now - self._dispatch_warned_at >= DISPATCH_WARNING_INTERVAL_S:
+            self._dispatch_warned_at = now
+            logger.warning("Dropped %d more file events for %s that could not be handled (still failing: %s); "
+                           "catching up", self._dispatch_dropped + 1, self._repo_id, exc)
+            self._dispatch_dropped = 0
+        else:
+            self._dispatch_dropped += 1
+            logger.debug("Dropped a file event for %s: %r", self._repo_id, event, exc_info=exc)
+        if self._request_catch_up is not None:
+            self._request_catch_up(self._repo_id, datetime.now(timezone.utc), DISPATCH_CATCH_UP_DELAY_S, "retry")
 
     def on_modified(self, event: FileSystemEvent) -> None:
         if event.is_directory:
@@ -1094,9 +1125,14 @@ class _RepoEventHandler(FileSystemEventHandler):
         rel = self._rel(raw)
         if rel is None or not rel.parts or is_ignored_path(rel):
             return None
-        # A .gitignore always passes, even one that ignores itself: its change
-        # is what makes RepoSync catch up.
-        if rel.name != GITIGNORE and is_gitignored(self._repo_root, rel.as_posix()):
+        # A .gitignore passes even when it ignores itself (its change is what
+        # makes RepoSync catch up), unless its folder is ignored, as a tool
+        # cache's own `*` .gitignore is (.mypy_cache/, .ruff_cache/).
+        if rel.name == GITIGNORE:
+            parent = rel.parent.as_posix()
+            if parent != "." and is_gitignored(self._repo_root, parent, is_dir=True):
+                return None
+        elif is_gitignored(self._repo_root, rel.as_posix()):
             return None
         return rel.as_posix()
 

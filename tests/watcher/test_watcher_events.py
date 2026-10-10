@@ -454,15 +454,33 @@ def test_indexable_paths_under_does_not_follow_symlinked_dirs(tree):
 # --- review fixes: a raising handler, and self-ignoring .gitignore files -----
 
 
-def test_an_event_that_raises_is_logged_once_and_later_events_still_queue(h, root, monkeypatch, caplog):
-    real = h.handler._queue_rel
-    monkeypatch.setattr(h.handler, "_queue_rel", lambda raw: (_ for _ in ()).throw(RuntimeError("boom")))
+def test_events_that_raise_are_counted_warned_every_few_minutes_and_caught_up(root, monkeypatch, caplog):
+    now = [1000.0]
+    requests = []
+    harness = Harness(root)
+    handler = _RepoEventHandler(
+        "repo", root, 500, lambda *a: None, timer_factory=lambda *a: FakeTimer(*a), batch_lock=threading.Lock(),
+        request_catch_up=lambda *a: requests.append(a), clock=lambda: now[0],
+    )
+    real = handler._queue_rel
+    monkeypatch.setattr(handler, "_queue_rel", lambda raw: (_ for _ in ()).throw(RuntimeError("boom")))
     with caplog.at_level("DEBUG", logger="devgraph.watcher.manager"):
-        h.send(FileDeletedEvent(h.p("pkg/a.py")), FileDeletedEvent(h.p("pkg/b.py")))
-    assert len([r for r in caplog.records if r.levelname == "WARNING"]) == 1
-    monkeypatch.setattr(h.handler, "_queue_rel", real)
-    h.send(FileDeletedEvent(h.p("pkg/c.py")))
-    assert h.one_batch() == (set(), {"pkg/c.py"})
+        for name in ("a", "b", "c"):
+            handler.dispatch(FileDeletedEvent(harness.p(f"pkg/{name}.py")))
+        warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+        assert len(warnings) == 1 and warnings[0].exc_info
+        now[0] += manager_module.DISPATCH_WARNING_INTERVAL_S
+        handler.dispatch(FileDeletedEvent(harness.p("pkg/d.py")))
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 2 and "3 more" in warnings[1].getMessage() and "boom" in warnings[1].getMessage()
+    assert len(requests) == 4 and all(r[0] == "repo" and r[3] == "retry" for r in requests)
+
+    monkeypatch.setattr(handler, "_queue_rel", real)
+    batches = []
+    handler._on_changes = lambda repo_id, changed, deleted: batches.append(deleted)
+    handler.dispatch(FileDeletedEvent(harness.p("pkg/e.py")))
+    handler.flush()
+    assert batches == [{root / "pkg/e.py"}]
 
 
 def test_a_raising_handler_leaves_a_real_observer_alive(root, monkeypatch):
@@ -507,3 +525,11 @@ def test_a_gitignore_that_ignores_itself_is_still_queued(h, root, ignores, rel):
     (root / rel).unlink()
     h.send(FileDeletedEvent(h.p(rel)))
     assert h.one_batch() == (set(), {rel})
+
+
+def test_a_gitignore_inside_an_ignored_folder_is_not_queued(h, root):
+    _write(root / ".gitignore", ".mypy_cache/\n")
+    _write(root / ".mypy_cache/.gitignore", "*\n")
+    h.send(FileModifiedEvent(h.p(".mypy_cache/.gitignore")))
+    h.handler.flush()
+    assert h.batches == []
