@@ -584,11 +584,16 @@ def describe_node(
     }
 
 
+#: Most results god_nodes returns, whatever max_results asks for.
+_GOD_NODES_MAX = 500
+
+
 def god_nodes(
     engine: GraphEngine,
     repo_id: str,
     cross_repo: bool = False,
     max_results: int = 10,
+    declared_labels: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     """Return the most-connected nodes in the graph — the core abstractions
     a new agent should look at first to orient itself in an unfamiliar repo.
@@ -597,24 +602,41 @@ def god_nodes(
         engine: GraphEngine instance
         repo_id: Repository ID to search within (unless cross_repo=True)
         cross_repo: If True, search across all repos
-        max_results: Maximum number of results to return
+        max_results: Maximum number of results to return, clamped to 1..500
+        declared_labels: The repository's schema-declared labels to rank as
+            well; anything that isn't a valid label identifier is ignored
 
     Returns:
-        Dict with count, results, and truncated flag. Each result has
-        name, labels, repo_id, and degree (number of direct relationships).
+        Dict with count (nodes ranked), results, and truncated flag. Each result
+        has name, labels, repo_id, and degree (number of direct relationships).
+        `Repository` nodes are not ranked.
     """
-    repo_filter = "" if cross_repo else "WHERE n.repo_id = $repo_id"
-    cypher = f"""
-    MATCH (n)
-    {repo_filter}
-    WITH n, size((n)--()) as degree
-    RETURN n.name as name, labels(n) as labels, n.repo_id as repo_id, degree
-    ORDER BY degree DESC
-    LIMIT 50
+    declared = tuple(d for d in dict.fromkeys(declared_labels) if LABEL_PATTERN.fullmatch(d))
+    labels = _DESCRIBE_BUILTIN_LABELS + tuple(d for d in declared if d not in _DESCRIBE_BUILTIN_LABELS)
+    repo_filter = "WHERE n.repo_id IS NOT NULL" if cross_repo else "WHERE n.repo_id = $repo_id"
+    # One label-anchored branch per label so each can use that label's repo_id
+    # index; UNION drops a node reached through two of its labels.
+    nodes = "\n  UNION\n".join(
+        f"  MATCH (n:`{label}`) {repo_filter} AND NOT n:Repository RETURN n" for label in labels
+    )
+    limit = max(1, min(_GOD_NODES_MAX, int(max_results)))
+    top_cypher = f"""
+    CALL () {{
+{nodes}
+    }}
+    WITH n, COUNT {{ (n)--() }} AS degree
+    ORDER BY degree DESC, n.name
+    LIMIT $limit
+    RETURN n.name AS name, labels(n) AS labels, n.repo_id AS repo_id, degree
     """
-    params = {} if cross_repo else {"repo_id": repo_id}
-    results = _query(engine, cypher, params)
-    return _envelope(results, max_results)
+    count_cypher = f"CALL () {{\n{nodes}\n}}\nRETURN count(n) AS total"
+    params: dict[str, Any] = {"limit": limit} if cross_repo else {"repo_id": repo_id, "limit": limit}
+    results = _query(engine, top_cypher, params)
+    (total_row,) = _query(engine, count_cypher, params)
+    envelope = _envelope(results, limit)
+    envelope["count"] = total_row["total"]
+    envelope["truncated"] = total_row["total"] > len(envelope["results"])
+    return envelope
 
 
 # Dependency-edge types find_dependency_cycles is allowed to traverse. A

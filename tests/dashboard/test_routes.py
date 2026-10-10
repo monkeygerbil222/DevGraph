@@ -594,3 +594,22 @@ def test_pending_only_label_is_gated_until_rescanned(schema_repo, engine):
 def test_search_is_not_available_for_the_all_scope(client):
     assert client.get("/api/repos/__all__/search", params={"q": "x"}).status_code == 404
     assert client.get("/api/repos/nope/search", params={"q": "x"}).status_code == 404
+
+
+def _dashboard_god_nodes_query(where: str) -> str:
+    """The degree fallback the dashboard's Overview panel runs, with its `${where}` filled in."""
+    import re
+
+    html = (Path(__file__).resolve().parents[2] / "devgraph" / "dashboard" / "static" / "index.html").read_text()
+    (template,) = re.findall(r"const godJson = await runCypher\(`([^`]*)`\)", html)
+    return template.replace("${where}", where)
+
+
+def test_dashboard_god_nodes_degree_query_runs_on_neo4j_5(client):
+    query = _dashboard_god_nodes_query('WHERE n.repo_id = "dash_repo_a" ')
+    res = client.post("/api/cypher", json={"query": query, "repo_id": "dash_repo_a"})
+    body = res.json()
+    assert body["errors"] == []
+    rows = [d["row"] for d in body["results"][0]["data"]]
+    assert rows and all(isinstance(row[2], int) for row in rows)
+    assert max(row[2] for row in rows) >= 1

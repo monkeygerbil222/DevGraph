@@ -500,7 +500,10 @@ def build_server(
         """Return the most-connected nodes in the graph — the core abstractions
         a new agent should look at first to orient itself in an unfamiliar repo.
         Returns {count, results, truncated} with degree (number of direct relationships)."""
-        return devgraph_tools.god_nodes(engine, repo_id, cross_repo, max_results)
+        return devgraph_tools.god_nodes(
+            engine, repo_id, cross_repo, max_results,
+            declared_labels=devgraph_tools.declared_node_labels(registry, repo_id),
+        )
 
     @server.tool(annotations=_READ_ONLY)
     def find_dependency_cycles(
