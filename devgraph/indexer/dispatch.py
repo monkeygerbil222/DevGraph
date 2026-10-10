@@ -294,15 +294,16 @@ def _max_file_bytes() -> int:
 
 
 def _skip_reason(
-    root_resolved: Path, own: str, rel_path: str, resolved: Path, docs_root: Path | None, mentions_enabled: bool,
+    root_resolved: Path, spellings: list[str], resolved: Path, docs_root: Path | None, mentions_enabled: bool,
     max_bytes: int,
 ) -> str | None:
     """Why `index_paths` leaves this file out, or None: a .gitignore ignores
-    its own path `own` (a link's, not its target's `rel_path`), or an extractor would read it but it is too large, binary, or minified
+    every one of the caller's `spellings` of it (a link is judged by its own
+    path, not its target's; none, for a file the batch pulled in), or an extractor would read it but it is too large, binary, or minified
     or generated (`walk.content_skip_reason`). A file no extractor reads (one
     only a schema provider represents, such as an image) is never judged by
     its content. Raises OSError when the file can't be read."""
-    if is_gitignored(root_resolved, own):
+    if spellings and all(is_gitignored(root_resolved, spelling) for spelling in spellings):
         return GITIGNORED
     if not _routes(resolved, docs_root, mentions_enabled):
         return None
@@ -713,7 +714,11 @@ def index_paths(
     # spelled a path (relative, absolute, through a symlink).
     root_resolved = repo_root.resolve()
     by_rel_path: dict[str, Path] = {}
-    own_paths: dict[str, str | None] = {}  # rel -> the caller's path, unresolved (see _own_rel)
+    # rel -> the caller's own spellings of it, unresolved (`_own_rel`). Only
+    # these are judged by .gitignore: reverse dependents and referrers come
+    # from graph keys the walk already let through (a .gitignore change is
+    # followed by a catch-up, whose prune handles them).
+    supplied: dict[str, list[str]] = {}
     for path in _expand_with_reverse_dependents(engine, repo_id, repo_root, paths):
         try:
             resolved = Path(path).resolve()
@@ -721,8 +726,10 @@ def index_paths(
             continue
         if not is_within(resolved, root_resolved):
             continue
-        by_rel_path[resolved.relative_to(root_resolved).as_posix()] = resolved
-        own_paths[resolved.relative_to(root_resolved).as_posix()] = _own_rel(repo_root, Path(path))
+        rel = resolved.relative_to(root_resolved).as_posix()
+        by_rel_path[rel] = resolved
+        if path in paths:
+            supplied.setdefault(rel, []).append(_own_rel(repo_root, Path(path)) or rel)
 
     max_bytes = _max_file_bytes()
     # Files left out by their content, for catch_up (see `_skip_marks`).
@@ -737,15 +744,18 @@ def index_paths(
         # otherwise silently lose every file after the failure point. Log and
         # skip the offending file so the rest of the batch still indexes.
         try:
-            own = own_paths.get(rel_path) or rel_path
-            reason = _skip_reason(root_resolved, own, rel_path, resolved, docs_root, mentions_enabled, max_bytes)
+            spellings = sorted(supplied.get(rel_path, []))
+            reason = _skip_reason(root_resolved, spellings, resolved, docs_root, mentions_enabled, max_bytes)
             if reason is not None:
-                logger.debug("%s: skipping %s (%s)", repo_id, own, reason)
+                shown = spellings[0] if spellings else rel_path
+                logger.debug("%s: skipping %s (%s)", repo_id, shown, reason)
                 if skipped is not None:
-                    skipped[own] = reason
+                    skipped[shown] = reason
                 if reason != GITIGNORED:
                     judged[rel_path] = [reason, max_bytes, _change_stamp_ns(os.stat(resolved))]
-                if own == rel_path:  # an ignored link leaves its target's nodes alone
+                # Only the file's own path being ignored clears its nodes: an
+                # ignored link leaves its target's alone.
+                if reason != GITIGNORED or rel_path in spellings:
                     engine.delete_nodes_by_source_file(repo_id, rel_path)
                 return
             indexed += _index_single_path(

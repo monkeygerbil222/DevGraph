@@ -471,3 +471,59 @@ def test_an_ignored_symlink_is_skipped_without_touching_its_target(tmp_path, mon
     assert engine.deleted == []  # real.py's nodes stay
     assert not dispatch._is_provider_file(tmp_path, tmp_path / "link.py")
     assert dispatch._is_provider_file(tmp_path, tmp_path / "real.py")
+
+
+# --- re-review fixes ----------------------------------------------------------
+
+
+@pytest.mark.skipif(__import__("os").name == "nt", reason="symlinks need privileges on Windows")
+def test_saving_an_import_keeps_a_file_indexed_through_a_symlink_into_an_ignored_folder(engine, tmp_path):
+    """link.py -> out/real.py with out/ ignored: the scan keys the target as
+    out/real.py. Saving a module it imports pulls out/real.py into the batch
+    as a reverse dependent, which must not be judged by .gitignore again."""
+    engine, (live, fresh) = engine
+    root = tmp_path / "repo"
+    (root / "pkg").mkdir(parents=True)
+    (root / "out").mkdir()
+    (root / ".gitignore").write_text("out/\n")
+    (root / "pkg" / "__init__.py").write_text("")
+    (root / "pkg" / "mod.py").write_text("def thing():\n    return 1\n")
+    (root / "out" / "real.py").write_text("from pkg.mod import thing\n\ndef real():\n    return thing()\n")
+    (root / "link.py").symlink_to(root / "out" / "real.py")
+    engine.upsert_repository(live, live, str(root))
+    full_scan(engine, live, root)
+    assert "out/real.py" in _files(engine, live)
+
+    (root / "pkg" / "mod.py").write_text("def thing():\n    return 2\n")
+    index_paths(engine, live, root, {root / "pkg" / "mod.py"})
+
+    assert "out/real.py" in _files(engine, live)
+    _matches_fresh(engine, live, fresh, root)
+
+
+@pytest.mark.skipif(__import__("os").name == "nt", reason="symlinks need privileges on Windows")
+def test_a_link_and_its_ignored_target_in_one_batch_keep_the_link_spelling(tmp_path, monkeypatch, small_limit):
+    (tmp_path / "out").mkdir()
+    (tmp_path / "out" / "real.py").write_text("x = 1\n")
+    (tmp_path / "link.py").symlink_to(tmp_path / "out" / "real.py")
+    (tmp_path / ".gitignore").write_text("out/\n")
+    seen = []
+    monkeypatch.setattr(dispatch, "_index_single_path", lambda e, r, root, resolved, rel, *a: seen.append(rel) or 1)
+    engine = _Engine()
+    index_paths(engine, "_unit_guards", tmp_path, {tmp_path / "link.py", tmp_path / "out" / "real.py"})
+    assert seen == ["out/real.py"] and engine.deleted == []
+
+
+def test_reverse_dependents_and_referrers_are_not_judged_by_gitignore(tmp_path, monkeypatch, small_limit):
+    (tmp_path / "out").mkdir()
+    (tmp_path / "out" / "dep.py").write_text("x = 1\n")
+    (tmp_path / "a.py").write_text("x = 1\n")
+    (tmp_path / ".gitignore").write_text("out/\n")
+    monkeypatch.setattr(
+        dispatch, "_expand_with_reverse_dependents", lambda e, r, root, paths: set(paths) | {tmp_path / "out" / "dep.py"}
+    )
+    seen = []
+    monkeypatch.setattr(dispatch, "_index_single_path", lambda e, r, root, resolved, rel, *a: seen.append(rel) or 1)
+    engine = _Engine()
+    index_paths(engine, "_unit_guards", tmp_path, {tmp_path / "a.py"})
+    assert seen == ["a.py", "out/dep.py"] and engine.deleted == []
