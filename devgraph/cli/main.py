@@ -1096,6 +1096,7 @@ def doctor() -> None:
     # The file-based checks below would misreport a missing folder as having no
     # schema or tools file, so they look only at the folders that are there.
     present_repos = [r for r in registered_repos if r.repo_id not in missing_ids]
+    nothing_to_check = "no reachable repositories to check" if registered_repos else "no registered repositories to check"
 
     # 7b. Per-repository project schemas. Filesystem-only, and reuses the list
     # section 7 already read: an unreadable registry is reported once, there,
@@ -1103,7 +1104,7 @@ def doctor() -> None:
     console.print("[bold]Project schemas[/bold]")
     schema_findings = _project_schema_findings(present_repos)
     if not schema_findings:
-        console.print("  [green][OK][/green] no registered repositories to check")
+        console.print(f"  [green][OK][/green] {escape(nothing_to_check)}")
     for finding in schema_findings:
         subject = escape(str(finding["repo_id"] or "conflict"))
         if finding["status"] == "disabled":
@@ -1132,7 +1133,7 @@ def doctor() -> None:
     console.print("[bold]Project tools[/bold]")
     tools_findings = _project_tools_findings(present_repos)
     if not tools_findings:
-        console.print("  [green][OK][/green] no registered repositories to check")
+        console.print(f"  [green][OK][/green] {escape(nothing_to_check)}")
     for finding in tools_findings:
         subject = escape(str(finding["repo_id"]))
         if finding["failed"]:

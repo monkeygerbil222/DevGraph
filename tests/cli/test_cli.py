@@ -2088,3 +2088,20 @@ def test_cli_info_with_neo4j_down_says_the_node_count_is_unknown(runner, temp_re
     assert "Nodes in graph: unknown (Neo4j unreachable)" in table.stdout
     as_json = _info_with_neo4j_down(runner, db_path, repo_id, "--json")
     assert json.loads(as_json.stdout)["node_count"] is None
+
+
+def test_cli_doctor_with_every_repository_folder_missing_says_none_are_reachable(
+    runner, temp_registry_db, tmp_path, monkeypatch
+):
+    import shutil
+
+    from devgraph.config import project_switch
+
+    db_path, registry = temp_registry_db
+    monkeypatch.setattr(project_switch, "_registry_db_path", lambda: db_path)
+    shutil.rmtree(registry.add_repo(_repo_with_schema(tmp_path, "gone")).path)
+    registry.close()
+
+    collapsed = _collapsed(_doctor_with_engine(runner, db_path, _stub_engine(None)).stdout)
+    assert "no registered repositories to check" not in collapsed
+    assert collapsed.count("[OK] no reachable repositories to check") >= 2
