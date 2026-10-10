@@ -77,6 +77,8 @@ A scan walks the repository's folder and skips:
 
 `devgraph add` and `devgraph rescan` list the files they skipped and why, for example `static/js/app.min.js (too large)`.
 
+Source that isn't UTF-8 is still read correctly: a Python file's `# -*- coding: latin-1 -*-` line is honoured, and any other file that isn't valid UTF-8 is read as Windows-1252 (or Latin-1), so identifiers such as `café` survive. A file that can't be read at all is skipped with a one-line warning.
+
 ### Keeping up with changes
 
 While the DevGraph agent (the tray app, or the headless agent in a container) is running, it keeps each watched repository's graph the same as a fresh scan would make it:
