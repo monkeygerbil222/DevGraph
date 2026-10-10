@@ -107,7 +107,7 @@ def _impact_expansion(cross_repo: bool) -> str:
     CALL per hop collecting the distinct nodes with a CALLS/USES/DEPENDS_ON edge
     into the previous hop's nodes, never one seen at an earlier hop, then
     returning `direct_dependents` (hop 1), `transitive_dependents` (hops 2 to
-    `IMPACT_MAX_DEPTH`), `direct_count` and `matched` (the changed nodes' names).
+    `IMPACT_MAX_DEPTH`), `direct_count` and `matched` (the changed nodes' {name, file}).
 
     Expanding distinct nodes hop by hop does work proportional to the nodes
     and edges within reach; a variable-length path enumerates every path, which
@@ -127,7 +127,7 @@ def _impact_expansion(cross_repo: bool) -> str:
     parts.append(
         "RETURN [d IN l1 | {name: d.name, type: labels(d)[0]}] AS direct_dependents, "
         f"[d IN {transitive} | {{name: d.name, type: labels(d)[0]}}] AS transitive_dependents, "
-        "size(l1) AS direct_count, [n IN l0 | n.name] AS matched"
+        "size(l1) AS direct_count, [n IN l0 | {name: n.name, file: n.file}] AS matched"
     )
     return "\n".join(parts)
 
@@ -541,12 +541,12 @@ def _suggestions_cypher(labels: tuple[str, ...]) -> str:
     )
 
 
-def _did_you_mean(suggestions: list[dict[str, Any]]) -> str:
+def _did_you_mean(suggestions: list[dict[str, Any]], lead: str = "Did you mean") -> str:
     """` Did you mean: label='...', name='...'; ...?`, or "" with no suggestions."""
     if not suggestions:
         return ""
     shown = "; ".join(", ".join(f"{k}={_echo(v)}" for k, v in _node_ref(s).items()) for s in suggestions)
-    return f" Did you mean: {shown}?"
+    return f" {lead}: {shown}?"
 
 
 def _not_found(
@@ -555,9 +555,12 @@ def _not_found(
     """A ToolError saying no `what` is named `name`, with up to five of this
     repository's nodes of `labels` whose name contains it."""
     suggestions = _query(engine, _suggestions_cypher(labels), {"repo_id": repo_id, "name": name})
-    where = "any repository" if cross_repo else f"repository {_echo(repo_id)}"
+    if cross_repo:
+        where, lead = "any repository", f"Similar names in repository {_echo(repo_id)}"
+    else:
+        where, lead = f"repository {_echo(repo_id)}", "Did you mean"
     return ToolError(
-        f"no {what} named {_echo(name)} in {where}.{_did_you_mean(suggestions)} "
+        f"no {what} named {_echo(name)} in {where}.{_did_you_mean(suggestions, lead)} "
         "search_component searches by partial name."
     )
 
@@ -1502,9 +1505,14 @@ def impact_analysis_for_diff(
     compare_branches does: git objects read in memory, never fetched, under its
     ref rules and caps. Functions and classes changed or removed are traced to
     their dependents with impact_analysis's bounded hop expansion; added ones
-    are listed apart, since nothing depends on new code yet. A changed code file
-    whose symbols couldn't be read (too large, a cap, a parse error, a blob
-    missing from a partial clone) counts every graph symbol in it, with a notice.
+    are listed apart, since nothing depends on new code yet. Every indexed
+    function and class of a changed code file counts as changed, with a notice,
+    when its symbols weren't diffed: it is past the 200-file detail cap, its
+    symbols couldn't be read (too large, a cap, a parse error, a blob missing
+    from a partial clone), or it was renamed (both paths). A changed or removed
+    symbol that matches no indexed node (by name and file) is named in a
+    notice: its dependents are unknown, for example when the index already
+    reflects the head.
 
     Args:
         engine: GraphEngine instance
@@ -1528,6 +1536,7 @@ def impact_analysis_for_diff(
             or git failing.
     """
     from devgraph.indexer.git_history import compare as git_compare
+    from devgraph.indexer.symbols import language_for
 
     record = _registered(registry, repo_id)
     _at_least(1, max_results=max_results)
@@ -1537,10 +1546,11 @@ def impact_analysis_for_diff(
             record.path, repo_id, base_ref, head_ref,
             arg_names=("base_ref", "head_ref"), tool="impact_analysis_for_diff",
         ) as comparison:
+            detail_failed = False
             try:
                 detailed = git_compare.symbol_detail(comparison)
             except git_compare.CompareError as exc:
-                detailed = []
+                detailed, detail_failed = [], True
                 notices.append(f"{exc}; every indexed symbol in the changed files counts as changed")
     except git_compare.CompareError as exc:
         raise ToolError(str(exc)) from exc
@@ -1549,16 +1559,24 @@ def impact_analysis_for_diff(
     changed_files = list(dict.fromkeys(p for c in changes for p in (c.old_path, c.path) if p is not None))
     symbols: dict[str, list[dict[str, Any]]] = {"added": [], "changed": [], "removed": []}
     targets: list[dict[str, str]] = []
-    unread: list[str] = []
+    # Files every indexed symbol of which counts as changed, by why.
+    fallback: dict[str, list[str]] = {"unread": [], "uncapped": [], "renamed": []}
     detailed_paths = {c.path for c in detailed}
     for change in changes:
-        if change.path not in detailed_paths:
-            if not detailed and change.kind == "blob" and change.status != "added":
-                unread.append(change.path)
+        if change.kind != "blob" or change.status == "added":
+            pass
+        elif language_for(change.path) is None and language_for(change.old_path or change.path) is None:
+            continue  # no functions or classes to trace
+        elif change.status == "renamed":
+            fallback["renamed"] += [change.old_path, change.path]
+            continue
+        elif change.path not in detailed_paths:
+            fallback["unread" if detail_failed else "uncapped"].append(change.path)
+            continue
+        elif change.symbols is None and change.symbols_skipped in ("too_large", "limit", "parse_error"):
+            fallback["unread"].append(change.path)
             continue
         if change.symbols is None:
-            if change.symbols_skipped in ("too_large", "limit", "parse_error") and change.status != "added":
-                unread.append(change.path)
             continue
         for name in symbols:
             symbols[name] += [_diff_symbol(entry, change.path) for entry in change.symbols[name]]
@@ -1567,24 +1585,45 @@ def impact_analysis_for_diff(
                 target = {"name": entry["name"], "file": change.path}
                 if target not in targets:
                     targets.append(target)
-    if unread and detailed:
+    if fallback["unread"] and not detail_failed:
         notices.append(
-            f"symbols of {len(unread)} changed file(s) could not be read; every indexed symbol in them counts as changed"
+            f"symbols of {len(fallback['unread'])} changed file(s) could not be read; "
+            "every indexed symbol in them counts as changed"
         )
+    if fallback["uncapped"]:
+        notices.append(
+            f"{len(fallback['uncapped'])} changed file(s) past the {git_compare._COMPARE_MAX_FILES}-file detail cap; "
+            "every indexed symbol in them counts as changed"
+        )
+    if fallback["renamed"]:
+        notices.append(
+            f"{len(fallback['renamed']) // 2} renamed file(s); every indexed symbol under the old or new path "
+            "counts as changed, since whatever imports the old path may break"
+        )
+    files = list(dict.fromkeys(f for paths in fallback.values() for f in paths))
 
     row = {"direct_dependents": [], "transitive_dependents": [], "direct_count": 0, "matched": []}
-    if targets or unread:
+    if targets or files:
         cypher = _DIFF_TARGETS_CYPHER + _impact_expansion(cross_repo)
-        rows = _query(engine, cypher, {"repo_id": repo_id, "targets": targets, "files": unread})
+        rows = _query(engine, cypher, {"repo_id": repo_id, "targets": targets, "files": files})
         if rows:
             row = rows[0]
+    found = {(m["name"], m["file"]) for m in row["matched"]}
+    missing = [t for t in targets if (t["name"], t["file"]) not in found]
+    if missing:
+        shown = ", ".join(f"{t['name']} ({t['file']})" for t in missing[:_DESCRIBE_MAX_SUGGESTIONS])
+        more = f" and {len(missing) - _DESCRIBE_MAX_SUGGESTIONS} more" if len(missing) > _DESCRIBE_MAX_SUGGESTIONS else ""
+        notices.append(
+            f"{len(missing)} changed or removed symbol(s) match no indexed node, so their dependents are unknown "
+            f"(the index may already be at the head, or not yet cover them): {_sanitize_value(shown)}{more}"
+        )
     reasons = comparison.truncated_reasons
     return {
         "changed_files": changed_files,
         "added_symbols": symbols["added"],
         "changed_symbols": symbols["changed"],
         "removed_symbols": symbols["removed"],
-        "changed_components": sorted({n for n in row["matched"] if n is not None}),
+        "changed_components": sorted({m["name"] for m in row["matched"] if m["name"] is not None}),
         "direct_dependents": _envelope(row["direct_dependents"], max_results),
         "transitive_dependents": _envelope(row["transitive_dependents"], max_results),
         "risk_level": _risk_level(row["direct_count"]),

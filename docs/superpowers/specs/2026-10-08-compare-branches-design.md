@@ -105,7 +105,8 @@ which functions or classes were added, removed or edited.
 - Two-dot (`branch_a..branch_b`, a straight tree-to-tree comparison). It
   reports every commit that landed on main after the branch point as a change
   "on the branch". That is the classic wrong answer to "what did my branch
-  change?". `impact_analysis_for_diff` uses two dots and is left as it is.
+  change?". (`impact_analysis_for_diff` used two dots when this was written;
+  it now reuses `compare.py` and compares from the merge base, three dots.)
 - New parameters (`max_files`, `include_callers`, ...). The brief keeps the
   signature, and the caps are constants like `describe_node`'s.
 
@@ -541,9 +542,10 @@ cut to 100 characters and quoted, as `tools._echo` does. The messages:
 - Fetching, or comparing remote refs that are not already local.
 - Indexing either ref into the graph, or graph-level (edge) differences
   between branches. That would need per-ref graphs.
-- Changing `impact_analysis_for_diff` (its two-dot range, its `git diff`
-  subprocess, its `error` key). It could reuse `compare.py` later; that is a
-  separate change.
+- Changing `impact_analysis_for_diff` (then a two-dot range, a `git diff`
+  subprocess and an `error` key). That came later as a separate change
+  (audit 2, item 8): it now reuses `compare.py`, compares three-dot from the
+  merge base, and raises a ToolError instead of the `error` key.
 - Opening submodules or nested repositories.
 - A merge-base timeout on Windows. GitPython cannot kill the process there
   (C4), so only the tree walk and parsing are bounded.

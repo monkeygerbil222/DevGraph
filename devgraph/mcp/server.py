@@ -669,8 +669,9 @@ def build_server(
         added, changed and removed (added_symbols, changed_symbols, removed_symbols).
         Dependents of the changed and removed ones are traced, direct (one
         CALLS/USES/DEPENDS_ON hop) and transitive (two to four hops); added ones have no
-        dependents yet. A changed file whose symbols can't be read counts every indexed
-        symbol in it, with a notice. Never fetches; same ref rules and caps as
+        dependents yet. A changed code file whose symbols weren't diffed (past the
+        200-file cap, unreadable, or renamed) counts every indexed symbol in it, with a
+        notice; a changed symbol the index doesn't have is named in a notice. Never fetches; same ref rules and caps as
         compare_branches. Dependents come from the last index of the working tree and are
         wrapped in {count, results, truncated} envelopes."""
         return devgraph_tools.impact_analysis_for_diff(

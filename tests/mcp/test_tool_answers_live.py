@@ -169,3 +169,9 @@ def test_trace_request_flow_on_an_unknown_endpoint_is_an_error(client):
     text = _error(client, "trace_request_flow", {"start_endpoint": "/user"})
     assert f"no endpoint named '/user' in repository '{REPO}'" in text
     assert "GET /users/<id>" in text
+
+
+def test_a_cross_repo_miss_says_where_its_suggestions_come_from(client):
+    text = _error(client, "impact_analysis", {"component_name": "validate", "cross_repo": True})
+    assert "no component named 'validate' in any repository." in text
+    assert f"Similar names in repository '{REPO}': label='Function', name='validate_token'" in text

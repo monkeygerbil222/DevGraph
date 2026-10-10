@@ -213,3 +213,145 @@ def test_a_rename_with_an_edit_in_a_blobless_clone_lists_both_paths_without_fetc
     assert "error" not in result, result
     assert sorted(result["changed_files"]) == ["new.py", "old.py"]
     assert not marker.exists()
+
+
+def _indexed(graph_engine, registry, repo_path, repo_id, *files):
+    registry.add_repo(repo_path, repo_id=repo_id)
+    for name in files:
+        index_file(graph_engine, repo_id, repo_path / name, repo_root=repo_path)
+
+
+def _direct(result):
+    return {d["name"] for d in result["direct_dependents"]["results"]}
+
+
+@pytest.fixture
+def two_files(tmp_path):
+    """Base: a.py defines fa, b.py defines fb, caller.py calls each. Head edits both."""
+    root = tmp_path / "two"
+    root.mkdir()
+    _run_git(root, "init", "-q", "-b", "main")
+    _run_git(root, "config", "user.email", "test@example.com")
+    _run_git(root, "config", "user.name", "Test Author")
+    (root / "a.py").write_text("def fa():\n    return 1\n")
+    (root / "b.py").write_text("def fb():\n    return 1\n")
+    (root / "caller.py").write_text(
+        "from a import fa\nfrom b import fb\n\n\ndef use_fa():\n    fa()\n\n\ndef use_fb():\n    fb()\n"
+    )
+    _run_git(root, "add", "-A")
+    _run_git(root, "commit", "-q", "-m", "base")
+    return root
+
+
+def _edit_both(root):
+    (root / "a.py").write_text("def fa():\n    return 2\n")
+    (root / "b.py").write_text("def fb():\n    return 2\n")
+    _run_git(root, "commit", "-q", "-am", "head")
+
+
+def test_files_past_the_detail_cap_count_every_indexed_symbol(graph_engine, registry, two_files, monkeypatch):
+    from devgraph.indexer.git_history import compare as git_compare
+
+    repo_id = "_smoketest_impact_diff_cap"
+    _indexed(graph_engine, registry, two_files, repo_id, "a.py", "b.py", "caller.py")
+    _edit_both(two_files)
+    monkeypatch.setattr(git_compare, "_COMPARE_MAX_FILES", 1)
+    try:
+        result = impact_analysis_for_diff(graph_engine, registry, repo_id, "HEAD~1", "HEAD")
+    finally:
+        graph_engine.delete_repository(repo_id)
+    assert [s["name"] for s in result["changed_symbols"]] == ["fa"]
+    assert _direct(result) == {"use_fa", "use_fb"}
+    assert "1 changed file(s) past the 1-file detail cap; every indexed symbol in them counts as changed" in (
+        result["notices"]
+    )
+    assert result["truncated_reasons"] == ["files"]
+
+
+def test_unreadable_symbols_count_every_indexed_symbol(graph_engine, registry, two_files, monkeypatch):
+    from devgraph.indexer.git_history import compare as git_compare
+
+    repo_id = "_smoketest_impact_diff_unread"
+    _indexed(graph_engine, registry, two_files, repo_id, "a.py", "b.py", "caller.py")
+    _edit_both(two_files)
+    monkeypatch.setattr(git_compare, "_COMPARE_MAX_FILE_BYTES", 5)
+    try:
+        result = impact_analysis_for_diff(graph_engine, registry, repo_id, "HEAD~1", "HEAD")
+    finally:
+        graph_engine.delete_repository(repo_id)
+    assert result["changed_symbols"] == []
+    assert _direct(result) == {"use_fa", "use_fb"}
+    assert (
+        "symbols of 2 changed file(s) could not be read; every indexed symbol in them counts as changed"
+        in result["notices"]
+    )
+
+
+def test_a_failed_symbol_detail_counts_every_indexed_symbol(graph_engine, registry, two_files, monkeypatch):
+    from devgraph.indexer.git_history import compare as git_compare
+
+    def fail(comparison):
+        raise git_compare.CompareError("git object missing")
+
+    repo_id = "_smoketest_impact_diff_detail_fails"
+    _indexed(graph_engine, registry, two_files, repo_id, "a.py", "b.py", "caller.py")
+    _edit_both(two_files)
+    monkeypatch.setattr(git_compare, "symbol_detail", fail)
+    try:
+        result = impact_analysis_for_diff(graph_engine, registry, repo_id, "HEAD~1", "HEAD")
+    finally:
+        graph_engine.delete_repository(repo_id)
+    assert _direct(result) == {"use_fa", "use_fb"}
+    assert result["notices"] == ["git object missing; every indexed symbol in the changed files counts as changed"]
+
+
+def test_a_pure_rename_traces_the_symbols_under_both_paths(graph_engine, registry, two_files):
+    repo_id = "_smoketest_impact_diff_rename"
+    _indexed(graph_engine, registry, two_files, repo_id, "a.py", "b.py", "caller.py")
+    _run_git(two_files, "mv", "a.py", "a2.py")
+    _run_git(two_files, "commit", "-q", "-m", "rename")
+    try:
+        result = impact_analysis_for_diff(graph_engine, registry, repo_id, "HEAD~1", "HEAD")
+    finally:
+        graph_engine.delete_repository(repo_id)
+    assert result["changed_files"] == ["a.py", "a2.py"]
+    assert result["changed_components"] == ["fa"]
+    assert _direct(result) == {"use_fa"}
+    assert any(n.startswith("1 renamed file(s)") for n in result["notices"])
+
+
+def test_symbols_the_index_lacks_are_named_in_a_notice(graph_engine, registry, two_files):
+    repo_id = "_smoketest_impact_diff_unindexed"
+    registry.add_repo(two_files, repo_id=repo_id)
+    _edit_both(two_files)
+    try:
+        result = impact_analysis_for_diff(graph_engine, registry, repo_id, "HEAD~1", "HEAD")
+    finally:
+        graph_engine.delete_repository(repo_id)
+    assert result["direct_dependents"]["count"] == 0
+    assert (
+        "2 changed or removed symbol(s) match no indexed node, so their dependents are unknown "
+        "(the index may already be at the head, or not yet cover them): fa (a.py), fb (b.py)"
+    ) in result["notices"]
+
+
+def test_a_merged_base_change_is_not_part_of_the_diff(graph_engine, registry, two_files):
+    """main moves on after the branch point and is merged into the branch: only the
+    branch's own change counts, from the merge base, as a pull request shows it."""
+    repo_id = "_smoketest_impact_diff_merge"
+    _indexed(graph_engine, registry, two_files, repo_id, "a.py", "b.py", "caller.py")
+    _run_git(two_files, "checkout", "-q", "-b", "feature")
+    (two_files / "a.py").write_text("def fa():\n    return 2\n")
+    _run_git(two_files, "commit", "-q", "-am", "feature edit")
+    _run_git(two_files, "checkout", "-q", "main")
+    (two_files / "b.py").write_text("def fb():\n    return 3\n")
+    _run_git(two_files, "commit", "-q", "-am", "main edit")
+    _run_git(two_files, "checkout", "-q", "feature")
+    _run_git(two_files, "merge", "-q", "--no-edit", "main")
+    try:
+        result = impact_analysis_for_diff(graph_engine, registry, repo_id, "main", "feature")
+    finally:
+        graph_engine.delete_repository(repo_id)
+    assert result["changed_files"] == ["a.py"]
+    assert [s["name"] for s in result["changed_symbols"]] == ["fa"]
+    assert _direct(result) == {"use_fa"}
