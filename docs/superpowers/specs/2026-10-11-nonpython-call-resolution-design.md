@@ -48,16 +48,22 @@ input of the walk (`devgraph/indexer/resolver_config.py`):
   `baseUrl`. A config under a path the walk ignores (a `.gitignore`, a
   `node_modules`) is treated as absent.
 - **Fingerprint.** Per language, a hash of the relevant content of every
-  configuration file in the repository (for TS: `baseUrl`, `paths`, `extends`,
-  `references`; a compiler flag never counts), stored on the Repository node
-  with the list of configuration paths it read, `extends` and `references`
-  targets included.
+  configuration file the walk finds (for TS: `baseUrl`, `paths`, `extends`,
+  `references`, with every config those reach, whatever its name; for Go:
+  each go.mod's `module` line and each go.work; a compiler flag or a
+  `require` bump never counts), stored on the Repository node
+  (`resolver_config`) with the list of paths it looked at, found or not.
 - **Triggers.** A live batch (`RepoSync.on_changes`) that changes or deletes a
   path on that list, a directory holding one, or a path named like a
   configuration file recomputes the fingerprint; `catch_up` recomputes it after
   its walk. When it differs, every graph file of that language is re-indexed in
   one more batch, and the new fingerprint is stored only once that batch
-  succeeds (never after a batch cut short by shutdown). `full_scan` stores it.
+  succeeds (never after a batch cut short by shutdown). `full_scan` takes it
+  before reading any file and stores it at the end
+  (`dispatch.sync_resolver_config`).
+- **Go today.** The Go extractor still reads only the root go.mod's module
+  line until slice B; that line is in the fingerprint, so editing it now
+  re-indexes the Go files, which it did not before.
 
 Fresh is then extract(text, configuration), and an incremental run re-extracts
 every dependent when the configuration changes.

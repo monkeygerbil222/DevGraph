@@ -13,6 +13,13 @@ aliased, relative and star imports, a package re-exporting from its module,
 a src/ layout, calls through modules, aliases and untyped values, and
 `self.shared()` reaching a base in the same or another file.
 
+TS files import through a tsconfig path alias, and the resolver configuration
+changes under them: the tsconfig is rewritten (its own `paths`, `extends` to
+an odd-named base, `references`), its base is edited or its folder deleted, a
+root or nested go.mod comes and goes, and a config under an ignored folder is
+edited. After every batch the fuzz runs what a live batch does,
+`sync_resolver_config`.
+
 Path pins (docs/superpowers/specs/2026-10-11-nonpython-call-resolution-design.md)
 are fuzzed ahead of the resolvers that write them: a Python file's
 `# pin calls <name> <pin>` and `# pin imports <pin>` comments become its
@@ -42,7 +49,12 @@ import pytest
 from devgraph.graph.engine import GraphEngine, provision_repository_schema
 from devgraph.indexer import dispatch
 from devgraph.indexer.calls import call_rows, import_rows
-from devgraph.indexer.dispatch import full_scan, index_paths, remove_paths
+from devgraph.indexer.dispatch import (
+    full_scan,
+    index_paths,
+    remove_paths,
+    sync_resolver_config,
+)
 from tests.watcher.live_helpers import fresh_snapshot, graph_snapshot, snapshot_diff
 
 SEEDS = [int(s) for s in os.environ.get("DEVGRAPH_ACCURACY_FUZZ_SEEDS", "1,2,3").split(",") if s.strip()]
@@ -147,6 +159,13 @@ def render(f: File) -> str:
             for name, calls in f.funcs.items()
         ]
         return "".join(parts) + "}\n"
+    if f.kind == "ts":
+        parts = [f"{m}\n" for m in f.imports]
+        parts += [
+            f"\nexport function {name}() {{\n" + "".join(f"  {g}();\n" for g in calls) + "}\n"
+            for name, calls in f.funcs.items()
+        ]
+        return "".join(parts) or "export {};\n"
     if f.kind == "compose":
         return "services:\n" + "".join(f"  {s}:\n    image: {i}\n" for s, i in f.services.items()) if f.services \
             else "services: {}\n"
@@ -163,6 +182,28 @@ def render(f: File) -> str:
         return "---\n" + "\n".join(front) + "\n---\n# Note\n"
     return f.head
 
+
+# The resolver configuration's versions, by path (None: the file is absent).
+TS_CONFIGS = {
+    "ts/tsconfig.json": [
+        '{"extends": "./configs/base.cfg"}',
+        '{"compilerOptions": {"paths": {"@/*": ["other/*"]}}}',
+        '{"compilerOptions": {"baseUrl": "src"}}',
+        '{"files": [], "references": [{"path": "./tsconfig.app.json"}]}',
+        '{\n  // both\n  "compilerOptions": {"baseUrl": ".", "paths": {"@/*": ["src/*", "other/*"],},},\n}',
+    ],
+    "ts/configs/base.cfg": [
+        '{"compilerOptions": {"paths": {"@/*": ["../src/*"]}}}',
+        '{"compilerOptions": {"paths": {"@/*": ["../other/*"]}}}',
+        '{"compilerOptions": {"baseUrl": "../other"}}',
+    ],
+    "ts/tsconfig.app.json": [None, '{"extends": "./configs/base.cfg"}', '{"compilerOptions": {"baseUrl": "other"}}'],
+    "ignored/tsconfig.json": ['{"compilerOptions": {"baseUrl": "."}}', '{"compilerOptions": {"baseUrl": ".."}}'],
+    "go.mod": [None, "module example.com/fz\n", "module example.com/other\n"],
+    "go/b/go.mod": [None, "module example.com/fz/b\n"],
+}
+# Folders holding a configuration file, which the fuzz may delete whole.
+CONFIG_DIRS = ["ts/configs", "go/b"]
 
 RS_FOO = "pub struct Foo;\n\nimpl Foo {\n    pub fn new() -> Foo {\n        Foo\n    }\n}\n"
 GO_SERVER = "type Server struct{}\n\nfunc (s *Server) Run() {\n\tServe()\n}\n"
@@ -189,6 +230,16 @@ def initial_repo() -> dict:
                                 funcs={"run": ["helper", "assist"]}),
         "java/base/Base.java": File("java", head="base", bases={"Base": None}, funcs={"assist": []}),
         "go/go.mod": File("static", head="module example.com/fz\n\ngo 1.22\n"),
+        "go.mod": File("static", head="module example.com/fz\n"),
+        "ts/tsconfig.json": File("static", head=TS_CONFIGS["ts/tsconfig.json"][0]),
+        "ts/configs/base.cfg": File("static", head=TS_CONFIGS["ts/configs/base.cfg"][0]),
+        "ts/app.ts": File("ts", imports=["import { f } from '@/lib';", "import * as u from '@/util';"],
+                          funcs={"main": ["f", "u.g"]}),
+        "ts/src/lib.ts": File("ts", funcs={"f": []}),
+        "ts/src/util.ts": File("ts", imports=["import { f } from './lib';"], funcs={"g": ["f"]}),
+        "ts/other/lib.ts": File("ts", funcs={"f": [], "g": []}),
+        ".gitignore": File("static", head="ignored/\n"),
+        "ignored/tsconfig.json": File("static", head=TS_CONFIGS["ignored/tsconfig.json"][0]),
         "go/a/a.go": File("go", head="a", imports=["example.com/fz/b"], funcs={"Start": ["Serve"]}),
         "go/b/b.go": File("go", head="b", extra=GO_SERVER, funcs={"Serve": [], "Stop": []}),
         "compose.yaml": File("compose", services={"api": "python:3.12", "web": "nginx:1.27"}),
@@ -206,7 +257,9 @@ IMPORTS = {
         "from lib import util", "import pkg.impl", "from pkg.impl import pkgfn as alias",
     ],
     "rs": ["display::Display", "foo::Foo"],
-    "go": ["example.com/fz/a", "example.com/fz/b"],
+    "go": ["example.com/fz/a", "example.com/fz/b", "example.com/fz/go/b"],
+    "ts": ["import { f } from '@/lib';", "import * as u from '@/util';", "import { g } from './src/util';",
+           "import { f } from './other/lib';", "import { f } from 'lib';"],
     "java": ["base.Base", "app.K"],
 }
 BASES = {"py": ["Base", "Child", "Foo", "Missing", "b.Base", "pkg.impl.Base"], "java": ["Base", "K"]}
@@ -216,11 +269,13 @@ PY_CALLS = ["{n}()", "b.{n}()", "c.{n}()", "obj.{n}()", "pkg.impl.{n}()", "alias
 # Path pins of every kind over the fuzz's own paths (renames add `_rN` to a stem).
 CALL_PINS = ["py/.", ".", "pkg/.!other.py", "/b.py", "/lib/util.py", "/py/.", "/lib/.", "src/", "pkg/", "py/b.py"]
 IMPORT_PINS = ["py/.", "pkg/.", ".", "src/lib/.!core.py", "/b.py", "/util.py", "/impl.py"]
+# How a TS call to `{n}` is written: bare, through a namespace import, on `this` or an untyped value.
+TS_CALLS = ["{n}", "u.{n}", "this.{n}", "obj.{n}"]
 SERVICES = ["api", "web", "worker", "db"]
 IMAGES = ["python:3.12", "nginx:1.27", "postgres:16", "alpine:3.20"]
 EXTRA_NAMES = ["Foo", "Display", "Server", "K", "Child", "python", "postgres", "py/b.py", "missing"]
-CODE = ("py", "rs", "go", "java")
-MOVABLE = ("py", "rs", "go")  # free functions only: a Java method stays in its class
+CODE = ("py", "rs", "go", "java", "ts")
+MOVABLE = ("py", "rs", "go", "ts")  # free functions only: a Java method stays in its class
 
 
 class Fuzz:
@@ -231,6 +286,8 @@ class Fuzz:
         self.counter = 0
         # (old, new) paths of the docs notes renamed in the current step.
         self.moved_notes: list[tuple[str, str]] = []
+        # Folders deleted whole in the current step.
+        self.removed_dirs: list[str] = []
 
     def _fresh(self, prefix: str) -> str:
         self.counter += 1
@@ -257,6 +314,8 @@ class Fuzz:
         names = self._func_names()
         if self.files[path].kind == "py":
             names = [style.format(n=n) for style in PY_CALLS for n in names]
+        elif self.files[path].kind == "ts":
+            names = [style.format(n=n) for style in TS_CALLS for n in names]
         new = self.rng.choice([n for n in names if n not in calls])
         calls.append(new)
         return f"add call {fn}->{new} in {path}", {path}
@@ -328,6 +387,8 @@ class Fuzz:
         names = self._func_names()
         if self.files[path].kind == "py":
             names = [style.format(n=n) for style in PY_CALLS for n in names]
+        elif self.files[path].kind == "ts":
+            names = [style.format(n=n) for style in TS_CALLS for n in names]
         self.files[path].funcs[name] = self.rng.sample(names, self.rng.randrange(3))
         return f"add function {name} in {path}", {path}
 
@@ -362,9 +423,31 @@ class Fuzz:
             self.moved_notes.append((path, new))
         return f"rename {path} to {new}", {path, new}
 
+    def op_config(self):
+        """Rewrite, create or delete a resolver configuration file."""
+        path = self.rng.choice(sorted(TS_CONFIGS))
+        current = self.files[path].head if path in self.files else None
+        text = self.rng.choice([t for t in TS_CONFIGS[path] if t != current])
+        if text is None:
+            del self.files[path]
+            return f"delete config {path}", {path}
+        self.files[path] = File("static", head=text)
+        return f"write config {path}: {text!r}", {path}
+
+    def op_delete_dir(self):
+        """Delete a folder holding a configuration file, with everything in it."""
+        folder = self.rng.choice(CONFIG_DIRS)
+        paths = sorted(p for p in self.files if p.startswith(folder + "/"))
+        if not paths:
+            return None
+        for path in paths:
+            self.deleted.append((path, self.files.pop(path)))
+        self.removed_dirs.append(folder)
+        return f"delete folder {folder}", set(paths)
+
     def op_delete(self):
         path = self._pick(lambda f: True)
-        if not path:
+        if not path or path == ".gitignore":
             return None
         self.deleted.append((path, self.files.pop(path)))
         return f"delete {path}", {path}
@@ -435,6 +518,7 @@ class Fuzz:
     OPS = [
         "call", "base", "import", "import_style", "impl", "add_function", "remove_function", "move_function",
         "rename", "delete", "restore", "service", "from", "mention", "link", "supersedes", "pin", "pin",
+        "config", "config", "delete_dir",
     ]
 
     def draw(self):
@@ -506,13 +590,23 @@ def test_graph_accuracy_fuzz(engine, repo_id, tmp_path, seed):
     log: list[str] = []
     check(engine, repo_id, root, seed, "initial", log)
 
+    def resync(paths):
+        # What a live batch does after indexing (agent/sync.py on_changes).
+        sync_resolver_config(engine, repo_id, root, {root / rel for rel in paths}, docs_path=DOCS,
+                             mentions_enabled=True)
+
     for step in range(STEPS):
         fuzz.moved_notes = []
+        fuzz.removed_dirs = []
         # The foreign-source edge (set (b)) is toggled on every seed.
         ops = [fuzz.op_impl()] if step == 0 else []
         ops += [fuzz.draw() for _ in range(rng.randint(1, 3))]
         touched = set().union(*(paths for _desc, paths in ops))
         fuzz.write(root, touched)
+        folders = {d for d in fuzz.removed_dirs if not any(p.startswith(d + "/") for p in fuzz.files)}
+        for folder in sorted(folders, reverse=True):
+            if (root / folder).is_dir() and not any((root / folder).iterdir()):
+                (root / folder).rmdir()
         gone = {rel for rel in touched if rel not in fuzz.files}
         changed = touched - gone
         split = rng.random() < 0.5
@@ -522,15 +616,17 @@ def test_graph_accuracy_fuzz(engine, repo_id, tmp_path, seed):
             if fuzz.moved_notes:
                 # A renamed note's old path goes first (see the module docstring).
                 order.sort(key=lambda rel: not (rel in gone and rel.startswith(f"{DOCS}/")))
-            for rel in order:
-                if rel in gone:
+            for rel in order + sorted(folders):
+                if rel in gone or rel in folders:
                     remove_paths(engine, repo_id, root, {root / rel})
                 else:
                     index_paths(engine, repo_id, root, {root / rel}, docs_path=DOCS, mentions_enabled=True)
+                resync({rel})
         else:
-            if gone:
-                remove_paths(engine, repo_id, root, {root / rel for rel in gone})
+            if gone or folders:
+                remove_paths(engine, repo_id, root, {root / rel for rel in gone | folders})
             if changed:
                 index_paths(engine, repo_id, root, {root / rel for rel in changed}, docs_path=DOCS,
                             mentions_enabled=True)
+            resync(touched | folders)
         check(engine, repo_id, root, seed, step, log)

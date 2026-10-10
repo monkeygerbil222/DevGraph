@@ -50,11 +50,12 @@ Known limitations (v1 scope cuts, documented per Implementation Plan #8):
     across the TypeScript sources that emit it - the same non-materializing-guess pattern the Python
     extractor uses (a guessed target that doesn't match a real indexed file
     simply never produces an edge, since upsert_relationship only
-    MATCH-links real existing nodes). Bare specifiers (`import x from
-    'lodash'`) get a single best-effort `node_modules/{name}` guess; no
-    `package.json`/`tsconfig.json` `paths` mapping is consulted (out of
-    scope per the plan - "don't over-engineer"). No pnpm/yarn workspace
-    resolution.
+    MATCH-links real existing nodes). A bare specifier the file's
+    tsconfig.json/jsconfig.json maps (`paths`, `baseUrl`, through `extends`
+    and `references`; see resolver_config.py) names the same candidates
+    under the mapped path; any other bare specifier (`import x from
+    'lodash'`) gets a single best-effort `node_modules/{name}` guess. No
+    pnpm/yarn workspace resolution.
 """
 
 from __future__ import annotations
@@ -66,7 +67,13 @@ import tree_sitter_javascript as tsjs
 import tree_sitter_typescript as tsts
 from tree_sitter import Language, Node, Parser
 
-from devgraph.indexer.common import ExtractionResult, GraphNode, GraphRelationship, own_edges
+from devgraph.indexer.common import (
+    ExtractionResult,
+    GraphNode,
+    GraphRelationship,
+    own_edges,
+)
+from devgraph.indexer.resolver_config import ResolverConfig
 
 logger = logging.getLogger(__name__)
 
@@ -337,7 +344,9 @@ def _resolve_relative_base(current_dir: str, specifier: str) -> str:
     return "/".join(parts)
 
 
-def _resolve_module_specifier(specifier: str, current_dir: str) -> list[str]:
+def _resolve_module_specifier(
+    specifier: str, current_dir: str, config: ResolverConfig | None = None, file_path: str = ""
+) -> list[str]:
     """Return candidate Module-node target names for an import specifier.
 
     A relative specifier with an explicit JS/TS extension (`./x.js`,
@@ -355,33 +364,44 @@ def _resolve_module_specifier(specifier: str, current_dir: str) -> list[str]:
     extractor uses for its own import targets (a candidate that doesn't
     match a real indexed Module node simply never produces an edge).
 
-    Bare specifiers (`lodash`, `@scope/pkg`) get a single best-effort
-    `node_modules/{name}` guess - no package.json/tsconfig 'paths' mapping is
-    consulted (out of scope, see module docstring).
+    A bare specifier the importing file's tsconfig maps (`paths`, else
+    `baseUrl`; see resolver_config.ResolverConfig.ts_alias, given `config`)
+    names the same candidates for each path it maps to. Any other bare
+    specifier (`lodash`, `@scope/pkg`) gets a single best-effort
+    `node_modules/{name}` guess.
     """
     # A bundler query or fragment (`./worker.js?worker`, `./x#frag`) names no file.
     specifier = specifier.split("?", 1)[0].split("#", 1)[0]
     if specifier.startswith("."):
-        base = _resolve_relative_base(current_dir, specifier)
-        stem, dot, ext = base.rpartition(".")
-        mapped = _EXPLICIT_EXTENSIONS.get(f".{ext}") if dot and "/" not in ext else None
-        if mapped and stem and not stem.endswith("/"):
-            # Then the specifier as a directory, for a folder named like a file.
-            return [f"{stem}.{each}" for each in mapped] + [f"{base}/index.{each}" for each in _EXTENSIONS]
-        if base:
-            candidates = [f"{base}.{ext}" for ext in _EXTENSIONS]
-            candidates += [f"{base}/index.{ext}" for ext in _EXTENSIONS]
-        else:
-            # Specifier resolves to the repo root itself (e.g. `require('../..')`
-            # from two directories down) - only the directory-import ('index.*')
-            # form is meaningful; a bare '.js'/'.jsx'/etc with no basename isn't
-            # a real candidate file path.
-            candidates = [f"index.{ext}" for ext in _EXTENSIONS]
-        return candidates
+        return _base_candidates(_resolve_relative_base(current_dir, specifier))
+    if config is not None and (aliased := config.ts_alias(specifier, file_path)) is not None:
+        return [candidate for base in aliased for candidate in _base_candidates(base)]
     return [f"node_modules/{specifier}"]
 
 
-def _extract_imports(root: Node, source: bytes, current_dir: str) -> list[tuple[str, list[str]]]:
+def _base_candidates(base: str) -> list[str]:
+    """The files a resolved specifier path (repo-relative, no extension
+    applied) can name: see `_resolve_module_specifier`."""
+    stem, dot, ext = base.rpartition(".")
+    mapped = _EXPLICIT_EXTENSIONS.get(f".{ext}") if dot and "/" not in ext else None
+    if mapped and stem and not stem.endswith("/"):
+        # Then the specifier as a directory, for a folder named like a file.
+        return [f"{stem}.{each}" for each in mapped] + [f"{base}/index.{each}" for each in _EXTENSIONS]
+    if base:
+        candidates = [f"{base}.{ext}" for ext in _EXTENSIONS]
+        candidates += [f"{base}/index.{ext}" for ext in _EXTENSIONS]
+    else:
+        # Specifier resolves to the repo root itself (e.g. `require('../..')`
+        # from two directories down) - only the directory-import ('index.*')
+        # form is meaningful; a bare '.js'/'.jsx'/etc with no basename isn't
+        # a real candidate file path.
+        candidates = [f"index.{ext}" for ext in _EXTENSIONS]
+    return candidates
+
+
+def _extract_imports(
+    root: Node, source: bytes, current_dir: str, config: ResolverConfig | None = None, file_path: str = ""
+) -> list[tuple[str, list[str]]]:
     """Extract import statements from the parse tree.
 
     Returns a list of (import_target, [bound_names]) tuples, where
@@ -398,14 +418,14 @@ def _extract_imports(root: Node, source: bytes, current_dir: str) -> list[tuple[
             if source_node is not None:
                 specifier = _string_value(source_node, source)
                 names = _import_clause_names(node, source) or [specifier]
-                for target in _resolve_module_specifier(specifier, current_dir):
+                for target in _resolve_module_specifier(specifier, current_dir, config, file_path):
                     imports.append((target, names))
         elif node.type == "export_statement":
             source_node = node.child_by_field_name("source")
             if source_node is not None:
                 specifier = _string_value(source_node, source)
                 names = _export_clause_names(node, source)
-                for target in _resolve_module_specifier(specifier, current_dir):
+                for target in _resolve_module_specifier(specifier, current_dir, config, file_path):
                     imports.append((target, names))
         elif node.type == "call_expression":
             func = node.child_by_field_name("function")
@@ -415,7 +435,7 @@ def _extract_imports(root: Node, source: bytes, current_dir: str) -> list[tuple[
                     first_arg = args.named_children[0]
                     if first_arg.type == "string":
                         specifier = _string_value(first_arg, source)
-                        for target in _resolve_module_specifier(specifier, current_dir):
+                        for target in _resolve_module_specifier(specifier, current_dir, config, file_path):
                             imports.append((target, [specifier]))
 
         for child in node.children:
@@ -425,7 +445,9 @@ def _extract_imports(root: Node, source: bytes, current_dir: str) -> list[tuple[
     return imports
 
 
-def extract_js_file(source_code: str, file_path: str, repo_id: str) -> ExtractionResult:
+def extract_js_file(
+    source_code: str, file_path: str, repo_id: str, config: ResolverConfig | None = None
+) -> ExtractionResult:
     """Parse a JS/TS/JSX/TSX file and extract nodes and relationships.
 
     Args:
@@ -434,6 +456,8 @@ def extract_js_file(source_code: str, file_path: str, repo_id: str) -> Extractio
             the repo root, forward-slashed (e.g. 'src/services/api.ts').
             Also used to pick the Tree-sitter grammar, by extension.
         repo_id: Repository ID for scoping nodes.
+        config: The repository's resolver configuration (its tsconfig path
+            aliases), read once per batch; None resolves no alias.
 
     Returns:
         ExtractionResult containing lists of nodes and relationships. On a
@@ -461,7 +485,7 @@ def extract_js_file(source_code: str, file_path: str, repo_id: str) -> Extractio
     result.nodes.append(module_node)
 
     current_dir = file_path.rsplit("/", 1)[0] if "/" in file_path else ""
-    for target, names in _extract_imports(root, source_bytes, current_dir):
+    for target, names in _extract_imports(root, source_bytes, current_dir, config, file_path):
         for _name in names:
             result.relationships.append(
                 GraphRelationship(

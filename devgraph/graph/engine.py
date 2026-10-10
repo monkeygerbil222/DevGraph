@@ -1341,6 +1341,28 @@ class GraphEngine:
                 repo_id=repo_id, version=version,
             )
 
+    def read_resolver_config(self, repo_id: str) -> dict[str, dict]:
+        """The resolver configuration fingerprints the repository's graph was
+        built with, per language (see indexer/resolver_config.fingerprints);
+        empty when none is recorded."""
+        with self._driver.session() as session:
+            result = _retry_transient(
+                session.run,
+                "MATCH (r:Repository {repo_id: $repo_id}) RETURN r.resolver_config AS config",
+                repo_id=repo_id,
+            )
+            records = [record["config"] for record in result or []]
+        return json.loads(records[0]) if records and records[0] else {}
+
+    def write_resolver_config(self, repo_id: str, config: dict[str, dict]) -> None:
+        """Record the resolver configuration fingerprints the graph was built with."""
+        with self._driver.session() as session:
+            _retry_transient(
+                session.run,
+                "MATCH (r:Repository {repo_id: $repo_id}) SET r.resolver_config = $config",
+                repo_id=repo_id, config=json.dumps(config, sort_keys=True),
+            )
+
     def read_skipped_files(self, repo_id: str) -> dict[str, list]:
         """The files the indexer left out of extraction, by repo-relative path:
         [reason, the size limit it was judged under, the file's change stamp]

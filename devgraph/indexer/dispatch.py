@@ -62,6 +62,7 @@ from devgraph.indexer.mentions.extractor import mentions_any, upsert_document_no
 from devgraph.indexer.cpp.extractor import extract_cpp_file
 from devgraph.indexer.providers import docs, docs_cache, filesystem
 from devgraph.indexer.python.extractor import extract_python_file
+from devgraph.indexer.resolver_config import LANGUAGE_SUFFIXES, ResolverConfig, fingerprints, touches_config
 from devgraph.indexer.rust.extractor import extract_rust_file
 from devgraph.indexer.schema_constraints import (
     encode_keys,
@@ -705,6 +706,9 @@ def index_paths(
     # per file) that the Python branch has no equivalent of.
     go_extractions: dict[str, tuple[list[dict], list[dict]]] = {}
     module_path = _find_module_path(repo_root)
+    # The resolver configuration (tsconfig path aliases), read once for the
+    # batch; see sync_resolver_config for when a change to it re-indexes.
+    config = ResolverConfig(repo_root)
     # Markdown files whose cross-file edges are resolved after every other
     # node in the batch exists (see the docs/mentions passes below).
     docs_files: list[Path] = []
@@ -772,7 +776,7 @@ def index_paths(
                 return
             indexed += _index_single_path(
                 engine, repo_id, repo_root, resolved, rel_path,
-                docs_root, mentions_enabled, module_path,
+                docs_root, mentions_enabled, module_path, config,
                 py_files, py_extractions, js_files, js_extractions,
                 cs_files, cs_extractions, cpp_files, cpp_extractions,
                 java_files, java_extractions, rs_files, rs_extractions,
@@ -1050,6 +1054,7 @@ def _index_single_path(
     docs_root: Path | None,
     mentions_enabled: bool,
     module_path: str | None,
+    config: ResolverConfig,
     py_files: list[tuple[str, str]],
     py_extractions: dict[str, tuple[list[dict], list[dict]]],
     js_files: list[str],
@@ -1115,7 +1120,7 @@ def _index_single_path(
         py_extractions[rel_path] = (nodes, rels)
     elif "js" in routes:
         content = read_source(resolved)
-        result = extract_js_file(content, rel_path, repo_id)
+        result = extract_js_file(content, rel_path, repo_id, config)
         nodes = [n.to_dict() for n in result.nodes]
         rels = [r.to_dict() for r in result.relationships]
         # Same replace-then-reupsert rationale as the .py branch above:
@@ -1918,7 +1923,8 @@ def catch_up(
     filesystem type declared) is never offered.
 
     An index older than `INDEX_FORMAT` gets a `full_scan` instead, which
-    upgrades it.
+    upgrades it. Last, a changed resolver configuration re-indexes its
+    language's files (sync_resolver_config).
 
     A missing, unreadable or apparently unmounted root is refused as
     `prune_stale_files` refuses it (`force` as there), before any change.
@@ -1984,7 +1990,56 @@ def catch_up(
         if due
         else 0
     )
+    indexed += sync_resolver_config(
+        engine, repo_id, repo_root, None, docs_path=docs_path, mentions_enabled=mentions_enabled
+    )
     return CatchUp(indexed=indexed, pruned=pruned, checked=len(walked), offered=len(due), unknown=unknown)
+
+
+def sync_resolver_config(
+    engine: GraphEngine,
+    repo_id: str,
+    repo_root: Path,
+    touched: set[Path] | None,
+    docs_path: str | None = None,
+    mentions_enabled: bool = False,
+) -> int:
+    """Re-index every graph file of a language whose resolver configuration
+    (tsconfig/jsconfig, go.mod/go.work; see resolver_config.fingerprints)
+    changed since the graph was built, and record the new fingerprints.
+
+    `touched` are a live batch's changed and deleted paths: nothing is
+    checked unless one of them can change the configuration (named like a
+    configuration file, read by the last fingerprint, or a folder holding
+    one; resolver_config.touches_config). None (a catch-up) always checks.
+    The fingerprints are taken before the re-index reads any file and
+    recorded only once it has succeeded, so a batch cut short is redone.
+    Returns the number of files re-indexed.
+    """
+    stored = engine.read_resolver_config(repo_id)
+    if touched is not None:
+        inputs = [rel for entry in stored.values() for rel in entry.get("inputs", [])]
+        rels = {rel for path in touched if (rel := _repo_relative(repo_root, Path(path))) is not None}
+        if not any(touches_config(rel, inputs) for rel in rels):
+            return 0
+    current = fingerprints(repo_root)
+    changed = [
+        lang for lang, entry in sorted(current.items())
+        if entry["fingerprint"] != (stored.get(lang) or {}).get("fingerprint")
+    ]
+    indexed = 0
+    if changed:
+        suffixes = tuple(suffix for lang in changed for suffix in LANGUAGE_SUFFIXES[lang])
+        files = {repo_root / rel for rel in engine.list_indexed_files(repo_id) if rel.endswith(suffixes)}
+        logger.info("%s: resolver configuration changed (%s); re-indexing %d files", repo_id,
+                    ", ".join(changed), len(files))
+        if files:
+            indexed = index_paths(
+                engine, repo_id, repo_root, files, docs_path=docs_path, mentions_enabled=mentions_enabled
+            )
+    if current != stored:
+        engine.write_resolver_config(repo_id, current)
+    return indexed
 
 
 def full_scan(
@@ -2019,6 +2074,9 @@ def full_scan(
     logged in one line and, when `skipped` is given, collected there by
     repo-relative path with why.
 
+    The resolver configuration's fingerprints (see sync_resolver_config) are
+    taken before any file is read and recorded at the end.
+
     The index format is unstamped (0) for the scan's duration and restamped
     at its end, so a scan cut short (the agent shutting down mid-rescan, say)
     leaves the index outdated and the next catch-up redoes it in full: the
@@ -2028,6 +2086,7 @@ def full_scan(
     docs_cache.forget(repo_root)
     prune_stale_files(engine, repo_id, repo_root, docs_path=docs_path, mentions_enabled=mentions_enabled, force=force)
     engine.set_index_format(repo_id, 0)
+    resolver = fingerprints(repo_root)  # before extraction reads the configuration
     all_files = _indexable_paths(repo_root)
     applied, applied_docs = _apply_project_schema(engine, repo_id, repo_root)
     left_out: dict[str, str] = {} if skipped is None else skipped
@@ -2046,6 +2105,7 @@ def full_scan(
         )
     if applied:
         _sync_docs_edges(engine, repo_id, repo_root, applied_docs)
+    engine.write_resolver_config(repo_id, resolver)
     engine.set_index_format(repo_id, INDEX_FORMAT)
     return indexed
 
