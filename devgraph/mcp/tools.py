@@ -603,8 +603,9 @@ def god_nodes(
         repo_id: Repository ID to search within (unless cross_repo=True)
         cross_repo: If True, search across all repos
         max_results: Maximum number of results to return, clamped to 1..500
-        declared_labels: The repository's schema-declared labels to rank as
-            well; anything that isn't a valid label identifier is ignored
+        declared_labels: Schema-declared labels to rank as well (with
+            cross_repo, every registered repository's); anything that isn't a
+            valid label identifier is ignored
 
     Returns:
         Dict with count (nodes ranked), results, and truncated flag. Each result
@@ -613,30 +614,36 @@ def god_nodes(
     """
     declared = tuple(d for d in dict.fromkeys(declared_labels) if LABEL_PATTERN.fullmatch(d))
     labels = _DESCRIBE_BUILTIN_LABELS + tuple(d for d in declared if d not in _DESCRIBE_BUILTIN_LABELS)
-    repo_filter = "WHERE n.repo_id IS NOT NULL" if cross_repo else "WHERE n.repo_id = $repo_id"
-    # One label-anchored branch per label so each can use that label's repo_id
-    # index; UNION drops a node reached through two of its labels.
-    nodes = "\n  UNION\n".join(
-        f"  MATCH (n:`{label}`) {repo_filter} AND NOT n:Repository RETURN n" for label in labels
-    )
+    repo_filter = "n.repo_id IS NOT NULL" if cross_repo else "n.repo_id = $repo_id"
+    # One branch per label, so each is a label scan rather than a scan of every
+    # node; UNION drops a node reached through two of its labels.
+    nodes = "\n  UNION\n".join(f"  MATCH (n:`{label}`) WHERE {repo_filter} RETURN n" for label in labels)
     limit = max(1, min(_GOD_NODES_MAX, int(max_results)))
-    top_cypher = f"""
+    # Ranked and counted in one scan.
+    cypher = f"""
     CALL () {{
 {nodes}
     }}
     WITH n, COUNT {{ (n)--() }} AS degree
     ORDER BY degree DESC, n.name
-    LIMIT $limit
-    RETURN n.name AS name, labels(n) AS labels, n.repo_id AS repo_id, degree
+    WITH collect({{name: n.name, labels: labels(n), repo_id: n.repo_id, degree: degree}}) AS ranked
+    RETURN size(ranked) AS total, ranked[0..$limit] AS top
     """
-    count_cypher = f"CALL () {{\n{nodes}\n}}\nRETURN count(n) AS total"
     params: dict[str, Any] = {"limit": limit} if cross_repo else {"repo_id": repo_id, "limit": limit}
-    results = _query(engine, top_cypher, params)
-    (total_row,) = _query(engine, count_cypher, params)
-    envelope = _envelope(results, limit)
-    envelope["count"] = total_row["total"]
-    envelope["truncated"] = total_row["total"] > len(envelope["results"])
+    (row,) = _query(engine, cypher, params)
+    envelope = _envelope(row["top"], limit)
+    envelope["count"] = row["total"]
+    envelope["truncated"] = row["total"] > len(envelope["results"])
     return envelope
+
+
+def all_declared_node_labels(registry: RepoRegistry | None) -> tuple[str, ...]:
+    """Every registered repository's declared node labels, each once, for a cross-repository query."""
+    if registry is None:
+        return ()
+    return tuple(
+        dict.fromkeys(label for repo in registry.list_repos() for label in declared_node_labels(registry, repo.repo_id))
+    )
 
 
 # Dependency-edge types find_dependency_cycles is allowed to traverse. A

@@ -502,7 +502,11 @@ def build_server(
         Returns {count, results, truncated} with degree (number of direct relationships)."""
         return devgraph_tools.god_nodes(
             engine, repo_id, cross_repo, max_results,
-            declared_labels=devgraph_tools.declared_node_labels(registry, repo_id),
+            declared_labels=(
+                devgraph_tools.all_declared_node_labels(registry)
+                if cross_repo
+                else devgraph_tools.declared_node_labels(registry, repo_id)
+            ),
         )
 
     @server.tool(annotations=_READ_ONLY)

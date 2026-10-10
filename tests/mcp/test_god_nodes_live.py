@@ -99,3 +99,38 @@ def test_god_nodes_cross_repo_runs(engine, hub, tmp_path, monkeypatch):
     result = _call(engine, tmp_path, monkeypatch, {"cross_repo": True, "max_results": 5})
     assert result.is_error is False, result.content
     assert len(result.structured_content["results"]) == 5
+
+
+class _RecordingEngine:
+    def __init__(self):
+        self.queries = []
+
+    def run_read_cypher(self, query, params, *, timeout_s, max_rows):
+        self.queries.append(query)
+        return [{"total": 0, "top": []}], False
+
+    def run_cypher(self, query, params=None):
+        raise AssertionError("built-in tools must not use the unbounded run_cypher")
+
+
+def test_cross_repo_god_nodes_ranks_every_repositorys_declared_labels(tmp_path, monkeypatch):
+    monkeypatch.setattr(mcp_server, "get_settings", lambda: Settings(registry_db_path=tmp_path / "r.sqlite3"))
+    declared = {"a": ("Runbook",), "b": ("Adr",)}
+    monkeypatch.setattr(mcp_server.devgraph_tools, "declared_node_labels", lambda registry, repo_id: declared.get(repo_id, ()))
+    for name in declared:
+        (tmp_path / name).mkdir()
+    records = [_Repo(name, tmp_path / name) for name in declared]
+    engine = _RecordingEngine()
+    server = mcp_server.build_server(engine, _Registry(records), session_repo=records[0], session_source="env")
+
+    async def scenario(arguments):
+        async with Client(server, mode="auto") as client:
+            return await client.call_tool("god_nodes", arguments)
+
+    assert anyio.run(scenario, {"cross_repo": True}).is_error is False
+    (query,) = engine.queries  # one scan ranks and counts
+    assert "`Runbook`" in query and "`Adr`" in query
+    engine.queries.clear()
+    anyio.run(scenario, {})
+    (query,) = engine.queries
+    assert "`Runbook`" in query and "`Adr`" not in query
