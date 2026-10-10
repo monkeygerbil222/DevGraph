@@ -215,3 +215,45 @@ def test_impact_for_diff_on_a_hub_is_fast(engine, hub, tmp_path):
     assert result["changed_components"] == ["get"]
     assert result["direct_dependents"]["count"] == WIDTH
     assert result["transitive_dependents"]["count"] == sum(1 for hop in distance.values() if hop >= 2)
+
+
+class _InsightsEngine:
+    """Insights computed; every query must be a bounded read."""
+
+    def __init__(self, error=None):
+        self.error = error
+        self.timeouts = []
+
+    def read_insights_summary(self, repo_id):
+        return {"computed_at": "2026-10-01T00:00:00+00:00", "node_count": 2, "community_count": 1,
+                "modularity": 0.1, "communities": '[{"community": 0, "label": "core", "size": 2}]'}
+
+    def run_read_cypher(self, query, params, *, timeout_s, max_rows):
+        self.timeouts.append(timeout_s)
+        if self.error is not None:
+            raise self.error
+        return [], False
+
+    def run_cypher(self, query, params=None):
+        raise AssertionError("insight tools must not use the unbounded run_cypher")
+
+
+class _Known:
+    def get(self, repo_id):
+        return object()
+
+
+@pytest.mark.parametrize("tool", [tools.key_nodes, tools.find_communities])
+def test_insight_tools_read_with_a_timeout(tool):
+    engine = _InsightsEngine()
+    tool(engine, _Known(), "demo")
+    assert engine.timeouts and all(t == tools.BUILTIN_TIMEOUT_S for t in engine.timeouts)
+
+
+@pytest.mark.parametrize("tool", [tools.key_nodes, tools.find_communities])
+def test_an_insight_timeout_is_a_tool_error(tool):
+    from mcp.server.mcpserver.exceptions import ToolError
+
+    timed_out = ClientError._hydrate_neo4j(code="Neo.ClientError.Transaction.TransactionTimedOut", message="slow")
+    with pytest.raises(ToolError, match="query timed out after"):
+        tool(_InsightsEngine(error=timed_out), _Known(), "demo")

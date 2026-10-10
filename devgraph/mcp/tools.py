@@ -8,6 +8,8 @@ All Cypher is parameterized — user input never concatenates directly into
 query strings.
 """
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from typing import Any
 
 import os
@@ -145,17 +147,24 @@ def _impact_expansion(cross_repo: bool) -> str:
     return "\n".join(parts)
 
 
-def _query(engine: GraphEngine, cypher: str, params: dict[str, Any]) -> list[dict]:
-    """Run a built-in tool's query read-only, bounded in time and rows. A
-    timeout or a row overflow becomes a ToolError the client can act on."""
+@contextmanager
+def _timeouts_as_tool_errors() -> Iterator[None]:
+    """Turn a Neo4j transaction timeout into a ToolError the client can act on."""
     from neo4j.exceptions import Neo4jError
 
     try:
-        rows, more = engine.run_read_cypher(cypher, params, timeout_s=BUILTIN_TIMEOUT_S, max_rows=BUILTIN_MAX_ROWS)
+        yield
     except Neo4jError as exc:
         if "TransactionTimedOut" in str(getattr(exc, "code", None) or ""):
             raise ToolError(f"query timed out after {BUILTIN_TIMEOUT_S} s; narrow the request") from exc
         raise
+
+
+def _query(engine: GraphEngine, cypher: str, params: dict[str, Any]) -> list[dict]:
+    """Run a built-in tool's query read-only, bounded in time and rows. A
+    timeout or a row overflow becomes a ToolError the client can act on."""
+    with _timeouts_as_tool_errors():
+        rows, more = engine.run_read_cypher(cypher, params, timeout_s=BUILTIN_TIMEOUT_S, max_rows=BUILTIN_MAX_ROWS)
     if more:
         raise ToolError(f"query returned more than {BUILTIN_MAX_ROWS} rows; narrow the request")
     return rows
@@ -793,7 +802,8 @@ def find_communities(
     communities = summary["communities"]
     shown = [c["community"] for c in communities[:max(0, max_results)]]
     k = max(1, min(members_per_community, _MAX_MEMBERS_PER_COMMUNITY))
-    members = community_members(engine, repo_id, shown, k) if shown else {}
+    with _timeouts_as_tool_errors():
+        members = community_members(engine, repo_id, shown, k, timeout_s=BUILTIN_TIMEOUT_S) if shown else {}
     # Members are nested dicts, which _envelope's per-row sanitizing doesn't
     # reach, so they are sanitized here.
     rows = [
@@ -831,7 +841,9 @@ def key_nodes(
         raise ToolError(f"metric must be {' or '.join(INSIGHT_METRICS)}, not {_echo(metric)}")
     if read_insights(engine, repo_id) is None:
         raise ToolError(_INSIGHTS_NOT_COMPUTED)
-    return _envelope(top_nodes(engine, repo_id, metric_key, _KEY_NODES_LIMIT), max_results)
+    with _timeouts_as_tool_errors():
+        rows = top_nodes(engine, repo_id, metric_key, _KEY_NODES_LIMIT, timeout_s=BUILTIN_TIMEOUT_S)
+    return _envelope(rows, max_results)
 
 
 def trace_request_flow(

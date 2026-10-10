@@ -213,32 +213,45 @@ def read_insights(engine: Any, repo_id: str) -> dict[str, Any] | None:
     return {**raw, "communities": communities}
 
 
-def top_nodes(engine: Any, repo_id: str, metric: str, limit: int) -> list[dict[str, Any]]:
+#: How long reading stored insights may take before Neo4j cancels it.
+READ_TIMEOUT_S = 30
+
+
+def top_nodes(
+    engine: Any, repo_id: str, metric: str, limit: int, timeout_s: float = READ_TIMEOUT_S
+) -> list[dict[str, Any]]:
     """Highest-scoring nodes for one of INSIGHT_METRICS (validated by callers).
+    A read-only query bounded by `timeout_s`.
 
     The property name comes from the INSIGHT_METRICS allow-list, never from
     caller input, so it is the only thing interpolated into the query.
     """
     prop = INSIGHT_METRICS[metric]
-    return engine.run_cypher(
+    rows, _more = engine.run_read_cypher(
         f"MATCH (n {{repo_id: $repo_id}}) WHERE n.{prop} IS NOT NULL "
         f"RETURN n.name AS name, labels(n) AS labels, n.file AS file, n.{prop} AS score, "
         f"n.insight_community AS community ORDER BY score DESC, name LIMIT $limit",
         {"repo_id": repo_id, "limit": limit},
+        timeout_s=timeout_s,
+        max_rows=max(1, limit),
     )
+    return rows
 
 
 def community_members(
-    engine: Any, repo_id: str, communities: list[int], per_community: int
+    engine: Any, repo_id: str, communities: list[int], per_community: int, timeout_s: float = READ_TIMEOUT_S
 ) -> dict[int, list[dict[str, Any]]]:
-    """Each community's top members by PageRank (containers without a score last)."""
-    rows = engine.run_cypher(
+    """Each community's top members by PageRank (containers without a score
+    last). A read-only query bounded by `timeout_s`."""
+    rows, _more = engine.run_read_cypher(
         "MATCH (n {repo_id: $repo_id}) WHERE n.insight_community IN $communities "
         "WITH n ORDER BY coalesce(n.insight_pagerank, -1.0) DESC, n.name "
         "WITH n.insight_community AS community, "
         "collect({name: n.name, labels: labels(n), file: n.file, pagerank: n.insight_pagerank})[..$k] AS members "
         "RETURN community, members",
         {"repo_id": repo_id, "communities": communities, "k": per_community},
+        timeout_s=timeout_s,
+        max_rows=max(1, len(communities)),
     )
     return {row["community"]: row["members"] for row in rows}
 
