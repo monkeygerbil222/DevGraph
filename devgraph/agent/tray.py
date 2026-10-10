@@ -337,6 +337,9 @@ class TrayApp:
             loop="asyncio",
             log_level="critical",
             access_log=False,
+            # An open /api/events stream ends when shutdown closes the
+            # broadcaster; this bounds any other connection still open.
+            timeout_graceful_shutdown=1,
         )
         server = uvicorn.Server(config)
         self._dashboard_server = server
@@ -367,6 +370,7 @@ class TrayApp:
             shutdown(
                 self._engine, self._watcher, self._schema_rescans, self._insights,
                 dashboard_server=self._dashboard_server, dashboard_thread=self._dashboard_thread,
+                events=self._events,
             )
         except Exception:
             logger.warning("error closing graph engine on quit", exc_info=True)
@@ -401,11 +405,13 @@ class TrayApp:
                 self._icon.run()
         except Exception:
             logger.critical("pystray event loop crashed", exc_info=True)
+            self._stop_event.set()
             self._sync.stopping = True
             try:
                 shutdown(
                     self._engine, self._watcher, self._schema_rescans, self._insights,
                     dashboard_server=self._dashboard_server, dashboard_thread=self._dashboard_thread,
+                    events=self._events,
                 )
             except Exception:
                 logger.warning("error closing graph engine after crash", exc_info=True)

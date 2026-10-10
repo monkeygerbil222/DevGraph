@@ -187,6 +187,9 @@ class HeadlessAgent:
             loop="asyncio",
             log_level="critical",
             access_log=False,
+            # An open /api/events stream ends when shutdown closes the
+            # broadcaster; this bounds any other connection still open.
+            timeout_graceful_shutdown=1,
         )
         server = uvicorn.Server(config)
         self._dashboard_server = server
@@ -204,6 +207,7 @@ class HeadlessAgent:
         shutdown(
             self._engine, self._watcher, self._schema_rescans, self._insights,
             dashboard_server=self._dashboard_server, dashboard_thread=self._dashboard_thread,
+            events=self._events,
         )
         self._registry.close()
 

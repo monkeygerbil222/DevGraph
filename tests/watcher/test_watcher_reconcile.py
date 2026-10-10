@@ -16,7 +16,7 @@ from pathlib import Path
 import pytest
 
 from devgraph.registry.store import RepoRegistry
-from devgraph.watcher.manager import WatcherManager
+from devgraph.watcher.manager import NEVER_INDEXED, WatcherManager
 
 DEADLINE_S = 10.0
 
@@ -828,8 +828,24 @@ def run_in_thread(fn) -> threading.Thread:
     return t
 
 
-def test_a_never_indexed_repo_gets_no_catch_up(cu, caplog):
+def test_a_never_indexed_repo_is_indexed_in_full_on_start(cu, caplog):
+    """A registration whose first scan was cut (the agent quit mid-scan) is
+    repaired by the next start: a catch-up from the epoch, which a missing or
+    unstamped index format turns into a full scan."""
     cu.manager.start()
+    with caplog.at_level("INFO", logger="devgraph.watcher.manager"):
+        cu.start_timer().fire()
+    assert cu.catch_ups == [(cu.repo_id, NEVER_INDEXED, "start")]
+    assert f"DevGraph hasn't finished indexing {cu.repo_id}; indexing it in full" in caplog.messages
+
+
+def test_a_repo_registered_while_running_is_left_to_its_first_scan(cu, caplog):
+    """`devgraph add` in another process registers, then scans: the watcher
+    picking the new repository up mid-scan does not scan it a second time."""
+    cu.registry.disable_watch(cu.repo_id)
+    cu.manager.start()
+    cu.registry.enable_watch(cu.repo_id)
+    cu.manager.refresh()
     with caplog.at_level("INFO", logger="devgraph.watcher.manager"):
         cu.start_timer().fire()
     assert cu.catch_ups == []
@@ -1258,12 +1274,12 @@ def test_a_repo_without_a_git_folder_never_syncs(cu):
     assert len(cu.catch_ups) == 2 and synced == []
 
 
-def test_a_never_indexed_repo_does_not_sync_on_start(cu):
+def test_a_never_indexed_repo_syncs_on_start_after_its_full_catch_up(cu):
     synced: list[str] = []
     cu.manager._on_git_state_changed = synced.append
     cu.manager.start()
     cu.start_timer().fire()
-    assert cu.catch_ups == [] and synced == []
+    assert cu.catch_ups == [(cu.repo_id, NEVER_INDEXED, "start")] and synced == [cu.repo_id]
 
 
 def test_stop_cancels_a_pending_git_burst(cu):

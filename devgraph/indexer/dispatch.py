@@ -36,7 +36,7 @@ from devgraph.config.project_schema import (
     resolve_effective_schema,
     schema_file_hash,
 )
-from devgraph.graph.engine import GraphEngine, provision_repository_schema
+from devgraph.graph.engine import EngineClosed, GraphEngine, provision_repository_schema
 from devgraph.graph.schema import FILE_SCOPED_LABELS, NODE_LABELS, RELATIONSHIP_TYPES
 from devgraph.indexer.apis.extractor import APIExtractor
 from devgraph.indexer.common import NAME_REF_SEP, name_ref_properties
@@ -164,6 +164,8 @@ def _apply_project_schema(engine: GraphEngine, repo_id: str, repo_root: Path) ->
         return False, None
     try:
         provision_repository_schema(engine, repo_root)
+    except EngineClosed:
+        raise  # shutdown: leave the work, and its stamp, for the next start
     except Exception as exc:
         logger.warning("could not provision the project schema for %s; not applied: %s", repo_root, exc)
         return False, None
@@ -202,6 +204,8 @@ def _apply_project_schema(engine: GraphEngine, repo_id: str, repo_root: Path) ->
         engine.init_schema(effective)
         release_labels(engine, removed_labels)
         realign_keys(engine, effective.node_types)
+    except EngineClosed:
+        raise  # shutdown: leave the work, and its stamp, for the next start
     except Exception as exc:
         logger.warning("could not reconcile generated constraints/indexes for %s: %s", repo_id, exc)
     for label in sorted(deferred):
@@ -236,6 +240,8 @@ def _upsert_deferred_label(
     them is written: warn, naming the repositories that disagree."""
     try:
         engine.upsert_nodes(nodes)
+    except EngineClosed:
+        raise  # shutdown: leave the work, and its stamp, for the next start
     except Exception as exc:
         key = next(tuple(node_type.key) for node_type in effective.node_types if node_type.label == label)
         # A repository with the same key spells the label differently (case only).
@@ -418,6 +424,8 @@ def _read_docs_batch(
             if pulled_in:
                 existing |= {node[:2] for node in engine.list_file_nodes(repo_id, pulled_in)}
         nodes, problems = docs.build_nodes(spec, repo_id, selected, owners)
+    except EngineClosed:
+        raise  # shutdown: leave the work, and its stamp, for the next start
     except Exception:
         logger.warning("docs node pass failed for %s; skipping it for this batch", repo_id, exc_info=True)
         return None
@@ -438,12 +446,16 @@ def _sync_docs(engine: GraphEngine, repo_id: str, spec: docs.DocsSpec, batch: _D
     paths = sorted(batch.selected)
     try:
         engine.upsert_nodes(batch.nodes)
+    except EngineClosed:
+        raise  # shutdown: leave the work, and its stamp, for the next start
     except Exception:
         logger.warning("docs node pass failed for %s; skipping it for this batch", repo_id, exc_info=True)
         return
     try:
         engine.delete_extracted_edges(repo_id, docs.EXTRACTOR, paths)
         engine.prune_extracted_at(repo_id, docs.EXTRACTOR, paths, [f"{n['label']}:{n['name']}" for n in batch.nodes])
+    except EngineClosed:
+        raise  # shutdown: leave the work, and its stamp, for the next start
     except Exception:
         logger.warning(
             "docs pass for %s wrote its nodes but could not clear their old links and entries; "
@@ -453,6 +465,8 @@ def _sync_docs(engine: GraphEngine, repo_id: str, spec: docs.DocsSpec, batch: _D
         return
     try:
         engine.upsert_relationships(docs.build_edges(spec, repo_id, batch.selected, owners=batch.owners))
+    except EngineClosed:
+        raise  # shutdown: leave the work, and its stamp, for the next start
     except Exception:
         logger.warning("docs edge pass failed for %s; skipping it for this batch", repo_id, exc_info=True)
 
@@ -497,6 +511,8 @@ def _relink_docs(
                 for label, name, path in engine.extracted_entries(repo_id, docs.EXTRACTOR, keyed)
             }
         engine.upsert_relationships(docs.build_edges(spec, repo_id, selected, targets, owners=owners))
+    except EngineClosed:
+        raise  # shutdown: leave the work, and its stamp, for the next start
     except Exception:
         logger.warning("docs relink failed for %s; the next rescan links them", repo_id, exc_info=True)
 
@@ -536,12 +552,16 @@ def _take_over_keys(engine: GraphEngine, repo_id: str, repo_root: Path, spec: do
             if (edge["from_label"], edge["from_name"]) in sources
         ]
         engine.upsert_nodes(nodes)
+    except EngineClosed:
+        raise  # shutdown: leave the work, and its stamp, for the next start
     except Exception:
         logger.warning("docs takeover failed for %s; the next rescan restores the entries", repo_id, exc_info=True)
         return
     try:
         engine.delete_extracted_edges(repo_id, docs.EXTRACTOR, sorted(selected))
         engine.upsert_relationships(edges)
+    except EngineClosed:
+        raise  # shutdown: leave the work, and its stamp, for the next start
     except Exception:
         logger.warning(
             "docs takeover for %s moved entries to the files that now own their ids but could not rebuild "
@@ -559,6 +579,8 @@ def _sync_docs_edges(engine: GraphEngine, repo_id: str, repo_root: Path, applied
     spec, selected, owners = applied
     try:
         engine.upsert_relationships(docs.build_edges(spec, repo_id, selected, owners=owners))
+    except EngineClosed:
+        raise  # shutdown: leave the work, and its stamp, for the next start
     except Exception:
         logger.warning("docs edge pass failed for %s; the next rescan retries it", repo_id, exc_info=True)
 
@@ -675,6 +697,8 @@ def index_paths(
                 kt_files, kt_extractions, go_extractions,
                 docs_files, mention_files, batch_services,
             )
+        except EngineClosed:
+            raise  # shutdown: leave the work, and its stamp, for the next start
         except Exception:
             logger.warning(
                 "indexing failed for %s (%s); skipping file", repo_id, rel_path, exc_info=True
@@ -853,6 +877,8 @@ def index_paths(
     for path in docs_files:
         try:
             index_doc_file(engine, repo_id, path, repo_root)
+        except EngineClosed:
+            raise  # shutdown: leave the work, and its stamp, for the next start
         except Exception:
             logger.warning("docs edge pass failed for %s (%s); skipping file", repo_id, path, exc_info=True)
 
@@ -864,6 +890,8 @@ def index_paths(
     for path in mention_files:
         try:
             index_mentions_file(engine, repo_id, path, repo_root, ambiguous_mode=get_settings().mentions_ambiguous_mode)
+        except EngineClosed:
+            raise  # shutdown: leave the work, and its stamp, for the next start
         except Exception:
             logger.warning("mentions pass failed for %s (%s); skipping file", repo_id, path, exc_info=True)
     added_names = {name for _label, name in added_nodes}
@@ -872,6 +900,8 @@ def index_paths(
             index_mentions_file(
                 engine, repo_id, path, repo_root, ambiguous_mode=get_settings().mentions_ambiguous_mode, names=added_names
             )
+        except EngineClosed:
+            raise  # shutdown: leave the work, and its stamp, for the next start
         except Exception:
             logger.warning("mentions relink failed for %s (%s); skipping file", repo_id, path, exc_info=True)
 
@@ -1734,8 +1764,14 @@ def full_scan(engine: GraphEngine, repo_id: str, repo_root: Path, docs_path: str
 
     The docs read cache forgets the repository first: the scan reads every
     docs file again, and a schema change is applied this way.
+
+    The index format is unstamped (0) for the scan's duration and restamped
+    at its end, so a scan cut short (the agent shutting down mid-rescan, say)
+    leaves the index outdated and the next catch-up redoes it in full: the
+    schema is recorded as applied before the files are written.
     """
     docs_cache.forget(repo_root)
+    engine.set_index_format(repo_id, 0)
     prune_stale_files(engine, repo_id, repo_root, docs_path=docs_path, mentions_enabled=mentions_enabled)
     all_files = _indexable_paths(repo_root)
     applied, applied_docs = _apply_project_schema(engine, repo_id, repo_root)

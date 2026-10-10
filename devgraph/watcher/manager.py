@@ -55,6 +55,10 @@ GIT_LOCK_WINDOW_S = 5.0
 #: this (a hung database) cannot hold shutdown hostage.
 STOP_WAIT_S = 3.0
 
+#: `since` for the start catch-up of a repository never indexed: everything
+#: is due, and a missing or unstamped index format makes it a full scan.
+NEVER_INDEXED = datetime.fromtimestamp(0, timezone.utc)
+
 
 def _is_relevant_git_state_path(path: Path) -> bool:
     """Whether a path under `.git/` actually represents git *history* state.
@@ -308,7 +312,7 @@ class WatcherManager:
             repos = self._registry.list_repos(active_only=True)
             repos_to_watch = [r for r in repos if r.watch_enabled]
             for repo in repos_to_watch:
-                self._start_single(repo)
+                self._start_single(repo, index_if_never=True)
 
     def stop(self, timeout: float = STOP_WAIT_S) -> None:
         """Stop all watchers and clean up.
@@ -430,7 +434,7 @@ class WatcherManager:
         if ok is not False and self._on_git_state_changed is not None and repo_id in self._git_handlers:
             self._on_git_state_changed(repo_id)
 
-    def _start_catch_up(self, repo_id: str, snapshot: datetime | None) -> None:
+    def _start_catch_up(self, repo_id: str, snapshot: datetime | None, index_if_never: bool = False) -> None:
         """The catch-up when watching starts, on its own thread (W5).
 
         `snapshot` is `last_indexed` as read before the observer started, so
@@ -438,6 +442,12 @@ class WatcherManager:
         edits made while nothing was watching. A None snapshot is re-read
         under the lock: a registration in this process may just have
         finished its first scan under the same lock.
+
+        A repository still never indexed then gets a catch-up from
+        `NEVER_INDEXED` when `index_if_never` (watching started with the
+        agent, so a first scan cut by its last shutdown is repaired). Not for
+        one registered while the agent runs: `devgraph add` in another
+        process may be scanning it right now.
         """
         with self._catch_up_lock:
             self._start_catch_ups.pop(repo_id, None)
@@ -449,8 +459,11 @@ class WatcherManager:
                 return  # paused while waiting for the lock
             since = snapshot if snapshot is not None else self._last_indexed(repo_id)
             if since is None:
-                logger.info('DevGraph hasn\'t indexed %s yet; run "devgraph rescan %s"', repo_id, repo_id)
-                return
+                if not index_if_never:
+                    logger.info('DevGraph hasn\'t indexed %s yet; run "devgraph rescan %s"', repo_id, repo_id)
+                    return
+                logger.info("DevGraph hasn't finished indexing %s; indexing it in full", repo_id)
+                since = NEVER_INDEXED
             self._catch_up_then_sync(repo_id, since, "start")
 
         self.run_exclusive(repo_id, run)
@@ -508,8 +521,10 @@ class WatcherManager:
                 if repo.repo_id in (desired_ids - current_ids):
                     self._start_single(repo)
 
-    def _start_single(self, repo: RepoRecord) -> None:
+    def _start_single(self, repo: RepoRecord, index_if_never: bool = False) -> None:
         """Start a watcher for a single repo. Must hold _lock.
+
+        `index_if_never`: see `_start_catch_up`.
         
         Logs and caches errors for repos with invalid paths; does not raise.
         This allows other repos to continue watching normally.
@@ -604,7 +619,7 @@ class WatcherManager:
             return
         if self._on_catch_up is not None:
             repo_id = repo.repo_id
-            timer = self._timer_factory(0.0, lambda: self._start_catch_up(repo_id, snapshot))
+            timer = self._timer_factory(0.0, lambda: self._start_catch_up(repo_id, snapshot, index_if_never))
             timer.daemon = True
             with self._catch_up_lock:
                 self._start_catch_ups[repo_id] = timer

@@ -140,7 +140,7 @@ class LiveAgents:
         events: list[dict] = []
         self._monkeypatch.setattr(headless, "get_settings", lambda: self._settings)
         self._monkeypatch.setattr(
-            headless, "EventBroadcaster", lambda: SimpleNamespace(publish=events.append, bind_loop=lambda loop: None)
+            headless, "EventBroadcaster", lambda: SimpleNamespace(publish=events.append, bind_loop=lambda loop: None, close=lambda: None)
         )
         agent = headless.HeadlessAgent()
         agent.events = events

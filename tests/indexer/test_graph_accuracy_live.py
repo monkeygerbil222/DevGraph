@@ -1239,5 +1239,5 @@ def test_failed_full_scan_leaves_the_index_unstamped(engine, repo_id, tmp_path, 
     monkeypatch.setattr(dispatch, "index_paths", broken)
     with pytest.raises(RuntimeError, match="scan interrupted"):
         scan(engine, repo_id, tmp_path)
-    assert engine.index_format(repo_id) is None
+    assert not engine.index_format(repo_id)  # 0: unstamped while the scan ran
     assert dispatch.index_outdated(engine, repo_id)

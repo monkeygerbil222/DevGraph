@@ -56,11 +56,11 @@ from devgraph.config.yaml_bound import bounded_safe_load
 from devgraph.dashboard import queries
 from devgraph.dashboard.config_model import GLOBAL_SCOPE, build_config, build_global, build_project, form_entry, scrub
 from devgraph.dashboard.db_metrics import MetricsHistory
-from devgraph.dashboard.events import EventBroadcaster
+from devgraph.dashboard.events import CLOSED, EventBroadcaster
 from devgraph.dashboard.git_info import get_git_log, get_git_status
 from devgraph.dashboard.layout_store import load_layout, save_layout
 from devgraph.dashboard.query_log import QueryLog
-from devgraph.graph.engine import GraphEngine, identity_key, provision_repository_schema
+from devgraph.graph.engine import EngineClosed, GraphEngine, identity_key, provision_repository_schema
 from devgraph.graph.schema import (
     INTERNAL_EDGE_PROPERTIES,
     INTERNAL_NODE_PROPERTIES,
@@ -341,6 +341,11 @@ def build_router(
             # this stamp.
             files_indexed = run_exclusive(record.repo_id, scan_and_stamp)
             indexed = True
+        except EngineClosed:
+            # The agent is shutting down. Never stamped, so its next start
+            # indexes the repository in full.
+            logger.info("registered %s; shutdown cut its initial scan, which the next start redoes", record.repo_id)
+            warning = "Registered, but DevGraph shut down during the initial scan; it finishes on the next start."
         except Exception as exc:
             # Registration already committed to SQLite; an indexing failure
             # (e.g. Neo4j down) must not undo it -- same call as the CLI's,
@@ -1120,6 +1125,8 @@ def build_router(
                         # doesn't silently drop a quiet connection.
                         yield ": keep-alive\n\n"
                         continue
+                    if event is CLOSED:
+                        break  # the agent is shutting down
                     yield f"data: {json.dumps(event)}\n\n"
             finally:
                 events.unsubscribe(queue)

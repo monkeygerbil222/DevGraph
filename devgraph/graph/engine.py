@@ -455,13 +455,14 @@ class _GatedDriver:
             self._exit()
 
     def close(self, timeout: float) -> None:
+        started = time.monotonic()
         with self._cond:
             self._closing = True
             if not self._cond.wait_for(lambda: self._active == 0, timeout=timeout):
                 logger.warning(
-                    "%d graph queries still running %.1f s after shutdown began; abandoning them",
+                    "%d graph queries still running %.1f s after the graph engine began closing; abandoning them",
                     self._active,
-                    timeout,
+                    time.monotonic() - started,
                 )
                 return
         self._driver.close()
