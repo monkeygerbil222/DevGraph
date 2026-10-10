@@ -259,31 +259,105 @@ def search_component(
         cutoff = _resolve_recency_cutoff(engine, repo_id, modified_within_commits)
 
     tokens = _search_tokens(query)
-
     labels = _SEARCH_LABELS + tuple(
         label for label in extra_labels if LABEL_PATTERN.fullmatch(label) and label not in _SEARCH_LABELS
     )
-    label_predicate = " OR ".join(f"n:{label}" for label in labels)
-    repo_filter = "" if cross_repo else "AND n.repo_id = $repo_id"
-    recency_filter = "AND n.last_modified_at >= $cutoff" if cutoff is not None else ""
-    cypher = f"""
-    MATCH (n)
-    WHERE ({label_predicate})
-    AND ANY(t IN $tokens WHERE toLower(n.name) CONTAINS t OR toLower(n.description) CONTAINS t)
-    {repo_filter}
-    {recency_filter}
-    RETURN n.name as name, labels(n) as labels, n.repo_id as repo_id,
-           n.description as description LIMIT 200
-    """
-    params: dict[str, Any] = {"tokens": tokens}
-    if not cross_repo:
-        params["repo_id"] = repo_id
-    if cutoff is not None:
-        params["cutoff"] = cutoff
+    rows, count, lower_bound = ranked_search(
+        engine, labels, tokens, _name_variants(query, tokens), max_results,
+        repo_id=None if cross_repo else repo_id, cutoff=cutoff,
+    )
+    envelope = _envelope([{k: v for k, v in row.items() if k != "id"} for row in rows], max_results)
+    envelope["count"] = count
+    envelope["truncated"] = count > len(envelope["results"])
+    if lower_bound:
+        envelope["count_is_lower_bound"] = True
+    return envelope
 
-    results = _query(engine, cypher, params)
-    results = _rank_search_results(results, tokens)
-    return _envelope(results, max_results)
+
+#: Rows the index-backed exact/prefix stage of `ranked_search` reads at most.
+_SEARCH_INDEX_CAP = 200
+
+# Rank of a matching node: exact name, name starts with a term, name contains
+# one, description only.
+_SEARCH_TIER = (
+    "CASE WHEN toLower(n.name) IN $terms THEN 0 "
+    "WHEN any(t IN $terms WHERE toLower(n.name) STARTS WITH t) THEN 1 "
+    "WHEN any(t IN $terms WHERE toLower(n.name) CONTAINS t) THEN 2 ELSE 3 END"
+)
+_SEARCH_ROW = (
+    "{id: elementId(n), name: n.name, labels: labels(n), repo_id: n.repo_id, description: n.description, "
+    "file: CASE WHEN coalesce(n.file, '') <> '' THEN n.file ELSE coalesce(n.path, n.source_file, n.source) END}"
+)
+
+
+def _name_variants(query: str, terms: list[str]) -> list[str]:
+    """Spellings of each term an exact-case index seek tries: the term, Capitalised,
+    UPPER, and the query's own words that lower-case to it."""
+    variants = [v for t in terms for v in (t, t.capitalize(), t.upper())]
+    variants += [w for w in [query.strip(), *re.findall(r"[A-Za-z0-9_]+", query)] if w.lower() in terms]
+    return list(dict.fromkeys(variants))
+
+
+def _search_branches(labels: tuple[str, ...], where: str, unwind: bool = False) -> str:
+    """`CALL () { ... }` over one MATCH per label, so each can use its label's indexes.
+
+    A file-scoped label's file-less node (a route's handler stub) is left out when
+    a real node of that label shares its name."""
+    branches = []
+    for label in labels:
+        stub = (
+            f" AND NOT (coalesce(n.file, '') = '' AND EXISTS {{ MATCH (m:`{label}`) "
+            "WHERE m.repo_id = n.repo_id AND m.name = n.name AND m.file <> '' })"
+            if label in schema.FILE_SCOPED_LABELS
+            else ""
+        )
+        unwound = "UNWIND $names AS p " if unwind else ""
+        branches.append(f"  {unwound}MATCH (n:`{label}`) WHERE {where}{stub} RETURN n")
+    return "CALL () {\n" + "\n  UNION\n".join(branches) + "\n}\n"
+
+
+def ranked_search(
+    engine: GraphEngine,
+    labels: tuple[str, ...],
+    terms: list[str],
+    names: list[str],
+    limit: int,
+    repo_id: str | None,
+    cutoff: Any = None,
+) -> tuple[list[dict], int, bool]:
+    """Nodes of `labels` whose name or description contains a (lower-case) term,
+    best first: exact name, name prefix, name substring, description only.
+
+    Names that start with one of `names` are found first through the
+    `(repo_id, name)` indexes. Only when they don't fill `limit` does a substring
+    scan fill the rest and count every match. Returns (rows, count,
+    count_is_lower_bound): the count is a lower bound when the scan never ran.
+    `repo_id` None searches every repository. Labels must be validated identifiers.
+    """
+    scope = "n.repo_id = $repo_id" if repo_id is not None else "n.repo_id IS NOT NULL"
+    if cutoff is not None:
+        scope += " AND n.last_modified_at >= $cutoff"
+    params: dict[str, Any] = {"repo_id": repo_id, "terms": terms, "names": names, "cutoff": cutoff}
+    order = f"WITH n, {_SEARCH_TIER} AS tier ORDER BY tier, n.name, n.file, elementId(n)\n"
+    indexed = _query(
+        engine,
+        _search_branches(labels, f"{scope} AND n.name STARTS WITH p", unwind=True)
+        + order + f"LIMIT {max(_SEARCH_INDEX_CAP, limit + 1)} RETURN {_SEARCH_ROW} AS row",
+        params,
+    )
+    found = [r["row"] for r in indexed]
+    if len(found) > limit:
+        return found[:limit], len(found), True
+    substring = "any(t IN $terms WHERE toLower(n.name) CONTAINS t OR toLower(n.description) CONTAINS t)"
+    rows = _query(
+        engine,
+        _search_branches(labels, f"{scope} AND {substring}") + order
+        + "WITH collect(n) AS ns "
+        f"RETURN size(ns) AS total, [n IN [n IN ns WHERE NOT elementId(n) IN $seen][..$fill] | {_SEARCH_ROW}] AS rest",
+        {**params, "seen": [r["id"] for r in found], "fill": limit - len(found)},
+    )
+    row = rows[0] if rows else {"total": 0, "rest": []}
+    return _rank_search_results(found + row["rest"], terms), max(row["total"], len(found)), False
 
 
 def declared_node_labels(registry: RepoRegistry | None, repo_id: str) -> tuple[str, ...]:
@@ -303,9 +377,9 @@ def declared_node_labels(registry: RepoRegistry | None, repo_id: str) -> tuple[s
 
 
 def _rank_search_results(results: list[dict], tokens: list[str]) -> list[dict]:
-    """Sort search_component rows: exact name match first, then name
-    starts-with a token, then name contains a token, then description-only
-    matches last. Stable sort preserves Neo4j's original order within a tier."""
+    """Sort search rows: exact name match first, then name starts-with a token,
+    then name contains a token, then description-only matches last; by name and
+    file within a tier, as `ranked_search`'s queries order them."""
     def tier(row: dict) -> int:
         name = (row.get("name") or "").lower()
         if name in tokens:
@@ -315,7 +389,7 @@ def _rank_search_results(results: list[dict], tokens: list[str]) -> list[dict]:
         if any(t in name for t in tokens):
             return 2
         return 3
-    return sorted(results, key=tier)
+    return sorted(results, key=lambda row: (tier(row), row.get("name") or "", row.get("file") or ""))
 
 
 # --- describe_node -------------------------------------------------------------

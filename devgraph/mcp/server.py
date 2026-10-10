@@ -479,8 +479,12 @@ def build_server(
         max_results: int = 15,
         modified_within_commits: int | None = None,
     ) -> dict[str, Any]:
-        """Search for components by name/description; returns {count, results, truncated}.
-        Pass modified_within_commits to restrict to components touched within the last
+        """Search for components by name/description; returns {count, results, truncated},
+        each result with name, labels, repo_id, description and file. Ranked: exact name,
+        then name prefix, then name substring, then description only. count is the true
+        number of matches, unless count_is_lower_bound is true (exact and prefix matches
+        alone filled max_results). A route's file-less handler stub is left out when a
+        real node has its name. Pass modified_within_commits to restrict to components touched within the last
         N commits repo-wide (requires git-history recency staging; entities never staged
         are excluded, not silently included).
         Also searches node types the repository's devgraph.schema.yaml declares (for

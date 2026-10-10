@@ -253,8 +253,12 @@ before assuming you've seen everything. `find_related_files` and
 `impact_analysis` apply the same envelope to each of their list-valued
 fields individually (e.g. `impact["direct_dependents"]["results"]`). Pass
 `max_results` (default 15) to widen the sample when you genuinely need more
-than the default. `search_component`'s `count` maxes out at 50 (its own
-Cypher cap) even if more matches exist beyond that. `describe_node`'s
+than the default. `search_component` ranks exact name matches first, then
+name prefixes, then other substrings, then description-only matches; each
+result carries its `file`, and a route's file-less handler stub is dropped
+when a real function of that name exists. Its `count` is the true number of
+matches, except when exact and prefix matches alone fill `max_results`: then
+the response adds `count_is_lower_bound: true`. `describe_node`'s
 response is not itself an envelope: each relationship group inside its
 `outgoing` and `incoming` maps is one (`{"count", "results", "truncated"}`).
 
