@@ -270,12 +270,22 @@ def _disk_files(repo_root: Path) -> dict[str, Path]:
 
 
 def _is_provider_file(repo_root: Path, path: Path) -> bool:
-    """A file the filesystem provider represents: what a full scan would index."""
+    """A file the filesystem provider represents: what a full scan would index.
+    A .gitignore judges the file by its own path, as the walk and git do."""
     rel = _repo_relative(repo_root, path)
     return (
         rel is not None and _is_indexable_file(path) and not is_ignored_path(Path(rel))
-        and not is_gitignored(repo_root.resolve(), rel)
+        and not is_gitignored(repo_root, _own_rel(repo_root, path) or rel)
     )
+
+
+def _own_rel(repo_root: Path, path: Path) -> str | None:
+    """`path`'s repo-relative POSIX path without resolving links (a symlink
+    keeps its own name), or None when it lies lexically outside the root."""
+    try:
+        return Path(os.path.abspath(path)).relative_to(os.path.abspath(repo_root)).as_posix()
+    except ValueError:
+        return None
 
 
 def _max_file_bytes() -> int:
@@ -284,14 +294,15 @@ def _max_file_bytes() -> int:
 
 
 def _skip_reason(
-    root_resolved: Path, rel_path: str, resolved: Path, docs_root: Path | None, mentions_enabled: bool, max_bytes: int
+    root_resolved: Path, own: str, rel_path: str, resolved: Path, docs_root: Path | None, mentions_enabled: bool,
+    max_bytes: int,
 ) -> str | None:
     """Why `index_paths` leaves this file out, or None: a .gitignore ignores
-    it, or an extractor would read it but it is too large, binary, or minified
+    its own path `own` (a link's, not its target's `rel_path`), or an extractor would read it but it is too large, binary, or minified
     or generated (`walk.content_skip_reason`). A file no extractor reads (one
     only a schema provider represents, such as an image) is never judged by
     its content. Raises OSError when the file can't be read."""
-    if is_gitignored(root_resolved, rel_path):
+    if is_gitignored(root_resolved, own):
         return GITIGNORED
     if not _routes(resolved, docs_root, mentions_enabled):
         return None
@@ -702,6 +713,7 @@ def index_paths(
     # spelled a path (relative, absolute, through a symlink).
     root_resolved = repo_root.resolve()
     by_rel_path: dict[str, Path] = {}
+    own_paths: dict[str, str | None] = {}  # rel -> the caller's path, unresolved (see _own_rel)
     for path in _expand_with_reverse_dependents(engine, repo_id, repo_root, paths):
         try:
             resolved = Path(path).resolve()
@@ -710,6 +722,7 @@ def index_paths(
         if not is_within(resolved, root_resolved):
             continue
         by_rel_path[resolved.relative_to(root_resolved).as_posix()] = resolved
+        own_paths[resolved.relative_to(root_resolved).as_posix()] = _own_rel(repo_root, Path(path))
 
     max_bytes = _max_file_bytes()
     # Files left out by their content, for catch_up (see `_skip_marks`).
@@ -724,14 +737,16 @@ def index_paths(
         # otherwise silently lose every file after the failure point. Log and
         # skip the offending file so the rest of the batch still indexes.
         try:
-            reason = _skip_reason(root_resolved, rel_path, resolved, docs_root, mentions_enabled, max_bytes)
+            own = own_paths.get(rel_path) or rel_path
+            reason = _skip_reason(root_resolved, own, rel_path, resolved, docs_root, mentions_enabled, max_bytes)
             if reason is not None:
-                logger.debug("%s: skipping %s (%s)", repo_id, rel_path, reason)
+                logger.debug("%s: skipping %s (%s)", repo_id, own, reason)
                 if skipped is not None:
-                    skipped[rel_path] = reason
+                    skipped[own] = reason
                 if reason != GITIGNORED:
                     judged[rel_path] = [reason, max_bytes, _change_stamp_ns(os.stat(resolved))]
-                engine.delete_nodes_by_source_file(repo_id, rel_path)
+                if own == rel_path:  # an ignored link leaves its target's nodes alone
+                    engine.delete_nodes_by_source_file(repo_id, rel_path)
                 return
             indexed += _index_single_path(
                 engine, repo_id, repo_root, resolved, rel_path,

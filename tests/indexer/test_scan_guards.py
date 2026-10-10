@@ -439,3 +439,35 @@ def test_same_package_referrer_scan_skips_ignored_and_oversized_siblings(tmp_pat
                                                     {"pkg/Base.java": (nodes, [])})
     assert found == {"pkg/Sub.java"}
     assert read == ["Sub.java"]
+
+
+@pytest.mark.skipif(__import__("os").name == "nt", reason="symlinks need privileges on Windows")
+def test_a_symlink_is_judged_by_its_own_path_not_its_target(tmp_path, monkeypatch, small_limit):
+    (tmp_path / "out").mkdir()
+    (tmp_path / "out" / "real.py").write_text("x = 1\n")
+    (tmp_path / "link.py").symlink_to(tmp_path / "out" / "real.py")
+    (tmp_path / ".gitignore").write_text("out/\n")
+    seen = []
+    monkeypatch.setattr(dispatch, "_index_single_path", lambda e, r, root, resolved, rel, *a: seen.append(rel) or 1)
+    engine = _Engine()
+    skipped: dict[str, str] = {}
+    index_paths(engine, "_unit_guards", tmp_path, {tmp_path / "link.py"}, skipped=skipped)
+    assert seen == ["out/real.py"] and skipped == {}  # git and the walk see link.py, which is not ignored
+    assert dispatch._is_provider_file(tmp_path, tmp_path / "link.py")
+    assert "link.py" in {p.name for p in walk.indexable_paths(tmp_path)}
+
+
+@pytest.mark.skipif(__import__("os").name == "nt", reason="symlinks need privileges on Windows")
+def test_an_ignored_symlink_is_skipped_without_touching_its_target(tmp_path, monkeypatch, small_limit):
+    (tmp_path / "real.py").write_text("x = 1\n")
+    (tmp_path / "link.py").symlink_to(tmp_path / "real.py")
+    (tmp_path / ".gitignore").write_text("link.py\n")
+    seen = []
+    monkeypatch.setattr(dispatch, "_index_single_path", lambda e, r, root, resolved, rel, *a: seen.append(rel) or 1)
+    engine = _Engine()
+    skipped: dict[str, str] = {}
+    index_paths(engine, "_unit_guards", tmp_path, {tmp_path / "link.py"}, skipped=skipped)
+    assert seen == [] and skipped == {"link.py": walk.GITIGNORED}
+    assert engine.deleted == []  # real.py's nodes stay
+    assert not dispatch._is_provider_file(tmp_path, tmp_path / "link.py")
+    assert dispatch._is_provider_file(tmp_path, tmp_path / "real.py")
