@@ -64,7 +64,7 @@ from devgraph.indexer.schema_constraints import (
 )
 # Re-exported under their pre-walk.py names for the watcher and existing callers.
 from devgraph.indexer.walk import IGNORED_DIR_NAMES as IGNORED_DIR_NAMES
-from devgraph.indexer.walk import RepoRootEmpty, check_repo_root
+from devgraph.indexer.walk import RepoRootEmpty, RepoRootUnavailable, check_repo_root
 from devgraph.indexer.walk import indexable_paths as _indexable_paths
 from devgraph.indexer.walk import indexable_paths_under
 from devgraph.indexer.walk import is_ignored_dir_name as is_ignored_dir_name
@@ -1584,6 +1584,7 @@ def prune_stale_files(
     written again under their repo-relative path by the scan or catch-up
     that follows.
 
+    Files below a subfolder the walk couldn't list are kept, with a warning.
     A root that is missing or unreadable raises `RepoRootUnavailable`, and
     one holding no indexable file while the graph has files for it (a mount
     point with nothing mounted) raises `RepoRootEmpty` unless `force`; either
@@ -1592,7 +1593,12 @@ def prune_stale_files(
     Returns the number of files pruned.
     """
     check_repo_root(repo_root)
-    on_disk = {rel for _, rel in _keyed_indexable_paths(repo_root, keep_ignored_targets=True)}
+    unreadable: list[str] = []
+    on_disk = {rel for _, rel in _keyed_indexable_paths(repo_root, keep_ignored_targets=True, unreadable=unreadable)}
+    # Checked again after the walk: a drive unmounted mid-walk lists as nothing.
+    if "" in unreadable:
+        raise RepoRootUnavailable(repo_root, "not readable")
+    check_repo_root(repo_root)
     if not on_disk and not force:
         graph_files = _graph_files(engine, repo_id, repo_root)
         if graph_files:
@@ -1608,6 +1614,13 @@ def prune_stale_files(
         if misplaced:
             logger.info("removed %d docs notes keyed outside %s from %s", misplaced, docs_folder, repo_id)
     stale = _graph_files(engine, repo_id, repo_root) - on_disk
+    if unreadable:
+        # A folder that couldn't be listed says nothing about its files: keep them.
+        logger.warning(
+            "%s: %s not readable; files the graph has below %s kept until they can be read",
+            repo_id, ", ".join(sorted(unreadable)), "them" if len(unreadable) > 1 else "it",
+        )
+        stale = {f for f in stale if not f.startswith(tuple(unreadable))}
     if not stale:
         return 0
     stale_paths = {repo_root / p for p in stale}

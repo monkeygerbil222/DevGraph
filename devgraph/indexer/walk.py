@@ -148,7 +148,9 @@ def indexable_paths_under(repo_root: Path, directory: Path) -> set[Path]:
     return {path for path, _, _ in _walk(repo_root, directory)}
 
 
-def keyed_indexable_paths(repo_root: Path, *, keep_ignored_targets: bool = False) -> list[tuple[Path, str]]:
+def keyed_indexable_paths(
+    repo_root: Path, *, keep_ignored_targets: bool = False, unreadable: list[str] | None = None
+) -> list[tuple[Path, str]]:
     """Each of `indexable_paths` with its `repo_relative` key, leaving out one
     whose key is under an ignored directory (a symlink into one) unless
     `keep_ignored_targets`, as `prune_stale_files` needs: `index_paths` keys
@@ -157,10 +159,13 @@ def keyed_indexable_paths(repo_root: Path, *, keep_ignored_targets: bool = False
     The root is resolved once. A file is keyed lexically unless it, or a
     directory above it, is a link; only those are resolved, so a symlink is
     still keyed by its target.
+
+    `unreadable`, when given, collects each folder that could not be listed,
+    as `_walk` reports it.
     """
     root = repo_root.resolve()
     keyed = []
-    for path, rel, linked in _walk(repo_root):
+    for path, rel, linked in _walk(repo_root, unreadable=unreadable):
         if linked:
             try:
                 rel = path.resolve().relative_to(root).as_posix()
@@ -172,7 +177,9 @@ def keyed_indexable_paths(repo_root: Path, *, keep_ignored_targets: bool = False
     return keyed
 
 
-def _walk(repo_root: Path, start: Path | None = None) -> Iterator[tuple[Path, str, bool]]:
+def _walk(
+    repo_root: Path, start: Path | None = None, unreadable: list[str] | None = None
+) -> Iterator[tuple[Path, str, bool]]:
     """(path, lexical repo-relative POSIX path, whether a link is on the way)
     for every indexable file: what `repo_root.rglob("*")` filtered by
     `is_indexable_file`, `is_ignored_path` and `links_outside` gives, without
@@ -184,6 +191,10 @@ def _walk(repo_root: Path, start: Path | None = None) -> Iterator[tuple[Path, st
 
     `start`, a directory lexically under repo_root, walks only that subtree
     under the same rules, judged relative to repo_root.
+
+    A folder that can't be listed is skipped; when `unreadable` is given, its
+    lexical repo-relative prefix (`pkg/`, or "" for the root) is appended, so a
+    caller can tell "no files here" from "couldn't look".
     """
     if is_ignored_path(repo_root):
         return
@@ -208,6 +219,8 @@ def _walk(repo_root: Path, start: Path | None = None) -> Iterator[tuple[Path, st
             with os.scandir(directory) as it:
                 entries = list(it)
         except OSError:
+            if unreadable is not None:
+                unreadable.append(prefix)
             continue
         for entry in entries:
             if is_ignored_dir_name(entry.name):

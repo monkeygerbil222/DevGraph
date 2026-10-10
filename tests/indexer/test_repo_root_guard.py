@@ -191,3 +191,30 @@ def test_the_agent_warns_once_and_skips_the_repo(engine, repo, scanned, caplog, 
     assert agent.requests == []  # skipped, not retried every 30 s
     agent.registry.mark_indexed.assert_not_called()
     assert count(engine) == scanned
+
+
+@pytest.fixture
+def unreadable_subfolder(repo):
+    if sys.platform == "win32" or os.geteuid() == 0:
+        pytest.skip("permission bits don't stop this user reading the folder")
+    yield repo / "pkg"
+    (repo / "pkg").chmod(0o755)
+
+
+@pytest.mark.parametrize("entry", sorted(ENTRY_POINTS))
+def test_files_under_an_unreadable_subfolder_are_kept(engine, repo, scanned, unreadable_subfolder, entry, caplog):
+    unreadable_subfolder.chmod(0)
+    with caplog.at_level(logging.WARNING, logger="devgraph.indexer.dispatch"):
+        ENTRY_POINTS[entry](engine, repo)
+    assert count(engine) == scanned
+    assert any("pkg" in r.getMessage() and "not readable" in r.getMessage() for r in caplog.records)
+
+
+def test_walk_reports_unreadable_folders(repo, unreadable_subfolder):
+    from devgraph.indexer.walk import keyed_indexable_paths
+
+    unreadable_subfolder.chmod(0)
+    unreadable: list[str] = []
+    keyed = keyed_indexable_paths(repo, unreadable=unreadable)
+    assert [rel for _, rel in keyed] == ["README.md"]
+    assert unreadable == ["pkg/"]
