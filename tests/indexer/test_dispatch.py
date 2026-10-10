@@ -1542,12 +1542,12 @@ def test_a_directory_pin_is_tested_before_the_fileless_pin():
     (prefix_row,) = groups[("Function", "CALLS", "Function", "file", "prefix")]
     assert prefix_row["targets"] == [{
         "to_name": "f", "to_file": "pkg/", "pin": {"k": "prefix", "v": "pkg/", "ns": ""},
-        "exclude": [{"k": "file", "v": "pkg/a.py", "ns": ""}], "no_self": False,
+        "ex_files": ["pkg/a.py"], "ex_pins": [],
     }]
     match = _end_match("b", "Function", "to", "prefix", "t")
     assert "USING INDEX SEEK b:Function(repo_id, name)" in match
     assert "WHEN 'prefix' THEN b.file STARTS WITH t.pin.v" in match
-    assert "NOT any(x IN t.exclude WHERE" in match
+    assert "NOT b.file IN t.ex_files" in match and "NOT any(x IN t.ex_pins WHERE" in match
 
 
 def test_edges_out_of_one_source_share_a_row():

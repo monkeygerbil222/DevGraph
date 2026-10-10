@@ -192,11 +192,12 @@ def pin_excludes(pins: Iterable[str], file_path: str) -> dict[str, list[str]]:
     `PIN_KINDS`), with the pins it leaves out: every pin of higher
     precedence, so a file two pins match gets one edge, from the stronger
     one; a recursive prefix also leaves out the writer's own file."""
-    pins = sorted(set(pins), key=lambda pin: (_rank(pin), pin))
+    ranks = {pin: _rank(pin) for pin in pins}
+    ordered = sorted(ranks, key=lambda pin: (ranks[pin], pin))
     excludes = {}
-    for pin in pins:
-        higher = {other for other in pins if _rank(other) < _rank(pin)}
-        if pin_kind(pin) == "prefix":
+    for pin in ordered:
+        higher = {other for other in ordered if ranks[other] < ranks[pin]}
+        if pin.endswith("/") and pin_kind(pin) == "prefix":
             higher.add(file_path)
         excludes[pin] = sorted(higher)
     return excludes

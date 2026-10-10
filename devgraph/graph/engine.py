@@ -717,12 +717,14 @@ def _group_rels_by_triple(
 
     Within a group, the edges out of one source with the same properties and
     `origin` (the file that wrote them, None for a writer that doesn't record
-    one) share a row, whose `targets` lists each edge's `to_name`, `to_file`,
-    `pin` (a path pin as graph/schema.py `pin_value` gives it, else None),
-    `exclude` (the pins whose files a path pin leaves out, the same way) and
-    `no_self` (the edge may not end at its source). The source is then
-    matched once for all of them: a resolved call names several candidate
-    files per callee.
+    one) share a row, whose `targets` lists each edge's `to_name` and
+    `to_file`; for a path pin also `pin` (as graph/schema.py `pin_value`
+    gives it) and the pins its `exclude` leaves out, split into `ex_files`
+    (files, a list test) and `ex_pins` (other pins, as `pin_value` gives
+    them); for a bare name also `no_self` (the edge may not end at its
+    source). Only the keys its group's Cypher reads are sent. The source is
+    then matched once for all of them: a resolved call names several
+    candidate files per callee.
     """
     groups: dict[tuple[str, str, str, str, str], dict[tuple, dict[str, Any]]] = {}
     for rel in rels:
@@ -744,12 +746,16 @@ def _group_rels_by_triple(
             "origin": origin,
             "targets": [],
         })
-        row["targets"].append({
-            "to_name": rel["to_name"], "to_file": to_file,
-            "pin": pin_value(to_file) if key[4] in _PATH_PINS else None,
-            "exclude": [pin_value(pin) for pin in rel.get("exclude") or []],
-            "no_self": bool(rel.get("no_self")),
-        })
+        target = {"to_name": rel["to_name"], "to_file": to_file}
+        if key[4] in _PATH_PINS:
+            # File pins are left out by a plain list test, other pins by `_pin_test`.
+            excluded = rel.get("exclude") or []
+            target["pin"] = pin_value(to_file)
+            target["ex_files"] = [pin for pin in excluded if pin_kind(pin) == "file"]
+            target["ex_pins"] = [pin_value(pin) for pin in excluded if pin_kind(pin) != "file"]
+        elif key[4] == "name":
+            target["no_self"] = bool(rel.get("no_self"))
+        row["targets"].append(target)
     return {key: list(rows.values()) for key, rows in groups.items()}
 
 
@@ -826,7 +832,7 @@ def _end_match(var: str, label: str, end: str, pin: str, ref: str = "row", also:
     INDEX allows that scan) after the label has filled; in CI that made a
     5,000-module relink take 20 s instead of under 1 s. A path pin seeks by
     name and keeps the nodes whose file its `pin` matches and no `exclude`
-    pin does; on a Module target it seeks the Module's `dir` (a directory
+    pin does (`ex_files`, `ex_pins`); on a Module target it seeks the Module's `dir` (a directory
     pin) or `basename` (a suffix pin), the row's `to_name`, and tests the
     Module's path. `also` is one more condition on the match."""
     conditions = [also] if also else []
@@ -846,7 +852,8 @@ def _end_match(var: str, label: str, end: str, pin: str, ref: str = "row", also:
             if label in FILE_SCOPED_LABELS:
                 match += f"USING INDEX SEEK {var}:{label}(repo_id, name) "
         conditions[:0] = [
-            _pin_test(f"{ref}.pin", path), f"NOT any(x IN {ref}.exclude WHERE {_pin_test('x', path)})",
+            _pin_test(f"{ref}.pin", path), f"NOT {path} IN {ref}.ex_files",
+            f"NOT any(x IN {ref}.ex_pins WHERE {_pin_test('x', path)})",
         ]
         return match + "WHERE " + " AND ".join(conditions) + " "
     pinned = pin == "file"
@@ -867,7 +874,7 @@ def _upsert_relationships_tx(tx, rels: list[dict[str, Any]]) -> None:
             "UNWIND $rows AS row "
             + _end_match("a", from_label, "from", from_pin)
             + "UNWIND row.targets AS t "
-            + _end_match("b", to_label, "to", to_pin, "t", also="(NOT t.no_self OR a <> b)")
+            + _end_match("b", to_label, "to", to_pin, "t", also="(NOT t.no_self OR a <> b)" if to_pin == "name" else None)
             + f"MERGE (a)-[r:{rel_type}]->(b) "
             "SET r += row.properties " + _ADD_ORIGIN,
             rows=rows,
