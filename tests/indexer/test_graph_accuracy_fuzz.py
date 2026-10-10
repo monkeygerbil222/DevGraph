@@ -259,7 +259,7 @@ IMPORTS = {
     "rs": ["display::Display", "foo::Foo"],
     "go": ["example.com/fz/a", "example.com/fz/b", "example.com/fz/go/b"],
     "ts": ["import { f } from '@/lib';", "import * as u from '@/util';", "import { g } from './src/util';",
-           "import { f } from './other/lib';", "import { f } from 'lib';"],
+           "import { f } from './other/lib';", "import { f } from 'lib';", "import { g } from './src';"],
     "java": ["base.Base", "app.K"],
 }
 BASES = {"py": ["Base", "Child", "Foo", "Missing", "b.Base", "pkg.impl.Base"], "java": ["Base", "K"]}

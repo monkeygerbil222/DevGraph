@@ -19,7 +19,7 @@ measure = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(measure)
 
 #: Languages whose resolution has not landed yet.
-PENDING = {"ts", "go", "java", "kotlin", "csharp", "rust", "cpp"}
+PENDING = {"go", "java", "kotlin", "csharp", "rust", "cpp"}
 
 
 @pytest.fixture(scope="module")

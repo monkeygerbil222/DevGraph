@@ -135,9 +135,11 @@ Specifier resolution: a relative specifier names its existing candidate files
 (the extensions and `index` files the extractor already tried; a `.js`
 specifier also names the `.ts`/`.tsx` source), plus the recursive prefix of
 its directory form, so a barrel re-export reaches the defining file at package
-confidence. An aliased specifier resolves through the file's tsconfig
-(`paths` first, then `baseUrl`) to the same candidates. Any other bare
-specifier (`react`, `lodash`) is external: no edge and no binding.
+confidence (never the repository root as a prefix). An aliased specifier
+resolves through the file's tsconfig (`paths` first, then `baseUrl`) to the
+same candidates. Any other bare specifier (`react`, `lodash`) is external: no
+`IMPORTS` edge (the old `node_modules/<name>` guess never matched, the walk
+skipping `node_modules`), and a call through its binding links nothing.
 
 Tiers, first match wins:
 
@@ -151,10 +153,15 @@ Tiers, first match wins:
    an annotation (`x: T`, `T | null`; not `T[]`), a constructor parameter
    property (`constructor(private repo: Repo)` types `this.repo`), `x = new
    T()`, or `T.f()` on a class: T's file (in this file, or its import's).
-5. Anything else: a bare-name row, unless the method is in `STOP_METHODS.js`;
-   `no_self` on a member call. A bare `f()` nothing defines or imports links
-   nothing, except in a classic script (no `import`, `export` or `require`),
-   whose top-level declarations are globals.
+5. Anything else: a bare-name row, unless the method is in `STOP_METHODS.js`
+   or the receiver is a literal or a library type (`STOP_TYPES.js`: `JSON`,
+   `Object`, `console`, ...); `no_self` on a member call. A bare `f()` nothing
+   defines or imports links nothing, except in a classic script (no `import`,
+   `export` or `require`), whose top-level declarations are globals (browser
+   globals such as `fetch` excepted).
+
+A parameter shadows an import of its name, as in Python. Calls inside an
+anonymous function (a callback, an IIFE) are still not attributed to anyone.
 
 ## Kotlin parse recovery (`devgraph/indexer/kotlin/extractor.py`)
 
