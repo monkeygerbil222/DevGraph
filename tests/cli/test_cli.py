@@ -372,8 +372,8 @@ def test_cli_status(runner, temp_registry_db, temp_git_repo):
     with patch.object(config_module, "get_settings", return_value=settings), \
          patch.object(cli_main, "get_settings", return_value=settings):
         result = runner.invoke(app, ["status"])
-        # Should exit successfully even if Neo4j is unreachable
-        assert result.exit_code == 0
+        # Still reports everything else, then exits non-zero: Neo4j is unreachable
+        assert result.exit_code == 1
         assert "Registered Repositories" in result.stdout
         # Just check that total is present (may vary due to other tests)
         assert "Total:" in result.stdout
@@ -1095,7 +1095,7 @@ def test_cli_add_with_an_invalid_schema_keeps_the_repo_registered(
          patch.object(cli_main, "full_scan", lambda *a, **k: scans.append(a)):
         result = runner.invoke(app, ["add", str(repo)])
 
-    assert result.exit_code == 0, f"stdout: {result.stdout}"
+    assert result.exit_code == 1, f"stdout: {result.stdout}"
     collapsed = _collapsed(result.stdout)
     assert "Registered but initial scan failed" in collapsed
     assert "invalid project schema" in collapsed

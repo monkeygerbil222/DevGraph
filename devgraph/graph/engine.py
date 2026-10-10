@@ -489,15 +489,15 @@ def _retry_transient(fn, *args, **kwargs):
             return fn(*args, **kwargs)
         except EngineClosed:
             raise
-        except _RETRYABLE_EXCEPTIONS:
+        except _RETRYABLE_EXCEPTIONS as exc:
             if attempt >= _MAX_RETRIES:
                 raise
             logger.warning(
-                "transient Neo4j error (attempt %d/%d); retrying in %.1fs",
+                "transient Neo4j error on try %d of %d, retrying in %.1fs: %s",
                 attempt + 1,
-                _MAX_RETRIES,
+                _MAX_RETRIES + 1,
                 delay,
-                exc_info=True,
+                " ".join(str(exc).split()),
             )
             time.sleep(delay)
             delay *= 2

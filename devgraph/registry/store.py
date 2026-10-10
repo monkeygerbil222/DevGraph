@@ -118,6 +118,14 @@ class RepoRegistry:
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._lock = threading.RLock()
         self._closed = False
+        try:
+            self._open()
+        except sqlite3.DatabaseError as exc:
+            self._conn.close()
+            # The bare sqlite message ("file is not a database") names no file.
+            raise type(exc)(f"registry {db_path}: {exc}") from exc
+
+    def _open(self) -> None:
         with self._lock:
             # WAL journal mode: far more crash-safe than the default rollback
             # journal (a crash mid-write can't corrupt the DB), and it lets

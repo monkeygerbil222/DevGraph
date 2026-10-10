@@ -49,12 +49,15 @@ Run `devgraph --help` or `devgraph <command> --help` for the complete, current i
 | Refresh source and reconcile git history | `devgraph rescan <repo_id> [--full] [--force]` |
 | Inspect registered repositories | `devgraph list`, `devgraph info <repo_id>`, `devgraph stats [repo_id]` |
 | Check installation and graph health | `devgraph status`, `devgraph doctor`, `devgraph self-test [repo_id]` |
+| Unregister a repository and delete its graph | `devgraph remove <repo_id> [--keep-graph]` |
 | Recompute communities, key nodes and bridges | `devgraph insights <repo_id>` |
 | Open the dashboard | `devgraph dashboard` |
 | Configure an MCP client | `devgraph client-config`, `devgraph mcp add`, `devgraph mcp doctor` |
 | View settings, project schema, or tray logs | `devgraph config`, `devgraph config show / validate / eject / enable / disable`, `devgraph config schema list / add / edit / delete / reset`, `devgraph config tools list / add / edit / delete / reset`, `devgraph logs` |
 | Export a repository graph | `devgraph export <repo_id> --format json|cypher|dot` |
 | Update DevGraph | `devgraph update` |
+
+`devgraph status` exits non-zero when Neo4j is unreachable or the registry cannot be read, and `devgraph register` when its initial scan fails (the repository stays registered; `devgraph rescan <repo_id>` indexes it once the cause is fixed). A refused Neo4j password names the settings file to fix (`~/.devgraph/.env`, or the folder holding `DEVGRAPH_REGISTRY_DB_PATH`). `devgraph remove` needs Neo4j to delete the graph data; with Neo4j down it stops and keeps the repository registered, and `--keep-graph` unregisters it without touching the graph.
 
 `devgraph update` is the normal update path. It fast-forwards the configured branch, reinstalls DevGraph, runs `doctor`, and restarts the tray app if it was running. Commit or stash local changes first; `--force` only suppresses the dirty-tree guard. The older `scripts/update.ps1` entry point remains available for existing Windows installations.
 

@@ -57,6 +57,23 @@ def _get_registry() -> RepoRegistry:
     return RepoRegistry(settings.registry_db_path)
 
 
+def _neo4j_problem(exc: Exception, settings) -> str:
+    """One line for a failed Neo4j call, naming the setting to check and the file it lives in."""
+    from neo4j.exceptions import AuthError, ServiceUnavailable
+
+    from devgraph.config.settings import devgraph_home
+
+    env_file = devgraph_home() / ".env"
+    if isinstance(exc, AuthError):
+        return (
+            f"Neo4j at {settings.neo4j_uri} refused the username or password; check "
+            f"DEVGRAPH_NEO4J_USER and DEVGRAPH_NEO4J_PASSWORD in {env_file}"
+        )
+    if isinstance(exc, ServiceUnavailable):
+        return f"nothing answers at {settings.neo4j_uri}; start Neo4j, or set DEVGRAPH_NEO4J_URI in {env_file}"
+    return " ".join(str(exc).split())
+
+
 @app.command()
 @app.command(name="register")
 def add(
@@ -117,11 +134,15 @@ def add(
                 # indexing failure (e.g. Neo4j unreachable) shouldn't undo that.
                 # `devgraph rescan <repo_id>` retries the scan once Neo4j is up.
                 console.print(
-                    f"[yellow]Registered but initial scan failed:[/yellow] {escape(str(e))}\n"
-                    f"  Run 'devgraph rescan {escape(record.repo_id)}' once Neo4j is reachable."
+                    f"[yellow]Registered but initial scan failed:[/yellow] {escape(_neo4j_problem(e, settings))}\n"
+                    f"  Fix that, then run 'devgraph rescan {escape(record.repo_id)}' to index it.",
+                    soft_wrap=True,
                 )
+                raise typer.Exit(code=1)
         finally:
             registry.close()
+    except typer.Exit:
+        raise
     except ValueError as e:
         console.print(f"[red][X] Error:[/red] {escape(str(e))}")
         raise typer.Exit(code=1)
@@ -149,8 +170,14 @@ def _print_skipped(skipped: dict[str, str]) -> None:
 
 
 @app.command()
-def remove(repo_id: str) -> None:
-    """Unregister a repository.
+def remove(
+    repo_id: str,
+    keep_graph: bool = typer.Option(
+        False, "--keep-graph",
+        help="Only unregister: leave the repository's graph data in Neo4j (for when Neo4j is down).",
+    ),
+) -> None:
+    """Unregister a repository and delete its graph data.
 
     Args:
         repo_id: The repository ID (shown by 'devgraph list').
@@ -161,12 +188,26 @@ def remove(repo_id: str) -> None:
             if registry.get(repo_id) is None:
                 raise ValueError(f"no such repo_id: {repo_id}")
 
+            if keep_graph:
+                registry.remove_repo(repo_id)
+                console.print(f"[green][OK][/green] Removed: {escape(repo_id)} (registry entry; graph data kept)")
+                return
+
             settings = get_settings()
             engine = GraphEngine(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password)
             try:
                 recorded = engine.read_applied_schema(repo_id) or {}
                 engine.delete_repository(repo_id)
                 _release_labels(engine, recorded.get("labels") or [])
+            except Exception as e:
+                console.print(
+                    f"[red][X] Could not delete the graph data of {escape(repo_id)}:[/red] "
+                    f"{escape(_neo4j_problem(e, settings))}\n"
+                    f"  {escape(repo_id)} is still registered. To unregister it and leave its graph data, "
+                    f"run 'devgraph remove {escape(repo_id)} --keep-graph'.",
+                    soft_wrap=True,
+                )
+                raise typer.Exit(code=1)
             finally:
                 engine.close()
 
@@ -174,6 +215,8 @@ def remove(repo_id: str) -> None:
             console.print(f"[green][OK][/green] Removed: {escape(repo_id)} (registry entry and graph data)")
         finally:
             registry.close()
+    except typer.Exit:
+        raise
     except ValueError as e:
         console.print(f"[red][X] Error:[/red] {escape(str(e))}")
         raise typer.Exit(code=1)
@@ -681,7 +724,10 @@ def _tray_liveness_text(settings) -> str:
 
 @app.command()
 def status() -> None:
-    """Check DevGraph status: Neo4j connectivity and repository counts."""
+    """Check DevGraph status: Neo4j connectivity and repository counts.
+
+    Exits non-zero when Neo4j is unreachable or the registry cannot be read.
+    """
     settings = get_settings()
     console.print()
 
@@ -693,7 +739,7 @@ def status() -> None:
         console.print(f"  [green][OK] Reachable[/green] at {escape(str(settings.neo4j_uri))}")
         reachable = True
     except Exception as e:
-        console.print(f"  [red][X] Not reachable:[/red] {escape(str(e))}")
+        console.print(f"  [red][X] Not reachable:[/red] {escape(_neo4j_problem(e, settings))}", soft_wrap=True)
         reachable = False
     try:
         if reachable:
@@ -703,6 +749,7 @@ def status() -> None:
 
     # Repository counts
     console.print("[bold]Registered Repositories[/bold]")
+    registry_ok = True
     try:
         registry = _get_registry()
         try:
@@ -713,7 +760,8 @@ def status() -> None:
         finally:
             registry.close()
     except Exception as e:
-        console.print(f"  [red]Error:[/red] {escape(str(e))}")
+        console.print(f"  [red]Error:[/red] {escape(str(e))}", soft_wrap=True)
+        registry_ok = False
 
     # Live watcher (tray app) liveness
     console.print("[bold]Live Watcher[/bold]")
@@ -741,6 +789,9 @@ def status() -> None:
             pass
 
     console.print()
+    # Non-zero when DevGraph cannot work: Neo4j or the registry is unusable.
+    if not (reachable and registry_ok):
+        raise typer.Exit(code=1)
 
 
 def _dashboard_port_hint(settings) -> str:
