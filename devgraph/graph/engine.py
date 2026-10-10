@@ -599,28 +599,33 @@ def _group_rels_by_triple(
     (a CALLS target could live anywhere in the repo) rather than a bug to
     paper over.
 
-    Each row carries its `origin`, the file that wrote it (None for a writer
-    that doesn't record one), and `exact`, the files a "prefix" target pin
-    leaves out (empty for every other pin).
+    Within a group, the edges out of one source with the same properties and
+    `origin` (the file that wrote them, None for a writer that doesn't record
+    one) share a row, whose `targets` lists each edge's `to_name`, `to_file`
+    and `exact` (the files a "prefix" target pin leaves out, empty for every
+    other pin). The source is then matched once for all of them: a resolved
+    Python call names several candidate files per callee.
     """
-    groups: dict[tuple[str, str, str, str, str], list[dict[str, Any]]] = {}
+    groups: dict[tuple[str, str, str, str, str], dict[tuple, dict[str, Any]]] = {}
     for rel in rels:
         from_file = rel.get("from_file")
         to_file = rel.get("to_file")
         key = (rel["from_label"], rel["rel_type"], rel["to_label"], _pin(from_file), _pin(to_file))
-        groups.setdefault(key, []).append(
-            {
-                "repo_id": rel["repo_id"],
-                "from_name": rel["from_name"],
-                "to_name": rel["to_name"],
-                "from_file": from_file,
-                "to_file": to_file,
-                "properties": rel.get("properties") or {},
-                "origin": rel.get("origin"),
-                "exact": rel.get("exact") or [],
-            }
+        properties = rel.get("properties") or {}
+        origin = rel.get("origin")
+        source = (
+            rel["repo_id"], rel["from_name"], from_file, origin, json.dumps(properties, sort_keys=True, default=str)
         )
-    return groups
+        row = groups.setdefault(key, {}).setdefault(source, {
+            "repo_id": rel["repo_id"],
+            "from_name": rel["from_name"],
+            "from_file": from_file,
+            "properties": properties,
+            "origin": origin,
+            "targets": [],
+        })
+        row["targets"].append({"to_name": rel["to_name"], "to_file": to_file, "exact": rel.get("exact") or []})
+    return {key: list(rows.values()) for key, rows in groups.items()}
 
 
 def _upsert_nodes_tx(tx, nodes: list[dict[str, Any]]) -> None:
@@ -661,26 +666,29 @@ _ADD_ORIGIN = (
 )
 
 
-def _end_match(var: str, label: str, end: str, pin: str) -> str:
-    """The MATCH for one end of an edge row (`pin` from `_pin`). An end of a
-    file-scoped label is hinted to seek its index: the (repo_id, name, file)
-    unique one when pinned to a file, the (repo_id, name) lookup one
-    otherwise (a file-less end then keeps only `file IS NULL`). A plan made
-    from index statistics sampled while the label was near-empty estimates 0
-    rows, and can then scan a whole index per row (a plain USING INDEX allows
-    that scan) after the label has filled; in CI that made a 5,000-module
-    relink take 20 s instead of under 1 s. A "prefix" end seeks by name and
-    keeps the nodes whose file is under the directory, less the row's
+def _end_match(var: str, label: str, end: str, pin: str, ref: str = "row") -> str:
+    """The MATCH for one end of an edge row (`pin` from `_pin`), reading its
+    `{end}_name`/`{end}_file` off `ref` (the row, or one of its targets). An
+    end of a file-scoped label is hinted to seek its index: the (repo_id,
+    name, file) unique one when pinned to a file, the (repo_id, name) lookup
+    one otherwise (a file-less end then keeps only `file IS NULL`). A plan
+    made from index statistics sampled while the label was near-empty
+    estimates 0 rows, and can then scan a whole index per row (a plain USING
+    INDEX allows that scan) after the label has filled; in CI that made a
+    5,000-module relink take 20 s instead of under 1 s. A "prefix" end seeks
+    by name and keeps the nodes whose file is under the directory, less the
     `exact` files."""
     pinned = pin == "file"
     keys = "repo_id, name, file" if pinned else "repo_id, name"
     hint = f"USING INDEX SEEK {var}:{label}({keys}) " if label in FILE_SCOPED_LABELS else ""
     if not pinned:
-        match = f"MATCH ({var}:{label} {{repo_id: row.repo_id, name: row.{end}_name}}) " + hint
+        match = f"MATCH ({var}:{label} {{repo_id: row.repo_id, name: {ref}.{end}_name}}) " + hint
         if pin == "prefix":
-            return match + f"WHERE {var}.file STARTS WITH row.{end}_file AND NOT {var}.file IN row.exact "
+            return match + f"WHERE {var}.file STARTS WITH {ref}.{end}_file AND NOT {var}.file IN {ref}.exact "
         return match + (f"WHERE {var}.file IS NULL " if pin == "fileless" else "")
-    return f"MATCH ({var}:{label} {{repo_id: row.repo_id, name: row.{end}_name, file: row.{end}_file}}) " + hint
+    return (
+        f"MATCH ({var}:{label} {{repo_id: row.repo_id, name: {ref}.{end}_name, file: {ref}.{end}_file}}) " + hint
+    )
 
 
 def _upsert_relationships_tx(tx, rels: list[dict[str, Any]]) -> None:
@@ -688,7 +696,8 @@ def _upsert_relationships_tx(tx, rels: list[dict[str, Any]]) -> None:
         tx.run(
             "UNWIND $rows AS row "
             + _end_match("a", from_label, "from", from_pin)
-            + _end_match("b", to_label, "to", to_pin)
+            + "UNWIND row.targets AS t "
+            + _end_match("b", to_label, "to", to_pin, "t")
             + f"MERGE (a)-[r:{rel_type}]->(b) "
             "SET r += row.properties " + _ADD_ORIGIN,
             rows=rows,
@@ -966,12 +975,14 @@ class GraphEngine:
         """Return the repo-relative paths of every Module with an IMPORTS edge
         into `module_name` (direct importers only, one level).
 
-        Used to widen an incremental reindex to a changed file's dependents:
-        a CALLS/IMPORTS edge in an importer's own extracted source is only
-        re-evaluated when that importer's file is itself reindexed, so a
-        rename/removal in the imported file otherwise leaves the importer's
-        edges stale until it happens to be edited again or a full rescan
-        runs. See dispatch.py's index_paths.
+        Used to widen an incremental reindex of a Java file to its
+        dependents: a CALLS/IMPORTS edge in an importer's own extracted
+        source is only re-evaluated when that importer's file is itself
+        reindexed, so a rename/removal in the imported file otherwise leaves
+        the importer's edges stale until it happens to be edited again or a
+        full rescan runs. Python importers need no re-index (their edges are
+        relinked from `name_refs`). See dispatch.py's
+        _expand_with_reverse_dependents.
         """
         with self._driver.session() as session:
             result = _retry_transient(

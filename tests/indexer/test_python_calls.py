@@ -134,6 +134,38 @@ def test_annotated_and_constructed_receivers_resolve_to_their_class():
     assert targets(source, "f", "run", "main.py") == {("main.py", "resolved")}
 
 
+def test_a_parameter_named_after_a_fixture_in_the_file_is_typed_by_it():
+    source = """\
+        import pytest
+        from engine import GraphEngine
+
+
+        @pytest.fixture
+        def engine():
+            built = GraphEngine()
+            yield built
+
+
+        @pytest.fixture
+        def other() -> GraphEngine:
+            return make()
+
+
+        def helper(engine):
+            return engine
+
+
+        def test_it(engine, other, helper):
+            engine.run_cypher()
+            other.close_all()
+            helper.work()
+        """
+    expected = {("engine.py", "resolved"), ("engine/__init__.py", "resolved"), ("engine/", "package")}
+    assert targets(source, "test_it", "run_cypher", "test_x.py") == expected
+    assert targets(source, "test_it", "close_all", "test_x.py") == expected
+    assert targets(source, "test_it", "work", "test_x.py") == {(None, "name")}  # not a fixture
+
+
 def test_an_unknown_receiver_keeps_a_bare_name_edge():
     assert targets("def f(obj):\n    obj.work()\n", "f", "work") == {(None, "name")}
 
@@ -272,4 +304,44 @@ def test_a_resolved_call_returns_with_its_deleted_module(engine, repo_id, tmp_pa
     write(tmp_path, "lib/tools.py", "def run():\n    return 1\n")
     index_paths(engine, repo_id, tmp_path, {tools})
     assert caller_edges(engine, repo_id, "main") == [("run", "lib/tools.py", "resolved")]
+    equals_fresh(engine, repo_id, tmp_path)
+
+
+def test_the_index_upgrade_replaces_bare_python_calls(engine, repo_id, tmp_path, monkeypatch):
+    """A graph indexed before calls were resolved (format 3) has bare-name
+    CALLS with no confidence and seven-field name_refs; catch_up's automatic
+    upgrade (a full_scan) leaves only the resolved edges."""
+    from datetime import datetime, timezone
+
+    from devgraph.indexer import dispatch
+
+    write(tmp_path, "app.py", "from lib import helper\n\n\ndef main():\n    return helper()\n")
+    write(tmp_path, "lib.py", "def helper():\n    return 1\n")
+    write(tmp_path, "other.py", "def helper():\n    return 2\n")
+    real = dispatch.extract_python_file
+
+    def old_extract(content, rel_path, repo_id):
+        result = real(content, rel_path, repo_id)
+        for rel in result.relationships:
+            if rel.rel_type == "CALLS":
+                rel.to_file, rel.exact, rel.properties = None, None, None
+        return result
+
+    with monkeypatch.context() as old_extractor:
+        old_extractor.setattr(dispatch, "extract_python_file", old_extract)
+        provision_repository_schema(engine, tmp_path)
+        engine.upsert_repository(repo_id, repo_id, str(tmp_path))
+        full_scan(engine, repo_id, tmp_path)
+    engine.run_cypher(
+        "MATCH (m:Module {repo_id: $r}) SET m.name_refs = [e IN m.name_refs | "
+        "reduce(s = '', f IN split(e, $sep)[0..7] | s + CASE WHEN s = '' THEN '' ELSE $sep END + f)]",
+        {"r": repo_id, "sep": "\x1f"},
+    )
+    engine.set_index_format(repo_id, 3)
+    assert caller_edges(engine, repo_id, "main") == [("helper", "lib.py", None), ("helper", "other.py", None)]
+    assert dispatch.index_outdated(engine, repo_id)
+
+    dispatch.catch_up(engine, repo_id, tmp_path, since=datetime.now(timezone.utc))
+    assert caller_edges(engine, repo_id, "main") == [("helper", "lib.py", "resolved")]
+    assert not dispatch.index_outdated(engine, repo_id)
     equals_fresh(engine, repo_id, tmp_path)

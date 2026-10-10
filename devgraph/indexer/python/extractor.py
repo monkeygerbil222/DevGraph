@@ -179,9 +179,20 @@ def _type_names(node: Node | None, source: bytes) -> list[str]:
     return []
 
 
-def _local_types(func: Node, body: Node, source: bytes) -> dict[str, list[str]]:
+def _constructed(node: Node | None, source: bytes) -> str | None:
+    """`X` for a call `X(...)` or `m.X(...)` of a capitalised callable (read
+    as a constructor), else None."""
+    called = node.child_by_field_name("function") if node is not None and node.type == "call" else None
+    name = _pure_dotted(called, source) if called is not None else None
+    return name if name and name.rsplit(".", 1)[-1][:1].isupper() else None
+
+
+def _local_types(
+    func: Node, body: Node, source: bytes, fixtures: dict[str, list[str]] | None = None
+) -> dict[str, list[str]]:
     """The class names a function's own variables are typed with: annotated
-    parameters, annotated assignments and `x = X(...)` (a capitalised
+    parameters, a parameter named after one of this file's pytest
+    `fixtures`, annotated assignments and `x = X(...)` (a capitalised
     callable, read as a constructor). Nested defs are not looked into."""
     types: dict[str, set[str]] = {}
     params = func.child_by_field_name("parameters")
@@ -191,6 +202,9 @@ def _local_types(func: Node, body: Node, source: bytes) -> dict[str, list[str]]:
         elif param.type == "typed_default_parameter":
             name_node = param.child_by_field_name("name")
         else:
+            name_node = param if param.type == "identifier" else param.child_by_field_name("name")
+            if name_node is not None and fixtures and _text(name_node, source) in fixtures:
+                types.setdefault(_text(name_node, source), set()).update(fixtures[_text(name_node, source)])
             continue
         if name_node is not None:
             types.setdefault(_text(name_node, source), set()).update(
@@ -204,11 +218,7 @@ def _local_types(func: Node, body: Node, source: bytes) -> dict[str, list[str]]:
             left = node.child_by_field_name("left")
             if left is not None and left.type == "identifier":
                 annotated = _type_names(node.child_by_field_name("type"), source)
-                right = node.child_by_field_name("right")
-                called = right.child_by_field_name("function") if right is not None and right.type == "call" else None
-                constructor = _pure_dotted(called, source) if called is not None else None
-                if constructor and not constructor.rsplit(".", 1)[-1][:1].isupper():
-                    constructor = None
+                constructor = _constructed(node.child_by_field_name("right"), source)
                 names = annotated or ([constructor] if constructor else [])
                 if names:
                     types.setdefault(_text(left, source), set()).update(names)
@@ -217,6 +227,42 @@ def _local_types(func: Node, body: Node, source: bytes) -> dict[str, list[str]]:
 
     walk(body)
     return {name: sorted(found) for name, found in types.items() if found}
+
+
+def _fixture_types(root: Node, source: bytes) -> dict[str, list[str]]:
+    """This file's module-level pytest fixtures and the class names their
+    value is built with: a return annotation, or a returned or yielded
+    `X(...)` or variable typed as in `_local_types`. A test's parameter of
+    that name is the fixture's value, so it is typed by it."""
+    fixtures: dict[str, list[str]] = {}
+    for node in root.named_children:
+        definition = node.child_by_field_name("definition") if node.type == "decorated_definition" else None
+        if definition is None or definition.type != "function_definition":
+            continue
+        decorators = _extract_decorator_names([c for c in node.named_children if c.type == "decorator"], source)
+        name_node = definition.child_by_field_name("name")
+        body = definition.child_by_field_name("body")
+        if name_node is None or body is None or not any(d.rsplit(".", 1)[-1] == "fixture" for d in decorators):
+            continue
+        local = _local_types(definition, body, source)
+        found = set(_type_names(definition.child_by_field_name("return_type"), source))
+
+        def walk(n: Node) -> None:
+            if n.type in ("function_definition", "class_definition", "lambda"):
+                return
+            if n.type in ("return_statement", "yield"):
+                for value in n.named_children:
+                    if value.type == "identifier":
+                        found.update(local.get(_text(value, source), []))
+                    elif (constructor := _constructed(value, source)) is not None:
+                        found.add(constructor)
+            for child in n.children:
+                walk(child)
+
+        walk(body)
+        if found:
+            fixtures[_text(name_node, source)] = sorted(found)
+    return fixtures
 
 
 def _direct_defs(block: Node | None, source: bytes) -> set[str]:
@@ -595,6 +641,7 @@ def extract_python_file(source_code: str, file_path: str, repo_id: str) -> Extra
         )
 
     resolver = _CallResolver(file_path, bindings, _class_table(root, source_bytes), source_bytes)
+    fixtures = _fixture_types(root, source_bytes)
     # (caller label, caller name) -> callee name -> [pins, bare?, caller classes]
     calls: dict[tuple[str, str], dict[str, list]] = {}
 
@@ -768,7 +815,8 @@ def extract_python_file(source_code: str, file_path: str, repo_id: str) -> Extra
         # attributed to the nested function itself, not hoisted here).
         if body_node is not None:
             scope = _Scope(
-                _direct_defs(body_node, source_bytes), _local_types(node, body_node, source_bytes), cls, enclosing
+                _direct_defs(body_node, source_bytes), _local_types(node, body_node, source_bytes, fixtures), cls,
+                enclosing,
             )
             caller_class = parent_name if parent_label == "Class" else None
             record_calls("Function", func_name, body_node, scope, caller_class)

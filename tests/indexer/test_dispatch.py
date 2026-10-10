@@ -1536,7 +1536,20 @@ def test_a_directory_pin_is_tested_before_the_fileless_pin():
     groups = _group_rels_by_triple([_rel("f", "pkg/a.py"), {**_rel("f", "pkg/"), "exact": ["pkg/a.py"]}])
     assert {key[4] for key in groups} == {"file", "prefix"}
     (prefix_row,) = groups[("Function", "CALLS", "Function", "file", "prefix")]
-    assert prefix_row["exact"] == ["pkg/a.py"]
-    match = _end_match("b", "Function", "to", "prefix")
+    assert prefix_row["targets"] == [{"to_name": "f", "to_file": "pkg/", "exact": ["pkg/a.py"]}]
+    match = _end_match("b", "Function", "to", "prefix", "t")
     assert "USING INDEX SEEK b:Function(repo_id, name)" in match
-    assert "b.file STARTS WITH row.to_file AND NOT b.file IN row.exact" in match
+    assert "b.file STARTS WITH t.to_file AND NOT b.file IN t.exact" in match
+
+
+def test_edges_out_of_one_source_share_a_row():
+    from devgraph.graph.engine import _group_rels_by_triple
+
+    rels = [_rel(name, f"lib/{name}.py", confidence="resolved") for name in ("f", "g")]
+    rels += [_rel("h", "lib/h.py", confidence="package"), {**_rel("f", "lib/f.py"), "from_name": "other"}]
+    (rows,) = _group_rels_by_triple(rels).values()
+    assert [(row["from_name"], row["properties"], [t["to_name"] for t in row["targets"]]) for row in rows] == [
+        ("main", {"confidence": "resolved"}, ["f", "g"]),
+        ("main", {"confidence": "package"}, ["h"]),
+        ("other", {}, ["f"]),
+    ]

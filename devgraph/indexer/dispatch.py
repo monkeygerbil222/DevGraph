@@ -600,7 +600,7 @@ def index_paths(
             compute relative paths for provenance.
         paths: Files to (re)index. Paths outside repo_root are silently
             skipped. Besides these, the batch also re-indexes files that
-            refer to what these files contain: direct importers (see
+            refer to what these files contain: direct Java importers (see
             _expand_with_reverse_dependents) and files whose by-name edges
             target a node the batch adds (see _find_referrers), relinks
             Markdown mentioning an added name (see _mention_referrers), and
@@ -1132,7 +1132,7 @@ def _expand_with_reverse_dependents(
     engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[Path]
 ) -> set[Path]:
     """Widen a changed-files batch to also include direct importers of any
-    changed .py or .java file already in the graph.
+    changed .java file already in the graph.
 
     Without this, a CALLS/IMPORTS edge in some other file (e.g. a caller of
     a since-renamed/removed function) is only ever re-evaluated when that
@@ -1142,6 +1142,11 @@ def _expand_with_reverse_dependents(
     fan-out only (direct importers, not transitive) to keep this a cheap
     per-change lookup rather than a repo walk; transitive staleness is rare
     enough that `--full` remains the intended escape hatch for it.
+
+    Python files are not widened to: every Python edge is a function of its
+    writer's own text and whether its target exists, so a removed target
+    goes with its node and an added one is relinked from the writer's
+    `name_refs` (_relink_name_refs), with no re-index of the importer.
 
     This finds referrers only through edges that already exist. A referrer
     indexed before its target existed has no edge to follow; index_paths
@@ -1156,7 +1161,7 @@ def _expand_with_reverse_dependents(
             resolved = Path(path).resolve()
         except OSError:
             continue
-        if resolved.suffix not in (".py", ".java") or not is_within(resolved, root_resolved):
+        if resolved.suffix != ".java" or not is_within(resolved, root_resolved):
             continue
         try:
             original_rel_paths.add(resolved.relative_to(root_resolved).as_posix())
