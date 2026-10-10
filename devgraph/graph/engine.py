@@ -357,9 +357,14 @@ _SHOW_INDEXES_CYPHER = (
 )
 # Graph insights (devgraph/analytics/insights.py). The Repository node is the
 # scoping root, not code, so it never takes part in the graph that's analysed.
+# A Python CALLS edge matched by name alone ("name") or to any file under an
+# imported package ("package") is left out: either can fan one call out to
+# many same-named functions. A CALLS edge without a confidence (another
+# language's) stays in.
 _LOAD_INSIGHT_EDGES_CYPHER = (
     "MATCH (a {repo_id: $repo_id})-[r]->(b {repo_id: $repo_id}) "
     "WHERE type(r) IN $types AND NOT a:Repository AND NOT b:Repository "
+    "  AND NOT (type(r) = 'CALLS' AND coalesce(r.confidence, '') IN ['name', 'package']) "
     "RETURN elementId(a) AS source, elementId(b) AS target, type(r) AS type"
 )
 _LOAD_INSIGHT_NODES_CYPHER = (
@@ -1567,7 +1572,8 @@ class GraphEngine:
     def load_insight_graph(
         self, repo_id: str, relationship_types: tuple[str, ...]
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-        """One repository's edges of `relationship_types` and the nodes they touch.
+        """One repository's edges of `relationship_types` and the nodes they touch,
+        less the Python CALLS edges of confidence "name" or "package".
 
         Identity is `elementId`, which is only promised stable within a
         transaction; it is used for the `write_insights` that immediately

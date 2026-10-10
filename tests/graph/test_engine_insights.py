@@ -64,6 +64,19 @@ def test_load_returns_only_relevant_edges_and_their_nodes(engine):
     assert len(edges) == 7 and {e["type"] for e in edges} == {"CALLS"}
 
 
+def test_load_leaves_out_python_calls_matched_by_name_or_package(engine):
+    build_two_subsystems(engine)
+    engine.run_cypher(
+        "UNWIND $pairs AS pair "
+        "MATCH (s:Function {repo_id: $repo, name: pair[0]}), (t:Function {repo_id: $repo, name: pair[1]}) "
+        "MATCH (s)-[r:CALLS]->(t) SET r.confidence = pair[2]",
+        {"repo": REPO, "pairs": [["a", "b", "resolved"], ["b", "c", "name"], ["a", "c", "package"]]},
+    )
+    _nodes, edges = engine.load_insight_graph(REPO, COMMUNITY_RELATIONSHIPS)
+    # The resolved edge and the four without a confidence stay.
+    assert len(edges) == 5
+
+
 def test_refresh_writes_node_and_repository_properties(engine):
     build_two_subsystems(engine)
     summary = refresh_insights(engine, REPO)

@@ -943,16 +943,23 @@ def find_callers(
     max_results: int = 15,
     scope_to_class: str | None = None,
     modified_within_commits: int | None = None,
+    resolved_only: bool = False,
 ) -> dict[str, Any]:
     """Find all functions, services, or endpoints that call a given target.
 
-    CALLS edges are name-based, not type-resolved: a call to `target_name`
-    made from inside any class's method links to every Function node named
+    A Python CALLS edge carries a `confidence`: "resolved" (the callee was
+    found through the caller's own scope or imports, in a file it names),
+    "package" (in a file under an imported package, e.g. a re-export) or
+    "name" (a method on a receiver nothing types, linked to every Function
+    of that name). Other languages' CALLS edges are name-based and carry
+    none: a call to `target_name` links to every Function node named
     `target_name` repo-wide, which can surface unrelated same-named methods
-    as noise. When a method-body call's enclosing class is known at index
-    time, the edge carries a `caller_class` property recording it — pass
-    scope_to_class to narrow results to callers made from within a specific
-    class's own methods (opt-in; omitted, behavior is unchanged/repo-wide).
+    as noise. Each caller is returned once, with its best confidence, and
+    resolved callers come first. When a method-body call's enclosing class
+    is known at index time, the edge carries a `caller_class` property
+    recording it — pass scope_to_class to narrow results to callers made
+    from within a specific class's own methods (opt-in; omitted, behavior is
+    unchanged/repo-wide).
 
     Args:
         engine: GraphEngine instance
@@ -968,10 +975,14 @@ def find_callers(
             `last_modified_at` property and is excluded, never silently included.
             If fewer than N commits exist repo-wide, no cutoff applies and this
             filter is a no-op.
+        resolved_only: If True, only return callers whose edge confidence is
+            "resolved" or "package" (dropping bare-name matches and every
+            edge without a confidence)
 
     Returns:
         Dict with count, results, and truncated flag containing callers with their
-        types, repo_id and file (same-named callers in different files are separate rows)
+        types, repo_id, file and confidence (same-named callers in different files
+        are separate rows)
     """
     cutoff = None
     if modified_within_commits is not None:
@@ -980,15 +991,20 @@ def find_callers(
     repo_filter = "" if cross_repo else "AND target.repo_id = $repo_id"
     class_filter = "AND rel.caller_class = $scope_to_class" if scope_to_class else ""
     recency_filter = "AND target.last_modified_at >= $cutoff" if cutoff is not None else ""
+    resolved_filter = "AND rel.confidence IN ['resolved', 'package']" if resolved_only else ""
     cypher = f"""
     MATCH (caller)-[rel:CALLS]->(target)
     WHERE target.name = $target_name
     {repo_filter}
     {class_filter}
     {recency_filter}
-    RETURN DISTINCT caller.name as name, labels(caller) as type, caller.repo_id as repo_id,
-           coalesce(caller.file, caller.source_file) as file
-    ORDER BY name, file
+    {resolved_filter}
+    WITH caller, min(CASE rel.confidence WHEN 'resolved' THEN 0 WHEN 'package' THEN 1 WHEN 'name' THEN 3
+                     ELSE 2 END) AS rank
+    RETURN caller.name as name, labels(caller) as type, caller.repo_id as repo_id,
+           coalesce(caller.file, caller.source_file) as file,
+           CASE rank WHEN 0 THEN 'resolved' WHEN 1 THEN 'package' WHEN 3 THEN 'name' END as confidence
+    ORDER BY rank, name, file
     LIMIT {LIST_ROW_LIMIT + 1}
     """
     params = {"target_name": target_name}
@@ -1011,6 +1027,8 @@ def find_related_files(
     max_results: int = 15,
 ) -> dict[str, Any]:
     """Find all files related to a component (via CONTAINS, IMPORTS, CALLS relationships).
+
+    Every CALLS edge counts whatever its `confidence` (see find_callers).
 
     Args:
         engine: GraphEngine instance
@@ -1233,6 +1251,10 @@ def impact_analysis(
     max_results: int = 15,
 ) -> dict[str, Any]:
     """Analyze the impact of changing a component on the rest of the system.
+
+    Every CALLS edge counts as a dependency whatever its `confidence` (see
+    find_callers), so a Python method called on an untyped receiver keeps
+    its by-name dependents: impact errs toward listing too much.
 
     Args:
         engine: GraphEngine instance

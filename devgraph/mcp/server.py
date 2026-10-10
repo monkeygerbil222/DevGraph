@@ -582,17 +582,22 @@ def build_server(
         max_results: int = 15,
         scope_to_class: str | None = None,
         modified_within_commits: int | None = None,
+        resolved_only: bool = False,
     ) -> dict[str, Any]:
         """Find all callers of a target; returns {count, results, truncated}, each caller
-        with its name, type, repo_id and file. CALLS is
-        name-based, not type-resolved — pass scope_to_class to narrow to callers made
-        from within a specific class's own methods and cut noise from unrelated
-        same-named methods elsewhere in the repo. Pass modified_within_commits to
-        restrict to targets touched within the last N commits repo-wide (requires
-        git-history recency staging; entities never staged are excluded, not silently
-        included)."""
+        with its name, type, repo_id, file and confidence, most certain first. Python
+        calls are resolved through the caller's scope and imports: confidence
+        "resolved" (callee in a file the caller names), "package" (in a file under an
+        imported package) or "name" (a method on an untyped receiver, matched by name
+        only); other languages' calls are name-based and have no confidence. Pass
+        resolved_only to keep only "resolved"/"package" callers, or scope_to_class to
+        narrow to callers made from within a specific class's own methods. Pass
+        modified_within_commits to restrict to targets touched within the last N
+        commits repo-wide (requires git-history recency staging; entities never staged
+        are excluded, not silently included)."""
         return devgraph_tools.find_callers(
-            engine, repo_id, target_name, cross_repo, max_results, scope_to_class, modified_within_commits
+            engine, repo_id, target_name, cross_repo, max_results, scope_to_class, modified_within_commits,
+            resolved_only,
         )
 
     @server.tool(annotations=_READ_ONLY)

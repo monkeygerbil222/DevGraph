@@ -304,6 +304,7 @@ Prefer these over re-reading files when the question is structural:
 | "What calls X?" | `find_callers` (name, not path) |
 | "What calls X, but only recently modified?" | `find_callers` with `modified_within_commits=N` (filters results to entities touched in the last N commits) |
 | "What calls X, but only from within class Y?" | `find_callers` with `scope_to_class=Y` (cuts noise from unrelated same-named methods elsewhere in the repo) |
+| "What definitely calls X?" | `find_callers` with `resolved_only=True` (Python callers resolved through scope or imports) |
 | "What breaks if I change X?" | `impact_analysis` (name, not path) |
 | "What breaks across this whole PR/diff?" | `impact_analysis_for_diff` (base_ref/head_ref, both must exist locally — never fetches) |
 | "What does X depend on?" | `get_service_dependencies` (service name), `find_related_files` (function/class name, not path) |
@@ -380,17 +381,25 @@ call edges, `explain_architecture` returning no `uses`/`calls`, and relative
 imports not resolving) have been fixed and checked against a reference repository.
 Two things worth knowing about how they work:
 
-- **Call graph is name-based, not type-resolved, in every language
-  DevGraph supports.** `self.foo()`, `this->foo()`, `obj.Foo()`, and a bare
-  `foo()` all link to whichever `Function` node is named `foo` — there's no
-  type inference, so same-named methods on unrelated classes/types will
-  over-link rather than under-link. Treat `find_callers` results as "things
-  that call something named X", not a guaranteed-precise call graph. When a
-  call was made from inside a method body, its `CALLS` edge records the
-  caller's enclosing class as `caller_class` — pass
-  `find_callers(..., scope_to_class="ThatClass")` to filter down to just
-  that class's own callers when a common method name (`get`, `run`,
-  `close`) is otherwise drowning in unrelated matches.
+- **Python calls are resolved through scope and imports; other languages'
+  are name-based.** A Python call links to the file its callee can be in:
+  a def in the same file, the module an imported name comes from (or any
+  file under that package, for a re-export), `self`/`super()` methods in
+  the class or its bases, and methods on a module or on a value whose type
+  an annotation or constructor call gives. Each Python `CALLS` edge has a
+  `confidence`: `resolved`, `package`, or `name` (a method on a value
+  nothing types, linked to every `Function` of that name). A call of a
+  builtin type's method (`.get`, `.join`, `.append`) on such a value, or a
+  bare name nothing defines or imports (a builtin), links nothing. In every
+  other language `self.foo()`, `this->foo()`, `obj.Foo()` and a bare `foo()`
+  all link to whichever `Function` node is named `foo`, so same-named
+  methods on unrelated types over-link. `find_callers` returns each
+  caller's `confidence`, most certain first; pass `resolved_only=True` to
+  keep only `resolved`/`package` callers. When a call was made from inside
+  a method body, its `CALLS` edge records the caller's enclosing class as
+  `caller_class` — pass `find_callers(..., scope_to_class="ThatClass")` to
+  filter down to just that class's own callers. Graph insights (PageRank,
+  communities) leave out `name` and `package` edges.
 - **Import/include resolution is a same-repo best-effort guess, per
   language, and it fails silently by design.** Each language extractor
   resolves its own dominant intra-repo import convention (Python's dotted
