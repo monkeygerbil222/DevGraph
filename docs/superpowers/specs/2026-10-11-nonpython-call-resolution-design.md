@@ -291,3 +291,56 @@ left out; every edge carries no confidence, so nothing is linked yet):
  }
 }
 ```
+
+### Results after slice A
+
+| | Target | BEFORE | AFTER | |
+|---|---|---|---|---|
+| ts M1 resolved multi-target share | < 2 % | no resolved edge (32 bare, 8 multi-target) | 0 % (20 resolved, 2 package, 1 name) | met |
+| ts M2 linked precision | ≥ 98 %, 0 cross-directory without import | none linked; 69 % of all edges right | 100 % (resolved, linked and all); 0 | met |
+| ts M3 `IMPORTS` precision / recall | ≥ 98 % / 95 % | 100 % / 58 % | 100 % / 100 % (24/24) | met |
+| ts M4 `CALLS` recall | ≥ 95 % | 96 % (all bare) | 100 % (linked 96 %, resolved 87 %) | met |
+| ts M5 named sites | all | 32/41 | 41/41 | met |
+| Kotlin symbols extracted | all | 5/13 | 13/13 (named sites 29/33 to 31/33; calls resolve in slice B) | met |
+| Python on DevGraph | unchanged but self-loops | name 4,087, self-loops 62 | name 4,072, self-loops 47; every other figure equal | met |
+| M6 DevGraph `full_scan` | ≤ +15 % | 54.4 s | 58.2 s (+7 %) | met |
+| M6 ts fixture `full_scan` | ≤ +15 % | 1.12-1.18 s | 1.18-1.30 s (+5-10 %) | met |
+| M6 largest `name_refs` | < 1 MiB | 231,682 B (DevGraph) | 229,842 B (DevGraph); 4,273 B (ts) | met |
+| M6 relink benchmark | green | green | green, by name and with path pins (about 56k and 59k db hits) | met |
+
+- **Timing.** The `full_scan` figures are medians of alternating runs of the
+  BEFORE and AFTER code over the same tree, in one process each (DevGraph:
+  three each; ts: two series of seven, the first run of a series left out),
+  on a machine other test runs were sharing, so single runs vary by up to a
+  third. A first AFTER build spent its extra time packing parameters (every
+  target carried `pin`, `exclude` maps and `no_self`, +23 %); a target now
+  carries a key only where its group's Cypher reads it.
+- **Python.** `no_self` removed 15 bare `name` self-loops (`x.save()` inside
+  `save`); M1-M5 are otherwise identical (resolved 8,555, package 40, `IMPORTS`
+  recall and precision 100 %, 21/21 sites, `find_callers` recall unchanged).
+- **The ts no-edge sites** (`getItem` calling `localStorage.getItem`, lodash's
+  `_.capitalize`, `JSON.parse`, React hooks) are now absent through the
+  stoplists, external bindings and `no_self`; the classic scripts'
+  `initLegacy -> trackEvent` stays a `name` edge, by design.
+
+AFTER (ts in full; Kotlin's parse coverage, its other measures waiting for
+slice B; `full_scan_s` is one cold run of the script, the table has the
+paired timing):
+
+```json
+{
+ "ts": {
+  "M1": {"calls_by_confidence": {"name": 1, "package": 2, "resolved": 20}, "multi_target_by_confidence": {}, "resolved_multi_share": 0.0},
+  "M2": {"precision_resolved": 1.0, "precision_linked": 1.0, "precision_all": 1.0, "resolved_cross_dir_without_import": 0},
+  "M3": {"graph_imports": 24, "truth_imports": 24, "precision": 1.0, "recall": 1.0},
+  "M4": {"recall_any": 1.0, "recall_linked": 0.9565, "recall_resolved": 0.8696, "top5": [["check", "src/api/http.ts"], ["src/types.ts", "src/types.ts"], ["src/api/http.ts", "src/api/http.ts"], ["src/lib/storage.ts", "src/lib/storage.ts"], ["get", "src/api/http.ts"]], "top5_stoplisted": []},
+  "M5": {"sites_ok": 41, "sites": 41},
+  "M6": {"full_scan_s": 3.93, "largest_name_refs_module": "src/pages/Settings.tsx", "largest_name_refs_bytes": 4273, "total_name_refs_bytes": 20721},
+  "failures": []
+ },
+ "kotlin": {
+  "M5": {"sites_ok": 31, "sites": 33, "symbols_found": 13, "symbols": 13, "symbols_missing": []}
+ }
+}
+```
+

@@ -177,3 +177,88 @@ def test_a_parameter_shadows_an_import_of_its_name():
 def test_a_resolved_call_suppresses_the_bare_row_of_the_same_name():
     source = "import { save } from './store';\nexport function f(x) { save(); x.save(); }\n"
     assert all(conf != "name" for _f, conf in targets(source, "f", "save"))
+
+
+# --- live: the INDEX_FORMAT 6 upgrade ------------------------------------------
+
+
+def test_the_index_upgrade_replaces_bare_js_calls(tmp_path, monkeypatch):
+    """A graph indexed before format 6 has bare JS CALLS with no confidence,
+    Modules without `dir`/`basename` and no resolver fingerprint; catch_up's
+    automatic upgrade (a full_scan) leaves the resolved edges and records
+    both."""
+    import uuid
+    from datetime import datetime, timezone
+
+    import pytest
+
+    from devgraph.graph.engine import GraphEngine, provision_repository_schema
+    from devgraph.indexer import dispatch
+    from devgraph.indexer.common import GraphRelationship
+    from tests.watcher.live_helpers import fresh_snapshot, graph_snapshot, snapshot_diff
+
+    engine = GraphEngine(uri="bolt://127.0.0.1:7687", user="neo4j", password="devgraph-local-dev")
+    try:
+        engine.verify_connectivity()
+    except Exception as e:
+        pytest.skip(f"Neo4j not available: {e}")
+    repo_id = f"zz-jscalls-{uuid.uuid4().hex[:8]}"
+    try:
+        (tmp_path / "tsconfig.json").write_text('{"compilerOptions": {"paths": {"@/*": ["src/*"]}}}')
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src/app.ts").write_text("import { save } from '@/store';\nexport function main() { save(); }\n")
+        (tmp_path / "src/store.ts").write_text("export function save() {}\n")
+        (tmp_path / "src/other.ts").write_text("export function save() {}\n")
+        real = dispatch.extract_js_file
+
+        def old_extract(content, rel_path, repo_id, config=None):
+            # Before format 6: no tsconfig, and every call a bare name.
+            result = real(content, rel_path, repo_id)
+            calls = {("main", "save")} if rel_path == "src/app.ts" else set()
+            result.relationships = [r for r in result.relationships if r.rel_type != "CALLS"]
+            result.relationships += [
+                GraphRelationship(
+                    from_label="Function", from_name=a, rel_type="CALLS", to_label="Function", to_name=b,
+                    repo_id=repo_id, from_file=rel_path, origin=rel_path,
+                )
+                for a, b in sorted(calls)
+            ]
+            return result
+
+        with monkeypatch.context() as old:
+            old.setattr(dispatch, "extract_js_file", old_extract)
+            provision_repository_schema(engine, tmp_path)
+            engine.upsert_repository(repo_id, repo_id, str(tmp_path))
+            dispatch.full_scan(engine, repo_id, tmp_path)
+        engine.run_cypher(
+            "MATCH (m:Module {repo_id: $r}) REMOVE m.dir, m.basename WITH count(m) AS n "
+            "MATCH (r:Repository {repo_id: $r}) REMOVE r.resolver_config",
+            {"r": repo_id},
+        )
+        engine.set_index_format(repo_id, 5)
+
+        def edges():
+            rows = engine.run_cypher(
+                "MATCH (:Function {repo_id: $r, name: 'main'})-[c:CALLS]->(b) RETURN b.file AS f, c.confidence AS c",
+                {"r": repo_id},
+            )
+            return sorted((row["f"], row["c"]) for row in rows)
+
+        assert edges() == [("src/other.ts", None), ("src/store.ts", None)]
+        assert dispatch.index_outdated(engine, repo_id)
+
+        dispatch.catch_up(engine, repo_id, tmp_path, since=datetime.now(timezone.utc))
+        assert edges() == [("src/store.ts", "resolved")]
+        assert not dispatch.index_outdated(engine, repo_id)
+        assert engine.read_resolver_config(repo_id)["ts"]["inputs"] == ["tsconfig.json"]
+        (row,) = engine.run_cypher(
+            "MATCH (m:Module {repo_id: $r, name: 'src/app.ts'}) RETURN m.dir AS d, m.basename AS b", {"r": repo_id}
+        )
+        assert (row["d"], row["b"]) == ("src", "app.ts")
+        expected, actual = fresh_snapshot(engine, repo_id, tmp_path), graph_snapshot(engine, repo_id)
+        if actual != expected:
+            pytest.fail("graph does not equal a fresh full_scan:\n" + snapshot_diff(expected, actual))
+    finally:
+        for each in (repo_id, f"{repo_id}_fresh"):
+            engine.delete_repository(each)
+        engine.close()

@@ -115,9 +115,12 @@ def _provider_specs(repo_root: Path) -> tuple[bool, filesystem.FilesystemSpec | 
 #: to every candidate file and CALLS resolved through scope and imports; 5: JS/TS
 #: `.mjs`/`.cjs`/`.mts`/`.cts` files, explicit-extension imports such as `./x.js`
 #: resolved to their TypeScript source, compose `depends_on`/`links` as Service
-#: DEPENDS_ON edges). An index stamped lower, or not at all, is rescanned
+#: DEPENDS_ON edges; 6: path pins, Module `dir`/`basename`, the resolver
+#: configuration fingerprint, JS/TS CALLS resolved through scope, imports,
+#: tsconfig aliases and types, Kotlin declarations recovered after one-line
+#: class bodies). An index stamped lower, or not at all, is rescanned
 #: automatically.
-INDEX_FORMAT = 5
+INDEX_FORMAT = 6
 
 
 def index_outdated(engine: GraphEngine, repo_id: str) -> bool:
