@@ -583,7 +583,8 @@ def build_server(
         scope_to_class: str | None = None,
         modified_within_commits: int | None = None,
     ) -> dict[str, Any]:
-        """Find all callers of a target; returns {count, results, truncated}. CALLS is
+        """Find all callers of a target; returns {count, results, truncated}, each caller
+        with its name, type, repo_id and file. CALLS is
         name-based, not type-resolved — pass scope_to_class to narrow to callers made
         from within a specific class's own methods and cut noise from unrelated
         same-named methods elsewhere in the repo. Pass modified_within_commits to
@@ -705,11 +706,16 @@ def build_server(
         return devgraph_tools.issue_history_for(engine, repo_id, component_name, cross_repo, max_results, registry)
 
     @server.tool(annotations=_READ_ONLY)
-    def get_source(repo_id: str, component_name: str, cross_repo: bool = False) -> dict[str, Any]:
+    def get_source(
+        repo_id: str, component_name: str, cross_repo: bool = False, file: str | None = None
+    ) -> dict[str, Any]:
         """Fetch a Function or Class's actual source text and full docstring (when present),
         using the graph's last-indexed line range. Reads live from disk — rescan first if
-        the file may have changed since the last index."""
-        return devgraph_tools.get_source(engine, registry, repo_id, component_name, cross_repo)
+        the file may have changed since the last index. When several nodes share the name,
+        returns status "ambiguous" with candidates ({label, name, file}) instead of
+        picking one: pass file (repo-relative path) to choose. A file that is not valid
+        UTF-8 is decoded with replacement characters, and a notice says so."""
+        return devgraph_tools.get_source(engine, registry, repo_id, component_name, cross_repo, file)
 
     @server.tool(annotations=_READ_ONLY)
     def describe_node(

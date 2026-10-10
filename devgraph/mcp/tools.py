@@ -920,7 +920,8 @@ def find_callers(
             filter is a no-op.
 
     Returns:
-        Dict with count, results, and truncated flag containing callers with their types and locations
+        Dict with count, results, and truncated flag containing callers with their
+        types, repo_id and file (same-named callers in different files are separate rows)
     """
     cutoff = None
     if modified_within_commits is not None:
@@ -935,8 +936,9 @@ def find_callers(
     {repo_filter}
     {class_filter}
     {recency_filter}
-    RETURN DISTINCT caller.name as name, labels(caller) as type, caller.repo_id as repo_id
-    ORDER BY caller.name
+    RETURN DISTINCT caller.name as name, labels(caller) as type, caller.repo_id as repo_id,
+           coalesce(caller.file, caller.source_file) as file
+    ORDER BY name, file
     """
     params = {"target_name": target_name}
     if not cross_repo:
@@ -1675,6 +1677,7 @@ def get_source(
     repo_id: str,
     component_name: str,
     cross_repo: bool = False,
+    file: str | None = None,
 ) -> dict[str, Any]:
     """Fetch a Function or Class's actual source text by reading its last-indexed line range.
 
@@ -1689,22 +1692,31 @@ def get_source(
         component_name: Name of the Function or Class to fetch source for
         cross_repo: If True, search across repos (the file is still read from
             whichever repo actually owns the matched node, via its own registry entry)
+        file: Repo-relative path of the defining file, to pick one of several
+            same-named Functions or Classes
 
     Returns:
         Dict with name, label, file, start_line, end_line, source, and
         docstring_full (when present). Empty/None fields if no match found.
+        When several nodes match, `source` is None and the dict adds
+        `status: "ambiguous"`, `count`, `truncated` and `candidates`
+        ({label, name, file}; repo_id too when cross_repo): pass one's `file`.
+        A file that is not valid UTF-8 is decoded with replacement characters
+        and the dict adds a `notice` saying so.
     """
     repo_filter = "" if cross_repo else "AND n.repo_id = $repo_id"
     cypher = f"""
     MATCH (n)
     WHERE (n:Function OR n:Class) AND n.name = $component_name
     {repo_filter}
+    AND ($file IS NULL OR n.file = $file)
     RETURN n.name as name, labels(n) as labels, n.repo_id as repo_id,
            n.file as file, n.start_line as start_line, n.end_line as end_line,
            n.docstring_full as docstring_full
-    LIMIT 1
+    ORDER BY n.repo_id, n.file, n.start_line
+    LIMIT {_DESCRIBE_MAX_CANDIDATES + 1}
     """
-    params = {"component_name": component_name}
+    params: dict[str, Any] = {"component_name": component_name, "file": file}
     if not cross_repo:
         params["repo_id"] = repo_id
 
@@ -1715,6 +1727,22 @@ def get_source(
     }
     if not results:
         return empty
+
+    def label_of(row: dict[str, Any]) -> str:
+        return next((l for l in row["labels"] if l in ("Function", "Class")), row["labels"][0])
+
+    if len(results) > 1:
+        candidates = [
+            {"label": label_of(r), "name": r["name"], "file": r["file"], **({"repo_id": r["repo_id"]} if cross_repo else {})}
+            for r in results[:_DESCRIBE_MAX_CANDIDATES]
+        ]
+        return {
+            **empty,
+            "status": "ambiguous",
+            "count": len(results),
+            "candidates": [_sanitize_row(c) for c in candidates],
+            "truncated": len(results) > _DESCRIBE_MAX_CANDIDATES,
+        }
 
     row = results[0]
     node_repo_id = row["repo_id"]
@@ -1736,23 +1764,32 @@ def get_source(
     # check above; platforms without it fall back to a plain open.
     try:
         fd = os.open(file_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-        with open(fd, encoding="utf-8") as handle:
-            lines = handle.read().splitlines()
+        with open(fd, "rb") as handle:
+            data = handle.read()
     except OSError:
         return empty
+    notice = None
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        text = data.decode("utf-8", errors="replace")
+        notice = "the file is not valid UTF-8; undecodable bytes are shown as U+FFFD"
+    lines = text.splitlines()
 
     source_text = "\n".join(lines[start_line - 1 : end_line])
-    label = next((l for l in row["labels"] if l in ("Function", "Class")), row["labels"][0])
 
-    return {
+    result = {
         "name": row["name"],
-        "label": label,
+        "label": label_of(row),
         "file": file_rel_path,
         "start_line": start_line,
         "end_line": end_line,
         "source": source_text,
         "docstring_full": row.get("docstring_full"),
     }
+    if notice is not None:
+        result["notice"] = notice
+    return result
 
 
 def find_mentions(
