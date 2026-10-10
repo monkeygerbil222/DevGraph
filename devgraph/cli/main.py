@@ -31,7 +31,7 @@ from devgraph.config.edits import project_config_notes as _project_config_notes
 from devgraph.config.edits import removed_types as _removed_types  # noqa: F401  (kept importable from here)
 from devgraph.config.schema_findings import project_schema_findings as _project_schema_findings
 from devgraph.dashboard import queries as dashboard_queries
-from devgraph.dashboard.url import dashboard_url
+from devgraph.dashboard.url import dashboard_url, probe_dashboard
 from devgraph.graph.engine import GraphEngine, provision_repository_schema
 from devgraph.indexer.dispatch import full_scan
 from devgraph.indexer.docs.extractor import index_file as index_doc_file
@@ -725,6 +725,8 @@ def status() -> None:
     else:
         console.print(f"  [red]{liveness}[/red]")
 
+    _print_dashboard_status(settings)
+
     # Repo issues (missing paths, etc.)
     issues_path = settings.registry_db_path.parent / "repo_issues.json"
     if issues_path.exists():
@@ -739,6 +741,31 @@ def status() -> None:
             pass
 
     console.print()
+
+
+def _dashboard_port_hint(settings) -> str:
+    from devgraph.config.settings import devgraph_home
+
+    return f"set DEVGRAPH_DASHBOARD_PORT in {devgraph_home() / '.env'} and restart the agent"
+
+
+def _print_dashboard_status(settings) -> None:
+    """The `status` "Dashboard" section: whether DevGraph's dashboard answers on its port."""
+    console.print("[bold]Dashboard[/bold]")
+    if not settings.dashboard_enabled:
+        console.print("  disabled (DEVGRAPH_DASHBOARD_ENABLED)")
+        return
+    url = dashboard_url(settings)
+    found = probe_dashboard(url)
+    if found == "devgraph":
+        console.print(f"  [green][OK] serving[/green] at {escape(url)}")
+    elif found == "other":
+        console.print(
+            f"  [red][X] port {escape(str(settings.dashboard_port))} is held by another program[/red]; "
+            f"{escape(_dashboard_port_hint(settings))}"
+        )
+    else:
+        console.print(f"  [yellow]not serving[/yellow] at {escape(url)} (it runs inside the agent: 'devgraph tray start')")
 
 
 def _print_graph_index(engine: GraphEngine) -> None:
@@ -1528,6 +1555,12 @@ def dashboard(
     if url_only:
         console.print(escape(url))
     elif open_browser:
+        if probe_dashboard(url) == "other":
+            console.print(
+                f"[red][X] Port {escape(str(settings.dashboard_port))} is held by another program,[/red] not DevGraph's "
+                f"dashboard; not opening it. {escape(_dashboard_port_hint(settings))}."
+            )
+            raise typer.Exit(code=1)
         console.print(f"Opening {escape(url)} ...")
         webbrowser.open(url)
     else:

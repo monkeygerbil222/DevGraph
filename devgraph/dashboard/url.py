@@ -29,3 +29,30 @@ def dashboard_url(settings: Settings) -> str:
     if ":" in host:
         host = f"[{host}]"
     return f"http://{host}:{settings.dashboard_port}"
+
+
+#: The body of the dashboard's `GET /api/health`: how a client tells DevGraph's
+#: dashboard from another program listening on the same port.
+DASHBOARD_IDENTITY = {"service": "devgraph-dashboard"}
+
+
+def probe_dashboard(url: str, timeout_s: float = 1.0) -> str:
+    """Who answers at `url`: "devgraph", "other" (another program holds the
+    port) or "none" (nothing listens there)."""
+    import http.client
+    import json
+    import urllib.error
+    import urllib.request
+
+    # No proxy: the dashboard is local, and a proxy would answer for it.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(f"{url}/api/health", timeout=timeout_s) as response:
+            body = json.loads(response.read(4096))
+    except urllib.error.URLError as exc:
+        return "none" if isinstance(exc.reason, ConnectionRefusedError) else "other"
+    except ConnectionRefusedError:
+        return "none"
+    except (OSError, ValueError, http.client.HTTPException):
+        return "other"
+    return "devgraph" if body == DASHBOARD_IDENTITY else "other"
