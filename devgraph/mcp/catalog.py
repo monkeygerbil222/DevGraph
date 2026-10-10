@@ -13,7 +13,7 @@ from typing import Any
 TOOL_CATALOG: list[dict[str, Any]] = [
     {"name": "search_component", "identifier_kind": "name/description substring", "envelope": True, "phase": 1, "note": "exact name matches first, then prefixes, then substrings; each result has its file; count_is_lower_bound marks a count the substring scan never finished"},
     {"name": "list_recent_changes", "identifier_kind": "commit-count window (within_commits), optional entity_type label", "envelope": True, "phase": 3},
-    {"name": "trace_request_flow", "identifier_kind": "endpoint name", "envelope": False, "phase": 1},
+    {"name": "trace_request_flow", "identifier_kind": "endpoint name (\"GET /users/<id>\") or bare path (\"/users/<id>\", every method)", "envelope": False, "phase": 1},
     {"name": "get_service_dependencies", "identifier_kind": "service name", "envelope": False, "phase": 1},
     {"name": "find_callers", "identifier_kind": "function/class/service/endpoint name (not a file path)", "envelope": True, "phase": 1},
     {"name": "find_related_files", "identifier_kind": "function/class name (not a file path)", "envelope": True, "phase": 1},
@@ -26,7 +26,7 @@ TOOL_CATALOG: list[dict[str, Any]] = [
     {"name": "explain_decision", "identifier_kind": "DesignDecision name/id", "envelope": False, "phase": 2},
     {"name": "find_requirements_for", "identifier_kind": "component name", "envelope": False, "phase": 2},
     {"name": "trace_design_rationale", "identifier_kind": "component name", "envelope": False, "phase": 2},
-    {"name": "find_mentions", "identifier_kind": "entity name (mentioned_by) or Document repo-relative path (mentions)", "envelope": True, "phase": 2},
+    {"name": "find_mentions", "identifier_kind": "entity name (mentioned_by) or Document repo-relative path (mentions)", "envelope": True, "phase": 2, "note": "requires mentions indexing opt-in; when off, an empty envelope with a notice naming the enable command"},
     {"name": "blame_component", "identifier_kind": "file path (not a function name)", "envelope": False, "phase": 3},
     {"name": "find_related_prs", "identifier_kind": "file path (not a function name)", "envelope": True, "phase": 3, "note": "requires PR/issue ingestion opt-in; when off, an empty envelope with a notice naming the enable command"},
     {"name": "god_nodes", "identifier_kind": None, "envelope": True, "phase": 3},

@@ -84,13 +84,13 @@ class TestFindRelatedPrs:
 
     def test_find_related_prs_truncation(self, seeded_graph):
         """Test that truncated flag is set when total count exceeds max_results."""
-        result = find_related_prs(seeded_graph, "test_repo_a", "auth.py", max_results=0)
+        result = find_related_prs(seeded_graph, "test_repo_a", "auth.py", max_results=1)
         assert "truncated" in result
         assert "count" in result
-        # If count > max_results (0), truncated should be True
-        if result["count"] > 0:
+        # If count > max_results (1), truncated should be True
+        if result["count"] > 1:
             assert result["truncated"] is True
-            assert len(result["results"]) == 0
+            assert len(result["results"]) == 1
 
 
 class TestIssueHistoryFor:
@@ -106,10 +106,10 @@ class TestIssueHistoryFor:
 
     def test_issue_history_truncation(self, seeded_graph):
         """Test that truncated flag is set when total count exceeds max_results."""
-        result = issue_history_for(seeded_graph, "test_repo_a", "auth.py", max_results=0)
+        result = issue_history_for(seeded_graph, "test_repo_a", "auth.py", max_results=1)
         assert "truncated" in result
         assert "count" in result
-        # If count > max_results (0), truncated should be True
-        if result["count"] > 0:
+        # If count > max_results (1), truncated should be True
+        if result["count"] > 1:
             assert result["truncated"] is True
-            assert len(result["results"]) == 0
+            assert len(result["results"]) == 1

@@ -71,8 +71,8 @@ def test_members_per_community_is_clamped():
     engine = StubEngine(rows=[])
     find_communities(engine, REGISTRY, "demo", members_per_community=500)
     assert engine.queries[0][1]["k"] == 20
-    find_communities(engine, REGISTRY, "demo", members_per_community=0)
-    assert engine.queries[1][1]["k"] == 1
+    with pytest.raises(ToolError, match="members_per_community must be at least 1, not 0"):
+        find_communities(engine, REGISTRY, "demo", members_per_community=0)
 
 
 def test_never_computed_is_an_error_that_names_the_command():

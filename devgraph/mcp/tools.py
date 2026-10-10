@@ -74,7 +74,7 @@ def _sanitize_row(row: dict) -> dict:
 
 
 def _source_off(registry: RepoRegistry | None, repo_id: str, flag: str) -> bool:
-    """Whether `repo_id` is registered with its PR or issue source (`flag`) off."""
+    """Whether `repo_id` is registered with its PR, issue or mentions source (`flag`) off."""
     repo = registry.get(repo_id) if registry is not None else None
     return repo is not None and not getattr(repo, flag)
 
@@ -253,6 +253,7 @@ def search_component(
         not the whole phrase. Results are ranked: exact name match > name
         starts-with > name contains > description contains.
     """
+    _at_least(1, max_results=max_results, modified_within_commits=modified_within_commits)
     cutoff = None
     if modified_within_commits is not None:
         cutoff = _resolve_recency_cutoff(engine, repo_id, modified_within_commits)
@@ -451,6 +452,13 @@ def _echo(value: Any) -> str:
     return repr(str(value)[:_DESCRIBE_ECHO])
 
 
+def _at_least(minimum: int, **values: int | None) -> None:
+    """A ToolError naming the first given argument below `minimum`; None is not given."""
+    for name, value in values.items():
+        if value is not None and value < minimum:
+            raise ToolError(f"{name} must be at least {minimum}, not {value}")
+
+
 def _registered(registry: RepoRegistry, repo_id: str) -> Any:
     """The registry record for `repo_id`, or a ToolError naming the unknown id."""
     record = registry.get(repo_id)
@@ -509,6 +517,27 @@ def _suggestions_cypher(labels: tuple[str, ...]) -> str:
         f"CALL () {{\n{body}\n}}\n"
         "RETURN labels(n)[0] AS label, n.name AS name, coalesce(n.file, n.path) AS file\n"
         f"ORDER BY name, file LIMIT {_DESCRIBE_MAX_SUGGESTIONS}"
+    )
+
+
+def _did_you_mean(suggestions: list[dict[str, Any]]) -> str:
+    """` Did you mean: label='...', name='...'; ...?`, or "" with no suggestions."""
+    if not suggestions:
+        return ""
+    shown = "; ".join(", ".join(f"{k}={_echo(v)}" for k, v in _node_ref(s).items()) for s in suggestions)
+    return f" Did you mean: {shown}?"
+
+
+def _not_found(
+    engine: GraphEngine, repo_id: str, what: str, name: str, labels: tuple[str, ...], cross_repo: bool = False
+) -> ToolError:
+    """A ToolError saying no `what` is named `name`, with up to five of this
+    repository's nodes of `labels` whose name contains it."""
+    suggestions = _query(engine, _suggestions_cypher(labels), {"repo_id": repo_id, "name": name})
+    where = "any repository" if cross_repo else f"repository {_echo(repo_id)}"
+    return ToolError(
+        f"no {what} named {_echo(name)} in {where}.{_did_you_mean(suggestions)} "
+        "search_component searches by partial name."
     )
 
 
@@ -587,6 +616,7 @@ def describe_node(
     """
     if not name.strip():
         raise ToolError("name is empty; pass a node's exact name, or search_component to find one")
+    _at_least(1, max_per_type=max_per_type)
     if direction not in _DESCRIBE_DIRECTIONS:
         raise ToolError(f"direction must be 'both', 'out' or 'in', not {_echo(direction)}")
     types = _validated_identifiers(relationship_types, RELATIONSHIP_TYPE_PATTERN, "relationship type")
@@ -613,12 +643,7 @@ def describe_node(
         filters = "".join(
             f", {key}={_echo(value)}" for key, value in (("label", label), ("file", file)) if value is not None
         )
-        message = f"no node named {_echo(name)}{filters} in repository {_echo(repo_id)}."
-        if suggestions:
-            shown = "; ".join(
-                ", ".join(f"{k}={_echo(v)}" for k, v in _node_ref(s).items()) for s in suggestions
-            )
-            message += f" Did you mean: {shown}?"
+        message = f"no node named {_echo(name)}{filters} in repository {_echo(repo_id)}.{_did_you_mean(suggestions)}"
         raise ToolError(f"{message} {_DESCRIBE_HINT}.")
 
     if len(rows) > 1:
@@ -685,6 +710,7 @@ def god_nodes(
         has name, labels, repo_id, and degree (number of direct relationships).
         `Repository` nodes are not ranked.
     """
+    _at_least(1, max_results=max_results)
     declared = tuple(d for d in dict.fromkeys(declared_labels) if LABEL_PATTERN.fullmatch(d))
     labels = _DESCRIBE_BUILTIN_LABELS + tuple(d for d in declared if d not in _DESCRIBE_BUILTIN_LABELS)
     repo_filter = "n.repo_id IS NOT NULL" if cross_repo else "n.repo_id = $repo_id"
@@ -799,6 +825,8 @@ def find_dependency_cycles(
             empty envelope from a cycle search reads as "no cycles here" — a
             false clean bill of health on a typo'd argument.
     """
+    _at_least(_CYCLE_MIN_LENGTH, max_length=max_length)
+    _at_least(1, max_results=max_results)
     validated = str(relationship).strip().upper()
     if validated not in _CYCLE_RELATIONSHIPS:
         raise ToolError(
@@ -907,6 +935,7 @@ def find_communities(
         ToolError: unknown repo_id, or insights never computed for it.
     """
     _registered(registry, repo_id)
+    _at_least(1, max_results=max_results, members_per_community=members_per_community)
     summary = read_insights(engine, repo_id)
     if summary is None:
         raise ToolError(_INSIGHTS_NOT_COMPUTED)
@@ -947,6 +976,7 @@ def key_nodes(
         ToolError: unknown repo_id or metric, or insights never computed.
     """
     _registered(registry, repo_id)
+    _at_least(1, max_results=max_results)
     metric_key = metric.strip().lower() if isinstance(metric, str) else ""
     if metric_key not in INSIGHT_METRICS:
         raise ToolError(f"metric must be {' or '.join(INSIGHT_METRICS)}, not {_echo(metric)}")
@@ -968,37 +998,43 @@ def trace_request_flow(
     Args:
         engine: GraphEngine instance
         repo_id: Repository ID (or cross-repo search if cross_repo=True)
-        start_endpoint: Name of the endpoint to start tracing from
+        start_endpoint: The endpoint's name, `"<METHOD> <path>"` (`"GET /users/<id>"`),
+            or a bare path (`"/users/<id>"`), which starts from that path's endpoint
+            for every method
         cross_repo: If True, cross repository boundaries
 
     Returns:
-        Dict containing the flow path and all traversed components
+        Dict with `components` (the start endpoints and every node within five
+        hops, each {name, labels, repo_id}) and `edges` ({type} per relationship).
+
+    Raises:
+        ToolError: no endpoint has that name or path.
     """
-    repo_filter = "" if cross_repo else "WHERE start.repo_id = $repo_id"
+    repo_filter = "" if cross_repo else "AND start.repo_id = $repo_id"
     cypher = f"""
-    MATCH (start:Endpoint {{name: $endpoint_name}})
+    MATCH (start:Endpoint)
+    WHERE (start.name = $endpoint OR ($bare AND start.name ENDS WITH ' ' + $endpoint))
     {repo_filter}
-    OPTIONAL MATCH path = (start)-[*1..5]->(node)
-    WITH COLLECT(DISTINCT node) + COLLECT(DISTINCT start) as all_nodes,
-         COLLECT(DISTINCT path) as paths
-    UNWIND paths as p
-    WITH all_nodes, COLLECT(DISTINCT relationships(p)) as all_rels
-    UNWIND all_rels as rel_list
-    UNWIND rel_list as rel
-    WITH all_nodes, COLLECT(DISTINCT rel) as edges
+    WITH collect(start) AS starts
+    CALL (starts) {{
+        UNWIND starts AS s
+        MATCH (s)-[rels*1..5]->(node)
+        UNWIND rels AS r
+        RETURN collect(DISTINCT node) AS reached, collect(DISTINCT r) AS edges
+    }}
     RETURN
-        [n IN all_nodes | {{name: n.name, labels: labels(n), repo_id: n.repo_id}}] as components,
-        [r IN edges | {{type: type(r)}}] as edges
-    LIMIT 1
+        [n IN starts + [m IN reached WHERE NOT m IN starts] |
+         {{name: n.name, labels: labels(n), repo_id: n.repo_id}}] AS components,
+        [r IN edges | {{type: type(r)}}] AS edges
     """
-    params = {"endpoint_name": start_endpoint}
+    params = {"endpoint": start_endpoint, "bare": not any(ch.isspace() for ch in start_endpoint.strip())}
     if not cross_repo:
         params["repo_id"] = repo_id
 
     results = _query(engine, cypher, params)
-    if results:
-        return results[0]
-    return {"components": [], "edges": []}
+    if not results or not results[0]["components"]:
+        raise _not_found(engine, repo_id, "endpoint", start_endpoint, ("Endpoint",), cross_repo)
+    return results[0]
 
 
 def get_service_dependencies(
@@ -1033,9 +1069,9 @@ def get_service_dependencies(
         params["repo_id"] = repo_id
 
     results = _query(engine, cypher, params)
-    if results:
-        return results[0]
-    return {"service": service_name, "dependencies": [], "calls": []}
+    if not results:
+        raise _not_found(engine, repo_id, "service", service_name, ("Service",), cross_repo)
+    return results[0]
 
 
 def find_callers(
@@ -1087,6 +1123,7 @@ def find_callers(
         types, repo_id, file and confidence (same-named callers in different files
         are separate rows)
     """
+    _at_least(1, max_results=max_results, modified_within_commits=modified_within_commits)
     cutoff = None
     if modified_within_commits is not None:
         cutoff = _resolve_recency_cutoff(engine, repo_id, modified_within_commits)
@@ -1144,6 +1181,7 @@ def find_related_files(
         Dict with containing_modules, imported_modules, and related_components,
         each wrapped as {count, results, truncated} envelope objects
     """
+    _at_least(1, max_results=max_results)
     repo_filter = "" if cross_repo else "WHERE n.repo_id = $repo_id"
     cypher = f"""
     MATCH (n {{name: $component_name}})
@@ -1372,6 +1410,7 @@ def impact_analysis(
         dependents are 2 to `IMPACT_MAX_DEPTH` hops away; a node is listed at its
         nearest hop only, so a direct dependent is never also transitive.
     """
+    _at_least(1, max_results=max_results)
     repo_filter = "" if cross_repo else "WHERE n.repo_id = $repo_id"
     cypher = f"""
     MATCH (n {{name: $component_name}})
@@ -1384,7 +1423,9 @@ def impact_analysis(
         params["repo_id"] = repo_id
 
     results = _query(engine, cypher, params)
-    row = results[0] if results else {"direct_dependents": [], "transitive_dependents": [], "direct_count": 0}
+    if not results or not results[0]["matched"]:
+        raise _not_found(engine, repo_id, "component", component_name, _DESCRIBE_BUILTIN_LABELS, cross_repo)
+    row = results[0]
     return {
         "direct_dependents": _envelope(row["direct_dependents"], max_results),
         "transitive_dependents": _envelope(row["transitive_dependents"], max_results),
@@ -1468,6 +1509,7 @@ def impact_analysis_for_diff(
     from devgraph.indexer.git_history import compare as git_compare
 
     record = _registered(registry, repo_id)
+    _at_least(1, max_results=max_results)
     notices: list[str] = []
     try:
         with git_compare.open_comparison(
@@ -1582,6 +1624,7 @@ def list_services(
     Returns:
         Dict with count, results, and truncated flag containing services with their properties
     """
+    _at_least(1, max_results=max_results)
     repo_filter = "" if cross_repo else "WHERE s.repo_id = $repo_id"
     # `truncated` is applied to the ordered list, so ordering decides what
     # survives max_results. Sorting by repo_id alone meant a cross-repo call
@@ -1636,9 +1679,9 @@ def explain_decision(
         params["repo_id"] = repo_id
 
     results = _query(engine, cypher, params)
-    if results:
-        return results[0]
-    return {"name": decision_name, "title": None, "body": None, "documents": [], "supersedes": [], "backed_by": []}
+    if not results:
+        raise _not_found(engine, repo_id, "design decision", decision_name, ("DesignDecision",), cross_repo)
+    return results[0]
 
 
 def find_requirements_for(
@@ -1700,8 +1743,9 @@ def trace_design_rationale(
     OPTIONAL MATCH (n)-[:SATISFIES]->(req:Requirement)
     OPTIONAL MATCH (n)-[:DOCUMENTED_BY]->(doc)
     RETURN n.name as component,
-           COLLECT(DISTINCT {{name: req.name, title: req.title}}) as requirements,
-           COLLECT(DISTINCT {{name: doc.name, title: doc.title, type: labels(doc)[0]}}) as notes
+           [r IN COLLECT(DISTINCT {{name: req.name, title: req.title}}) WHERE r.name IS NOT NULL] as requirements,
+           [d IN COLLECT(DISTINCT {{name: doc.name, title: doc.title, type: labels(doc)[0]}})
+            WHERE d.name IS NOT NULL] as notes
     """
     params = {"component_name": component_name}
     if not cross_repo:
@@ -1776,6 +1820,7 @@ def find_related_prs(
         (via RESOLVES on an Issue referenced by a commit that touched this component)
         to the component.
     """
+    _at_least(1, max_results=max_results)
     if _source_off(registry, repo_id, "pr_source_enabled"):
         return _source_off_notice(max_results, "PR", "pr-source", repo_id)
 
@@ -1824,6 +1869,7 @@ def issue_history_for(
         Dict with count, results, and truncated flag containing Issues referenced
         by commits that modified this component.
     """
+    _at_least(1, max_results=max_results)
     if _source_off(registry, repo_id, "issue_source_enabled"):
         return _source_off_notice(max_results, "Issue", "issue-source", repo_id)
 
@@ -1980,8 +2026,12 @@ def find_mentions(
     direction: str = "mentioned_by",
     cross_repo: bool = False,
     max_results: int = 15,
+    registry: RepoRegistry | None = None,
 ) -> dict[str, Any]:
     """Find Document nodes that mention an entity, or what a Document mentions.
+
+    When the repository's mentions indexing is off (mentions_enabled=False) the
+    envelope is empty, with a `notice` saying how to enable it.
 
     Args:
         engine: GraphEngine instance
@@ -1992,10 +2042,14 @@ def find_mentions(
                    "mentions" to find what a Document mentions
         cross_repo: If True, search across repos
         max_results: Maximum number of results to return in the envelope
+        registry: RepoRegistry, used to check whether the repository's mentions indexing is on
 
     Returns:
         Dict with count, results, and truncated flag containing nodes with name, type (labels), and repo_id
     """
+    _at_least(1, max_results=max_results)
+    if _source_off(registry, repo_id, "mentions_enabled"):
+        return _source_off_notice(max_results, "Mentions", "mentions", repo_id)
     # Validate and reject unrecognized labels
     if label is not None and label not in schema.NODE_LABELS:
         return _envelope([], max_results)
@@ -2068,6 +2122,7 @@ def list_recent_changes(
         Dict with count, results, and truncated flag containing entities with
         name, type (labels), repo_id, and last_modified_at, ordered most-recently-modified first.
     """
+    _at_least(1, within_commits=within_commits, max_results=max_results)
     # Validate and reject unrecognized labels
     if entity_type is not None and entity_type not in schema.NODE_LABELS:
         return _envelope([], max_results)

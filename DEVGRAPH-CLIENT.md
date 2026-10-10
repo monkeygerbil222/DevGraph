@@ -312,13 +312,13 @@ Prefer these over re-reading files when the question is structural:
 | "What breaks if I change X?" | `impact_analysis` (name, not path) |
 | "What breaks across this whole PR/diff?" | `impact_analysis_for_diff` (base_ref/head_ref, both must exist locally — never fetches) |
 | "What does X depend on?" | `get_service_dependencies` (service name), `find_related_files` (function/class name, not path) |
-| "Trace a request from this endpoint through services/datastores" | `trace_request_flow` (endpoint name) |
+| "Trace a request from this endpoint through services/datastores" | `trace_request_flow` (endpoint name like `GET /users/<id>`, or a bare path like `/users/<id>` for every method) |
 | "What changed recently?" | `list_recent_changes` (lists entities touched in the last N commits, most-recent first; filters by optional entity type) |
 | "What's the overall architecture?" | `explain_architecture`, `summarise_repository` |
 | "What changed between my branch and main?" | `compare_branches(branch_a="main", branch_b="<branch>")`: files, per-file symbols added, removed and changed, and the graph callers of what changed |
 | "Why was X built this way?" | `explain_decision`, `trace_design_rationale` |
 | "What requirements does X satisfy?" | `find_requirements_for` |
-| "Which docs mention X?" | `find_mentions` (only useful if Markdown mentions indexing was enabled) |
+| "Which docs mention X?" | `find_mentions` (only useful if Markdown mentions indexing was enabled; otherwise an empty result whose `notice` names the enable command) |
 | "Who changed X and when?" | `blame_component` (file path, not name) |
 | "What PRs/issues touched X?" | `find_related_prs`, `issue_history_for` (only useful if PR/issue ingestion was enabled in step 2; otherwise they return an empty result whose `notice` names the enable command, and never contact GitHub) |
 | "Show me X's actual code" | `get_source` (name, not path — returns source text + full docstring; reads live from disk using the last-indexed line range, so rescan first if the file may have changed; a name defined in several files returns `status: "ambiguous"` with `candidates`, so pass `file` to pick one) |
@@ -336,6 +336,14 @@ cap, a blob missing from a partial clone) counts every indexed symbol in it,
 and a notice says so. An unknown repository or ref is an error. Use `compare_branches` for "what did my
 branch change?" and `impact_analysis_for_diff` for "what could this diff
 break?".
+
+Mistakes are errors, not empty answers: an unregistered `repo_id` fails with
+`no such repo_id`; `impact_analysis`, `get_service_dependencies`,
+`trace_request_flow` and `explain_decision` on a name the graph doesn't have
+fail with `no ... named ...` and up to five similar names; and a count
+argument below its minimum (`max_results`, `within_commits`,
+`modified_within_commits`, `members_per_community`, `max_per_type` below 1,
+`max_length` below 2) fails and names the argument.
 
 If a tool returns empty/sparse results, check whether the repo has actually
 been scanned (step 1/2) before concluding the graph has nothing to say — an

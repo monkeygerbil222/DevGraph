@@ -8,6 +8,7 @@ from pathlib import Path
 import anyio
 import pytest
 from mcp.client import Client
+from mcp.server.mcpserver.exceptions import ToolError
 from neo4j.exceptions import ClientError
 
 from devgraph.config.settings import Settings
@@ -68,7 +69,8 @@ def test_builtin_queries_run_read_only_with_a_timeout():
         def run_cypher(self, query, params=None):
             raise AssertionError("built-in tools must not use the unbounded run_cypher")
 
-    impact_analysis(Engine(), "demo", "f0")
+    with pytest.raises(ToolError, match="no component named 'f0'"):
+        impact_analysis(Engine(), "demo", "f0")
     assert seen["timeout_s"] == tools.BUILTIN_TIMEOUT_S
 
 
