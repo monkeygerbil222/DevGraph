@@ -73,6 +73,7 @@ def test_status_with_neo4j_down_exits_non_zero_with_one_clean_line(settings, mon
 
 def test_a_retry_warning_counts_tries_and_carries_no_traceback(monkeypatch, caplog):
     monkeypatch.setattr(engine_module, "_BASE_DELAY_S", 0.001)
+    monkeypatch.setattr(engine_module, "RETRY_LOG_LEVEL", logging.WARNING)
     caplog.set_level(logging.WARNING)
 
     def refuse():
@@ -80,12 +81,57 @@ def test_a_retry_warning_counts_tries_and_carries_no_traceback(monkeypatch, capl
 
     with pytest.raises(ServiceUnavailable):
         engine_module._retry_transient(refuse)
-    retries = [r for r in caplog.records if "transient Neo4j error" in r.getMessage()]
-    assert all(r.exc_info is None for r in retries)
+    retries = [r for r in caplog.records if "Neo4j" in r.getMessage()]
+    assert all(r.exc_info is None and r.levelno == logging.WARNING for r in retries)
     assert [r.getMessage() for r in retries] == [
-        f"transient Neo4j error on try {n} of 4, retrying in {d}s: Couldn't connect to 127.0.0.1:9"
-        for n, d in ((1, "0.0"), (2, "0.0"), (3, "0.0"))
+        f"Neo4j not answering on try {n} of 4, retrying in 0.0s: Couldn't connect to 127.0.0.1:9" for n in (1, 2, 3)
     ]
+
+
+def test_other_transient_errors_keep_their_wording(monkeypatch, caplog):
+    from neo4j.exceptions import TransientError
+
+    monkeypatch.setattr(engine_module, "_BASE_DELAY_S", 0.001)
+    monkeypatch.setattr(engine_module, "RETRY_LOG_LEVEL", logging.WARNING)
+    caplog.set_level(logging.WARNING)
+    calls = []
+
+    def flaky():
+        calls.append(1)
+        if len(calls) == 1:
+            raise TransientError("deadlock")
+        return "ok"
+
+    assert engine_module._retry_transient(flaky) == "ok"
+    (record,) = [r for r in caplog.records if "Neo4j" in r.getMessage()]
+    assert record.getMessage().startswith("transient Neo4j error on try 1 of 4")
+
+
+def test_the_cli_logs_retries_at_info_so_only_its_error_line_shows(settings, monkeypatch, caplog):
+    monkeypatch.setattr(engine_module, "_BASE_DELAY_S", 0.001)
+    monkeypatch.setattr(engine_module, "RETRY_LOG_LEVEL", logging.WARNING)
+    caplog.set_level(logging.DEBUG)
+    engine = engine_module.GraphEngine("bolt://127.0.0.1:9", "neo4j", "x")
+    with patch.object(cli_main, "GraphEngine", return_value=engine):
+        result = CliRunner().invoke(cli_main.app, ["status"], terminal_width=400)
+    assert result.exit_code == 1
+    retries = [r for r in caplog.records if r.name == engine_module.__name__ and "retrying" in r.getMessage()]
+    assert all(r.levelno == logging.INFO for r in retries)
+
+
+def test_the_neo4j_hint_allows_the_environment_too(settings):
+    engine = _engine_raising(AuthError("unauthorized"))
+    with patch.object(cli_main, "GraphEngine", return_value=engine):
+        result = CliRunner().invoke(cli_main.app, ["status"], terminal_width=400)
+    assert ".env (or the environment)" in _line(result.output, "Not reachable")
+
+
+def test_remove_suggests_keep_graph_when_the_engine_cannot_be_built(settings, repo):
+    with patch.object(cli_main, "GraphEngine", side_effect=ValueError("Unsupported URI scheme")):
+        result = CliRunner().invoke(cli_main.app, ["remove", repo], terminal_width=400)
+    assert result.exit_code == 1
+    assert "--keep-graph" in result.output
+    assert _registered(settings) == [repo]
 
 
 def test_a_wrong_password_names_the_settings_file(settings):
@@ -126,6 +172,7 @@ def test_remove_keep_graph_unregisters_without_touching_the_graph(settings, repo
         result = CliRunner().invoke(cli_main.app, ["remove", repo, "--keep-graph"], terminal_width=400)
     assert result.exit_code == 0, result.output
     assert "graph data kept" in result.output
+    assert "devgraph prune" in result.output
     assert _registered(settings) == []
 
 

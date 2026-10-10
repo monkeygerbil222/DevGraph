@@ -51,6 +51,14 @@ app.add_typer(tray_app, name="tray")
 console = Console(emoji=False)
 
 
+@app.callback()
+def _cli() -> None:
+    # A command reports a Neo4j failure as one line; each retry before it is detail.
+    from devgraph.graph import engine as engine_module
+
+    engine_module.RETRY_LOG_LEVEL = logging.INFO
+
+
 def _get_registry() -> RepoRegistry:
     """Get or create the registry from configured path."""
     settings = get_settings()
@@ -67,10 +75,13 @@ def _neo4j_problem(exc: Exception, settings) -> str:
     if isinstance(exc, AuthError):
         return (
             f"Neo4j at {settings.neo4j_uri} refused the username or password; check "
-            f"DEVGRAPH_NEO4J_USER and DEVGRAPH_NEO4J_PASSWORD in {env_file}"
+            f"DEVGRAPH_NEO4J_USER and DEVGRAPH_NEO4J_PASSWORD in {env_file} (or the environment)"
         )
     if isinstance(exc, ServiceUnavailable):
-        return f"nothing answers at {settings.neo4j_uri}; start Neo4j, or set DEVGRAPH_NEO4J_URI in {env_file}"
+        return (
+            f"nothing answers at {settings.neo4j_uri}; start Neo4j, or set DEVGRAPH_NEO4J_URI in {env_file} "
+            "(or the environment)"
+        )
     return " ".join(str(exc).split())
 
 
@@ -190,12 +201,17 @@ def remove(
 
             if keep_graph:
                 registry.remove_repo(repo_id)
-                console.print(f"[green][OK][/green] Removed: {escape(repo_id)} (registry entry; graph data kept)")
+                console.print(
+                    f"[green][OK][/green] Removed: {escape(repo_id)} (registry entry; graph data kept). "
+                    "Run 'devgraph prune' once Neo4j is up to delete its graph data.",
+                    soft_wrap=True,
+                )
                 return
 
             settings = get_settings()
-            engine = GraphEngine(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password)
+            engine = None
             try:
+                engine = GraphEngine(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password)
                 recorded = engine.read_applied_schema(repo_id) or {}
                 engine.delete_repository(repo_id)
                 _release_labels(engine, recorded.get("labels") or [])
@@ -209,7 +225,8 @@ def remove(
                 )
                 raise typer.Exit(code=1)
             finally:
-                engine.close()
+                if engine is not None:
+                    engine.close()
 
             registry.remove_repo(repo_id)
             console.print(f"[green][OK][/green] Removed: {escape(repo_id)} (registry entry and graph data)")

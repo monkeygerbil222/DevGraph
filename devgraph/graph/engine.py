@@ -401,6 +401,9 @@ _READ_INSIGHTS_SUMMARY_CYPHER = (
 # errors (syntax, constraint violations, unknown labels) are NOT retried.
 _RETRYABLE_EXCEPTIONS = (ServiceUnavailable, SessionExpired, TransientError)
 _MAX_RETRIES = 3
+#: Level of the per-try retry message. The CLI lowers it to INFO: its user sees
+#: the final one-line error, not every try.
+RETRY_LOG_LEVEL = logging.WARNING
 _BASE_DELAY_S = 0.5
 
 
@@ -492,8 +495,10 @@ def _retry_transient(fn, *args, **kwargs):
         except _RETRYABLE_EXCEPTIONS as exc:
             if attempt >= _MAX_RETRIES:
                 raise
-            logger.warning(
-                "transient Neo4j error on try %d of %d, retrying in %.1fs: %s",
+            logger.log(
+                RETRY_LOG_LEVEL,
+                "%s on try %d of %d, retrying in %.1fs: %s",
+                "Neo4j not answering" if isinstance(exc, ServiceUnavailable) else "transient Neo4j error",
                 attempt + 1,
                 _MAX_RETRIES + 1,
                 delay,
