@@ -449,3 +449,61 @@ def test_indexable_paths_under_does_not_follow_symlinked_dirs(tree):
     assert indexable_paths_under(tree, tree / "pkg/link") == set()
     found = {p.relative_to(tree).as_posix() for p in indexable_paths_under(tree, tree / "pkg")}
     assert found == {"pkg/a.py", "pkg/sub/b.py"}
+
+
+# --- review fixes: a raising handler, and self-ignoring .gitignore files -----
+
+
+def test_an_event_that_raises_is_logged_once_and_later_events_still_queue(h, root, monkeypatch, caplog):
+    real = h.handler._queue_rel
+    monkeypatch.setattr(h.handler, "_queue_rel", lambda raw: (_ for _ in ()).throw(RuntimeError("boom")))
+    with caplog.at_level("DEBUG", logger="devgraph.watcher.manager"):
+        h.send(FileDeletedEvent(h.p("pkg/a.py")), FileDeletedEvent(h.p("pkg/b.py")))
+    assert len([r for r in caplog.records if r.levelname == "WARNING"]) == 1
+    monkeypatch.setattr(h.handler, "_queue_rel", real)
+    h.send(FileDeletedEvent(h.p("pkg/c.py")))
+    assert h.one_batch() == (set(), {"pkg/c.py"})
+
+
+def test_a_raising_handler_leaves_a_real_observer_alive(root, monkeypatch):
+    import time
+
+    from watchdog.observers import Observer
+
+    calls = []
+
+    def boom(path):
+        calls.append(path)
+        raise RuntimeError("boom")
+
+    harness = Harness(root)
+    monkeypatch.setattr(harness.handler, "_is_tracked_path", boom)
+    observer = Observer()
+    observer.schedule(harness.handler, str(root), recursive=True)
+    observer.start()
+    try:
+        _write(root / "pkg/x.py")
+        deadline = time.monotonic() + 10
+        while not calls and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert calls
+        time.sleep(0.2)
+        assert observer.is_alive()
+    finally:
+        observer.stop()
+        observer.join(timeout=5)
+
+
+@pytest.mark.parametrize(
+    ("ignores", "rel"),
+    [({"pkg/.gitignore": "*\n"}, "pkg/.gitignore"), ({".gitignore": ".*\n"}, ".gitignore")],
+)
+def test_a_gitignore_that_ignores_itself_is_still_queued(h, root, ignores, rel):
+    for path, text in ignores.items():
+        _write(root / path, text)
+    h.send(FileModifiedEvent(h.p(rel)))
+    assert h.one_batch() == ({rel}, set())
+    h.batches.clear()
+    (root / rel).unlink()
+    h.send(FileDeletedEvent(h.p(rel)))
+    assert h.one_batch() == (set(), {rel})

@@ -28,7 +28,7 @@ from watchdog.observers.api import ObservedWatch
 
 from devgraph.config import get_settings
 from devgraph.indexer.dispatch import is_ignored_path
-from devgraph.indexer.gitignore import is_gitignored
+from devgraph.indexer.gitignore import GITIGNORE, is_gitignored
 from devgraph.indexer.walk import _junction_inside, indexable_paths_under, is_ignored_dir_name
 from devgraph.registry.store import RepoRegistry, RepoRecord
 
@@ -877,8 +877,22 @@ class _RepoEventHandler(FileSystemEventHandler):
         self._debounce_timer: Any = None
         self._closed = False
         self._lock = threading.Lock()
+        self._dispatch_warned = False
 
     # --- watchdog callbacks -------------------------------------------------
+
+    def dispatch(self, event: FileSystemEvent) -> None:
+        """watchdog's entry point. An exception here would end the observer
+        thread, which serves every watched repository, so one event that
+        raises is logged (a warning the first time, then at debug level) and
+        dropped."""
+        try:
+            super().dispatch(event)
+        except Exception:
+            level = logging.DEBUG if self._dispatch_warned else logging.WARNING
+            self._dispatch_warned = True
+            logger.log(level, "Dropped a file event for %s that could not be handled: %r",
+                       self._repo_id, event, exc_info=True)
 
     def on_modified(self, event: FileSystemEvent) -> None:
         if event.is_directory:
@@ -1078,7 +1092,11 @@ class _RepoEventHandler(FileSystemEventHandler):
         inside the repository, not the root itself, and not ignored (by name
         or by a .gitignore, as the walk ignores it)."""
         rel = self._rel(raw)
-        if rel is None or not rel.parts or is_ignored_path(rel) or is_gitignored(self._repo_root, rel.as_posix()):
+        if rel is None or not rel.parts or is_ignored_path(rel):
+            return None
+        # A .gitignore always passes, even one that ignores itself: its change
+        # is what makes RepoSync catch up.
+        if rel.name != GITIGNORE and is_gitignored(self._repo_root, rel.as_posix()):
             return None
         return rel.as_posix()
 

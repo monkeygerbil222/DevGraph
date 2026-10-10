@@ -254,3 +254,42 @@ def test_full_scan_reports_what_it_skipped(engine, tmp_path, small_limit):
     assert skipped == {"static/app.min.js": TOO_LARGE, "data.py": BINARY}
     assert _files(engine, live) == {"a.py"}
 
+
+
+@pytest.mark.parametrize(
+    ("gitignore", "gone"),
+    [("pkg/.gitignore", {"pkg/b.py", "pkg/.gitignore"}), (".gitignore", {".hidden.py", ".gitignore"})],
+)
+def test_a_gitignore_that_ignores_itself_reaches_the_catch_up(engine, tmp_path, gitignore, gone):
+    """A nested `*` or a root `.*` ignores the .gitignore itself: the watcher
+    still queues it, and RepoSync's catch-up leaves a fresh scan's graph."""
+    import threading
+    from unittest.mock import MagicMock
+
+    from watchdog.events import FileCreatedEvent
+
+    from devgraph.agent.sync import RepoSync
+    from devgraph.registry.store import RepoRecord
+    from devgraph.watcher.manager import _RepoEventHandler
+
+    engine, (live, fresh) = engine
+    root = tmp_path / "repo"
+    (root / "pkg").mkdir(parents=True)
+    (root / "a.py").write_text("def alpha():\n    return 1\n")
+    (root / "pkg" / "b.py").write_text("def beta():\n    return 2\n")
+    (root / ".hidden.py").write_text("def hidden():\n    return 3\n")
+    engine.upsert_repository(live, live, str(root))
+    full_scan(engine, live, root)
+    assert {"pkg/b.py", ".hidden.py"} <= _files(engine, live)
+
+    registry = MagicMock()
+    registry.get.return_value = RepoRecord(live, root, True, True, None, docs_path=None)
+    repo_sync = RepoSync(engine, registry, lambda event: None, lambda *a: None)
+    handler = _RepoEventHandler(live, root, 500, repo_sync.on_changes, timer_factory=lambda *a: MagicMock(),
+                                batch_lock=threading.Lock())
+    (root / gitignore).write_text("*\n" if gitignore.startswith("pkg/") else ".*\n")
+    handler.dispatch(FileCreatedEvent(str(root / gitignore)))
+    handler.flush()
+
+    assert not (gone & _files(engine, live))
+    _matches_fresh(engine, live, fresh, root)
