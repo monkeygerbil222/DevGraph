@@ -2,12 +2,11 @@
 repository's PR or issue source off they say how to turn it on."""
 
 import subprocess
-from pathlib import Path
 
 import pytest
 
 from devgraph.mcp import tools
-from devgraph.mcp.tools import _resolve_gh_repo, find_related_prs, issue_history_for
+from devgraph.mcp.tools import find_related_prs, issue_history_for
 from devgraph.registry.store import RepoRecord
 
 
@@ -61,20 +60,5 @@ def test_a_source_that_is_on_reads_the_graph(tmp_path, no_subprocess, tool, flag
     assert len(graph.queries) == 1
 
 
-@pytest.mark.parametrize(
-    ("url", "slug"),
-    [
-        ("git@github.com:acme/toolkit.git", "acme/toolkit"),
-        ("https://github.com/acme/widget", "acme/widget"),
-        ("https://github.com/acme/widget.git", "acme/widget"),
-        ("https://gitlab.example.com/acme/widget.git", None),
-    ],
-)
-def test_resolve_gh_repo_strips_only_a_git_suffix(tmp_path: Path, url, slug):
-    subprocess.check_call(["git", "init", "-q", str(tmp_path)])
-    subprocess.check_call(["git", "-C", str(tmp_path), "remote", "add", "origin", url])
-    assert _resolve_gh_repo(str(tmp_path)) == slug
-
-
 def test_no_gh_fallback_is_left():
-    assert not hasattr(tools, "_gh_pr_list") and not hasattr(tools, "_gh_issue_list")
+    assert not any(hasattr(tools, name) for name in ("_gh_pr_list", "_gh_issue_list", "_resolve_gh_repo"))

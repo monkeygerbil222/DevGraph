@@ -73,21 +73,6 @@ def _sanitize_row(row: dict) -> dict:
     return {k: _sanitize_value(v) for k, v in row.items()}
 
 
-def _resolve_gh_repo(repo_path: str) -> str | None:
-    """Resolve a local repo path to its 'owner/name' GitHub slug via git remote.
-    Returns None if no 'origin' remote exists or parsing fails."""
-    try:
-        repo = open_repo(repo_path)
-        remote_url = repo.remote("origin").url
-        repo.close()
-        if "github.com" not in remote_url:
-            return None
-        slug = remote_url.removesuffix(".git").split("github.com")[-1].lstrip(":/")
-        return slug if "/" in slug else None
-    except Exception:
-        return None
-
-
 def _source_off(registry: RepoRegistry | None, repo_id: str, flag: str) -> bool:
     """Whether `repo_id` is registered with its PR or issue source (`flag`) off."""
     repo = registry.get(repo_id) if registry is not None else None
