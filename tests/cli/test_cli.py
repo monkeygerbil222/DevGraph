@@ -2028,3 +2028,61 @@ def test_cli_rescan_refuses_a_missing_or_empty_repo_folder(runner, temp_registry
         assert nodes() < before
     finally:
         engine.close()
+
+
+def test_cli_doctor_fails_a_missing_repository_folder(runner, temp_registry_db, tmp_path, monkeypatch):
+    import shutil
+
+    from devgraph.config import project_switch
+
+    db_path, registry = temp_registry_db
+    monkeypatch.setattr(project_switch, "_registry_db_path", lambda: db_path)
+    present = registry.add_repo(_repo_with_schema(tmp_path, "present")).repo_id
+    gone_root = _repo_with_schema(tmp_path, "gone")
+    gone = registry.add_repo(gone_root).repo_id
+    registry.close()
+    shutil.rmtree(gone_root)
+
+    result = _doctor_with_engine(runner, db_path, _stub_engine(None))
+    collapsed = _collapsed(result.stdout)
+    assert result.exit_code == 1
+    assert f"[X] {gone}: path missing: repository folder not found: {gone_root}" in collapsed
+    assert f"[OK] {present}:" in collapsed
+    # Not misreported as a repository without a schema file, or as pending drift.
+    assert f"{gone}: no devgraph.schema.yaml" not in collapsed
+    assert f"{gone}: no devgraph.tools.yaml" not in collapsed
+    assert f"devgraph rescan {gone} --now" not in collapsed
+
+
+def _info_with_neo4j_down(runner, db_path, *args):
+    from devgraph.cli import main as cli_main
+
+    class DownEngine:
+        def __init__(self, *a, **k):
+            pass
+
+        def run_cypher(self, *a, **k):
+            from neo4j.exceptions import ServiceUnavailable
+
+            raise ServiceUnavailable("connection refused")
+
+        def close(self):
+            pass
+
+    config_module.get_settings.cache_clear()
+    with patch.object(config_module, "get_settings", return_value=_mock_settings(db_path)), \
+         patch.object(cli_main, "get_settings", return_value=_mock_settings(db_path)), \
+         patch.object(cli_main, "GraphEngine", DownEngine):
+        return runner.invoke(app, ["info", *args])
+
+
+def test_cli_info_with_neo4j_down_says_the_node_count_is_unknown(runner, temp_registry_db, temp_git_repo):
+    db_path, registry = temp_registry_db
+    repo_id = registry.add_repo(temp_git_repo).repo_id
+    registry.close()
+
+    table = _info_with_neo4j_down(runner, db_path, repo_id)
+    assert table.exit_code == 0, table.stdout
+    assert "Nodes in graph: unknown (Neo4j unreachable)" in table.stdout
+    as_json = _info_with_neo4j_down(runner, db_path, repo_id, "--json")
+    assert json.loads(as_json.stdout)["node_count"] is None
