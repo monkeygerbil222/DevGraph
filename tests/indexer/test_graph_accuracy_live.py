@@ -1354,7 +1354,8 @@ def test_per_file_save_cost_ignores_other_repositories(engine, repo_id, tmp_path
     held to a wall-clock bound; in CI, where the clock is too noisy, every query a
     save runs is PROFILEd instead and must neither scan a populated label
     (or every node) nor touch the other repository's nodes. A save also re-indexes no
-    other file, except a Java file's direct importers."""
+    other file, except a Java file's direct importers; an edit that adds a
+    function is profiled too, for the mention lookup it runs."""
     import os
     import statistics
     import time
@@ -1414,12 +1415,20 @@ def test_per_file_save_cost_ignores_other_repositories(engine, repo_id, tmp_path
             index_paths(engine, repo_id, tmp_path, {tmp_path / rel}, **options)
             elapsed[rel] = min(elapsed.get(rel, float("inf")), time.perf_counter() - started)
             assert sorted(seen) == (["p/A.java", "q/B.java"] if rel == "q/B.java" else [rel])
+    # An edit that adds a node also looks for Markdown files that mention it.
+    added = write(tmp_path, "app/util.py", _SAVE_COST_FIXTURE["app/util.py"] + "\n\ndef added():\n    return 2\n")
+    seen.clear()
+    started = time.perf_counter()
+    index_paths(engine, repo_id, tmp_path, {added}, **options)
+    elapsed["app/util.py, adding a function"] = time.perf_counter() - started
+    assert seen == ["app/util.py"]
     monkeypatch.undo()
 
     print("per-file save:", {rel: round(t, 3) for rel, t in elapsed.items()})
     if not os.environ.get("CI"):
-        # About 0.03 s anchored; the old queries' scans made it 0.2 s.
-        assert statistics.median(elapsed.values()) < 0.1, elapsed
+        # About 0.03 s anchored (0.09 s on a busy machine); the old queries'
+        # scans made it 0.2 s.
+        assert statistics.median(elapsed.values()) < 0.15, elapsed
         return
 
     def operators(plan):

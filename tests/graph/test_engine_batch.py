@@ -300,3 +300,73 @@ def test_the_provenance_label_families_cover_every_extractor_label():
     assert set(DOC_NOTE_LABELS) | {"Module", "Document"} <= set(SOURCE_FILE_LABELS)
     assert {t.value for t in DatastoreType} | {"Container", "Endpoint", "Function"} <= set(CLAIMED_LABELS)
     assert set(CLAIMED_LABELS) | set(SOURCE_FILE_LABELS) <= set(NAMED_LABELS)
+
+
+_HINT_FAILURE = (
+    "Failed to fulfil the hints of the query. Could not solve these hints: "
+    "`USING INDEX SEEK n:Class(repo_id, file)`"
+)
+
+
+def _fail_hinted_queries(monkeypatch, times):
+    """Make the next `times` hinted queries fail as they do while their
+    index is still POPULATING (a missing index only warns)."""
+    left = {"n": times}
+    for cls in (neo4j.ManagedTransaction, neo4j.Session):
+        original = cls.run
+
+        def run(self, query, *args, _original=original, **kwargs):
+            if "USING INDEX SEEK" in query and left["n"]:
+                left["n"] -= 1
+                raise neo4j.exceptions.ClientError(_HINT_FAILURE)
+            return _original(self, query, *args, **kwargs)
+
+        monkeypatch.setattr(cls, "run", run)
+    return left
+
+
+class TestIndexesStillBuilding:
+    def test_a_write_waits_for_the_index_and_is_not_dropped(self, engine, monkeypatch):
+        import devgraph.graph.engine as engine_module
+
+        repo_id = "_smoketest_index_building_write"
+        monkeypatch.setattr(engine_module.time, "sleep", lambda _s: None)
+        left = _fail_hinted_queries(monkeypatch, 2)
+        try:
+            engine.replace_file_nodes(repo_id, "a.py", [
+                {"label": "Function", "repo_id": repo_id, "name": "f", "properties": {"file": "a.py"}},
+            ], [])
+            assert left["n"] == 0
+            assert engine.list_file_nodes(repo_id, ["a.py"]) == {("Function", "f", "a.py")}
+        finally:
+            monkeypatch.undo()
+            engine.delete_repository(repo_id)
+
+    def test_an_index_that_stays_unbuilt_fails_the_call(self, engine, monkeypatch):
+        import devgraph.graph.engine as engine_module
+
+        clock = {"t": 0.0}
+        monkeypatch.setattr(engine_module.time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + s))
+        monkeypatch.setattr(engine_module.time, "monotonic", lambda: clock["t"])
+        _fail_hinted_queries(monkeypatch, 10**6)
+        with pytest.raises(engine_module.IndexesNotReady):
+            engine.list_file_nodes("_smoketest_index_building_read", ["a.py"])
+        assert clock["t"] >= engine_module.INDEX_WAIT_S
+
+    def test_init_schema_waits_for_the_indexes_it_creates(self, engine, monkeypatch):
+        """An upgraded database builds the new indexes in the background;
+        init_schema returns only once they are ONLINE."""
+        queries = []
+        original = neo4j.Session.run
+
+        def run(self, query, *args, **kwargs):
+            queries.append(query)
+            return original(self, query, *args, **kwargs)
+
+        engine.run_cypher("DROP INDEX class_repo_file_lookup IF EXISTS")
+        monkeypatch.setattr(neo4j.Session, "run", run)
+        engine.init_schema()
+        monkeypatch.undo()
+        assert any("db.awaitIndexes" in q for q in queries), queries[-3:]
+        rows = engine.run_cypher("SHOW INDEXES YIELD name, state WHERE name = 'class_repo_file_lookup' RETURN state")
+        assert [r["state"] for r in rows] == ["ONLINE"]

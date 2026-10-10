@@ -1574,3 +1574,40 @@ def test_an_indexer_module_imports_first_in_a_fresh_interpreter(module):
 
     done = subprocess.run([sys.executable, "-c", f"import {module}"], capture_output=True, text=True)
     assert done.returncode == 0, done.stderr
+
+
+@pytest.mark.parametrize("deleted", [False, True])
+def test_a_save_while_the_indexes_build_fails_its_batch_instead_of_skipping_the_file(
+    engine, temp_repo, monkeypatch, deleted
+):
+    """A hinted query fails outright while its index is POPULATING. If that
+    outlasts the wait, the batch must fail (so it is retried and never
+    stamped), not log and skip the file as a per-file failure would."""
+    import neo4j
+
+    import devgraph.graph.engine as engine_module
+
+    repo_id = "_smoketest_dispatch_index_building" + ("_rm" if deleted else "")
+    source = temp_repo / "a.py"
+    source.write_text("def f():\n    return 1\n")
+    try:
+        full_scan(engine, repo_id, temp_repo)
+        source.write_text("def g():\n    return 1\n")
+        if deleted:
+            source.unlink()
+        monkeypatch.setattr(engine_module, "INDEX_WAIT_S", 0.0)
+        for cls in (neo4j.ManagedTransaction, neo4j.Session):
+            def run(self, query, *args, _original=cls.run, **kwargs):
+                if "USING INDEX SEEK" in query:
+                    raise neo4j.exceptions.ClientError("Failed to fulfil the hints of the query.")
+                return _original(self, query, *args, **kwargs)
+
+            monkeypatch.setattr(cls, "run", run)
+        with pytest.raises(engine_module.IndexesNotReady):
+            if deleted:
+                remove_paths(engine, repo_id, temp_repo, {source})
+            else:
+                index_paths(engine, repo_id, temp_repo, {source})
+    finally:
+        monkeypatch.undo()
+        engine.delete_repository(repo_id)

@@ -57,3 +57,36 @@ def test_a_first_sync_says_live_updates_wait_for_it(caplog):
         "INFO",
         "Reading the git history of r for the first time (412 commits); live updates resume when it finishes",
     ) in logs
+
+
+def _start_order(agent, module):
+    order = []
+    agent._engine.init_schema.side_effect = lambda: order.append("schema")
+    agent._watcher.start.side_effect = lambda: order.append("watch")
+    agent._settings.dashboard_enabled = False
+    agent._stop_event.set()
+    with patch(f"{module}.threading.Thread"):
+        agent.start()
+    return order
+
+
+def test_start_provisions_the_graph_indexes_before_watching():
+    """An upgraded agent creates (and waits for) the built-in indexes before
+    its first catch-up, not only when an MCP server happens to start."""
+    assert _start_order(_agent(), "devgraph.agent.headless")[:2] == ["schema", "watch"]
+
+
+def test_a_schema_failure_at_start_is_retried_when_neo4j_recovers():
+    agent = _agent()
+    agent._engine.init_schema.side_effect = RuntimeError("Neo4j down")
+    agent._settings.dashboard_enabled = False
+    agent._stop_event.set()
+    with patch("devgraph.agent.headless.threading.Thread"):
+        agent.start()  # does not raise
+    agent._stop_event.clear()
+    agent._engine.init_schema.side_effect = None
+    agent._engine.init_schema.reset_mock()
+    agent._healthy = False
+    agent._stop_event.wait = lambda _interval: agent._stop_event.set()
+    agent._health_check_loop()
+    agent._engine.init_schema.assert_called_once_with()

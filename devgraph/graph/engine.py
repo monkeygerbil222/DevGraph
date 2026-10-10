@@ -17,8 +17,8 @@ from pathlib import Path
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
 
-from neo4j import Driver, GraphDatabase, READ_ACCESS, unit_of_work
-from neo4j.exceptions import ServiceUnavailable, SessionExpired, TransientError
+from neo4j import Driver, GraphDatabase, NotificationDisabledClassification, READ_ACCESS, unit_of_work
+from neo4j.exceptions import Neo4jError, ServiceUnavailable, SessionExpired, TransientError
 from neo4j.graph import Node, Relationship
 
 from devgraph.graph.schema import (
@@ -455,6 +455,72 @@ class EngineClosed(ServiceUnavailable):
     """
 
 
+class IndexesNotReady(ServiceUnavailable):
+    """A query's hinted index was still being built after INDEX_WAIT_S.
+
+    An index Neo4j is still POPULATING (an upgraded database builds the
+    lookup indexes in the background) fails a `USING INDEX SEEK` query
+    outright, where a missing one only warns. Like `EngineClosed`, the
+    indexer lets it fail the whole batch, so the batch is never stamped and
+    is retried, rather than skipping the file."""
+
+
+#: What the indexer lets fail a whole batch or scan instead of one file or
+#: pass: a shutdown, or an index still being built. Either way nothing is
+#: stamped, and the work is redone.
+ABORTS_BATCH = (EngineClosed, IndexesNotReady)
+
+#: How long a query, or `init_schema`, waits for an index still being built.
+INDEX_WAIT_S = 300.0
+_INDEX_POLL_S = 2.0
+_HINT_FAILURE = "Failed to fulfil the hints"
+
+
+def _is_index_building(exc: Exception) -> bool:
+    return isinstance(exc, Neo4jError) and any(
+        _HINT_FAILURE in text for text in (str(exc), getattr(exc, "message", None) or "")
+    )
+
+
+def _wait_for_indexes(fn, *args, **kwargs):
+    """Run `fn`, re-running it while its hinted index is still being built,
+    for up to INDEX_WAIT_S; then raise `IndexesNotReady`."""
+    deadline = None
+    while True:
+        try:
+            return fn(*args, **kwargs)
+        except Neo4jError as exc:
+            if not _is_index_building(exc):
+                raise
+            now = time.monotonic()
+            if deadline is None:
+                deadline = now + INDEX_WAIT_S
+                logger.warning("a graph index is still being built; waiting up to %.0f s for it", INDEX_WAIT_S)
+            if now >= deadline:
+                raise IndexesNotReady(f"a graph index was still being built after {INDEX_WAIT_S:.0f} s") from exc
+            time.sleep(_INDEX_POLL_S)
+
+
+class _IndexWaitingSession:
+    """A session whose queries wait for an index still being built (see
+    `_wait_for_indexes`); everything else is the driver's session."""
+
+    def __init__(self, session) -> None:
+        self._session = session
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._session, name)
+
+    def run(self, *args: Any, **kwargs: Any):
+        return _wait_for_indexes(self._session.run, *args, **kwargs)
+
+    def execute_write(self, *args: Any, **kwargs: Any):
+        return _wait_for_indexes(self._session.execute_write, *args, **kwargs)
+
+    def execute_read(self, *args: Any, **kwargs: Any):
+        return _wait_for_indexes(self._session.execute_read, *args, **kwargs)
+
+
 class _GatedDriver:
     """The driver behind a gate that closes it only once no session is open.
 
@@ -488,7 +554,7 @@ class _GatedDriver:
         self._enter()
         try:
             with self._driver.session(**kwargs) as session:
-                yield session
+                yield _IndexWaitingSession(session)
         finally:
             self._exit()
 
@@ -855,7 +921,12 @@ def repository_constraint_statements(effective: EffectiveSchema | None = None) -
 
 class GraphEngine:
     def __init__(self, uri: str, user: str, password: str) -> None:
-        self._driver = _GatedDriver(GraphDatabase.driver(uri, auth=(user, password)))
+        # Hint notifications are off: a hinted index an older database hasn't
+        # built yet (init_schema creates it) would log one per query.
+        self._driver = _GatedDriver(GraphDatabase.driver(
+            uri, auth=(user, password),
+            notifications_disabled_classifications=[NotificationDisabledClassification.HINT],
+        ))
 
     def close(self, timeout: float = CLOSE_WAIT_S) -> None:
         """Refuse new sessions, wait up to `timeout` for open ones, then close
@@ -874,11 +945,28 @@ class GraphEngine:
         the built-in statements. Statements always come from
         `repository_constraint_statements`, never from
         `EffectiveSchema.constraint_statements()` directly. The built-in
-        `(repo_id, name)` lookup indexes follow.
+        lookup indexes follow, and it returns once every index is ONLINE (up
+        to INDEX_WAIT_S): an upgraded database builds new ones in the
+        background, and a query hinted to seek one fails until it is built.
         """
         with self._driver.session() as session:
             for stmt in repository_constraint_statements(effective) + lookup_index_statements():
                 _retry_transient(session.run, stmt)
+            building = [
+                record["name"] for record in _retry_transient(
+                    session.run, "SHOW INDEXES YIELD name, state WHERE state <> 'ONLINE' RETURN name"
+                )
+            ]
+            if building:
+                logger.info(
+                    "Building %d graph indexes (%s); indexing waits up to %.0f s for them",
+                    len(building), ", ".join(sorted(building)), INDEX_WAIT_S,
+                )
+            try:
+                _retry_transient(session.run, "CALL db.awaitIndexes($timeout)", timeout=int(INDEX_WAIT_S)).consume()
+            except Neo4jError:
+                # Still building (or failed): each hinted query waits on its own.
+                logger.warning("graph indexes not online after %.0f s; queries wait for them", INDEX_WAIT_S, exc_info=True)
 
     def upsert_repository(self, repo_id: str, name: str, path: str) -> None:
         with self._driver.session() as session:
@@ -1337,15 +1425,14 @@ class GraphEngine:
         (the docs/mentions extractors' shape). `Commit`/`Repository` nodes
         are excluded, and so are `source`-keyed shared nodes
         (Container/Datastore/Endpoint, co-produced by several files): their
-        files come from `list_claim_sources`.
+        files come from `list_claim_sources`. Sought label by label through
+        the provenance indexes (see `_owned_branches`).
         """
         with self._driver.session() as session:
             result = _retry_transient(
                 session.run,
-                "MATCH (n {repo_id: $repo_id}) "
-                "WHERE n.source_file IS NOT NULL OR n.file IS NOT NULL "
-                "   OR (n:Module AND n.name IS NOT NULL) "
-                "RETURN DISTINCT coalesce(n.source_file, n.file, n.name) AS path",
+                _union(_owned_branches("IS NOT NULL"))
+                + "RETURN DISTINCT coalesce(n.source_file, n.file, n.name) AS path",
                 repo_id=repo_id,
             )
             records = result or []
@@ -1358,8 +1445,8 @@ class GraphEngine:
         with self._driver.session() as session:
             result = _retry_transient(
                 session.run,
-                "MATCH (n {repo_id: $repo_id}) "
-                "WHERE n.file IS NULL AND n.source_file IS NULL AND n.extractor IS NULL "
+                _union(_CLAIMED_BRANCHES)
+                + "WITH n WHERE n.file IS NULL AND n.source_file IS NULL AND n.extractor IS NULL "
                 "  AND (n.sources IS NOT NULL OR n.source IS NOT NULL) "
                 "UNWIND coalesce(n.sources, [n.source]) AS source "
                 "RETURN DISTINCT source",
@@ -1568,12 +1655,13 @@ class GraphEngine:
         """Return the route files that left a file-less handler stub
         `Function` named one of `names` (see apis/extractor.py): the files
         whose Endpoint IMPLEMENTS edges can now resolve to a real function
-        of that name."""
+        of that name. Hinted to seek by name: the planner otherwise scanned
+        the `(repo_id, source)` index, every repository's stubs."""
         with self._driver.session() as session:
             result = _retry_transient(
                 session.run,
-                "MATCH (f:Function {repo_id: $repo_id}) "
-                "WHERE f.name IN $names AND f.file IS NULL AND f.source IS NOT NULL "
+                "MATCH (f:Function) USING INDEX SEEK f:Function(repo_id, name) "
+                "WHERE f.repo_id = $repo_id AND f.name IN $names AND f.file IS NULL AND f.source IS NOT NULL "
                 "UNWIND coalesce(f.sources, [f.source]) AS source "
                 "RETURN DISTINCT source",
                 repo_id=repo_id,

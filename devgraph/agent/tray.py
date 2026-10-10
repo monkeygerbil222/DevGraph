@@ -106,6 +106,7 @@ class TrayApp:
         )
         self._paused = False
         self._healthy = True
+        self._schema_ready = False
         self._stop_event = threading.Event()
         self._icon: pystray.Icon | None = None  # type: ignore[valid-type]
         self._last_seen_registry_change = self._registry.last_changed_at()
@@ -171,12 +172,27 @@ class TrayApp:
         except Exception:
             logger.warning("git history sync failed for %s", repo_id, exc_info=True)
 
+    def _provision_schema(self) -> None:
+        """Create the built-in constraints and indexes and wait until they are
+        built (`GraphEngine.init_schema`), so an upgraded database has its
+        lookup indexes before the first catch-up. Retried by the health check
+        while it fails."""
+        try:
+            self._engine.init_schema()
+            self._schema_ready = True
+        except Exception:
+            if self._stop_event.is_set():
+                return  # the engine refuses new sessions once shutdown closes it
+            logger.warning("could not provision the graph schema; retrying when Neo4j is reachable", exc_info=True)
+
     def _health_check_loop(self) -> None:
         while not self._stop_event.is_set():
             try:
                 self._engine.verify_connectivity()
                 recovered = not self._healthy
                 self._healthy = True
+                if not self._schema_ready:
+                    self._provision_schema()
                 if recovered:
                     self._sync.retry_failed()
             except Exception:
@@ -381,6 +397,7 @@ class TrayApp:
         icon.stop()
 
     def start(self) -> None:
+        self._provision_schema()
         self._watcher.start()
         self._schema_rescans.start()
         self._insights.start()

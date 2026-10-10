@@ -155,3 +155,26 @@ class TestOpenDashboard:
         with patch("devgraph.agent.tray.webbrowser.open") as mock_open:
             tray_app._open_dashboard(MagicMock(), MagicMock())
         mock_open.assert_called_once_with("http://127.0.0.1:8765")
+
+
+class TestSchemaAtStart:
+    def test_start_provisions_the_graph_indexes_before_watching(self, tray_app):
+        order = []
+        tray_app._engine.init_schema.side_effect = lambda: order.append("schema")
+        tray_app._watcher.start.side_effect = lambda: order.append("watch")
+        tray_app._settings.dashboard_enabled = False
+        with patch("devgraph.agent.tray.threading.Thread"), patch("devgraph.agent.tray.pystray"):
+            tray_app.start()
+        assert order[:2] == ["schema", "watch"]
+
+    def test_a_schema_failure_at_start_is_retried_when_neo4j_recovers(self, tray_app):
+        tray_app._engine.init_schema.side_effect = RuntimeError("Neo4j down")
+        tray_app._settings.dashboard_enabled = False
+        with patch("devgraph.agent.tray.threading.Thread"), patch("devgraph.agent.tray.pystray"):
+            tray_app.start()  # does not raise
+        tray_app._engine.init_schema.side_effect = None
+        tray_app._engine.init_schema.reset_mock()
+        tray_app._healthy = False
+        tray_app._stop_event.wait = lambda _interval: tray_app._stop_event.set()
+        tray_app._health_check_loop()
+        tray_app._engine.init_schema.assert_called_once_with()
