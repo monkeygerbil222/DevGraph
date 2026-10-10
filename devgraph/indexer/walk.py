@@ -2,6 +2,12 @@
 
 Shared by the dispatcher, the watcher, the schema providers and doctor, so
 each scopes files the same way without importing the dispatcher.
+
+The walk leaves out the directories named in `IGNORED_DIR_NAMES` and
+whatever the repository's .gitignore files ignore (see `gitignore`). Which
+walked files are worth extracting is judged by their content, separately
+(`content_skip_reason`): a schema provider still represents a large or
+binary file, such as an image.
 """
 
 from __future__ import annotations
@@ -12,6 +18,7 @@ import stat
 from collections.abc import Iterator
 from pathlib import Path
 
+from devgraph.indexer import gitignore
 from devgraph.paths import is_within
 
 logger = logging.getLogger(__name__)
@@ -61,6 +68,49 @@ IGNORED_DIR_NAMES = {
     ".worktrees",
     "worktrees",
 }
+
+
+#: Why a file is left out of extraction (`content_skip_reason`, or a .gitignore).
+TOO_LARGE = "too large"
+BINARY = "binary"
+GENERATED = "minified or generated"
+GITIGNORED = "ignored by .gitignore"
+
+#: The default of the `max_file_bytes` setting: larger files are not extracted.
+DEFAULT_MAX_FILE_BYTES = 1024 * 1024
+#: How much of a file is searched for a NUL byte, as git does.
+BINARY_SNIFF_BYTES = 8192
+#: A line this long is minified or generated, never hand-written.
+MAX_LINE_BYTES = 10_000
+#: A file of at least `AVERAGE_CHECK_BYTES` whose lines average more than this is too.
+MAX_AVERAGE_LINE_BYTES = 200
+AVERAGE_CHECK_BYTES = 4096
+#: Prose has long lines (a paragraph per line), so its line length says nothing.
+_PROSE_SUFFIXES = {".md", ".markdown", ".txt", ".rst"}
+
+
+def content_skip_reason(path: Path, max_bytes: int) -> str | None:
+    """Why the file at `path` should not be extracted -- `TOO_LARGE` (over
+    `max_bytes`), `BINARY` (a NUL byte in the first 8 KiB) or `GENERATED`
+    (a line over `MAX_LINE_BYTES`, or long lines on average) -- or None.
+
+    The size comes from a stat, so a too-large file is never read. Raises
+    OSError when the file can't be read.
+    """
+    if os.stat(path).st_size > max_bytes:
+        return TOO_LARGE
+    with open(path, "rb") as f:
+        data = f.read(max_bytes + 1)
+    if b"\0" in data[:BINARY_SNIFF_BYTES]:
+        return BINARY
+    if path.suffix.lower() in _PROSE_SUFFIXES:
+        return None
+    lines = data.splitlines() or [b""]
+    if max(len(line) for line in lines) > MAX_LINE_BYTES:
+        return GENERATED
+    if len(data) >= AVERAGE_CHECK_BYTES and len(data) / len(lines) > MAX_AVERAGE_LINE_BYTES:
+        return GENERATED
+    return None
 
 
 class RepoRootUnavailable(Exception):
@@ -136,7 +186,7 @@ def is_indexable_file(path: Path) -> bool:
 
 def indexable_paths(repo_root: Path) -> set[Path]:
     """Every file under repo_root that a full scan would index: a regular
-    file, not under an ignored directory. Shared by full_scan (which indexes
+    file, not under an ignored directory nor ignored by a .gitignore. Shared by full_scan (which indexes
     them) and prune_stale_files (which diffs them against the graph)."""
     return {path for path, _, _ in _walk(repo_root)}
 
@@ -187,7 +237,8 @@ def _walk(
     symlinked directory; a Windows junction it does descend into, so the files
     below one are marked as linked, but only one whose target is inside the
     repository and not under an ignored directory (the rule a symlinked file
-    follows), so nothing outside the repository is ever walked.
+    follows), so nothing outside the repository is ever walked. A path a
+    .gitignore ignores is left out, and an ignored directory is not entered.
 
     `start`, a directory lexically under repo_root, walks only that subtree
     under the same rules, judged relative to repo_root.
@@ -199,7 +250,7 @@ def _walk(
     if is_ignored_path(repo_root):
         return
     root: Path | None = None  # resolved at the first junction, if any
-    stack = [(repo_root, "", False)]
+    stack: list[tuple[Path, str, bool, gitignore.Chain]] = [(repo_root, "", False, ())]
     if start is not None and start != repo_root:
         try:
             rel = start.relative_to(repo_root)
@@ -207,14 +258,18 @@ def _walk(
             return
         if is_ignored_path(rel) or start.is_symlink():
             return
+        chain = gitignore.chain_to(repo_root, rel.as_posix())
+        if chain is None:
+            return
         junction = start.is_junction()
         if junction:
             root = repo_root.resolve()
             if not _junction_inside(start, root):
                 return
-        stack = [(start, f"{rel.as_posix()}/", junction)]
+        # chain_to read start's own .gitignore; the loop below reads it again.
+        stack = [(start, f"{rel.as_posix()}/", junction, tuple(c for c in chain if c[0] != f"{rel.as_posix()}/"))]
     while stack:
-        directory, prefix, linked = stack.pop()
+        directory, prefix, linked, chain = stack.pop()
         try:
             with os.scandir(directory) as it:
                 entries = list(it)
@@ -222,6 +277,10 @@ def _walk(
             if unreadable is not None:
                 unreadable.append(prefix)
             continue
+        if any(entry.name == gitignore.GITIGNORE for entry in entries):
+            rules = gitignore.rules_in(directory)
+            if rules:
+                chain = (*chain, (prefix, rules))
         for entry in entries:
             if is_ignored_dir_name(entry.name):
                 continue
@@ -230,13 +289,15 @@ def _walk(
                 is_dir = entry.is_dir(follow_symlinks=False)
             except OSError:
                 is_dir = False
+            if chain and gitignore.matches(chain, prefix + entry.name, is_dir):
+                continue
             if is_dir:
                 junction = entry.is_junction()
                 if junction:
                     root = root or repo_root.resolve()
                     if not _junction_inside(path, root):
                         continue
-                stack.append((path, f"{prefix}{entry.name}/", linked or junction))
+                stack.append((path, f"{prefix}{entry.name}/", linked or junction, chain))
                 continue
             if not is_indexable_file(path) or (entry.is_symlink() and links_outside(path, repo_root)):
                 continue

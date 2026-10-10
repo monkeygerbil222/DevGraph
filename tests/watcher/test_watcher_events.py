@@ -137,6 +137,20 @@ def test_move_into_ignored_dir_is_a_delete(h, root):
     assert h.one_batch() == (set(), {"pkg/a.py"})
 
 
+def test_a_gitignored_file_is_not_queued_but_the_gitignore_is(h, root):
+    _write(root / ".gitignore", "*.log\nout/\n")
+    _write(root / "pkg/debug.log")
+    _write(root / "out/bundle.js")
+    _write(root / "pkg/a.py")
+    h.send(
+        FileModifiedEvent(h.p("pkg/debug.log")),
+        FileCreatedEvent(h.p("out/bundle.js")),
+        FileModifiedEvent(h.p("pkg/a.py")),
+        FileModifiedEvent(h.p(".gitignore")),
+    )
+    assert h.one_batch() == ({"pkg/a.py", ".gitignore"}, set())
+
+
 def test_move_out_of_repo_is_a_delete(h, root, tmp_path):
     outside = _write(tmp_path / "outside/a.py")
     h.send(FileMovedEvent(h.p("pkg/a.py"), str(outside)))

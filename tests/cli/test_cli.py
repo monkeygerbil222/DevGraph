@@ -1160,6 +1160,41 @@ def test_cli_add_and_rescan_stamp_the_start_of_the_scan(runner, temp_registry_db
         verify.close()
 
 
+@pytest.mark.parametrize("command", ["add", "rescan"])
+def test_cli_add_and_rescan_report_skipped_files(runner, temp_registry_db, tmp_path, command):
+    db_path, registry = temp_registry_db
+    repo = _repo_with_schema(tmp_path, "plain")
+    if command == "rescan":
+        registry.add_repo(repo)
+    registry.close()
+
+    from devgraph.cli import main as cli_main
+
+    def scan(*a, skipped=None, **k):
+        skipped.update({
+            "static/js/app.min.js": "too large",
+            "gen/big_pb2.py": "minified or generated",
+            "assets/blob.py": "binary",
+        })
+        return 4
+
+    config_module.get_settings.cache_clear()
+    with patch.object(config_module, "get_settings", return_value=_mock_settings(db_path)), \
+         patch.object(cli_main, "get_settings", return_value=_mock_settings(db_path)), \
+         patch.object(cli_main, "GraphEngine", lambda *a, **k: _StubEngine()), \
+         patch.object(cli_main, "full_scan", scan), \
+         patch.object(cli_main, "sync_git_history",
+                      lambda *a, **k: {"commits_indexed": 0, "commits_deleted": 0}):
+        result = runner.invoke(app, [command, "plain" if command == "rescan" else str(repo)])
+
+    assert result.exit_code == 0, f"stdout: {result.stdout}"
+    out = " ".join(result.stdout.split())
+    assert "Skipped 3 file(s)" in out
+    assert "static/js/app.min.js (too large)" in out
+    assert "gen/big_pb2.py (minified or generated)" in out
+    assert "assets/blob.py (binary)" in out
+
+
 def test_project_schema_findings_report_absent_valid_and_invalid(temp_registry_db, tmp_path):
     from devgraph.cli.main import _project_schema_findings
 

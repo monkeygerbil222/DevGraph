@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from devgraph.indexer.dispatch import catch_up, index_paths, remove_paths
+from devgraph.indexer.gitignore import GITIGNORE
 from devgraph.indexer.walk import RepoRootUnavailable
 
 logger = logging.getLogger(__name__)
@@ -91,6 +92,16 @@ class RepoSync:
                 )
             if deleted_paths:
                 removed = remove_paths(self._engine, repo_id, repo.path, deleted_paths)
+            if any(Path(p).name == GITIGNORE for p in changed_paths | deleted_paths):
+                # A .gitignore edit changes which files are indexed anywhere
+                # below it: catch up, which prunes the files now ignored and
+                # indexes the ones no longer ignored, as a fresh scan would.
+                result = catch_up(
+                    self._engine, repo_id, repo.path, started,
+                    docs_path=repo.docs_path, mentions_enabled=repo.mentions_enabled,
+                )
+                indexed += result.indexed
+                removed += result.pruned
             self._registry.mark_indexed(repo_id, at=self._held_back(repo_id, started))
             self._publish({"type": "reindexed", "repo_id": repo_id, "changed": indexed, "deleted": removed})
         except RepoRootUnavailable as exc:

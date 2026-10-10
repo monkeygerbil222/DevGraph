@@ -36,7 +36,7 @@ from devgraph.graph.engine import GraphEngine, provision_repository_schema
 from devgraph.indexer.dispatch import full_scan
 from devgraph.indexer.docs.extractor import index_file as index_doc_file
 from devgraph.indexer.git_history.extractor import sync_git_history
-from devgraph.indexer.walk import RepoRootUnavailable, check_repo_root, repo_root_problem
+from devgraph.indexer.walk import TOO_LARGE, RepoRootUnavailable, check_repo_root, repo_root_problem
 from devgraph.paths import is_within, read_bounded
 from devgraph.registry.store import RepoRegistry
 
@@ -92,9 +92,14 @@ def add(
                     provision_repository_schema(engine, record.path)
                     engine.upsert_repository(record.repo_id, record.repo_id, str(record.path))
                     started = datetime.now(timezone.utc)
-                    count = full_scan(engine, record.repo_id, record.path, docs_path=record.docs_path, mentions_enabled=record.mentions_enabled)
+                    skipped: dict[str, str] = {}
+                    count = full_scan(
+                        engine, record.repo_id, record.path, docs_path=record.docs_path,
+                        mentions_enabled=record.mentions_enabled, skipped=skipped,
+                    )
                     registry.mark_indexed(record.repo_id, at=started)
                     console.print(f"[green][OK][/green] Indexed {count} file(s)")
+                    _print_skipped(skipped)
 
                     if full:
                         try:
@@ -123,6 +128,24 @@ def add(
     except Exception as e:
         console.print(f"[red][X] Unexpected error:[/red] {escape(str(e))}")
         raise typer.Exit(code=1)
+
+
+#: How many skipped files `_print_skipped` names before summarising the rest.
+_SKIPPED_SHOWN = 20
+
+
+def _print_skipped(skipped: dict[str, str]) -> None:
+    """The files a scan left out (too large, binary, minified or generated),
+    each with why. Files a .gitignore ignores are not walked, so not listed."""
+    if not skipped:
+        return
+    console.print(f"[yellow]Skipped {len(skipped)} file(s)[/yellow] (not indexed):")
+    for rel in sorted(skipped)[:_SKIPPED_SHOWN]:
+        console.print(f"  {escape(rel)} ({escape(skipped[rel])})", soft_wrap=True)
+    if len(skipped) > _SKIPPED_SHOWN:
+        console.print(f"  … and {escape(str(len(skipped) - _SKIPPED_SHOWN))} more")
+    if TOO_LARGE in skipped.values():
+        console.print("  Set DEVGRAPH_MAX_FILE_BYTES to index larger files.")
 
 
 @app.command()
@@ -284,12 +307,14 @@ def rescan(
                 provision_repository_schema(engine, repo.path)
                 engine.upsert_repository(repo_id, repo_id, str(repo.path))
                 started = datetime.now(timezone.utc)
+                skipped: dict[str, str] = {}
                 count = full_scan(
                     engine, repo_id, repo.path, docs_path=repo.docs_path, mentions_enabled=repo.mentions_enabled,
-                    force=force,
+                    force=force, skipped=skipped,
                 )
                 registry.mark_indexed(repo_id, at=started)
                 console.print(f"[green][OK][/green] Rescanned {escape(repo_id)}: {count} file(s) indexed")
+                _print_skipped(skipped)
 
                 # Always reconcile git history on a rescan — not just with
                 # --full. sync_git_history is a cheap no-op when HEAD hasn't

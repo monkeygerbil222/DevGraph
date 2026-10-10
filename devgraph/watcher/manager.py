@@ -28,6 +28,7 @@ from watchdog.observers.api import ObservedWatch
 
 from devgraph.config import get_settings
 from devgraph.indexer.dispatch import is_ignored_path
+from devgraph.indexer.gitignore import is_gitignored
 from devgraph.indexer.walk import _junction_inside, indexable_paths_under, is_ignored_dir_name
 from devgraph.registry.store import RepoRegistry, RepoRecord
 
@@ -1074,9 +1075,10 @@ class _RepoEventHandler(FileSystemEventHandler):
 
     def _queue_rel(self, raw: str) -> str | None:
         """The repo-relative POSIX path of an event path that may be queued:
-        inside the repository, not the root itself, and not ignored."""
+        inside the repository, not the root itself, and not ignored (by name
+        or by a .gitignore, as the walk ignores it)."""
         rel = self._rel(raw)
-        if rel is None or not rel.parts or is_ignored_path(rel):
+        if rel is None or not rel.parts or is_ignored_path(rel) or is_gitignored(self._repo_root, rel.as_posix()):
             return None
         return rel.as_posix()
 

@@ -67,6 +67,16 @@ Run `devgraph --help` or `devgraph <command> --help` for the complete, current i
 - **Live updates.** Connecting an MCP client starts the tray app when needed. The watcher reindexes file and git-state changes; manual rescans remain safe and idempotent. See [Keeping up with changes](#keeping-up-with-changes).
 - **Purpose-built queries.** MCP clients should use the registered tools and the live `devgraph://tool-catalog` resource rather than relying on a hand-maintained tool count. Built-in tools run their queries read-only with a 30-second timeout; a query that runs longer comes back as `query timed out after 30 s; narrow the request`. `impact_analysis` and `impact_analysis_for_diff` follow transitive dependents at most four hops.
 
+### Which files are indexed
+
+A scan walks the repository's folder and skips:
+
+- **Ignored folders**: `.git`, virtual environments (`.venv`, `venv`), build output (`build`, `dist`, `target`, `bin`, `obj`), `node_modules`, `vendor`, caches and agent worktrees.
+- **Anything a `.gitignore` ignores**: the one at the root and every nested one, with `!` negations, as git applies them (a file inside an ignored folder can't be re-included). This applies to any registered folder, git checkout or not. `.git/info/exclude` and your global excludes file are not read, so two clones of a repository index the same files. Editing a `.gitignore` while the agent runs updates the graph straight away: files it now ignores are removed and files it no longer ignores are added.
+- **Files too big or not worth reading as source**: larger than 1 MiB (set `DEVGRAPH_MAX_FILE_BYTES` to change the limit), binary (a NUL byte in the first 8 KiB), or minified or generated (a line longer than 10,000 bytes, or lines averaging more than 200 bytes in a file of 4 KiB or more; Markdown and other prose is never judged by line length). These are not extracted, and a file that grows past the limit leaves the graph until it shrinks back. A schema-declared `filesystem` node type still lists them as files.
+
+`devgraph add` and `devgraph rescan` list the files they skipped and why, for example `static/js/app.min.js (too large)`.
+
 ### Keeping up with changes
 
 While the DevGraph agent (the tray app, or the headless agent in a container) is running, it keeps each watched repository's graph the same as a fresh scan would make it:

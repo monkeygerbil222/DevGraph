@@ -19,6 +19,7 @@ import logging
 import os
 import re
 import sys
+from collections import Counter
 from collections.abc import Callable, Mapping
 from datetime import datetime
 from functools import partial
@@ -62,10 +63,11 @@ from devgraph.indexer.schema_constraints import (
     recorded_declarations,
     release_labels,
 )
+from devgraph.indexer.gitignore import is_gitignored
 from devgraph.indexer.source_text import read_source
 # Re-exported under their pre-walk.py names for the watcher and existing callers.
 from devgraph.indexer.walk import IGNORED_DIR_NAMES as IGNORED_DIR_NAMES
-from devgraph.indexer.walk import RepoRootEmpty, RepoRootUnavailable, check_repo_root
+from devgraph.indexer.walk import GITIGNORED, RepoRootEmpty, RepoRootUnavailable, check_repo_root, content_skip_reason
 from devgraph.indexer.walk import indexable_paths as _indexable_paths
 from devgraph.indexer.walk import indexable_paths_under
 from devgraph.indexer.walk import is_ignored_dir_name as is_ignored_dir_name
@@ -270,7 +272,30 @@ def _disk_files(repo_root: Path) -> dict[str, Path]:
 def _is_provider_file(repo_root: Path, path: Path) -> bool:
     """A file the filesystem provider represents: what a full scan would index."""
     rel = _repo_relative(repo_root, path)
-    return rel is not None and _is_indexable_file(path) and not is_ignored_path(Path(rel))
+    return (
+        rel is not None and _is_indexable_file(path) and not is_ignored_path(Path(rel))
+        and not is_gitignored(repo_root.resolve(), rel)
+    )
+
+
+def _max_file_bytes() -> int:
+    """The `max_file_bytes` setting: larger files are not extracted."""
+    return get_settings().max_file_bytes
+
+
+def _skip_reason(
+    root_resolved: Path, rel_path: str, resolved: Path, docs_root: Path | None, mentions_enabled: bool, max_bytes: int
+) -> str | None:
+    """Why `index_paths` leaves this file out, or None: a .gitignore ignores
+    it, or an extractor would read it but it is too large, binary, or minified
+    or generated (`walk.content_skip_reason`). A file no extractor reads (one
+    only a schema provider represents, such as an image) is never judged by
+    its content. Raises OSError when the file can't be read."""
+    if is_gitignored(root_resolved, rel_path):
+        return GITIGNORED
+    if not _routes(resolved, docs_root, mentions_enabled):
+        return None
+    return content_skip_reason(resolved, max_bytes)
 
 
 def _prune_docs(
@@ -590,6 +615,7 @@ def _sync_docs_edges(engine: GraphEngine, repo_id: str, repo_root: Path, applied
 def index_paths(
     engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[Path], docs_path: str | None = None,
     mentions_enabled: bool = False, sync_provider: bool = True, relink_outside: bool = True,
+    skipped: dict[str, str] | None = None,
 ) -> int:
     """Index a set of changed files, routing each to its extractor by name/extension.
 
@@ -615,6 +641,10 @@ def index_paths(
         relink_outside: Relink other code files' by-name edges to the
             nodes the batch adds. False for a full scan, which has no file
             outside the batch.
+        skipped: When given, collects each file left out, by repo-relative
+            path, with why (`_skip_reason`). Its graph nodes are deleted, so
+            a file that grows past the size limit or becomes ignored leaves
+            the graph, as a full scan would leave it out.
 
     Returns:
         Number of files actually indexed, including those referrers
@@ -681,6 +711,8 @@ def index_paths(
             continue
         by_rel_path[resolved.relative_to(root_resolved).as_posix()] = resolved
 
+    max_bytes = _max_file_bytes()
+
     def index_one(rel_path: str, resolved: Path) -> None:
         nonlocal indexed
         if not resolved.exists() or not resolved.is_file():
@@ -690,6 +722,13 @@ def index_paths(
         # otherwise silently lose every file after the failure point. Log and
         # skip the offending file so the rest of the batch still indexes.
         try:
+            reason = _skip_reason(root_resolved, rel_path, resolved, docs_root, mentions_enabled, max_bytes)
+            if reason is not None:
+                logger.debug("%s: skipping %s (%s)", repo_id, rel_path, reason)
+                if skipped is not None:
+                    skipped[rel_path] = reason
+                engine.delete_nodes_by_source_file(repo_id, rel_path)
+                return
             indexed += _index_single_path(
                 engine, repo_id, repo_root, resolved, rel_path,
                 docs_root, mentions_enabled, module_path,
@@ -1696,10 +1735,26 @@ def _would_index(
         return False  # index_paths skips it too
     if _routes(resolved, docs_root, mentions_enabled):
         return True
+    return _provider_represents(rel, specs)
+
+
+def _provider_represents(
+    rel: str, specs: tuple[bool, filesystem.FilesystemSpec | None, docs.DocsSpec | None]
+) -> bool:
+    """Whether a declared schema provider writes a node for this file."""
     ok, fs_spec, docs_spec = specs
     if ok and fs_spec is not None and fs_spec.file_label:
         return True
     return ok and docs_spec is not None and any(docs.selects(t, rel) for t in docs_spec.types)
+
+
+def _content_skipped(path: Path, max_bytes: int) -> bool:
+    """Whether `walk.content_skip_reason` leaves the file out; one that can't
+    be read is left for `index_paths` to report."""
+    try:
+        return content_skip_reason(path, max_bytes) is not None
+    except OSError:
+        return False
 
 
 def _docs_note_files(engine: GraphEngine, repo_id: str) -> set[str]:
@@ -1773,9 +1828,12 @@ def catch_up(
     walked = _keyed_indexable_paths(repo_root)
     due: set[Path] = set()
     unknown = 0
+    max_bytes = _max_file_bytes()
     for path, rel in walked:
         if not _would_index(path, rel, docs_root, mentions_enabled, specs):
             continue
+        if rel not in known and not _provider_represents(rel, specs) and _content_skipped(path, max_bytes):
+            continue  # index_paths would leave it out again
         if rel not in known or (rel not in notes and _is_unindexed_note(path, docs_root, mentions_enabled)):
             due.add(path)
             unknown += 1
@@ -1801,6 +1859,7 @@ def full_scan(
     docs_path: str | None = None,
     mentions_enabled: bool = False,
     force: bool = False,
+    skipped: dict[str, str] | None = None,
 ) -> int:
     """Walk every file under repo_root and index it, skipping VCS/build/venv noise. Used by `devgraph add`/`rescan`.
 
@@ -1820,6 +1879,11 @@ def full_scan(
     A missing, unreadable or apparently unmounted root is refused as
     `prune_stale_files` refuses it (`force` as there), before any change.
 
+    Files a .gitignore ignores are never walked; files too large, binary, or
+    minified or generated are not extracted (see `index_paths`). Those are
+    logged in one line and, when `skipped` is given, collected there by
+    repo-relative path with why.
+
     The index format is unstamped (0) for the scan's duration and restamped
     at its end, so a scan cut short (the agent shutting down mid-rescan, say)
     leaves the index outdated and the next catch-up redoes it in full: the
@@ -1831,11 +1895,19 @@ def full_scan(
     engine.set_index_format(repo_id, 0)
     all_files = _indexable_paths(repo_root)
     applied, applied_docs = _apply_project_schema(engine, repo_id, repo_root)
+    left_out: dict[str, str] = {} if skipped is None else skipped
     indexed = index_paths(
         engine, repo_id, repo_root, all_files, docs_path=docs_path, mentions_enabled=mentions_enabled,
         sync_provider=False,  # applied just above
         relink_outside=False,  # every file is in the batch
+        skipped=left_out,
     )
+    if left_out:
+        counts = Counter(left_out.values())
+        logger.info(
+            "%s: skipped %d file(s) (%s); see `devgraph rescan %s`",
+            repo_id, len(left_out), ", ".join(f"{n} {reason}" for reason, n in sorted(counts.items())), repo_id,
+        )
     if applied:
         _sync_docs_edges(engine, repo_id, repo_root, applied_docs)
     engine.set_index_format(repo_id, INDEX_FORMAT)
