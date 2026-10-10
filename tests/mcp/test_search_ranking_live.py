@@ -94,10 +94,10 @@ def test_the_exact_match_comes_first_past_two_hundred_substring_matches(seeded, 
 
 
 def test_a_stub_is_dropped_when_a_real_node_has_its_name(seeded, tmp_path, monkeypatch):
-    body = _call(seeded, tmp_path, monkeypatch, {"query": "get", "max_results": 400})
+    body = _call(seeded, tmp_path, monkeypatch, {"query": "get", "max_results": 200})
     gets = [r for r in body["results"] if r["name"] == "get"]
     assert gets == [{**gets[0], "file": "api/client.py"}]
-    assert len(body["results"]) == FILLERS + 1
+    assert body["count"] == FILLERS + 1  # the stub is not counted either
 
 
 def test_a_lone_stub_is_kept(seeded, tmp_path, monkeypatch):
@@ -126,3 +126,47 @@ def test_the_dashboard_search_ranks_the_exact_match_first(seeded):
     assert (rows[0]["name"], rows[0]["file"]) == ("get", "api/client.py")
     assert len(rows) == 15
     assert not any(r["name"] == "get" and not r["file"] for r in rows)
+
+
+@pytest.fixture
+def snake(engine):
+    """An exact snake_case name, written last, behind 250 names that share its first
+    eleven characters and sort before it (`user_servic000` < `user_service`)."""
+    repo = f"{REPO}_snake"
+    nodes = [
+        {"label": "Function", "repo_id": repo, "name": f"user_servic{i:03d}", "properties": {"file": "s.py"}}
+        for i in range(250)
+    ]
+    nodes.append({"label": "Function", "repo_id": repo, "name": "user_service", "properties": {"file": "svc.py"}})
+    engine.upsert_nodes(nodes)
+    yield engine, repo
+    engine.delete_repository(repo)
+
+
+def _call_repo(engine, repo, tmp_path, monkeypatch, arguments):
+    monkeypatch.setattr(mcp_server, "get_settings", lambda: Settings(registry_db_path=tmp_path / "r.sqlite3"))
+    record = _Repo(repo, tmp_path)
+    server = mcp_server.build_server(engine, _Registry([record]), session_repo=record, session_source="env")
+
+    async def scenario():
+        async with Client(server, mode="auto") as client:
+            return await client.call_tool("search_component", arguments)
+
+    result = anyio.run(scenario)
+    assert result.is_error is False, result.content
+    return result.structured_content
+
+
+def test_an_exact_snake_case_name_comes_first_past_two_hundred_prefix_matches(snake, tmp_path, monkeypatch):
+    engine, repo = snake
+    body = _call_repo(engine, repo, tmp_path, monkeypatch, {"query": "user_service", "max_results": 5})
+    assert (body["results"][0]["name"], body["results"][0]["file"]) == ("user_service", "svc.py")
+    assert queries.search_components(engine, repo, "user_service", 5)[0]["name"] == "user_service"
+
+
+def test_max_results_is_capped(seeded, tmp_path, monkeypatch):
+    from devgraph.mcp.tools import SEARCH_MAX_RESULTS
+
+    body = _call(seeded, tmp_path, monkeypatch, {"query": "get", "max_results": 100_000})
+    assert len(body["results"]) == SEARCH_MAX_RESULTS
+    assert body["count"] == FILLERS + 1 and body["truncated"] is True

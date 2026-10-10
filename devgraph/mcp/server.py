@@ -485,7 +485,10 @@ def build_server(
         each result with name, labels, repo_id, description and file. Ranked: exact name,
         then name prefix, then name substring, then description only. count is the true
         number of matches, unless count_is_lower_bound is true (exact and prefix matches
-        alone filled max_results). A route's file-less handler stub is left out when a
+        alone filled max_results). max_results is capped at 200. A snake_case query such as
+        user_service also matches as a whole word. An exact name in unusual case (gEt for
+        get) is found by the substring scan, so it can be missed when exact and prefix
+        matches alone fill max_results. A route's file-less handler stub is left out when a
         real node has its name. Pass modified_within_commits to restrict to components touched within the last
         N commits repo-wide (requires git-history recency staging; entities never staged
         are excluded, not silently included).

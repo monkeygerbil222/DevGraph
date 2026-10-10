@@ -258,7 +258,11 @@ name prefixes, then other substrings, then description-only matches; each
 result carries its `file`, and a route's file-less handler stub is dropped
 when a real function of that name exists. Its `count` is the true number of
 matches, except when exact and prefix matches alone fill `max_results`: then
-the response adds `count_is_lower_bound: true`. `describe_node`'s
+the response adds `count_is_lower_bound: true`. `max_results` is capped at
+200. The whole query and each of its words (`user_service`, underscores kept)
+are matched as well as its tokens. An exact name in unusual case (`gEt` for
+`get`) is only found by the substring scan, so it can be missed when exact and
+prefix matches alone fill the page. `describe_node`'s
 response is not itself an envelope: each relationship group inside its
 `outgoing` and `incoming` maps is one (`{"count", "results", "truncated"}`).
 

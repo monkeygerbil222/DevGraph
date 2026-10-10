@@ -250,15 +250,18 @@ def search_component(
     Returns:
         Dict with count, results, and truncated flag. Query is tokenized and
         stopword-filtered — multi-word natural-language queries match any token,
-        not the whole phrase. Results are ranked: exact name match > name
-        starts-with > name contains > description contains.
+        not the whole phrase — and the whole query and each of its words
+        (underscores kept, so `user_service`) are terms too. Results are ranked:
+        exact name match > name starts-with > name contains > description
+        contains. At most `SEARCH_MAX_RESULTS` results are returned.
     """
     _at_least(1, max_results=max_results, modified_within_commits=modified_within_commits)
+    max_results = min(max_results, SEARCH_MAX_RESULTS)
     cutoff = None
     if modified_within_commits is not None:
         cutoff = _resolve_recency_cutoff(engine, repo_id, modified_within_commits)
 
-    tokens = _search_tokens(query)
+    tokens = _search_terms(query)
     labels = _SEARCH_LABELS + tuple(
         label for label in extra_labels if LABEL_PATTERN.fullmatch(label) and label not in _SEARCH_LABELS
     )
@@ -277,6 +280,17 @@ def search_component(
 #: Rows the index-backed exact/prefix stage of `ranked_search` reads at most.
 _SEARCH_INDEX_CAP = 200
 
+#: Most results search_component returns, whatever max_results asks for.
+SEARCH_MAX_RESULTS = _SEARCH_INDEX_CAP
+
+
+def _search_terms(query: str) -> list[str]:
+    """`_search_tokens`, plus the whole query and each `[A-Za-z0-9_]+` word,
+    lower-cased: a snake_case name is a token split at `_`, and only whole it
+    can match exactly."""
+    whole = [query.strip().lower(), *(w.lower() for w in re.findall(r"[A-Za-z0-9_]+", query))]
+    return list(dict.fromkeys([*_search_tokens(query), *(t for t in whole if t)]))
+
 # Rank of a matching node: exact name, name starts with a term, name contains
 # one, description only.
 _SEARCH_TIER = (
@@ -284,9 +298,10 @@ _SEARCH_TIER = (
     "WHEN any(t IN $terms WHERE toLower(n.name) STARTS WITH t) THEN 1 "
     "WHEN any(t IN $terms WHERE toLower(n.name) CONTAINS t) THEN 2 ELSE 3 END"
 )
+_SEARCH_FILE = "CASE WHEN coalesce(n.file, '') <> '' THEN n.file ELSE coalesce(n.path, n.source_file, n.source) END"
 _SEARCH_ROW = (
     "{id: elementId(n), name: n.name, labels: labels(n), repo_id: n.repo_id, description: n.description, "
-    "file: CASE WHEN coalesce(n.file, '') <> '' THEN n.file ELSE coalesce(n.path, n.source_file, n.source) END}"
+    f"file: {_SEARCH_FILE}}}"
 )
 
 
@@ -338,7 +353,10 @@ def ranked_search(
     if cutoff is not None:
         scope += " AND n.last_modified_at >= $cutoff"
     params: dict[str, Any] = {"repo_id": repo_id, "terms": terms, "names": names, "cutoff": cutoff}
-    order = f"WITH n, {_SEARCH_TIER} AS tier ORDER BY tier, n.name, n.file, elementId(n)\n"
+    order = (
+        f"WITH n, {_SEARCH_TIER} AS tier, {_SEARCH_FILE} AS file "
+        "ORDER BY tier, n.name, file IS NULL, file, elementId(n)\n"
+    )
     indexed = _query(
         engine,
         _search_branches(labels, f"{scope} AND n.name STARTS WITH p", unwind=True)
@@ -379,7 +397,7 @@ def declared_node_labels(registry: RepoRegistry | None, repo_id: str) -> tuple[s
 def _rank_search_results(results: list[dict], tokens: list[str]) -> list[dict]:
     """Sort search rows: exact name match first, then name starts-with a token,
     then name contains a token, then description-only matches last; by name and
-    file within a tier, as `ranked_search`'s queries order them."""
+    file within a tier (no file last), as `ranked_search`'s queries order them."""
     def tier(row: dict) -> int:
         name = (row.get("name") or "").lower()
         if name in tokens:
@@ -389,7 +407,10 @@ def _rank_search_results(results: list[dict], tokens: list[str]) -> list[dict]:
         if any(t in name for t in tokens):
             return 2
         return 3
-    return sorted(results, key=lambda row: (tier(row), row.get("name") or "", row.get("file") or ""))
+    return sorted(
+        results,
+        key=lambda row: (tier(row), row.get("name") or "", row.get("file") is None, row.get("file") or ""),
+    )
 
 
 # --- describe_node -------------------------------------------------------------
