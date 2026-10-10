@@ -953,6 +953,22 @@ def test_module_added_after_its_importer(engine, repo_id, tmp_path):
     incremental_equals_fresh(engine, repo_id, tmp_path)
 
 
+@pytest.mark.parametrize("importer, specifier, target", [
+    ("src/main.ts", "import { util } from './util.js';", "src/util.ts"),
+    ("src/main.mts", "import { util } from './util.mjs';", "src/util.mts"),
+    ("src/main.cjs", "const util = require('./util.cjs');", "src/util.cts"),
+], ids=["js-to-ts", "mjs-to-mts", "cjs-to-cts"])
+def test_explicit_extension_import_reaches_its_typescript_source(engine, repo_id, tmp_path, importer, specifier, target):
+    write(tmp_path, importer, specifier + "\n")
+    scan(engine, repo_id, tmp_path)
+    assert not [e for e in edges(engine, repo_id, "IMPORTS") if e[5] == target]
+
+    added = write(tmp_path, target, "export function util() {\n  return 1;\n}\n")
+    index_paths(engine, repo_id, tmp_path, {added})
+    assert [e for e in edges(engine, repo_id, "IMPORTS") if (e[1], e[5]) == (importer, target)]
+    incremental_equals_fresh(engine, repo_id, tmp_path)
+
+
 @pytest.mark.parametrize("files", [
     {
         "app/k.py": "from base.b import Base\n\n\nclass K(Base):\n    pass\n",
