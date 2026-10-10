@@ -83,6 +83,25 @@ def test_a_batch_stamps_its_start(rig, indexing):
     rig.registry.mark_indexed.assert_called_once_with(REPO, at=T0)
 
 
+@pytest.mark.parametrize("deleted", [False, True])
+def test_a_gitignore_change_catches_up_from_the_batch_start(rig, indexing, deleted):
+    """A .gitignore edit changes which files are indexed: the batch is
+    followed by a catch-up, which prunes what is now ignored and indexes what
+    no longer is."""
+    indexing["catch_up"].return_value = CatchUp(indexed=2, pruned=3, checked=9)
+    gitignore = rig.root / "web" / ".gitignore"
+    changed, gone = (set(), {gitignore}) if deleted else ({gitignore}, set())
+    rig.sync.on_changes(REPO, changed, gone)
+    assert indexing["catch_up"].call_args.args[:4] == (rig.engine, REPO, rig.root, T0)
+    assert rig.events[-1] == {"type": "reindexed", "repo_id": REPO, "changed": 2 + (0 if deleted else 1),
+                              "deleted": 3 + (1 if deleted else 0)}
+
+
+def test_a_batch_without_a_gitignore_does_not_catch_up(rig, indexing):
+    rig.sync.on_changes(REPO, {rig.root / "a.py"}, set())
+    indexing["catch_up"].assert_not_called()
+
+
 def test_a_failed_batch_sets_the_floor_and_asks_for_a_catch_up(rig, indexing):
     indexing["index"].side_effect = RuntimeError("neo4j down")
     rig.sync.on_changes(REPO, {rig.root / "a.py"}, set())

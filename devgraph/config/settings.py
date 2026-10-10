@@ -90,6 +90,9 @@ class Settings(BaseSettings):
         return Path.home() / ".devgraph" / "registry.sqlite3"
 
     watch_debounce_ms: int = 500
+    # Files larger than this many bytes are not extracted (a minified bundle
+    # or a generated module would otherwise become tens of thousands of nodes).
+    max_file_bytes: int = 1024 * 1024
     health_check_interval_s: int = 30
 
     log_file: Path | None = None

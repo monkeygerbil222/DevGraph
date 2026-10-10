@@ -21,6 +21,7 @@ from devgraph.indexer.jsts.extractor import extract_js_file
 from devgraph.indexer.kotlin.extractor import extract_kotlin_file
 from devgraph.indexer.python.extractor import extract_python_file
 from devgraph.indexer.rust.extractor import extract_rust_file
+from devgraph.indexer import source_text
 
 # One entry per `_CODE_ROUTES` value; a test fails if a route has none.
 EXTRACTORS: dict[str, Callable[[str, str], ExtractionResult]] = {
@@ -54,9 +55,10 @@ def language_for(path: str) -> str | None:
     return _CODE_ROUTES.get(PurePosixPath(path).suffix)
 
 
-def decode_source(data: bytes) -> str:
-    """Blob bytes as the indexer would see the file: UTF-8 with replacement, CRLF as LF."""
-    return data.decode("utf-8", errors="replace").replace("\r\n", "\n")
+def decode_source(data: bytes, path: str = "") -> str:
+    """Blob bytes as the indexer would see the file at `path` (`source_text`:
+    a Python coding line, else UTF-8, cp1252 or Latin-1), CRLF as LF."""
+    return source_text.decode_source(data, python=source_text.is_python_path(path)).replace("\r\n", "\n")
 
 
 class TooManySymbols(Exception):

@@ -14,6 +14,7 @@ import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
+from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
 
 from neo4j import Driver, GraphDatabase, READ_ACCESS, unit_of_work
@@ -1145,6 +1146,38 @@ class GraphEngine:
                 session.run,
                 "MERGE (r:Repository {repo_id: $repo_id}) SET r.index_format = $version",
                 repo_id=repo_id, version=version,
+            )
+
+    def read_skipped_files(self, repo_id: str) -> dict[str, list]:
+        """The files the indexer left out of extraction, by repo-relative path:
+        [reason, the size limit it was judged under, the file's change stamp]
+        (see dispatch.index_paths). Empty when none are recorded."""
+        with self._driver.session() as session:
+            result = _retry_transient(
+                session.run,
+                "MATCH (r:Repository {repo_id: $repo_id}) RETURN r.skipped_files AS skipped",
+                repo_id=repo_id,
+            )
+            records = [record.data() for record in result or []]
+        raw = records[0]["skipped"] if records else None
+        return json.loads(raw) if raw else {}
+
+    def update_skipped_files(
+        self, repo_id: str, add: dict[str, list] | None = None, drop: Iterable[str] = (), replace: bool = False
+    ) -> None:
+        """Add `read_skipped_files` entries and drop the ones at `drop`, or,
+        with `replace`, set exactly `add`. Written only when something changes."""
+        before = {} if replace else self.read_skipped_files(repo_id)
+        dropped = set(drop)
+        after = {path: entry for path, entry in before.items() if path not in dropped}
+        after.update(add or {})
+        if after == before and not replace:
+            return
+        with self._driver.session() as session:
+            _retry_transient(
+                session.run,
+                "MERGE (r:Repository {repo_id: $repo_id}) SET r.skipped_files = $skipped",
+                repo_id=repo_id, skipped=json.dumps(after, sort_keys=True) if after else None,
             )
 
     def index_format(self, repo_id: str) -> int | None:

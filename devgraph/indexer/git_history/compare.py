@@ -397,7 +397,7 @@ class _Detail:
                 change.symbols_skipped = "binary"
                 return
             try:
-                sides.append(extract_symbols(change.path, decode_source(data), _COMPARE_MAX_FILE_SYMBOLS))
+                sides.append(extract_symbols(change.path, decode_source(data, change.path), _COMPARE_MAX_FILE_SYMBOLS))
             except TooManySymbols:
                 # Not sticky: the next file may be small. Bounds the per-symbol work on one file.
                 change.symbols_skipped = "limit"
