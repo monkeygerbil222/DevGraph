@@ -734,6 +734,7 @@ def index_paths(
     max_bytes = _max_file_bytes()
     # Files left out by their content, for catch_up (see `_skip_marks`).
     judged: dict[str, list] = {}
+    read: set[str] = set()  # files extracted, whose old marks go
 
     def index_one(rel_path: str, resolved: Path) -> None:
         nonlocal indexed
@@ -767,6 +768,7 @@ def index_paths(
                 kt_files, kt_extractions, go_extractions,
                 docs_files, mention_files, batch_services,
             )
+            read.add(rel_path)
         except EngineClosed:
             raise  # shutdown: leave the work, and its stamp, for the next start
         except Exception as exc:
@@ -833,8 +835,8 @@ def index_paths(
     )
     for rel_path in sorted(referrers):
         index_one(rel_path, root_resolved / rel_path)
-    if judged:
-        engine.record_skipped_files(repo_id, judged)
+    if judged or read:
+        engine.update_skipped_files(repo_id, add=judged, drop=read)
     # Markdown that only mentions an added name is unchanged itself, so it
     # just gains edges to the added names (in the mentions pass below)
     # instead of a full re-index that re-matches every name in the repo.
@@ -1641,6 +1643,8 @@ def remove_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[
     # `sources`).
     for rel in sorted(removed):
         engine.delete_nodes_by_source_file(repo_id, rel)
+    if removed:
+        engine.update_skipped_files(repo_id, drop=removed)
 
     ok, fs_spec, docs_spec = specs
     if removed:
@@ -1768,14 +1772,17 @@ def _would_index(
     docs_root: Path | None,
     mentions_enabled: bool,
     specs: tuple[bool, filesystem.FilesystemSpec | None, docs.DocsSpec | None],
+    resolved: Path | None = None,
 ) -> bool:
     """Whether `index_paths` would write anything for this file: a built-in
     extractor routes it (`_routes`, as `_index_single_path` does), or a
-    declared schema provider represents it."""
-    try:
-        resolved = path.resolve()
-    except OSError:
-        return False  # index_paths skips it too
+    declared schema provider represents it. `resolved` is the path resolved,
+    when the caller already has it."""
+    if resolved is None:
+        try:
+            resolved = path.resolve()
+        except OSError:
+            return False  # index_paths skips it too
     if _routes(resolved, docs_root, mentions_enabled):
         return True
     return _provider_represents(rel, specs)
@@ -1884,30 +1891,42 @@ def catch_up(
     walked = _keyed_indexable_paths(repo_root)
     due: set[Path] = set()
     unknown = 0
-    # A file an extractor reads is known only through extraction nodes, not a
-    # provider's File node: one skipped for its content keeps that node. It is
-    # not offered again while its skip mark still holds (see `_skip_marks`).
+    # A file skipped for its content keeps a provider's File node, so for a
+    # file an extractor reads and that has a skip mark, only extraction nodes
+    # make it known. It is not offered again while its mark still holds (see
+    # `_skip_marks`).
     extracted = _extracted_files(engine, repo_id)
     marks = _skip_marks(engine, repo_id)
     max_bytes = _max_file_bytes()
+    walked_rels = set()
     for path, rel in walked:
-        if not _would_index(path, rel, docs_root, mentions_enabled, specs):
+        walked_rels.add(rel)
+        try:
+            resolved = path.resolve()
+        except OSError:
+            continue  # index_paths skips it too
+        if not _would_index(path, rel, docs_root, mentions_enabled, specs, resolved):
             continue
-        routed = bool(_routes(path.resolve(), docs_root, mentions_enabled))
-        if (rel not in extracted if routed else rel not in known) or (
+        routed = bool(_routes(resolved, docs_root, mentions_enabled))
+        marked = routed and rel in marks and rel not in extracted
+        if rel not in known or marked or (
             rel not in notes and _is_unindexed_note(path, docs_root, mentions_enabled)
         ):
             mark = marks.get(rel)
-            if mark is not None and mark[1] == max_bytes and _stamp_or_none(path) == mark[2]:
+            if mark is not None and rel not in extracted and mark[1] == max_bytes and _stamp_or_none(path) == mark[2]:
                 continue  # left out under this limit, and unchanged since
             due.add(path)
             unknown += 1
             continue
-        stamp = _stamp_or_none(path)
-        if stamp is None:
+        try:
+            st = os.stat(path)
+        except OSError:
             continue  # gone since the walk; the next catch-up prunes it
-        if stamp >= cutoff:
+        # A file extracted under a higher limit is offered so it can be left out.
+        if _change_stamp_ns(st) >= cutoff or (routed and rel in extracted and st.st_size > max_bytes):
             due.add(path)
+    if marks.keys() - walked_rels:
+        engine.update_skipped_files(repo_id, drop=marks.keys() - walked_rels)
     indexed = (
         index_paths(engine, repo_id, repo_root, due, docs_path=docs_path, mentions_enabled=mentions_enabled)
         if due
@@ -1960,7 +1979,7 @@ def full_scan(
     all_files = _indexable_paths(repo_root)
     applied, applied_docs = _apply_project_schema(engine, repo_id, repo_root)
     left_out: dict[str, str] = {} if skipped is None else skipped
-    engine.record_skipped_files(repo_id, {}, replace=True)  # every file is judged again below
+    engine.update_skipped_files(repo_id, replace=True)  # every file is judged again below
     indexed = index_paths(
         engine, repo_id, repo_root, all_files, docs_path=docs_path, mentions_enabled=mentions_enabled,
         sync_provider=False,  # applied just above

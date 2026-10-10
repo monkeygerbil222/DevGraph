@@ -19,6 +19,9 @@ class _QuietEngine:
     def read_applied_schema(self, repo_id):
         return None
 
+    def update_skipped_files(self, repo_id, add=None, drop=(), replace=False):
+        pass
+
 
 def test_a_failing_file_logs_one_line_and_the_traceback_only_at_debug(tmp_path, monkeypatch, caplog):
     (tmp_path / "locked.py").write_text("x = 1\n")

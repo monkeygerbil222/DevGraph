@@ -91,8 +91,8 @@ class _Engine:
     def delete_nodes_by_source_file(self, repo_id, rel):
         self.deleted.append(rel)
 
-    def record_skipped_files(self, repo_id, entries, replace=False):
-        self.marks = entries
+    def update_skipped_files(self, repo_id, add=None, drop=(), replace=False):
+        self.marks = add or {}
 
 
 @pytest.fixture
@@ -144,6 +144,9 @@ class _CatchUpEngine:
 
     def read_skipped_files(self, repo_id):
         return dict(self.skips)
+
+    def update_skipped_files(self, repo_id, add=None, drop=(), replace=False):
+        self.dropped = set(drop)
 
 
 @pytest.fixture
@@ -527,3 +530,90 @@ def test_reverse_dependents_and_referrers_are_not_judged_by_gitignore(tmp_path, 
     engine = _Engine()
     index_paths(engine, "_unit_guards", tmp_path, {tmp_path / "a.py"})
     assert seen == ["a.py", "out/dep.py"] and engine.deleted == []
+
+
+@pytest.fixture
+def provider_repo(engine, tmp_path):
+    """A repository declaring a filesystem `File` type, so every file has a provider node."""
+    import textwrap
+
+    engine_, ids = engine
+    label = f"ZzGuardFile{uuid.uuid4().hex[:8]}"
+    root = tmp_path / "prov"
+    root.mkdir()
+    (root / "devgraph.schema.yaml").write_text(textwrap.dedent(f"""
+        version: 1
+        node_types:
+          - label: {label}
+            key: [path]
+            metadata: [{{name: path}}]
+            source: {{provider: filesystem, kind: file}}
+    """))
+    yield engine_, ids, root
+    engine_.run_cypher(f"DROP CONSTRAINT {label.lower()}_repo_key IF EXISTS")
+    engine_.run_cypher(f"DROP INDEX {label.lower()}_repo_name IF EXISTS")
+
+
+def _scan(engine, repo_id, root):
+    from devgraph.graph.engine import provision_repository_schema
+
+    provision_repository_schema(engine, root)
+    engine.upsert_repository(repo_id, repo_id, str(root))
+    full_scan(engine, repo_id, root)
+
+
+LATER = timedelta(minutes=1)  # a `since` after every write: nothing is due by its stamps
+
+
+def test_an_idle_catch_up_offers_nothing_even_for_files_without_extraction_nodes(provider_repo, monkeypatch):
+    engine, (live, _fresh), root = provider_repo
+    (root / "a.py").write_text("def alpha():\n    return 1\n")
+    (root / "compose.yaml").write_text("volumes:\n  data: {}\n")  # no services
+    (root / "Dockerfile").write_text("# no FROM\n")
+    (root / "big.py").write_text("x = 1\n" * 1000)
+    monkeypatch.setattr(dispatch, "_max_file_bytes", lambda: LIMIT)
+    _scan(engine, live, root)
+    assert catch_up(engine, live, root, datetime.now(UTC) + LATER).offered == 0
+
+
+def test_lowering_the_limit_lets_catch_up_drop_a_now_too_large_file(provider_repo, monkeypatch):
+    engine, (live, fresh), root = provider_repo
+    (root / "a.py").write_text("def alpha():\n    return 1\n")
+    (root / "big.py").write_text("def big():\n    return 2\n" + "# padding\n" * 600)
+    _scan(engine, live, root)
+    assert ("Function", "big", "big.py") in _graph(engine, live)
+
+    monkeypatch.setattr(dispatch, "_max_file_bytes", lambda: LIMIT)
+    result = catch_up(engine, live, root, datetime.now(UTC) + LATER)
+    assert result.offered == 1
+    assert ("Function", "big", "big.py") not in _graph(engine, live)
+    assert engine.read_skipped_files(live)["big.py"][:2] == [TOO_LARGE, LIMIT]
+    assert catch_up(engine, live, root, datetime.now(UTC) + LATER).offered == 0
+    _matches_fresh(engine, live, fresh, root)
+
+
+def test_skip_marks_follow_deletes_renames_and_files_that_shrink(engine, tmp_path, small_limit):
+    engine, (live, _fresh) = engine
+    root = tmp_path / "repo"
+    root.mkdir()
+    padding = "# padding\n" * 600
+    for name in ("gone", "moved", "kept", "shrinks", "offline"):
+        (root / f"{name}.py").write_text(f"def {name}():\n    return 1\n{padding}")
+    engine.upsert_repository(live, live, str(root))
+    full_scan(engine, live, root)
+    assert set(engine.read_skipped_files(live)) == {"gone.py", "moved.py", "kept.py", "shrinks.py", "offline.py"}
+
+    # Live batches, as the watcher sends them.
+    (root / "gone.py").unlink()
+    remove_paths(engine, live, root, {root / "gone.py"})
+    (root / "moved.py").rename(root / "renamed.py")
+    remove_paths(engine, live, root, {root / "moved.py"})
+    index_paths(engine, live, root, {root / "renamed.py"})
+    (root / "shrinks.py").write_text("def shrinks():\n    return 1\n")
+    index_paths(engine, live, root, {root / "shrinks.py"})
+    assert set(engine.read_skipped_files(live)) == {"renamed.py", "kept.py", "offline.py"}
+
+    # A delete made while nothing was watching.
+    (root / "offline.py").unlink()
+    catch_up(engine, live, root, datetime.now(UTC) + LATER)
+    assert set(engine.read_skipped_files(live)) == {"renamed.py", "kept.py"}

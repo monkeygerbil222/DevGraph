@@ -898,6 +898,9 @@ class _NoImportersEngine:
     def read_applied_schema(self, repo_id):
         return None
 
+    def update_skipped_files(self, repo_id, add=None, drop=(), replace=False):
+        pass
+
 
 class TestDeterministicIndexOrder:
     def test_index_paths_processes_files_in_sorted_path_order(self, temp_repo, monkeypatch):
