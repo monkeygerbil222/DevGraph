@@ -36,6 +36,7 @@ from devgraph.graph.engine import GraphEngine, provision_repository_schema
 from devgraph.indexer.dispatch import full_scan
 from devgraph.indexer.docs.extractor import index_file as index_doc_file
 from devgraph.indexer.git_history.extractor import sync_git_history
+from devgraph.indexer.walk import RepoRootUnavailable, check_repo_root
 from devgraph.paths import is_within, read_bounded
 from devgraph.registry.store import RepoRegistry
 
@@ -238,6 +239,12 @@ def rescan(
         help="Apply a changed devgraph.schema.yaml right away instead of waiting for the agent's "
         "5-minute quiet period. A CLI rescan always applies immediately; this states it explicitly.",
     ),
+    force: bool = typer.Option(
+        False, "--force",
+        help="Rescan even though the repository folder has no indexable files while the graph has files "
+        "for it, pruning them all. Without it such a rescan is refused, since that is what an unmounted "
+        "drive looks like.",
+    ),
 ) -> None:
     """Run a full re-index of a registered repository.
 
@@ -255,6 +262,10 @@ def rescan(
     A changed devgraph.schema.yaml is applied by this command immediately;
     --now says so explicitly (the agent applies it only after a quiet period).
 
+    A repository folder that is missing or unreadable is refused with a
+    non-zero exit and nothing changed; so is one with no indexable files
+    while the graph has files for it, unless --force.
+
     Args:
         repo_id: The repository ID to rescan.
     """
@@ -265,6 +276,7 @@ def rescan(
             if not repo:
                 console.print(f"[red][X] Error:[/red] no such repo_id: {escape(repo_id)}")
                 raise typer.Exit(code=1)
+            check_repo_root(repo.path)
 
             settings = get_settings()
             engine = GraphEngine(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password)
@@ -272,7 +284,10 @@ def rescan(
                 provision_repository_schema(engine, repo.path)
                 engine.upsert_repository(repo_id, repo_id, str(repo.path))
                 started = datetime.now(timezone.utc)
-                count = full_scan(engine, repo_id, repo.path, docs_path=repo.docs_path, mentions_enabled=repo.mentions_enabled)
+                count = full_scan(
+                    engine, repo_id, repo.path, docs_path=repo.docs_path, mentions_enabled=repo.mentions_enabled,
+                    force=force,
+                )
                 registry.mark_indexed(repo_id, at=started)
                 console.print(f"[green][OK][/green] Rescanned {escape(repo_id)}: {count} file(s) indexed")
 
@@ -302,6 +317,9 @@ def rescan(
             registry.close()
     except typer.Exit:
         raise
+    except RepoRootUnavailable as e:
+        console.print(f"[red][X] Error:[/red] {escape(str(e))}", soft_wrap=True)
+        raise typer.Exit(code=1)
     except Exception as e:
         console.print(f"[red][X] Error:[/red] {escape(str(e))}")
         raise typer.Exit(code=1)

@@ -25,6 +25,7 @@ from git import GitCommandError, Repo
 from devgraph.config.settings import get_settings
 from devgraph.indexer.git_history import open_repo
 from devgraph.indexer.git_history.blame import compute_function_recency
+from devgraph.indexer.walk import check_repo_root
 
 logger = logging.getLogger(__name__)
 
@@ -417,10 +418,12 @@ def sync_git_history(
 
     Raises:
         ValueError: If repo_id is not registered.
+        RepoRootUnavailable: The repository folder is missing or unreadable.
     """
     repo_record = registry.get(repo_id)
     if repo_record is None:
         raise ValueError(f"no such repo_id: {repo_id}")
+    check_repo_root(repo_record.path)
 
     repo = open_repo(repo_record.path)
     try:

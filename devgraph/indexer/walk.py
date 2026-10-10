@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import os
+import stat
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -60,6 +61,59 @@ IGNORED_DIR_NAMES = {
     ".worktrees",
     "worktrees",
 }
+
+
+class RepoRootUnavailable(Exception):
+    """A repository's root folder is missing, not a folder, or unreadable (an
+    unmounted drive, a moved folder). Every scan entry point raises it before
+    changing anything: walking such a root finds no files, and pruning
+    against that would wipe the repository's graph."""
+
+    def __init__(self, path: Path, problem: str, message: str | None = None) -> None:
+        self.path = Path(path)
+        self.problem = problem
+        super().__init__(message or f"repository folder {problem}: {path}; nothing was changed")
+
+
+class RepoRootEmpty(RepoRootUnavailable):
+    """The root folder exists but holds no indexable file while the graph has
+    files for it: what a mount point with nothing mounted looks like. Refused
+    unless the caller forces it."""
+
+    def __init__(self, path: Path, repo_id: str, graph_files: int) -> None:
+        super().__init__(
+            path,
+            "empty",
+            f"repository folder has no indexable files but the graph has {graph_files} for it "
+            f"(an unmounted drive?): {path}; nothing was changed. If the files really are gone, "
+            f"run `devgraph rescan {repo_id} --force`",
+        )
+
+
+def repo_root_problem(repo_root: Path) -> str | None:
+    """Why `repo_root` can't be scanned ("not found", "not a folder", "not
+    readable"), or None when it is a readable folder."""
+    try:
+        is_dir = stat.S_ISDIR(os.stat(repo_root).st_mode)
+    except (FileNotFoundError, NotADirectoryError):
+        return "not found"
+    except OSError:
+        return "not readable"
+    if not is_dir:
+        return "not a folder"
+    try:
+        with os.scandir(repo_root) as entries:
+            next(entries, None)
+    except OSError:
+        return "not readable"
+    return None
+
+
+def check_repo_root(repo_root: Path) -> None:
+    """Raise `RepoRootUnavailable` unless `repo_root` is a readable folder."""
+    problem = repo_root_problem(repo_root)
+    if problem is not None:
+        raise RepoRootUnavailable(repo_root, problem)
 
 
 def is_ignored_dir_name(name: str) -> bool:

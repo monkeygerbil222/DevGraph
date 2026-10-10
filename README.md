@@ -46,7 +46,7 @@ Run `devgraph --help` or `devgraph <command> --help` for the complete, current i
 | Task | Command |
 |---|---|
 | Register and initially index a repository | `devgraph register [path] [--full]` |
-| Refresh source and reconcile git history | `devgraph rescan <repo_id> [--full]` |
+| Refresh source and reconcile git history | `devgraph rescan <repo_id> [--full] [--force]` |
 | Inspect registered repositories | `devgraph list`, `devgraph info <repo_id>`, `devgraph stats [repo_id]` |
 | Check installation and graph health | `devgraph status`, `devgraph doctor`, `devgraph self-test [repo_id]` |
 | Recompute communities, key nodes and bridges | `devgraph insights <repo_id>` |
@@ -77,6 +77,8 @@ While the DevGraph agent (the tray app, or the headless agent in a container) is
 - **After a git operation** (checkout, pull, merge, reset, stash), DevGraph checks the repository again a couple of seconds later, in case the operating system dropped some of the change notifications for a large checkout.
 - **Git history** (commits, the files each one changed, and each module's recency) is brought up to date right after each of those checks: after a git operation, on start or resume, and on a retry. So a commit made while DevGraph was off, or just before it was stopped or paused, is picked up when it starts again. A repository registered without `--full` gets its history the first time the agent checks it, and live updates wait until that read finishes: about a minute and a half for 400 commits, several minutes for thousands. The log says so when it starts (`Reading the git history of <repo> for the first time (N commits); live updates resume when it finishes`); registering with `--full` reads it up front instead.
 - **If an update fails** (for example Neo4j is down), DevGraph logs `Couldn't update <repo>; DevGraph will retry, or run "devgraph rescan <repo>"`, tries again 30 seconds later, and again as soon as Neo4j comes back. While it keeps failing, the warning is repeated every few minutes rather than on every attempt.
+
+- **If a repository's folder is missing or unreadable** (an unmounted drive, a moved folder), nothing in the graph is changed: `devgraph rescan` exits non-zero with `repository folder not found: <path>; nothing was changed`, the agent logs one warning and skips that repository until it restarts, and the dashboard's repository list and `devgraph doctor` mark it as path missing. A folder that exists but has no indexable files while the graph still has files for it (what a mount point with nothing mounted looks like) is refused the same way; if the files really are gone, `devgraph rescan <repo_id> --force` prunes them.
 
 While a check like this runs, the tray icon's tooltip reads `DevGraph (catching up)` and the dashboard's Entities card shows `Catching up…` instead of `Live`. The log says what it found, for example `Caught up on myrepo: 12 files updated, 3 removed (4.1 s)`. A dashboard opened in the middle of a check doesn't show it.
 

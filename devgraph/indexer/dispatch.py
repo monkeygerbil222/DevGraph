@@ -64,6 +64,7 @@ from devgraph.indexer.schema_constraints import (
 )
 # Re-exported under their pre-walk.py names for the watcher and existing callers.
 from devgraph.indexer.walk import IGNORED_DIR_NAMES as IGNORED_DIR_NAMES
+from devgraph.indexer.walk import RepoRootEmpty, check_repo_root
 from devgraph.indexer.walk import indexable_paths as _indexable_paths
 from devgraph.indexer.walk import indexable_paths_under
 from devgraph.indexer.walk import is_ignored_dir_name as is_ignored_dir_name
@@ -1501,7 +1502,12 @@ def remove_paths(engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[
 
     Returns:
         Number of paths whose provenance was cleaned up.
+
+    Raises:
+        RepoRootUnavailable: The root itself is missing or unreadable (an
+            unmount can report every file gone); nothing is removed.
     """
+    check_repo_root(repo_root)
     keys = {key for p in paths if (key := _gone_key(repo_root, Path(p))) is not None and key != "."}
     if not keys:
         return 0
@@ -1553,6 +1559,7 @@ def prune_stale_files(
     repo_root: Path,
     docs_path: str | None = None,
     mentions_enabled: bool = False,
+    force: bool = False,
 ) -> int:
     """Delete graph nodes whose file no longer exists on disk.
 
@@ -1577,8 +1584,19 @@ def prune_stale_files(
     written again under their repo-relative path by the scan or catch-up
     that follows.
 
+    A root that is missing or unreadable raises `RepoRootUnavailable`, and
+    one holding no indexable file while the graph has files for it (a mount
+    point with nothing mounted) raises `RepoRootEmpty` unless `force`; either
+    way before anything is deleted.
+
     Returns the number of files pruned.
     """
+    check_repo_root(repo_root)
+    on_disk = {rel for _, rel in _keyed_indexable_paths(repo_root, keep_ignored_targets=True)}
+    if not on_disk and not force:
+        graph_files = _graph_files(engine, repo_id, repo_root)
+        if graph_files:
+            raise RepoRootEmpty(repo_root, repo_id, len(graph_files))
     bare = engine.delete_bare_modules(repo_id)
     if bare:
         logger.info("removed %d leftover module nodes with no file behind them from %s", bare, repo_id)
@@ -1589,7 +1607,6 @@ def prune_stale_files(
         misplaced = engine.delete_docs_notes_outside(repo_id, docs_folder)
         if misplaced:
             logger.info("removed %d docs notes keyed outside %s from %s", misplaced, docs_folder, repo_id)
-    on_disk = {rel for _, rel in _keyed_indexable_paths(repo_root, keep_ignored_targets=True)}
     stale = _graph_files(engine, repo_id, repo_root) - on_disk
     if not stale:
         return 0
@@ -1669,6 +1686,7 @@ def catch_up(
     since: datetime,
     docs_path: str | None = None,
     mentions_enabled: bool = False,
+    force: bool = False,
 ) -> CatchUp:
     """Bring the graph up to date with changes made since `since`, while
     nothing was watching: an incremental `full_scan`.
@@ -1682,11 +1700,19 @@ def catch_up(
 
     An index older than `INDEX_FORMAT` gets a `full_scan` instead, which
     upgrades it.
+
+    A missing, unreadable or apparently unmounted root is refused as
+    `prune_stale_files` refuses it (`force` as there), before any change.
     """
+    check_repo_root(repo_root)
     if index_outdated(engine, repo_id):
-        indexed = full_scan(engine, repo_id, repo_root, docs_path=docs_path, mentions_enabled=mentions_enabled)
+        indexed = full_scan(
+            engine, repo_id, repo_root, docs_path=docs_path, mentions_enabled=mentions_enabled, force=force
+        )
         return CatchUp(indexed=indexed, pruned=0, checked=0, offered=0, unknown=0)
-    pruned = prune_stale_files(engine, repo_id, repo_root, docs_path=docs_path, mentions_enabled=mentions_enabled)
+    pruned = prune_stale_files(
+        engine, repo_id, repo_root, docs_path=docs_path, mentions_enabled=mentions_enabled, force=force
+    )
     specs = _applied_provider_specs(engine, repo_id, repo_root)
     known = _graph_files(engine, repo_id, repo_root, specs)
     docs_root = (repo_root / docs_path).resolve() if docs_path else None
@@ -1719,7 +1745,14 @@ def catch_up(
     return CatchUp(indexed=indexed, pruned=pruned, checked=len(walked), offered=len(due), unknown=unknown)
 
 
-def full_scan(engine: GraphEngine, repo_id: str, repo_root: Path, docs_path: str | None = None, mentions_enabled: bool = False) -> int:
+def full_scan(
+    engine: GraphEngine,
+    repo_id: str,
+    repo_root: Path,
+    docs_path: str | None = None,
+    mentions_enabled: bool = False,
+    force: bool = False,
+) -> int:
     """Walk every file under repo_root and index it, skipping VCS/build/venv noise. Used by `devgraph add`/`rescan`.
 
     Reconciles the graph to disk before indexing: any file the graph has
@@ -1734,9 +1767,13 @@ def full_scan(engine: GraphEngine, repo_id: str, repo_root: Path, docs_path: str
 
     The docs read cache forgets the repository first: the scan reads every
     docs file again, and a schema change is applied this way.
+
+    A missing, unreadable or apparently unmounted root is refused as
+    `prune_stale_files` refuses it (`force` as there), before any change.
     """
+    check_repo_root(repo_root)
     docs_cache.forget(repo_root)
-    prune_stale_files(engine, repo_id, repo_root, docs_path=docs_path, mentions_enabled=mentions_enabled)
+    prune_stale_files(engine, repo_id, repo_root, docs_path=docs_path, mentions_enabled=mentions_enabled, force=force)
     all_files = _indexable_paths(repo_root)
     applied, applied_docs = _apply_project_schema(engine, repo_id, repo_root)
     indexed = index_paths(

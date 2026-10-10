@@ -1976,3 +1976,55 @@ def test_generated_mcp_command_ignores_devgraph_package_in_working_directory(tmp
     assert safe.returncode != 0
     assert "ServiceUnavailable" in safe.stderr  # reached the real server
     assert str(workdir) not in safe.stderr
+
+
+def test_cli_rescan_refuses_a_missing_or_empty_repo_folder(runner, temp_registry_db, tmp_path, purge_registered_repos):
+    """A missing folder (a moved repo, an unmounted drive) or an empty one (a
+    mount point with nothing mounted) never wipes the repository's graph."""
+    import shutil
+
+    from devgraph.cli import main as cli_main
+    from devgraph.graph.engine import GraphEngine
+
+    db_path, registry = temp_registry_db
+    root = tmp_path / "widget"
+    root.mkdir()
+    subprocess.run(["git", "init"], cwd=root, capture_output=True, check=True)
+    (root / "widget.py").write_text("class Widget:\n    pass\n")
+    repo_id = registry.add_repo(root).repo_id
+    registry.close()
+
+    def rescan(*args):
+        with patch.object(config_module, "get_settings", return_value=_mock_settings(db_path)), \
+             patch.object(cli_main, "get_settings", return_value=_mock_settings(db_path)):
+            return runner.invoke(app, ["rescan", repo_id, *args])
+
+    engine = GraphEngine("bolt://127.0.0.1:7687", "neo4j", "devgraph-local-dev")
+
+    def nodes():
+        return engine.run_cypher("MATCH (n {repo_id: $r}) RETURN count(n) AS c", {"r": repo_id})[0]["c"]
+
+    try:
+        config_module.get_settings.cache_clear()
+        assert rescan().exit_code == 0
+        before = nodes()
+        assert before > 1
+
+        shutil.rmtree(root)
+        missing = rescan()
+        assert missing.exit_code == 1
+        assert f"repository folder not found: {root}; nothing was changed" in " ".join(missing.stdout.split())
+        assert "[OK]" not in missing.stdout
+        assert nodes() == before
+
+        root.mkdir()
+        empty = rescan()
+        assert empty.exit_code == 1
+        assert "no indexable files" in empty.stdout and "--force" in empty.stdout
+        assert nodes() == before
+
+        forced = rescan("--force")
+        assert forced.exit_code == 0, forced.stdout
+        assert nodes() < before
+    finally:
+        engine.close()
