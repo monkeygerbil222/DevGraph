@@ -95,14 +95,25 @@ agree):
   a Module seeks `dir`; a suffix pin seeks `basename` and keeps the paths ending
   with it. The row's `to_name` is then that seek key (the directory or the
   basename), and the Module's own path is what relink pins.
+- **A file's imports collapse like one call.** Every `IMPORTS` edge of a file
+  ends at a Module, so its imports by path (unpinned, no confidence, as
+  before) and its Module pins form one set (`calls.import_rows`): a pin leaves
+  out what a path import or a stronger pin matches, and the file itself.
+  Relink rebuilds the set from the file's `IMPORTS` entries.
 - **`no_self`** on a row adds `a <> b`: a call `x.m()` on an untyped receiver
   inside a method `m` never links the method to itself. A collapsed row has it
   only when every one of its call sites had it.
 
-`name_refs` keeps its format (pins are strings). An entry's confidence is no
-longer stored as one value for all its pins: relink derives each pin's from
-its kind. `find_name_refs` also looks for Module entries by an added Module's
-`dir` and `basename`.
+`name_refs` keeps its format (pins are strings). A pinned entry no longer
+stores one confidence for all its pins: its confidence field is `pin` when its
+edges carry one, and relink gives each pin its kind's (`common.best_pin`
+picks the strongest pin matching the added file, as the writer's `exclude`
+did). Relink also looks for Module entries by an added Module's `dir` and
+`basename`.
+
+Until the resolvers write them, the graph-accuracy fuzz writes path pins of
+every kind from `# pin` comments in its Python files, and the relink
+benchmark runs with pinned entries too.
 
 ## Shared extractor pieces (`devgraph/indexer/calls.py`)
 

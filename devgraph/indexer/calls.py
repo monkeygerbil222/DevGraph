@@ -8,9 +8,10 @@ module turns that into rows, so every language writes them the same way.
 
 from __future__ import annotations
 
-from devgraph.indexer.common import GraphRelationship
+from devgraph.graph.schema import PIN_CONFIDENCE, pin_kind
+from devgraph.indexer.common import GraphRelationship, module_pin_name, pin_excludes
 
-__all__ = ["STOP_METHODS", "STOP_TYPES", "call_rows"]
+__all__ = ["STOP_METHODS", "STOP_TYPES", "call_rows", "import_rows"]
 
 _JS_METHODS = frozenset({
     # Array
@@ -165,26 +166,52 @@ def call_rows(
 ) -> list[GraphRelationship]:
     """One caller's CALLS rows to one callee name, every call site to it
     collapsed together, so no two rows can meet in one edge with different
-    properties: a row per file pin ("resolved"), a row per package directory
-    ("package", leaving out the file pins and this file), or else, when no
-    call site resolved, one bare-name row ("name"). `caller_class` is the
-    least of the call sites' enclosing classes. `no_self` (every bare call
-    site was a member call on an untyped receiver) keeps the bare row off the
-    caller itself."""
+    properties: a row per pin, highest precedence first, whose confidence is
+    its kind's (graph/schema.py `PIN_CONFIDENCE`) and which leaves out what a
+    stronger pin matches (`pin_excludes`); or else, when no call site
+    resolved, one bare-name row ("name"). `caller_class` is the least of the
+    call sites' enclosing classes. `no_self` (every bare call site was a
+    member call on an untyped receiver) keeps the bare row off the caller
+    itself."""
 
-    def row(to_file: str | None, confidence: str, exact: list[str] | None = None) -> GraphRelationship:
+    def row(to_file: str | None, confidence: str, exclude: list[str] | None = None) -> GraphRelationship:
         properties = {"confidence": confidence}
         if caller_class:
             properties["caller_class"] = caller_class
         return GraphRelationship(
             from_label=caller_label, from_name=caller_name, rel_type="CALLS", to_label="Function", to_name=name,
-            repo_id=repo_id, properties=properties, to_file=to_file, exact=exact,
+            repo_id=repo_id, properties=properties, to_file=to_file, exclude=exclude,
             no_self=no_self and to_file is None,
         )
 
-    files = sorted(pin for pin in pins if not pin.endswith("/"))
-    dirs = sorted(pin for pin in pins if pin.endswith("/"))
-    if not files and not dirs:
+    if not pins:
         return [row(None, "name")] if bare else []
-    excluded = sorted(set(files) | {file_path})
-    return [row(f, "resolved") for f in files] + [row(d, "package", excluded) for d in dirs]
+    return [
+        row(pin, PIN_CONFIDENCE[pin_kind(pin)], excluded or None)
+        for pin, excluded in pin_excludes(pins, file_path).items()
+    ]
+
+
+def import_rows(file_path: str, repo_id: str, files: set[str], pins: set[str]) -> list[GraphRelationship]:
+    """A file's IMPORTS rows: one to each Module path in `files` (by name, no
+    confidence, as every IMPORTS edge before path pins), and one per
+    directory or suffix pin in `pins`, sought by `module_pin_name`, with its
+    kind's confidence. A file's imports all end at Modules, so they collapse
+    together like one call's pins: each pin leaves out what a stronger pin,
+    or one of `files`, matches."""
+    rows = [
+        GraphRelationship(
+            from_label="Module", from_name=file_path, rel_type="IMPORTS", to_label="Module", to_name=target,
+            repo_id=repo_id,
+        )
+        for target in sorted(files - {file_path})
+    ]
+    for pin, excluded in pin_excludes(files | pins, file_path).items():
+        if pin in pins and pin not in files:
+            rows.append(GraphRelationship(
+                from_label="Module", from_name=file_path, rel_type="IMPORTS", to_label="Module",
+                to_name=module_pin_name(pin), repo_id=repo_id, properties={"confidence": PIN_CONFIDENCE[pin_kind(pin)]},
+                to_file=pin, exclude=sorted(set(excluded) | {file_path}),
+            ))
+    return rows
+

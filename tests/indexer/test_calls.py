@@ -8,7 +8,7 @@ from devgraph.indexer.calls import STOP_METHODS, STOP_TYPES, call_rows
 
 def rows(pins, bare=False, no_self=False, caller_class=None):
     return [
-        (r.to_file, r.properties["confidence"], r.exact, r.no_self, r.properties.get("caller_class"))
+        (r.to_file, r.properties["confidence"], r.exclude, r.no_self, r.properties.get("caller_class"))
         for r in call_rows("Function", "main", "f", set(pins), bare, caller_class, "app/main.ts", "repo", no_self)
     ]
 

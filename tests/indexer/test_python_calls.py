@@ -276,7 +276,7 @@ def test_a_resolved_call_suppresses_the_bare_row_of_the_same_name():
 def test_a_package_row_leaves_out_the_exact_files_and_this_file():
     result = extract_python_file("from pkg import f\n\n\ndef g():\n    f()\n", "pkg/user.py", "repo")
     (prefix,) = [r for r in result.relationships if r.rel_type == "CALLS" and r.to_file == "pkg/"]
-    assert prefix.exact == sorted({"pkg.py", "pkg/__init__.py", "pkg/pkg.py", "pkg/pkg/__init__.py", "pkg/user.py"})
+    assert prefix.exclude == sorted({"pkg.py", "pkg/__init__.py", "pkg/pkg.py", "pkg/pkg/__init__.py", "pkg/user.py"})
 
 
 def test_call_sites_collapse_to_one_caller_class_per_callee():
@@ -392,7 +392,7 @@ def test_the_index_upgrade_replaces_bare_python_calls(engine, repo_id, tmp_path,
         result = real(content, rel_path, repo_id)
         for rel in result.relationships:
             if rel.rel_type == "CALLS":
-                rel.to_file, rel.exact, rel.properties = None, None, None
+                rel.to_file, rel.exclude, rel.properties = None, None, None
         return result
 
     with monkeypatch.context() as old_extractor:

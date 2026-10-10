@@ -13,6 +13,12 @@ aliased, relative and star imports, a package re-exporting from its module,
 a src/ layout, calls through modules, aliases and untyped values, and
 `self.shared()` reaching a base in the same or another file.
 
+Path pins (docs/superpowers/specs/2026-10-11-nonpython-call-resolution-design.md)
+are fuzzed ahead of the resolvers that write them: a Python file's
+`# pin calls <name> <pin>` and `# pin imports <pin>` comments become its
+Module's pinned CALLS and IMPORTS rows (`_with_pin_comments`), so every pin
+kind is written, relinked and removed as files come and go.
+
 The spec's "Out of scope" gaps are left out by construction:
 - compose services have `image:` only, never `build:`;
 - no datastore or route code (so no handler stub either);
@@ -34,6 +40,8 @@ from dataclasses import dataclass, field, replace
 import pytest
 
 from devgraph.graph.engine import GraphEngine, provision_repository_schema
+from devgraph.indexer import dispatch
+from devgraph.indexer.calls import call_rows, import_rows
 from devgraph.indexer.dispatch import full_scan, index_paths, remove_paths
 from tests.watcher.live_helpers import fresh_snapshot, graph_snapshot, snapshot_diff
 
@@ -82,12 +90,13 @@ class File:
     mentions: list = field(default_factory=list)
     links: list = field(default_factory=list)
     supersedes: str | None = None
+    pins: list = field(default_factory=list)  # py: "calls <name> <pin>" / "imports <pin>"
 
     def copy(self):
         return replace(
             self, imports=list(self.imports), bases=dict(self.bases),
             funcs={k: list(v) for k, v in self.funcs.items()}, services=dict(self.services),
-            froms=list(self.froms), mentions=list(self.mentions), links=list(self.links),
+            froms=list(self.froms), mentions=list(self.mentions), links=list(self.links), pins=list(self.pins),
         )
 
 
@@ -102,7 +111,7 @@ def render(f: File) -> str:
     if f.kind == "py":
         # A Python file's imports are whole statements and its calls whole
         # call expressions (`helper()`, `b.helper()`, `obj.helper()`).
-        parts = [f"{m}\n" for m in f.imports]
+        parts = [f"{m}\n" for m in f.imports] + [f"# pin {p}\n" for p in f.pins]
         parts += [py_class(c, b) for c, b in f.bases.items()]
         parts += [
             f"\n\ndef {name}():\n" + "".join(f"    {g}\n" for g in calls) + "    return 0\n"
@@ -204,6 +213,9 @@ BASES = {"py": ["Base", "Child", "Foo", "Missing", "b.Base", "pkg.impl.Base"], "
 # How a Python call to `{n}` is written: bare, through a module or alias, on
 # an untyped value, on `self`, or on a literal.
 PY_CALLS = ["{n}()", "b.{n}()", "c.{n}()", "obj.{n}()", "pkg.impl.{n}()", "alias.{n}()", "self.{n}()", "''.{n}()"]
+# Path pins of every kind over the fuzz's own paths (renames add `_rN` to a stem).
+CALL_PINS = ["py/.", ".", "pkg/.!other.py", "/b.py", "/lib/util.py", "/py/.", "/lib/.", "src/", "pkg/", "py/b.py"]
+IMPORT_PINS = ["py/.", "pkg/.", ".", "src/lib/.!core.py", "/b.py", "/util.py", "/impl.py"]
 SERVICES = ["api", "web", "worker", "db"]
 IMAGES = ["python:3.12", "nginx:1.27", "postgres:16", "alpine:3.20"]
 EXTRA_NAMES = ["Foo", "Display", "Server", "K", "Child", "python", "postgres", "py/b.py", "missing"]
@@ -282,6 +294,24 @@ class Fuzz:
         i = self.rng.randrange(len(f.imports))
         old, f.imports[i] = f.imports[i], self.rng.choice([m for m in IMPORTS["py"] if m not in f.imports])
         return f"switch import {old!r} to {f.imports[i]!r} in {path}", {path}
+
+    def op_pin(self):
+        """Add or remove one of a Python file's pin comments."""
+        path = self._pick(lambda f: f.kind == "py")
+        if not path:
+            return None
+        pins = self.files[path].pins
+        if pins and self.rng.random() < 0.4:
+            gone = pins.pop(self.rng.randrange(len(pins)))
+            return f"remove pin {gone!r} in {path}", {path}
+        if self.rng.random() < 0.6:
+            new = f"calls {self.rng.choice(self._func_names())} {self.rng.choice(CALL_PINS)}"
+        else:
+            new = f"imports {self.rng.choice(IMPORT_PINS)}"
+        if new in pins:
+            return None
+        pins.append(new)
+        return f"add pin {new!r} in {path}", {path}
 
     def op_impl(self):
         path = self._pick(lambda f: f.impl is not None)
@@ -404,7 +434,7 @@ class Fuzz:
 
     OPS = [
         "call", "base", "import", "import_style", "impl", "add_function", "remove_function", "move_function",
-        "rename", "delete", "restore", "service", "from", "mention", "link", "supersedes",
+        "rename", "delete", "restore", "service", "from", "mention", "link", "supersedes", "pin", "pin",
     ]
 
     def draw(self):
@@ -421,6 +451,37 @@ class Fuzz:
                 path.write_text(render(self.files[rel]))
             elif path.exists():
                 path.unlink()
+
+
+@pytest.fixture(autouse=True)
+def _with_pin_comments(monkeypatch):
+    """A Python file's `# pin` comments as its Module's pinned rows: calls
+    collapse per callee (calls.call_rows), imports per file (calls.import_rows)."""
+    real = dispatch.extract_python_file
+
+    def extract(content, rel_path, repo_id):
+        result = real(content, rel_path, repo_id)
+        calls: dict[str, set] = {}
+        imports: set = set()
+        for line in content.splitlines():
+            words = line.split()
+            if words[:3] == ["#", "pin", "calls"]:
+                calls.setdefault(words[3], set()).add(words[4])
+            elif words[:3] == ["#", "pin", "imports"]:
+                imports.add(words[3])
+        rows = [row for name, pins in sorted(calls.items())
+                for row in call_rows("Module", rel_path, name, pins, False, None, rel_path, repo_id)]
+        # The file's own imports by path join its pinned ones, as a resolver
+        # writing both would collapse them.
+        own = {r.to_name for r in result.relationships if r.rel_type == "IMPORTS"}
+        result.relationships = [r for r in result.relationships if r.rel_type != "IMPORTS"]
+        rows += import_rows(rel_path, repo_id, own, imports)
+        for row in rows:
+            row.origin = rel_path
+        result.relationships += rows
+        return result
+
+    monkeypatch.setattr(dispatch, "extract_python_file", extract)
 
 
 def check(engine, repo_id, root, seed, step, log):

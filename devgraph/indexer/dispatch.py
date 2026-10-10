@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import os
+import posixpath
 import re
 import sys
 from collections import Counter
@@ -40,7 +41,13 @@ from devgraph.config.project_schema import (
 from devgraph.graph.engine import ABORTS_BATCH, GraphEngine, provision_repository_schema
 from devgraph.graph.schema import FILE_SCOPED_LABELS, NODE_LABELS, RELATIONSHIP_TYPES
 from devgraph.indexer.apis.extractor import APIExtractor
-from devgraph.indexer.common import name_ref_properties, parse_name_ref
+from devgraph.indexer.common import (
+    best_pin,
+    name_ref_properties,
+    parse_name_ref,
+    pin_confidence,
+    pin_excludes,
+)
 from devgraph.indexer.containers.extractor import ContainerExtractor, ExtractionResult
 from devgraph.indexer.datastores.extractor import DatastoreExtractor
 from devgraph.indexer.docs.extractor import DocsExtractor
@@ -1319,46 +1326,67 @@ def _relink_name_refs(
     by file. Its edges to same-named nodes that were already there exist
     (they were written when the file was indexed, or relinked when that node
     was added), and a bare-name match can't use the file-keyed index. An
-    entry with target pins relinks only an added node its pins name: one of
-    its files, or a file under one of its package directories that is not
-    one of its files or the origin's own (a "package" edge). Each edge gets
-    back the entry's `caller_class` and `confidence`.
+    entry with target pins relinks only an added node a pin of its links
+    (common.best_pin: the strongest pin that matches its file, as the
+    writer's rows leave out what a stronger pin matches), with that pin's
+    confidence. A pinned Module target is found by an added Module's
+    directory or basename (the row's `to_name`, see common.module_pin_name)
+    and relinked by its path. Each edge gets back the entry's `caller_class`.
     """
     if not added:
         return
     pinned: dict[tuple[str, str], set[str | None]] = {}
+    modules: set[str] = set()
     for label, name, file in added:
         pinned.setdefault((label, name), set()).add(file if label in FILE_SCOPED_LABELS else None)
+        if label == "Module":
+            modules.add(name)
     rels = []
 
-    def relink(origin, fields, from_file, to_file, confidence, exact=()):
-        rel_type, from_label, from_name, _from_file, to_label, to_name, caller_class = fields
+    def relink(origin, fields, from_file, to_file, confidence, exclude=(), to_name=None):
+        rel_type, from_label, from_name, _from_file, to_label, field_to_name, caller_class = fields
         properties = {key: value for key, value in (("caller_class", caller_class), ("confidence", confidence)) if value}
         rels.append({
             "from_label": from_label, "from_name": from_name, "rel_type": rel_type,
-            "to_label": to_label, "to_name": to_name, "repo_id": repo_id,
+            "to_label": to_label, "to_name": to_name or field_to_name, "repo_id": repo_id,
             "properties": properties or None,
-            "from_file": from_file or None, "to_file": to_file, "origin": origin, "exact": sorted(exact),
+            "from_file": from_file or None, "to_file": to_file, "origin": origin, "exclude": list(exclude),
         })
 
-    names = sorted({name for _label, name in pinned})
-    for origin, refs in engine.find_name_refs(repo_id, names, sorted(skip)):
-        for entry in refs:
-            fields, pins, confidence = parse_name_ref(entry)
+    names = {name for _label, name in pinned}
+    names |= {posixpath.dirname(module) for module in modules} | {posixpath.basename(module) for module in modules}
+    for origin, refs in engine.find_name_refs(repo_id, sorted(names), sorted(skip)):
+        parsed = [parse_name_ref(entry) for entry in refs]
+        # Every Module a source imports, by path or by pin, as calls.import_rows
+        # collapsed them: a pinned Module target leaves out what a stronger
+        # one of them matches.
+        imported: dict[tuple, set[str]] = {}
+        for fields, pins, _confidence in parsed:
+            if fields[4] == "Module":
+                imported.setdefault(tuple(fields[:4]), set()).update(pins if pins is not None else [fields[5]])
+        for fields, pins, confidence in parsed:
             _rel_type, from_label, from_name, from_file, to_label, to_name, _caller_class = fields
-            exact = {pin for pin in pins or () if not pin.endswith("/")}
-            prefixes = [pin for pin in pins or () if pin.endswith("/")]
-            for to_file in pinned.get((to_label, to_name), ()):
-                if pins is None or to_file in exact:
+            if pins is None:
+                for to_file in pinned.get((to_label, to_name), ()):
                     relink(origin, fields, from_file, to_file, confidence)
-                elif to_file and to_file != origin and any(to_file.startswith(prefix) for prefix in prefixes):
-                    relink(origin, fields, from_file, to_file, "package")
+            elif to_label == "Module":
+                # A directory or suffix pin: to_name is what it seeks.
+                for module in sorted(modules):
+                    if to_name in (posixpath.dirname(module), posixpath.basename(module)):
+                        pin = best_pin(imported[tuple(fields[:4])], module, origin)
+                        if pin in pins:
+                            relink(origin, fields, from_file, None, pin_confidence(pin, confidence), to_name=module)
+            else:
+                for to_file in pinned.get((to_label, to_name), ()):
+                    pin = best_pin(pins, to_file or "", origin) if to_file is not None else None
+                    if pin is not None:
+                        relink(origin, fields, from_file, to_file, pin_confidence(pin, confidence))
             if not from_file and from_label != "Module":
+                excludes = pin_excludes(pins, origin) if pins is not None else {None: ()}
                 for source_file in pinned.get((from_label, from_name), ()):
-                    for to_file in pins if pins is not None else [None]:
-                        prefix = to_file is not None and to_file.endswith("/")
-                        relink(origin, fields, source_file, to_file, "package" if prefix else confidence,
-                               exact | {origin} if prefix else ())
+                    for to_file, exclude in excludes.items():
+                        conf = confidence if to_file is None else pin_confidence(to_file, confidence)
+                        relink(origin, fields, source_file, to_file, conf, exclude)
     if rels:
         engine.upsert_relationships(rels)
 
