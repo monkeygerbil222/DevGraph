@@ -370,3 +370,17 @@ class TestIndexesStillBuilding:
         assert any("db.awaitIndexes" in q for q in queries), queries[-3:]
         rows = engine.run_cypher("SHOW INDEXES YIELD name, state WHERE name = 'class_repo_file_lookup' RETURN state")
         assert [r["state"] for r in rows] == ["ONLINE"]
+
+
+def test_init_schema_without_wait_does_not_await_the_indexes(engine, monkeypatch):
+    queries = []
+    original = neo4j.Session.run
+
+    def run(self, query, *args, **kwargs):
+        queries.append(query)
+        return original(self, query, *args, **kwargs)
+
+    monkeypatch.setattr(neo4j.Session, "run", run)
+    engine.init_schema(wait=False)
+    monkeypatch.undo()
+    assert queries and not any("db.awaitIndexes" in q for q in queries)

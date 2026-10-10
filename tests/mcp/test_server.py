@@ -179,3 +179,22 @@ class TestServerToolCall:
             assert all(item["repo_id"] == "_smoketest_mcp_server" for item in payload)
         finally:
             seeded_graph.delete_repository("_smoketest_mcp_server_b")
+
+
+def test_mcp_startup_does_not_wait_for_the_graph_indexes():
+    """An MCP client's handshake times out in about 30 s; building the
+    indexes of an upgraded database can take minutes. The server provisions
+    them without waiting, and its queries wait for an index on their own."""
+    from unittest.mock import MagicMock, patch
+
+    from devgraph.mcp import server as server_module
+
+    with patch.object(server_module, "get_settings", return_value=MagicMock()), \
+         patch.object(server_module, "GraphEngine") as engine_cls, \
+         patch.object(server_module, "RepoRegistry"), \
+         patch.object(server_module, "lifecycle"), \
+         patch.object(server_module, "resolve_session_repo", return_value=(None, None)), \
+         patch.object(server_module, "build_server"), \
+         patch.object(server_module.anyio, "run"):
+        server_module.main()
+    engine_cls.return_value.init_schema.assert_called_once_with(wait=False)

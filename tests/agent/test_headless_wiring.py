@@ -59,31 +59,46 @@ def test_a_first_sync_says_live_updates_wait_for_it(caplog):
     ) in logs
 
 
-def _start_order(agent, module):
+def test_start_returns_to_signal_handling_while_the_indexes_build():
+    """`start` waits on the stop event, where a signal can stop the agent,
+    while another thread provisions the indexes and only then watches."""
+    import threading
+
+    agent = _agent()
+    release = threading.Event()
+    order = []
+
+    def init_schema():
+        release.wait(5)
+        order.append("schema")
+
+    agent._engine.init_schema.side_effect = init_schema
+    agent._watcher.start.side_effect = lambda: order.append("watch")
+    agent._settings.dashboard_enabled = False
+    agent._health_check_loop = lambda: None
+    started = threading.Thread(target=agent.start, daemon=True)
+    started.start()
+    assert not agent._stop_event.wait(0.2) and order == []
+    agent._stop_event.set()  # what the signal handler's stop() does
+    started.join(5)
+    assert not started.is_alive() and order == []
+    release.set()
+
+
+def test_the_watcher_starts_once_the_indexes_are_built():
+    agent = _agent()
     order = []
     agent._engine.init_schema.side_effect = lambda: order.append("schema")
     agent._watcher.start.side_effect = lambda: order.append("watch")
-    agent._settings.dashboard_enabled = False
-    agent._stop_event.set()
-    with patch(f"{module}.threading.Thread"):
-        agent.start()
-    return order
-
-
-def test_start_provisions_the_graph_indexes_before_watching():
-    """An upgraded agent creates (and waits for) the built-in indexes before
-    its first catch-up, not only when an MCP server happens to start."""
-    assert _start_order(_agent(), "devgraph.agent.headless")[:2] == ["schema", "watch"]
+    agent._start_watching()
+    assert order == ["schema", "watch"]
 
 
 def test_a_schema_failure_at_start_is_retried_when_neo4j_recovers():
     agent = _agent()
     agent._engine.init_schema.side_effect = RuntimeError("Neo4j down")
-    agent._settings.dashboard_enabled = False
-    agent._stop_event.set()
-    with patch("devgraph.agent.headless.threading.Thread"):
-        agent.start()  # does not raise
-    agent._stop_event.clear()
+    agent._start_watching()  # does not raise, and still starts watching
+    agent._watcher.start.assert_called_once_with()
     agent._engine.init_schema.side_effect = None
     agent._engine.init_schema.reset_mock()
     agent._healthy = False

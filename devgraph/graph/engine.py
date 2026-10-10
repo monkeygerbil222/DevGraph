@@ -941,7 +941,7 @@ class GraphEngine:
     def verify_connectivity(self) -> None:
         _retry_transient(self._driver.verify_connectivity)
 
-    def init_schema(self, effective: EffectiveSchema | None = None) -> None:
+    def init_schema(self, effective: EffectiveSchema | None = None, wait: bool = True) -> None:
         """Provision the built-in constraints, plus a repository's declared ones.
 
         Idempotent (every statement is `IF NOT EXISTS`/`IF EXISTS` guarded), so
@@ -953,10 +953,14 @@ class GraphEngine:
         lookup indexes follow, and it returns once every index is ONLINE (up
         to INDEX_WAIT_S): an upgraded database builds new ones in the
         background, and a query hinted to seek one fails until it is built.
+        `wait=False` returns at once (the MCP server, whose client's handshake
+        would time out first); each query still waits for its index then.
         """
         with self._driver.session() as session:
             for stmt in repository_constraint_statements(effective) + lookup_index_statements():
                 _retry_transient(session.run, stmt)
+            if not wait:
+                return
             building = [
                 record["name"] for record in _retry_transient(
                     session.run, "SHOW INDEXES YIELD name, state WHERE state <> 'ONLINE' RETURN name"

@@ -1346,7 +1346,9 @@ def test_name_ref_relink_benchmark(engine, repo_id, monkeypatch):
     expected = sum(len(set(m["properties"]["name_ref_targets"]) & set(added_names)) for m in modules)
     assert expected > 0 and row["n"] == expected
     if not os.environ.get("CI"):
-        assert elapsed < 2.0
+        # About 1.3 s alone and over 2 s with another suite sharing Neo4j; the
+        # stale-statistics plan it guards against took 20 s.
+        assert elapsed < 4.0
         return
 
     def operators(plan):

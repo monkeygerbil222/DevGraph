@@ -872,7 +872,9 @@ def main() -> None:
     settings = get_settings()
     engine = GraphEngine(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password)
     engine.verify_connectivity()
-    engine.init_schema()
+    # Not waiting for indexes an upgrade is still building: that can outlast
+    # the client's handshake timeout, and each query waits for its own.
+    engine.init_schema(wait=False)
     registry = RepoRegistry(settings.registry_db_path)
 
     try:

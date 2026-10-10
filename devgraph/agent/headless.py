@@ -79,6 +79,7 @@ class HeadlessAgent:
         )
         self._healthy = True
         self._schema_ready = False
+        self._preparing = False
         self._stop_event = threading.Event()
         self._last_seen_registry_change = self._registry.last_changed_at()
         self._schema_rescans = SchemaRescanScheduler(
@@ -147,13 +148,27 @@ class HeadlessAgent:
                 return  # the engine refuses new sessions once shutdown closes it
             logger.warning("could not provision the graph schema; retrying when Neo4j is reachable", exc_info=True)
 
+    def _start_watching(self) -> None:
+        """Provision the graph indexes and wait for them, then start the
+        watcher and the schedulers. Run on its own thread from `start`, so
+        an upgrade's index build (up to minutes) never holds up signal handling."""
+        try:
+            self._provision_schema()
+        finally:
+            self._preparing = False
+        if self._stop_event.is_set():
+            return
+        self._watcher.start()
+        self._schema_rescans.start()
+        self._insights.start()
+
     def _health_check_loop(self) -> None:
         while not self._stop_event.is_set():
             try:
                 self._engine.verify_connectivity()
                 recovered = not self._healthy
                 self._healthy = True
-                if not self._schema_ready:
+                if not self._schema_ready and not self._preparing:
                     self._provision_schema()
                 if recovered:
                     self._sync.retry_failed()
@@ -232,10 +247,8 @@ class HeadlessAgent:
         self._registry.close()
 
     def start(self) -> None:
-        self._provision_schema()
-        self._watcher.start()
-        self._schema_rescans.start()
-        self._insights.start()
+        self._preparing = True
+        threading.Thread(target=self._start_watching, daemon=True).start()
         health_thread = threading.Thread(target=self._health_check_loop, daemon=True)
         health_thread.start()
 
