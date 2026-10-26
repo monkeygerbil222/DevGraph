@@ -469,7 +469,7 @@ def rescan(
         console.print(f"[red][X] Error:[/red] {escape(str(e))}", soft_wrap=True)
         raise typer.Exit(code=1)
     except Exception as e:
-        console.print(f"[red][X] Error:[/red] {escape(str(e))}")
+        console.print(f"[red][X] Error:[/red] {escape(_neo4j_problem(e, get_settings()))}", soft_wrap=True)
         raise typer.Exit(code=1)
 
 
@@ -503,7 +503,7 @@ def insights(repo_id: str) -> None:
     except typer.Exit:
         raise
     except Exception as e:
-        console.print(f"[red][X] Error:[/red] {escape(str(e))}")
+        console.print(f"[red][X] Error:[/red] {escape(_neo4j_problem(e, get_settings()))}", soft_wrap=True)
         raise typer.Exit(code=1)
     console.print(
         f"[green][OK][/green] Insights for {escape(repo_id)}: {summary['community_count']} communities "
@@ -1980,7 +1980,11 @@ def mcp_add(
     """Register DevGraph as an MCP server for every Claude Code project (runs 'claude mcp add -s user')."""
     claude_path = shutil.which("claude")
     if claude_path is None:
-        console.print("[red][X] Error:[/red] 'claude' not found on PATH")
+        console.print(
+            "[red][X] Error:[/red] 'claude' not found on PATH. This command registers DevGraph with Claude Code; "
+            "for VS Code or another MCP client, 'devgraph client-config' prints the server entry to add.",
+            soft_wrap=True,
+        )
         raise typer.Exit(code=1)
     if not _run_claude_mcp_add(claude_path, resolve_venv_python(), resolve_repo_root(), replace=replace):
         raise typer.Exit(code=1)
@@ -2184,7 +2188,7 @@ def stats(
     try:
         engine.verify_connectivity()
     except Exception as e:
-        console.print(f"[red][X] Neo4j not reachable:[/red] {escape(str(e))}")
+        console.print(f"[red][X] Error:[/red] {escape(_neo4j_problem(e, settings))}", soft_wrap=True)
         raise typer.Exit(code=1)
 
     try:
@@ -2345,7 +2349,9 @@ _UPDATE_WAIT_PID = "DEVGRAPH_UPDATE_WAIT_PID"
 @app.command()
 def update(
     force: bool = typer.Option(
-        False, "--force", help="Allow update with a dirty working tree (stash first)."
+        False, "--force",
+        help="Skip the local-changes check. Nothing is stashed: git pull --ff-only still refuses "
+        "when a change touches a file it updates.",
     ),
     branch: str = typer.Option(
         "origin/master", "--branch", help="Remote branch to pull from."
@@ -3764,7 +3770,7 @@ def prune(
     try:
         engine.verify_connectivity()
     except Exception as e:
-        console.print(f"[red][X] Neo4j not reachable:[/red] {escape(str(e))}")
+        console.print(f"[red][X] Error:[/red] {escape(_neo4j_problem(e, settings))}", soft_wrap=True)
         raise typer.Exit(code=1)
 
     try:
@@ -3832,7 +3838,7 @@ def self_test(
     try:
         engine.verify_connectivity()
     except Exception as e:
-        console.print(f"[red][X] Neo4j not reachable:[/red] {escape(str(e))}")
+        console.print(f"[red][X] Error:[/red] {escape(_neo4j_problem(e, settings))}", soft_wrap=True)
         raise typer.Exit(code=1)
 
     registry = _get_registry()
@@ -3969,7 +3975,7 @@ def export(
     try:
         engine.verify_connectivity()
     except Exception as e:
-        console.print(f"[red][X] Neo4j not reachable:[/red] {escape(str(e))}")
+        console.print(f"[red][X] Error:[/red] {escape(_neo4j_problem(e, settings))}", soft_wrap=True)
         raise typer.Exit(code=1)
 
     try:
