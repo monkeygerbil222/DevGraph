@@ -8,9 +8,11 @@ read, never an optional convenience — see Design Brief Principle 3.
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import posixpath
+import random
 import threading
 import time
 from contextlib import contextmanager
@@ -20,7 +22,7 @@ from typing import TYPE_CHECKING, Any
 
 from neo4j import Driver, GraphDatabase, NotificationDisabledClassification, Query, READ_ACCESS, unit_of_work
 from neo4j.exceptions import (
-    ConnectionAcquisitionTimeoutError, Neo4jError, ServiceUnavailable, SessionExpired, TransientError,
+    ConnectionAcquisitionTimeoutError, DriverError, Neo4jError, ServiceUnavailable, SessionExpired, TransientError,
 )
 from neo4j.graph import Node, Relationship
 
@@ -742,6 +744,52 @@ def _wait_for_indexes(fn, *args, **kwargs):
             time.sleep(_INDEX_POLL_S)
 
 
+#: How long a managed transaction is retried after a transient error (a
+#: deadlock, a lock timeout) or an expired session (a cluster's leader
+#: switch): the driver's own default, which the engine's retry replaces.
+TRANSACTION_RETRY_S = 30.0
+
+#: How long it is retried after losing its connection to Neo4j (refused,
+#: dropped): every later try would most likely fail the same way, and an
+#: indexing batch then aborts with `Neo4jLost` within about this long, where
+#: the driver's retry made it wait about 31 s.
+CONNECTION_RETRY_S = 5.0
+
+#: The first pause before a retry, doubled after each one, as the driver's.
+_TRANSACTION_RETRY_DELAY_S = 1.0
+_TRANSACTION_RETRY_JITTER = 0.2
+
+
+def _managed_retry(call, *args, **kwargs):
+    """`call(*args, **kwargs)` (a session's `execute_read` or `execute_write`,
+    the driver's retry off), retried the way the driver would, after any
+    retryable error, for `TRANSACTION_RETRY_S` from the first failure, except
+    a lost connection (`ServiceUnavailable`), retried for `CONNECTION_RETRY_S`.
+    A pause never runs past the window."""
+    first_failure = None
+    delay = _TRANSACTION_RETRY_DELAY_S
+    while True:
+        try:
+            return call(*args, **kwargs)
+        except (DriverError, Neo4jError) as exc:
+            if not exc.is_retryable():
+                raise
+            now = time.monotonic()
+            if first_failure is None:
+                first_failure = now
+            window = CONNECTION_RETRY_S if isinstance(exc, ServiceUnavailable) else TRANSACTION_RETRY_S
+            remaining = first_failure + window - now
+            if remaining <= 0:
+                raise
+            pause = min(remaining, delay * (1 + random.uniform(-_TRANSACTION_RETRY_JITTER, _TRANSACTION_RETRY_JITTER)))
+            logger.log(
+                RETRY_LOG_LEVEL, "transaction failed, retrying in %.1f s: %s", pause, " ".join(str(exc).split())
+            )
+            time.sleep(pause)
+            delay *= 2
+            _new_try()  # a fail-fast read's deadline (see `_within`) restarts with the retry
+
+
 _BATCH_MARKER_STATEMENT = (
     "UNWIND $rows AS row MATCH (r:Repository {repo_id: row.repo_id}) "
     "SET r.batch_open = [t IN coalesce(r.batch_open, []) WHERE NOT t IN row.add AND NOT t IN row.remove] "
@@ -815,13 +863,18 @@ class _BatchMarkers:
 
 class _IndexWaitingSession:
     """A session whose queries wait for an index still being built (see
-    `_wait_for_indexes`), and whose write transactions carry the pending
-    `batch_open` marker changes (`_BatchMarkers`); everything else is the
-    driver's session."""
+    `_wait_for_indexes`), whose write transactions carry the pending
+    `batch_open` marker changes (`_BatchMarkers`), and whose transactions are
+    retried by `_managed_retry` when `retry` (a fail-fast engine's are not);
+    everything else is the driver's session."""
 
-    def __init__(self, session, markers: _BatchMarkers | None = None) -> None:
+    def __init__(self, session, markers: _BatchMarkers | None = None, retry: bool = False) -> None:
         self._session = session
         self._markers = markers
+        self._retry = retry
+
+    def _tried(self, call):
+        return functools.partial(_managed_retry, call) if self._retry else call
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._session, name)
@@ -832,7 +885,7 @@ class _IndexWaitingSession:
     def execute_write(self, fn, *args: Any, **kwargs: Any):
         rows, adds, removes = self._markers.take() if self._markers is not None else ([], {}, {})
         if not rows:
-            return _wait_for_indexes(self._session.execute_write, fn, *args, **kwargs)
+            return _wait_for_indexes(self._tried(self._session.execute_write), fn, *args, **kwargs)
 
         def with_markers(tx, *a: Any, **k: Any):
             tx.run(_BATCH_MARKER_STATEMENT, rows=rows)  # pipelined with fn's first query, consumed at commit
@@ -840,14 +893,14 @@ class _IndexWaitingSession:
 
         applied = False
         try:
-            result = _wait_for_indexes(self._session.execute_write, with_markers, *args, **kwargs)
+            result = _wait_for_indexes(self._tried(self._session.execute_write), with_markers, *args, **kwargs)
             applied = True
             return result
         finally:
             self._markers.settle(adds, removes, applied)
 
     def execute_read(self, *args: Any, **kwargs: Any):
-        return _wait_for_indexes(self._session.execute_read, *args, **kwargs)
+        return _wait_for_indexes(self._tried(self._session.execute_read), *args, **kwargs)
 
 
 class _GatedDriver:
@@ -861,8 +914,9 @@ class _GatedDriver:
     process is exiting) rather than closed under it.
     """
 
-    def __init__(self, driver: Driver) -> None:
+    def __init__(self, driver: Driver, retry: bool = False) -> None:
         self._driver = driver
+        self._retry = retry
         self.markers = _BatchMarkers()
         self._cond = threading.Condition()
         self._active = 0
@@ -884,7 +938,7 @@ class _GatedDriver:
         self._enter()
         try:
             with self._driver.session(**kwargs) as session:
-                yield _IndexWaitingSession(session, self.markers)
+                yield _IndexWaitingSession(session, self.markers, self._retry)
         except ConnectionAcquisitionTimeoutError as exc:
             raise Neo4jNotAnswering(str(exc)) from exc
         finally:
@@ -1650,8 +1704,11 @@ class GraphEngine:
         fail_fast: bool = False,
         connection_timeout_s: float | None = None,
     ) -> None:
-        """Omitted, both keep the driver's defaults: a managed transaction is
-        retried for up to 30 s, and getting a connection may take 30-60 s.
+        """Omitted, a managed transaction is retried by the engine
+        (`_managed_retry`, in place of the driver's retry): for up to
+        `TRANSACTION_RETRY_S` (30 s) after a transient error, and
+        `CONNECTION_RETRY_S` (5 s) after a lost connection; getting a
+        connection keeps the driver's default of 30-60 s.
 
         `connection_timeout_s` bounds getting a connection: opening it, the Bolt
         handshake, or waiting for a pooled one; a pooled connection idle for
@@ -1659,7 +1716,7 @@ class GraphEngine:
         time, so one whose server is gone behind a forwarder that still
         accepts is replaced, not used. Running out of it raises
         `Neo4jNotAnswering`. `fail_fast` turns
-        the driver's retries off, and `verify_connectivity`'s; `run_read_cypher`
+        the engine's transaction retries off, and `verify_connectivity`'s; `run_read_cypher`
         then retries a read once, `FAIL_FAST_RETRY_PAUSE_S` later, when it
         failed once connected (a transient error, an expired session, the
         connection lost mid-query), and never when no connection could be had
@@ -1670,11 +1727,11 @@ class GraphEngine:
         `devgraph status` and `doctor` for their connection check."""
         self.uri = uri
         self._fail_fast = fail_fast
-        limits: dict[str, float] = {}
-        if fail_fast:
-            # Negative: the driver retries while `elapsed > limit` is false, and
-            # a coarse clock can make the elapsed time exactly 0.
-            limits["max_transaction_retry_time"] = -1
+        # The driver never retries a managed transaction itself: the engine
+        # does (`_managed_retry`), unless `fail_fast`. Negative: the driver
+        # retries while `elapsed > limit` is false, and a coarse clock can
+        # make the elapsed time exactly 0.
+        limits: dict[str, float] = {"max_transaction_retry_time": -1}
         if connection_timeout_s is not None:
             limits["connection_timeout"] = connection_timeout_s
             limits["connection_acquisition_timeout"] = connection_timeout_s
@@ -1696,7 +1753,7 @@ class GraphEngine:
                 NotificationDisabledClassification.UNRECOGNIZED,
             ],
             **limits,
-        ))
+        ), retry=not fail_fast)
 
     def close(self, timeout: float = CLOSE_WAIT_S) -> None:
         """Release the full-scan claims still held, then refuse new sessions,
