@@ -270,9 +270,14 @@ def _provider_specs(repo_root: Path) -> tuple[bool, filesystem.FilesystemSpec | 
 #: (`scan_options_pending`), its mentions Documents deleted with mentions
 #: off and its docs notes with no docs path; docs notes and front matter
 #: read after a UTF-8 byte-order mark; and a docs note's `links` naming a
-#: Service as well as a Module.
+#: Service as well as a Module; 23: UTF-16 and UTF-32 source extracted
+#: instead of skipped as binary (an older index holds no nodes, and a skip
+#: mark, for such a file); C++ without a file-less Class per out-of-class
+#: method, with typed-receiver calls owned by the receiver's type (heir keys
+#: on a file's inherited methods), and an overload set kept at its first
+#: definition.
 #: An index stamped lower, or not at all, is rescanned automatically.
-INDEX_FORMAT = 22
+INDEX_FORMAT = 23
 
 
 def index_outdated(engine: GraphEngine, repo_id: str) -> bool:
