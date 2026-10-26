@@ -841,7 +841,8 @@ table.dstable input[type="text"] { width: 100%; }
 <div id="tooltipBubble"></div>
 <div id="gitHoverCard"></div>
 
-<script src="/static/vendor/cytoscape-3.30.2.min.js"></script>
+<script src="/static/vendor/graphology-0.26.0.umd.min.js"></script>
+<script src="/static/vendor/sigma-4.0.3.min.js"></script>
 <script>
 /* ── global fixed tooltip (not clipped by scroll containers) ─────── */
 /* Each trigger is focusable and described by the one shared bubble, which
@@ -1044,7 +1045,7 @@ const CAT_COLORS = {
 };
 function catColor(cat) { return CAT_COLORS[cat] || "#8a8f98"; }
 /* Community colours for the "Color by community" toggle. Defined here, ahead
-   of the Cytoscape style that calls communityColor, and cycled when a
+   of the canvas styles that call communityColor, and cycled when a
    repository has more communities than colours. */
 const COMMUNITY_PALETTE = ["#5e6ad2", "#26b5ce", "#4cb782", "#f2c94c", "#f2994a", "#eb5757", "#bb87fc", "#ff7eb6", "#6fcf97", "#56ccf2", "#c9a227", "#9b8afb"];
 function communityColor(c) {
@@ -1077,7 +1078,7 @@ document.getElementById("ctlRotationEnabled").addEventListener("change", e => {
 });
 document.getElementById("ctlCommunityColors").addEventListener("change", e => {
   state.colorByCommunity = e.target.checked;
-  cy.style().update(); // background-color below is function-valued on state.colorByCommunity
+  graphView.restyle(); // node colours read state.colorByCommunity
 });
 document.getElementById("ctlHighlightMode").addEventListener("change", e => { state.highlightMode = e.target.checked; });
 document.getElementById("ctlSettleOnChange").addEventListener("change", e => { state.settleOnChange = e.target.checked; });
@@ -1135,11 +1136,11 @@ document.getElementById("ctlNodeCeiling").value = entityTotal;
 document.getElementById("valNodeCeiling").textContent = entityTotal;
 state.nodeCeiling = entityTotal;
 
-/* The label a canvas node stands for. Live nodes carry it (mapGraphResultToElements);
+/* The label a canvas node (its data) stands for. Live nodes carry it (mapGraphResultToElements);
    the demo graph's nodes only carry a built-in category, each of which it
    uses for exactly one label. */
 function nodeType(n) {
-  return n.data("ntype") || BUILTIN_NODE_TYPES.find(t => t.cat === n.data("cat"))?.id;
+  return n.ntype || BUILTIN_NODE_TYPES.find(t => t.cat === n.cat)?.id;
 }
 /* (Re)builds the Entities rows and Relationships chips from NODE_TYPES/REL_TYPES.
    Rows are keyed by label (data-label): several built-ins share a category,
@@ -1209,7 +1210,7 @@ function applySchemaTypes(schema) {
     schema.schema_state === "never" ? "Schema file not applied yet — run a rescan." :
     schema.schema_state === "invalid" ? "Schema file is invalid — showing the types from the last scan." + (notice ? " " + notice : "") : "";
   hint.style.display = hint.textContent ? "" : "none";
-  cy.style().update(); // nodes already on the canvas re-read catColor
+  graphView.restyle(); // nodes already on the canvas re-read catColor
 }
 /* Fetches the selected repository's types (the union of every repo's for
    __all__). A failed read leaves the current lists as they are.
@@ -1257,7 +1258,7 @@ function buildElements() {
   const els = [];
   els.push({ data:{ id:"repo:devgraph", label:"devgraph", cat:"repo" } });
   els.push({ data:{ id:"svc:devgraph", label:"devgraph", cat:"service" } });
-  els.push({ data:{ id:"svc:neo4j", label:"devgraph-neo4j", cat:"service" } });
+  els.push({ data:{ id:"svc:neo4j", label:"devgraph-neo4j", cat:"service", labelSide:"left" } });
   els.push({ data:{ source:"repo:devgraph", target:"svc:devgraph", label:"CONTAINS" } });
   els.push({ data:{ source:"repo:devgraph", target:"svc:neo4j", label:"CONTAINS" } });
   REAL_MODULES.forEach((m,i) => { const id = "mod:"+i; els.push({ data:{ id, label:m.split("/").pop(), cat:"module" } }); els.push({ data:{ source:"svc:devgraph", target:id, label:"CONTAINS" } }); });
@@ -1278,180 +1279,318 @@ function buildElements() {
   return els;
 }
 const STRUCTURAL_CATS = new Set(["repo","service","database","vectorstore","queue","cache","endpoint"]);
-const cy = cytoscape({
-  container: document.getElementById("cy"),
-  /* starts empty, not seeded with the mock graph -- buildElements() is only
-     ever added if the boot check below finds Neo4j unreachable. Seeding it
-     here unconditionally meant every real load flashed ~20 fake nodes on
-     screen for the moment before the real fetch replaced them. */
-  elements: [],
-  wheelSensitivity: 0.15,
-  userZoomingEnabled: false, /* scroll-to-zoom stays off deliberately — use the +/- controls instead */
-  style: [
-    { selector: "node", style: {
-        "background-color": ele => state.colorByCommunity ? communityColor(ele.data("community")) : catColor(ele.data("cat")),
-        /* No label unless something is asking to read one. Text is the most
-           expensive thing in a canvas repaint and the ambient rotation
-           repaints on a tick, so a permanent label is paid for over and over
-           by a graph nobody is currently reading. Keying it off the query
-           match doesn't help either: the default query matches every node,
-           so every node would still be labelled. Names appear on demand
-           instead -- hovering a node, or hovering its type in the entity
-           list to name that whole type at once -- via .show-label below. */
-        "label": "",
-        /* subtle by default — dim, small, low-opacity; hover brightens it, doesn't resize it */
-        "color": "#8a8f98", "font-size": 7.5, "font-family": "var(--font-mono)",
-        "text-valign": "center", "text-halign": "right", "text-margin-x": 8, "text-opacity": 0.55,
-        "text-outline-color": "#08090a", "text-outline-width": 1.5, "text-outline-opacity": 0.7,
-        "width": ele => STRUCTURAL_CATS.has(ele.data("cat")) ? 15 : 9, "height": ele => STRUCTURAL_CATS.has(ele.data("cat")) ? 15 : 9,
-        /* Cytoscape 3.x has no shadow-* style properties, so there are none
-           here; a query match shows through the edges' glow opacity. */
-        /* A thin border in the exact canvas background color (#08090a,
-           same constant as text-outline-color above) helps separate
-           adjacent same-color nodes in a tight cluster: it reads as a gap
-           rather than a ring, for the flat cost of a stroke() call. */
-        "border-width": 1, "border-color": "#08090a", "border-opacity": 0.1,
-        } },
-    { selector: "node.show-label", style: { "label": "data(label)" } },
-    { selector: "node[cat='repo']", style: { "shape":"round-hexagon" } },
-    { selector: "node[cat='service']", style: { "shape":"round-diamond" } },
-    { selector: "node[id='svc:neo4j']", style: { "text-halign": "left", "text-margin-x": -8 } },
-    { selector: "node.excluded", style: { "background-opacity": 0, "border-width": 1.3, "border-color": ele => catColor(ele.data("cat")), "border-opacity": 0.9, "opacity": 0.45 } },
-    /* beyond-the-ceiling elements aren't dimmed context like .excluded -- they
-       shouldn't cost draw time every frame at all. display:none pulls them out
-       of cytoscape's paint pass entirely instead of just fading them. */
-    { selector: "node.culled, edge.culled, node.offscreen, edge.offscreen", style: { "display": "none" } },
-    { selector: "edge", style: {
-        "width": 1,
-        "line-fill": "linear-gradient",
-        "line-gradient-stop-colors": ele => `${catColor(ele.source().data("cat"))} ${catColor(ele.target().data("cat"))}`,
-        "line-gradient-stop-positions": "0% 100%",
-        "curve-style": "unbundled-bezier", "control-point-distances": [16], "control-point-weights": [0.5],
-        "target-arrow-shape": "triangle", "target-arrow-color": ele => catColor(ele.target().data("cat")), "arrow-scale": 0.55,
-        "opacity": ele => 0.35 + (ele.data("glow")||0) * 0.55,
-    } },
-    { selector: "edge.excluded", style: { "line-fill": "solid", "line-color": "var(--meta)", "line-style": "dashed", "opacity": 0.25, "target-arrow-color": "var(--meta)" } },
-    /* heavy-mode: engaged only once the on-screen node count (post-culling)
-       crosses the user's render-quality threshold -- see updateHeavyMode().
-       Drops the per-edge gradient + bezier control points for a flat color
-       and a straight line, the two most expensive things left in an edge's
-       draw call once shadows are gone. */
-    { selector: "edge.heavy-mode", style: {
-        "line-fill": "solid", "line-color": ele => catColor(ele.target().data("cat")),
-        "curve-style": "straight",
-    } },
-    { selector: ".faded", style: { "opacity": 0.07 } },
-    { selector: "node.highlighted", style: { "border-width": 1.5, "border-color": "#7170ff", "border-opacity": 0.9, "z-index": 10 } },
-    { selector: "node.hover-hl", style: {
-        "background-color": ele => catColorBright(ele.data("cat")),
-        "color": "#ffffff", "text-opacity": 1, "text-outline-opacity": 0.9,
-        "z-index": 20,
-    } },
-    { selector: "edge.hover-hl", style: { "width": 2.2, "opacity": 1, "z-index": 15 } },
-  ],
-  layout: { name: "random" },
-  minZoom: 0.2, maxZoom: 3,
-  autoungrabify: true, /* dragging nodes is off entirely — the graph only pans/zooms/rotates now */
-  motionBlur: false, /* motion-blur trails are extra composited frames on top of a graph that's
-     already repainting every frame for the ambient rotation -- pure cost, no payoff here. */
-  pixelRatio: 1, /* retina displays otherwise render at 2-3x the canvas pixel count for zero
-     perceptible gain on a graph this dense -- cut it once, unconditionally, for every graph size. */
-  /* textureOnViewport/hideEdgesOnViewport start off so small graphs keep full fidelity while
-     panning; updateRenderQuality() (below) turns them on past RENDER_QUALITY_NODE_THRESHOLD
-     nodes, where per-frame paint cost is the actual bottleneck and the fidelity trade is worth it. */
-  textureOnViewport: false,
-  hideEdgesOnViewport: false,
-});
-const RENDER_QUALITY_NODE_THRESHOLD = 800;
-/* re-evaluated after every add/remove (mergeGraphElements calls this) rather than
-   computed once at boot, since a repo switch or incremental load can cross the
-   threshold in either direction after the graph is already up. */
-function updateRenderQuality() {
-  const heavy = cy.nodes().length > RENDER_QUALITY_NODE_THRESHOLD;
-  const renderer = cy.renderer();
-  if (renderer) { renderer.hideEdgesOnViewport = heavy; renderer.textureOnViewport = heavy; }
-}
+/* ── the graph canvas: sigma.js (WebGL) drawing a graphology graph ────────
+   Nothing outside graphView below touches either library. Cytoscape drew
+   this canvas until real repositories outgrew it: django's default view
+   panned at 0.1 frames per second, where sigma keeps to the display's rate
+   (docs/graph-render-research.md).
 
-/* ── viewport culling ────────────────────────────────────────────────────
-   Cytoscape draws every non-culled, non-excluded element every repaint
-   regardless of whether it's actually inside the visible viewport -- a
-   graph loaded at 5000 nodes pays full paint cost for those 5000 nodes
-   even zoomed into a cluster of 20. This is the actual size-scaling
-   bottleneck behind both the zoom slowdown and the rotation stutter: every
-   rotation tick and every zoom-animation frame repaints the *whole* graph,
-   on-screen or not.
-
-   .offscreen (display:none, same "skip the paint pass entirely" mechanism
-   as .culled -- see the stylesheet) is kept in sync with the real viewport
-   here. A node is offscreen when it's outside the current extent plus a
-   margin (so a node near the edge doesn't pop in/out on every micro-pan);
-   an edge is offscreen only when BOTH endpoints are, so a relationship
-   crossing into view stays visible as long as either end is near/in frame.
-
-   Called wherever positions or the viewport can change: pan/zoom (debounced
-   -- see scheduleViewportCulling below), every rotation tick, every settle
-   animation frame, and after the graph is rebuilt/diffed. Returns the
-   resulting on-screen node count, which updateHeavyMode() below uses as the
-   "actually rendered" figure the user asked the render-quality threshold to
-   be judged against -- not the total loaded count. */
-const VIEWPORT_CULL_MARGIN_FRAC = 0.2;
-let lastOnscreenNodeCount = 0;
-/* Cache of the actual on-screen node elements (not just a count), rebuilt
-   every full culling pass -- rotationTick's per-frame path (see below)
-   iterates this directly instead of re-deriving it from Cytoscape each
-   frame, so the smooth path only ever touches what's actually visible. */
-let cachedOnscreenNodes = [];
-function updateViewportCulling(marginFrac) {
-  const nodes = cy.nodes();
-  if (!nodes.length) { lastOnscreenNodeCount = 0; cachedOnscreenNodes = []; updateHeavyMode(); return 0; }
-  const ext = cy.extent();
-  const frac = marginFrac ?? VIEWPORT_CULL_MARGIN_FRAC;
-  const marginX = ext.w * frac, marginY = ext.h * frac;
-  const x1 = ext.x1 - marginX, x2 = ext.x2 + marginX, y1 = ext.y1 - marginY, y2 = ext.y2 + marginY;
-  const offscreenIds = new Set();
-  const onscreenNodes = [];
-  cy.batch(() => {
-    nodes.forEach(n => {
-      const p = n.position();
-      const offscreen = p.x < x1 || p.x > x2 || p.y < y1 || p.y > y2;
-      if (offscreen) offscreenIds.add(n.id()); else onscreenNodes.push(n);
-      n.toggleClass("offscreen", offscreen);
-    });
-    cy.edges().forEach(e => {
-      e.toggleClass("offscreen", offscreenIds.has(e.source().id()) && offscreenIds.has(e.target().id()));
-    });
-  });
-  cachedOnscreenNodes = onscreenNodes;
-  lastOnscreenNodeCount = onscreenNodes.length;
-  updateHeavyMode();
-  return onscreenNodes.length;
-}
-
-/* ── heavy-mode: gated on the live on-screen count updateViewportCulling
-   maintains above (not total graph size) against the user-settable
-   state.renderThreshold -- reads the cached count rather than taking one as
-   an argument so a pure threshold-value change (no position/viewport change)
-   can re-evaluate it without re-running the O(n) culling pass. Toggling the
-   class on the whole element set is itself an O(n) pass, same order as
-   culling, but only actually runs on the rare tick the heavy/not-heavy state
-   flips -- everywhere else it's a no-op guard. */
+   Each element carries its data (nodes: label, cat, ntype, key, community;
+   edges: label, the relationship type) plus the flags the page sets on it,
+   which the styles below read:
+     excluded     filtered out by an isolate or query: hollow node, grey edge, dimmed
+     culled       past a ceiling: not drawn
+     hoverHl      hovered, or its type is: brighter and on top
+     showLabel    its name is drawn
+     highlighted  a search match: accent ring
+     faded        not a search match: almost transparent
+     glow         0..1, the query match glow-in: edge opacity
+   Positions are the page's model coordinates (y down, as the layout cache
+   stores them); zoom() is screen pixels per model unit and pan() the
+   screen position of the model origin. */
+/* true while more nodes are on screen than the render-quality threshold (updateHeavyMode) */
 let graphHeavyMode = false;
+/* Cytoscape never resolved the stylesheet's var(--font-mono), so labels have
+   always been drawn in its default sans-serif; this keeps that look. */
+const NODE_LABEL_FONT = '"Helvetica Neue", Helvetica, Arial, sans-serif';
+const EXCLUDED_EDGE_COLOR = "#62666d"; // --meta
+const SEARCH_RING_COLOR = "#7170ff";
+const NODE_FLAGS = ["excluded", "culled", "hoverHl", "showLabel", "highlighted", "faded"];
+/* Labels are off unless something asks for one: hovering a node, or a
+   search holding it highlighted. Text is the most expensive thing to draw,
+   and the default query matches every node, so labelling matches would
+   label everything. Hovering an entity type highlights that type without
+   naming all of it. */
+function nodeLabelShown(a) { return !!a.showLabel; }
+function nodeFillColor(a) {
+  if (a.hoverHl) return catColorBright(a.cat);
+  return state.colorByCommunity ? communityColor(a.community) : catColor(a.cat);
+}
+function edgeOpacity(a) {
+  if (a.hoverHl) return 1;
+  return a.excluded ? 0.25 : 0.35 + (a.glow || 0) * 0.55;
+}
+/* The repository's rounded hexagon, as a sigma node shape: Inigo Quilez's
+   hexagon distance function, flat top and bottom, rounded corners. */
+const HEXAGON_SHAPE = { name: "hexagon", inradiusFactor: 0.866, glsl: `
+float sdf_hexagon(vec2 uv, float size) {
+  const vec3 k = vec3(-0.866025404, 0.5, 0.577350269);
+  float corner = size * 0.18;
+  float r = size * 0.866025404 - corner;
+  vec2 p = abs(uv);
+  p -= 2.0 * min(dot(k.xy, p), 0.0) * k.xy;
+  p -= vec2(clamp(p.x, -k.z * r, k.z * r), r);
+  return length(p) * sign(p.y) - corner;
+}
+` };
+function createGraphView(container) {
+  const { sdfCircle, sdfDiamond, pathCurved, pathLine, pathLoop, extremityArrow, layerPlain, layerGradient } = Sigma.rendering;
+  const { FLOAT, UNSIGNED_BYTE } = WebGL2RenderingContext;
+  /* One node layer: the fill (transparent for a hollow, excluded node) and
+     a ring just inside the outline (the excluded node's outline, the search
+     match's accent). ringWidth is a fraction of the node's radius, so the
+     ring scales with zoom as the node does, but never thinner than a pixel. */
+  const nodeLayer = { name: "dgnode", uniforms: [], attributes: [
+    { name: "fillColor", size: 4, type: UNSIGNED_BYTE, normalized: true, source: "color" },
+    { name: "fillAlpha", size: 1, type: FLOAT, source: "fillAlpha" },
+    { name: "ringColor", size: 4, type: UNSIGNED_BYTE, normalized: true, source: "ringColor" },
+    { name: "ringWidth", size: 1, type: FLOAT, source: "ringWidth" },
+  ], glsl: `
+vec4 layer_dgnode(vec4 fillColor, float fillAlpha, vec4 ringColor, float ringWidth) {
+  vec4 fill = vec4(fillColor.rgb, fillColor.a * fillAlpha);
+  if (ringWidth <= 0.0) return fill;
+  float w = max(ringWidth * context.shapeSize, context.pixelToUV);
+  return mix(fill, ringColor, smoothstep(-w - context.aaWidth, -w, context.sdf));
+}
+` };
+  const graph = new graphology.Graph({ multi: true, type: "directed", allowSelfLoops: true });
+  const renderer = new Sigma(graph, container, {
+    settings: {
+      autoRescale: false, // model coordinates are the camera's: fitting is the page's own (fitToCircle)
+      itemSizesReference: "positions", zoomToSizeRatioFunction: r => r, // sizes scale with zoom
+      minCameraRatio: 1 / 3, maxCameraRatio: 5, // zoom 0.2 to 3
+      enableEdgeEvents: true, enableNodeDrag: false, enableCameraMouseRotation: false, // node drag: below
+      doubleClickZoomingRatio: 1, minEdgeThickness: 0.6, stagePadding: 0,
+      labelRenderedSizeThreshold: 0, labelDensity: 1,
+    },
+    primitives: {
+      nodes: {
+        shapes: [sdfCircle(), sdfDiamond({ cornerRadius: 0.12 }), HEXAGON_SHAPE],
+        variables: { fillAlpha: { type: "number", default: 1 }, ringColor: { type: "color", default: "#00000000" }, ringWidth: { type: "number", default: 0 } },
+        layers: [nodeLayer],
+      },
+      edges: {
+        /* Every edge is tessellated with as many segments as the most
+           detailed path in this list needs, so they stay few: at sigma's
+           defaults (16 curved, 32 loop) django's default view panned at
+           about 40 frames per second on the test machine, at 8 at 60. */
+        paths: [pathCurved({ curvature: 0.35, segments: 8 }), pathLine(), pathLoop({ segments: 8 })],
+        extremities: [extremityArrow({ lengthRatio: 6, widthRatio: 5 })],
+        variables: { gradientOn: { type: "boolean", default: true } },
+        // source-to-target colour gradient, off for excluded edges and in heavy mode
+        layers: [layerPlain(), layerGradient({ stops: [{ node: "source" }, { node: "target" }], enabled: { attribute: "gradientOn" } })],
+      },
+    },
+    styles: {
+      nodes: {
+        x: { attribute: "x" }, y: { attribute: "y" },
+        size: a => STRUCTURAL_CATS.has(a.cat) ? 7.5 : 4.5,
+        shape: a => a.cat === "repo" ? "hexagon" : a.cat === "service" ? "diamond" : "circle",
+        color: a => nodeFillColor(a),
+        fillAlpha: a => a.excluded ? 0 : 1,
+        ringColor: a => a.highlighted ? SEARCH_RING_COLOR : catColor(a.cat),
+        // Cytoscape's border widths (1.5 and 1.3 units) over the node's radius
+        ringWidth: a => (a.highlighted ? 1.5 : a.excluded ? 1.3 : 0) / (STRUCTURAL_CATS.has(a.cat) ? 7.5 : 4.5),
+        opacity: a => a.faded ? 0.07 : a.excluded ? 0.45 : 1,
+        visibility: a => a.culled ? "hidden" : "visible",
+        zIndex: a => a.hoverHl ? 20 : a.highlighted ? 10 : 0,
+        depth: a => a.hoverHl ? "topNodes" : "nodes",
+        // no text at all for a hidden label: sigma prepares glyphs for every label it is given
+        label: a => nodeLabelShown(a) ? a.label : null,
+        labelVisibility: a => nodeLabelShown(a) ? "visible" : "hidden",
+        labelColor: a => a.hoverHl ? "#ffffff" : "#8a8f98",
+        labelBackgroundColor: "rgba(8,9,10,0.7)", labelBackgroundPadding: 2,
+        labelPosition: a => a.labelSide || "right",
+        labelDepth: "topNodes", // over every node, as a hovered node's name was
+        labelSize: 12, labelFont: NODE_LABEL_FONT,
+      },
+      edges: {
+        size: a => a.hoverHl ? 2.2 : 1,
+        color: a => a.excluded ? EXCLUDED_EDGE_COLOR : catColor(a.tcat),
+        opacity: a => edgeOpacity(a),
+        visibility: a => a.culled ? "hidden" : "visible",
+        // heavy mode draws straight, flat-coloured lines (updateHeavyMode)
+        path: () => graphHeavyMode ? "straight" : "curved",
+        gradientOn: a => !a.excluded && !graphHeavyMode,
+        head: "arrow",
+        zIndex: a => a.hoverHl ? 15 : 0,
+        depth: a => a.hoverHl ? "topEdges" : "edges",
+      },
+    },
+  });
+  const camera = renderer.getCamera();
+  // scroll-to-zoom stays off deliberately -- the +/- controls zoom instead
+  renderer.getMouseCaptor().on("wheel", e => e.preventSigmaDefault());
+  /* Node drag is done here rather than by sigma's own (enableNodeDrag), which
+     re-processes every node on each move of the dragged one: that held
+     django's default view to under 30 frames per second. This redraws only
+     the dragged node and its edges while it moves, and refreshes everything
+     once when it is let go. */
+  let dragged = null, dragMoved = false;
+  const dragEndCallbacks = [];
+  renderer.on("downNode", e => { dragged = e.node; dragMoved = false; e.preventSigmaDefault(); });
+  renderer.on("moveBody", e => {
+    if (!dragged) return;
+    const p = renderer.viewportToGraph(e.event);
+    const a = graph.getNodeAttributes(dragged);
+    a.x = p.x; a.y = p.y; // in place, without a graph event: the partial refresh below is the redraw
+    dragMoved = true;
+    renderer.refresh({ partialGraph: { nodes: [dragged], edges: graph.edges(dragged) }, skipIndexation: true, schedule: true });
+    e.preventSigmaDefault(); // the camera stays put
+    e.event.original.preventDefault();
+  });
+  const endDrag = () => {
+    const id = dragged, moved = dragMoved;
+    dragged = null; dragMoved = false;
+    if (id && moved) { renderer.refresh(); dragEndCallbacks.forEach(fn => fn(id)); }
+  };
+  renderer.on("upNode", endDrag);
+  renderer.on("upStage", endDrag);
+  window.addEventListener("pointerup", endDrag); // let go outside the canvas
+  const toScreen = (x, y) => renderer.graphToViewport({ x, y: -y });
+  const view = {
+    renderer, graph, camera,
+    hasNode: id => graph.hasNode(id),
+    hasEdge: id => graph.hasEdge(id),
+    has: id => graph.hasNode(id) || graph.hasEdge(id),
+    nodeCount: () => graph.order,
+    edgeCount: () => graph.size,
+    elementCount: () => graph.order + graph.size,
+    nodeIds: () => graph.nodes(),
+    elementIds: () => graph.nodes().concat(graph.edges()),
+    addNode(id, data, p) { graph.addNode(id, { ...data, x: p.x, y: -p.y }); },
+    addEdge(id, source, target, data) {
+      graph.addEdgeWithKey(id, source, target, { ...data, tcat: graph.getNodeAttribute(target, "cat") });
+    },
+    remove(id) { if (graph.hasEdge(id)) graph.dropEdge(id); else if (graph.hasNode(id)) graph.dropNode(id); },
+    /* an element's data value (node or edge), and setting one */
+    data(id, k) { return graph.hasNode(id) ? graph.getNodeAttribute(id, k) : graph.getEdgeAttribute(id, k); },
+    setData(id, k, v) { if (graph.hasNode(id)) graph.setNodeAttribute(id, k, v); else graph.setEdgeAttribute(id, k, v); },
+    /* sets several flags on one element, touching only those that change */
+    setFlags(id, flags) {
+      const isNode = graph.hasNode(id);
+      const a = isNode ? graph.getNodeAttributes(id) : graph.getEdgeAttributes(id);
+      const changed = Object.keys(flags).filter(k => !!a[k] !== !!flags[k]);
+      if (!changed.length) return;
+      if (isNode) graph.mergeNodeAttributes(id, flags); else graph.mergeEdgeAttributes(id, flags);
+    },
+    /* bulk edits: fn(id, attrs) changes attrs in place */
+    updateNodes(fn) { graph.updateEachNodeAttributes((id, a) => { fn(id, a); return a; }); },
+    /* The zIndex hint makes sigma re-index the edges, not just restyle them:
+       a flag can change an edge's z-order (hover), and an edge added since
+       the last frame is not indexed yet. */
+    updateEdges(fn) { graph.updateEachEdgeAttributes((id, a, s, t) => { fn(id, a, s, t); return a; }, { attributes: ["zIndex"] }); },
+    nodeData: id => graph.getNodeAttributes(id), // live: read, don't change
+    forEachNode(fn) { graph.forEachNode(fn); },
+    forEachEdge(fn) { graph.forEachEdge((id, a, s, t) => fn(id, a, s, t)); },
+    /* an element as the inspector reads it */
+    element: id => ({ id: () => id, data: k => view.data(id, k) }),
+    position(id) { const a = graph.getNodeAttributes(id); return { x: a.x, y: -a.y }; },
+    setPosition(id, p) { graph.mergeNodeAttributes(id, { x: p.x, y: -p.y }); },
+    forEachPosition(fn) { graph.forEachNode((id, a) => fn(id, a.x, -a.y)); },
+    /* positions for `ids` from xy (interleaved x, y), in one update */
+    setPositions(ids, xy) {
+      const index = new Map(ids.map((id, i) => [id, i]));
+      graph.updateEachNodeAttributes((id, a) => {
+        const i = index.get(id);
+        if (i !== undefined) { a.x = xy[2 * i]; a.y = -xy[2 * i + 1]; }
+        return a;
+      }, { attributes: ["x", "y"] });
+    },
+    /* moves the given nodes ({id: {x, y}}) over `duration` ms */
+    animatePositions(targets, duration, done) {
+      const flipped = {};
+      for (const id in targets) flipped[id] = { x: targets[id].x, y: -targets[id].y };
+      Sigma.utils.animateNodes(graph, flipped, { duration }, done);
+    },
+    size: () => renderer.getDimensions(),
+    zoom: () => renderer.getGraphToViewportRatio(),
+    pan: () => toScreen(0, 0),
+    toScreen: p => toScreen(p.x, p.y),
+    toModel(s) { const g = renderer.viewportToGraph(s); return { x: g.x, y: -g.y }; },
+    /* the model rectangle the screen shows (its bounding box, while rotated) */
+    extent() {
+      const { width, height } = renderer.getDimensions();
+      const pts = [[0, 0], [width, 0], [0, height], [width, height]].map(([x, y]) => view.toModel({ x, y }));
+      const xs = pts.map(p => p.x), ys = pts.map(p => p.y);
+      const x1 = Math.min(...xs), x2 = Math.max(...xs), y1 = Math.min(...ys), y2 = Math.max(...ys);
+      return { x1, x2, y1, y2, w: x2 - x1, h: y2 - y1 };
+    },
+    /* puts the model point `center` mid-screen at `zoom` (kept when omitted),
+       animated over `duration` ms when given */
+    setView(center, zoom, duration) {
+      const target = {};
+      if (center) Object.assign(target, renderer.graphToFramedGraph({ x: center.x, y: -center.y }));
+      if (zoom) target.ratio = camera.ratio * view.zoom() / zoom;
+      if (duration) return camera.animate(target, { duration, easing: "quadraticOut" });
+      camera.setState(target);
+    },
+    angle: () => camera.angle,
+    setAngle(angle) { camera.setState({ angle }); },
+    on(event, fn) { renderer.on(event, fn); },
+    onCamera(fn) { camera.on("updated", fn); },
+    onNodeDragEnd(fn) { dragEndCallbacks.push(fn); },
+    restyle() { renderer.refresh(); },
+    resize() { renderer.resize(); },
+  };
+  return view;
+}
+const graphView = createGraphView(document.getElementById("cy"));
+/* Adds element literals ({data: {...}}; an edge has
+   source/target) -- the demo graph's shape. Edges without an id get one. */
+function addElements(els) {
+  els.filter(el => !el.data.source).forEach(el => graphView.addNode(el.data.id, el.data, el.position || { x: 0, y: 0 }));
+  els.filter(el => el.data.source).forEach((el, i) =>
+    graphView.addEdge(el.data.id || `demo-e:${i}`, el.data.source, el.data.target, el.data));
+}
+
+/* ── on-screen count ─────────────────────────────────────────────────────
+   sigma only draws what is in view, so nothing here hides off-screen
+   elements any more; what is still needed is how many nodes are actually
+   on screen (the current extent plus a margin, so a node at the edge
+   doesn't flip in and out on every micro-pan), which the render-quality
+   threshold below is judged against -- not the total loaded count.
+   Recounted after the camera stops moving (scheduleOnscreenCount), on each
+   settle frame, and after the graph is diffed. */
+const ONSCREEN_MARGIN_FRAC = 0.2;
+let lastOnscreenNodeCount = 0;
+function updateOnscreenCount() {
+  if (!graphView.nodeCount()) { lastOnscreenNodeCount = 0; updateHeavyMode(); return 0; }
+  const ext = graphView.extent();
+  const marginX = ext.w * ONSCREEN_MARGIN_FRAC, marginY = ext.h * ONSCREEN_MARGIN_FRAC;
+  const x1 = ext.x1 - marginX, x2 = ext.x2 + marginX, y1 = ext.y1 - marginY, y2 = ext.y2 + marginY;
+  let count = 0;
+  graphView.forEachPosition((id, x, y) => { if (x >= x1 && x <= x2 && y >= y1 && y <= y2) count++; });
+  lastOnscreenNodeCount = count;
+  updateHeavyMode();
+  return count;
+}
+
+/* ── heavy-mode: gated on the on-screen count above (not total graph size)
+   against the user-settable state.renderThreshold -- reads the cached count
+   rather than taking one as an argument so a pure threshold-value change
+   (no position/viewport change) can re-evaluate it without recounting.
+   Restyling every element only happens on the rare tick the heavy/not-heavy
+   state flips -- everywhere else it's a no-op guard. */
 function updateHeavyMode() {
   const heavy = lastOnscreenNodeCount > state.renderThreshold;
   if (heavy === graphHeavyMode) return;
   graphHeavyMode = heavy;
-  cy.batch(() => cy.elements().toggleClass("heavy-mode", heavy));
+  graphView.restyle();
 }
-cy.one("layoutstop", () => forceDirectedSettle(() => focusRotation(null, 60, 1000)));
-cy.on("mouseover", "node", e => { e.target.addClass("show-label hover-hl"); });
-cy.on("mouseout", "node", e => {
-  e.target.removeClass("hover-hl");
+function onNodeEnter(id) { graphView.setFlags(id, { showLabel: true, hoverHl: true }); }
+function onNodeLeave(id) {
   /* Release the label unless a search is holding this node highlighted. */
-  if (!e.target.hasClass("highlighted")) e.target.removeClass("show-label");
-});
+  graphView.setFlags(id, graphView.data(id, "highlighted") ? { hoverHl: false } : { hoverHl: false, showLabel: false });
+}
+graphView.on("enterNode", e => onNodeEnter(e.node));
+graphView.on("leaveNode", e => onNodeLeave(e.node));
+/* A node the user moved stays where they put it: the layout is saved as
+   after a settle. */
+graphView.onNodeDragEnd(() => saveCachedLayout());
 
 /* ── node/relationship inspector: tap an element for its real properties ──
-   Cy elements only carry a curated {id, label, cat} — enough for the graph
+   Canvas elements only carry a curated {id, label, cat} — enough for the graph
    itself, not enough for an inspector — so a click fetches the full property
    map live by internal id, the same "live:<id>" / "live-e:<id>" scheme
    mapGraphResultToElements already uses. */
@@ -1534,124 +1673,15 @@ function showDetailsCard(ele, isEdge) {
     }
   }).catch(() => { if (detailsCard.classList.contains("open")) detailsBody.innerHTML = `<div class="placeholder-note">Request failed.</div>`; });
 }
-cy.on("tap", "node", e => showDetailsCard(e.target, false));
-cy.on("tap", "edge", e => showDetailsCard(e.target, true));
-cy.on("tap", e => { if (e.target === cy) detailsCard.classList.remove("open"); });
+graphView.on("clickNode", e => showDetailsCard(graphView.element(e.node), false));
+graphView.on("clickEdge", e => showDetailsCard(graphView.element(e.edge), true));
+graphView.on("clickStage", () => detailsCard.classList.remove("open"));
 document.getElementById("btnCloseDetails").addEventListener("click", () => detailsCard.classList.remove("open"));
 
-/* uniform Fruchterman-Reingold force settle — every node repels every other
-   node by the same rule and every real edge pulls its two ends together by
-   the same rule, with no notion of "connected component" anywhere in the
-   math. This is deliberately not cose: cose bins disconnected components
-   into their own separately-packed grid (the "islands line up outside the
-   cluster" bug, and tethering them in with a fake edge just hides them
-   instead of actually placing them well). Here an island is just a node (or
-   small group of nodes) with no springs pulling it — pure repulsion from
-   every other node plus mild centering gravity settles it into open space
-   around the main mass on its own, the same way it would for every other
-   node. Runs a few iterations per animation frame so it never blocks the
-   page even at several hundred nodes. */
-/* Repulsion and attraction are deliberately DIFFERENT strengths, not the
-   textbook symmetric Fruchterman-Reingold (repulsion = idealLength²/dist,
-   attraction = dist²/idealLength, same constant both ways) — pure FR at a
-   reasonable idealLength was pushing connected nodes apart almost as hard as
-   it pulled them together, which reads as "only repulsion" once several
-   hundred nodes are all pushing on each other at once. ATTRACTION_MULT makes
-   real edges pull noticeably harder than the symmetric baseline so connected
-   clusters actually pull tight, GRAVITY is much stronger so separate
-   clusters/islands (nothing but repulsion + gravity acting on them) get
-   pulled in close instead of drifting out to wherever repulsion alone would
-   put them, and idealLength itself is smaller so the whole graph sits
-   tighter overall. mode:"light" is for a future incremental reindex (a few
-   nodes added to an already-settled graph) — short, low-temperature run that
-   nudges things into place without re-shuffling a graph that was already
-   fine. mode:"full" (default) is for a first load or a materially different
-   node set. */
-/* Barnes-Hut spatial partitioning for the repulsion phase below. Naive
-   repulsion is all-pairs (every node checks every other node), which is
-   O(n^2) per step -- fine at a few hundred nodes, but measured at ~360ms
-   per step at "All Repos" scale (~3300 nodes, ~5.3M pairs), meaning a full
-   settle blocked the main thread for over a second per animation frame,
-   repeated ~47 times. A quadtree groups nearby nodes into cells and lets a
-   node treat a whole distant cell as one point (its center of mass) instead
-   of visiting every node in it -- O(n log n) instead of O(n^2), the
-   standard fix for force-directed layouts at this scale (same technique
-   d3-force and sigma.js use). THETA controls the accuracy/speed tradeoff:
-   a cell is only approximated (rather than recursed into) once its size
-   relative to distance from the query point is below THETA -- 0.8 trades a
-   small amount of physical accuracy (repulsion is meant to look organic,
-   not exact) for a large speedup. */
-const QUAD_THETA = 0.8;
-function makeQuadNode(cx, cy, half) {
-  return { cx, cy, half, mass: 0, comX: 0, comY: 0, children: null, leafId: null };
-}
-function quadChildFor(node, p) {
-  const right = p.x >= node.cx, bottom = p.y >= node.cy;
-  return node.children[(bottom ? 2 : 0) + (right ? 1 : 0)];
-}
-function quadInsert(node, id, p, depth) {
-  if (node.mass === 0 && node.children === null) {
-    node.mass = 1; node.comX = p.x; node.comY = p.y; node.leafId = id;
-    return;
-  }
-  if (node.children === null) {
-    // was a leaf -- split into 4 quadrants and re-insert the point it held.
-    // Depth-capped: two nodes at (near-)identical positions would otherwise
-    // recurse forever trying to separate them into ever-smaller quadrants.
-    // Past depth 24 just let the cell hold multiple points (comX/comY
-    // becomes their shared centroid) rather than splitting further --
-    // negligible accuracy cost for what's already an approximation.
-    if (depth >= 24) { node.leafId = null; }
-    else {
-      const oldId = node.leafId, oldP = { x: node.comX, y: node.comY };
-      node.leafId = null;
-      const h = node.half / 2;
-      node.children = [
-        makeQuadNode(node.cx - h, node.cy - h, h),
-        makeQuadNode(node.cx + h, node.cy - h, h),
-        makeQuadNode(node.cx - h, node.cy + h, h),
-        makeQuadNode(node.cx + h, node.cy + h, h),
-      ];
-      quadInsert(quadChildFor(node, oldP), oldId, oldP, depth + 1);
-    }
-  }
-  if (node.children !== null) quadInsert(quadChildFor(node, p), id, p, depth + 1);
-  node.comX = (node.comX * node.mass + p.x) / (node.mass + 1);
-  node.comY = (node.comY * node.mass + p.y) / (node.mass + 1);
-  node.mass += 1;
-}
-function buildQuadTree(ids, positions) {
-  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-  ids.forEach(id => {
-    const p = positions.get(id);
-    if (p.x < minX) minX = p.x; if (p.x > maxX) maxX = p.x;
-    if (p.y < minY) minY = p.y; if (p.y > maxY) maxY = p.y;
-  });
-  const cx = (minX + maxX) / 2, cy = (minY + maxY) / 2;
-  const half = Math.max(maxX - minX, maxY - minY, 1) / 2 * 1.01;
-  const root = makeQuadNode(cx, cy, half);
-  ids.forEach(id => quadInsert(root, id, positions.get(id), 0));
-  return root;
-}
-function quadRepulsion(node, id, p, idealLength2, out) {
-  if (node.mass === 0) return;
-  if (node.children === null) {
-    if (node.leafId === id) return; // self
-    let dx = p.x - node.comX, dy = p.y - node.comY;
-    const dist = Math.hypot(dx, dy) || 0.01;
-    const force = node.mass * idealLength2 / dist;
-    out.x += (dx / dist) * force; out.y += (dy / dist) * force;
-    return;
-  }
-  const dx = p.x - node.comX, dy = p.y - node.comY;
-  const dist = Math.hypot(dx, dy) || 0.01;
-  if ((node.half * 2) / dist < QUAD_THETA) {
-    const force = node.mass * idealLength2 / dist;
-    out.x += (dx / dist) * force; out.y += (dy / dist) * force;
-  } else {
-    for (const c of node.children) quadRepulsion(c, id, p, idealLength2, out);
-  }
-}
+/* The force-directed settle (a uniform Fruchterman-Reingold variant, with
+   the reasoning behind each of its constants) runs in a Web Worker:
+   static/graph-layout-worker.js. forceDirectedSettle below seeds it, frames
+   the camera and applies the positions it posts. */
 /* true once the force-directed layout has stopped moving and stays true
    until mergeGraphElements next changes the element set -- a static graph
    with a settled flag is how the render-optimisation work above knows there's
@@ -1664,23 +1694,21 @@ function setGraphSettled(v) {
   graphSettled = v;
   document.getElementById("btnGraphReload")?.classList.toggle("settled", v);
 }
-/* True for the whole duration of a settle run. Rotation can already be
-   armed and running when a new settle starts -- the graph was sitting there
-   rotating and a query/isolate/reindex change just triggered a re-settle --
-   and rotationTick writes node positions from its own snapshot every frame,
-   completely independently of this function's physics loop. Without this
-   guard the two fight over the same positions every frame: the settle's
-   physics result gets immediately clobbered by a rotation write computed
-   from a stale, unrelated base, and vice versa, which is both visibly janky
-   and doubles the per-frame position-write/repaint cost. rotationTick checks
-   this and skips its own write while true; the settle's own onDone always
-   calls focusRotation() afterward (every call site does), which re-captures
-   a fresh base and re-arms rotation correctly once the real layout is
-   final -- so simply pausing here needs no separate resume logic. */
+/* True for the whole duration of a settle run. The ambient rotation pauses
+   meanwhile (rotationTick checks it), so the camera holds still while the
+   nodes move; every settle's onDone calls focusRotation(), which frames the
+   final layout and re-arms rotation, so pausing needs no resume logic. */
 let graphSettling = false;
+/* Applying positions on animation frames, at most once a frame, is also
+   what keeps a hidden tab still (#2), and the worker itself is paused while
+   the tab is hidden, so a background tab does no layout work at all. A new
+   settle supersedes one still running: the old one's positions and onDone
+   are dropped. */
+let layoutWorker = null;
+let settleRun = 0;
+let activeSettle = null;
 function forceDirectedSettle(onDone, mode) {
-  const nodes = cy.nodes();
-  const ids = nodes.map(n => n.id());
+  const ids = graphView.nodeIds();
   if (!ids.length) { onDone && onDone(); return; }
   graphSettling = true;
   // Every call site is about to actually move nodes -- flip the indicator
@@ -1688,16 +1716,15 @@ function forceDirectedSettle(onDone, mode) {
   // switch, the demo fallback, every mergeGraphElements path) to remember to
   // do it themselves before calling in.
   setGraphSettled(false);
-  const rect = cy.container().getBoundingClientRect();
-  const area = Math.max((rect.width || 900) * (rect.height || 600), 300000);
-  const idealLength = Math.sqrt(area / ids.length) * 0.5;
-  const ATTRACTION_MULT = 2.2;
-  const GRAVITY = 0.09;
-  const positions = new Map();
+  const { width, height } = graphView.size();
+  const area = Math.max((width || 900) * (height || 600), 300000);
   const spread = Math.sqrt(area) / 2;
-  nodes.forEach(n => {
-    const p = n.position();
-    positions.set(n.id(), (p.x || p.y) ? { x: p.x, y: p.y } : { x: (Math.random()-0.5)*spread, y: (Math.random()-0.5)*spread });
+  const xy = new Float64Array(2 * ids.length);
+  ids.forEach((id, i) => {
+    const p = graphView.position(id);
+    const placed = p.x || p.y;
+    xy[2 * i] = placed ? p.x : (Math.random() - 0.5) * spread;
+    xy[2 * i + 1] = placed ? p.y : (Math.random() - 0.5) * spread;
   });
 
   /* Center the camera on the gravity target RIGHT NOW, before a single
@@ -1708,131 +1735,61 @@ function forceDirectedSettle(onDone, mode) {
      means the camera is already framing the right spot as nodes converge
      into it; the pan doesn't move again until the slower reveal below. */
   let startCx = 0, startCy = 0;
-  positions.forEach(p => { startCx += p.x; startCy += p.y; });
+  for (let i = 0; i < ids.length; i++) { startCx += xy[2 * i]; startCy += xy[2 * i + 1]; }
   startCx /= ids.length; startCy /= ids.length;
   rotationPivot = { x: startCx, y: startCy };
-  if (rect.width && rect.height) {
-    const zoom = cy.zoom();
-    cy.pan({ x: rect.width / 2 - startCx * zoom, y: rect.height / 2 - startCy * zoom });
-  }
+  if (width && height) graphView.setView({ x: startCx, y: startCy });
 
-  const edgePairs = [];
-  cy.edges().forEach(e => edgePairs.push([e.source().id(), e.target().id()]));
-  /* a connected node gets pulled toward the cluster TWICE — gravity, and the
-     spring on every one of its edges. An island has no edges, so gravity is
-     its only pull against the same repulsion everyone else feels — at equal
-     gravity it settles measurably farther out than a connected node would,
-     and the tighter attraction now pulling the main mass into a smaller
-     cluster only makes that gap look bigger. Scale gravity up for low-degree
-     nodes specifically so an island is held in about as tightly, relative to
-     the cluster, as a connected node is. */
-  const degree = new Map(ids.map(id => [id, 0]));
-  edgePairs.forEach(([s, t]) => { degree.set(s, (degree.get(s)||0) + 1); degree.set(t, (degree.get(t)||0) + 1); });
-  const ISLAND_GRAVITY_BOOST = 16;
-  const gravityMult = new Map(ids.map(id => [id, 1 + ISLAND_GRAVITY_BOOST / (1 + degree.get(id))]));
-  const light = mode === "light";
-  let temp = Math.sqrt(area) / (light ? 30 : 10);
-  /* A hard step budget, not the thing that decides when settling is done --
-     see convergeThreshold below for that. This is only a safety net against
-     a graph that genuinely never quiets down (or the theta-approximated
-     repulsion oscillating forever), so it's set generously high rather than
-     tuned to "how many steps a typical graph needs": a graph the size of
-     devgraph converges in well under this on its own; a much larger one
-     (RAG4's scale) gets the room to actually finish instead of getting cut
-     off mid-motion, which is what a low fixed cap here used to do -- the
-     cooldown schedule below still drives temp near zero by the time this
-     many steps run, so it was quietly masquerading as "converged" while
-     really just "out of steps." */
-  const COOLING_STEPS = light ? 30 : 180;
-  let iter = 0;
-
-  const idealLength2 = idealLength * idealLength;
-  /* Average per-node displacement below which the layout reads as stopped --
-     scaled off idealLength (which already scales with graph size/viewport
-     area, see above) rather than a bare pixel constant, so a small tight
-     graph and a large sparse one both stop at "no longer visibly moving"
-     instead of the large one either stopping too early or burning steps it
-     doesn't need. Measured against the UNCAPPED force displacement computed
-     in step() below (dlen, before it's clamped to the current `temp`), not
-     the clamped movement actually applied to positions -- `temp` decays every
-     step regardless of whether the layout is anywhere near equilibrium, so
-     capped movement shrinks toward zero on its own late in a run even while
-     the real forces (and so the true, still-wanted displacement) stay large.
-     Checking the capped value read that shrinkage as "settled" and froze the
-     frame mid-motion on anything that didn't fully resolve within the old,
-     much lower step cap -- most visibly on a bigger graph like RAG4.
-     idealLength itself is sqrt(area/n) * 0.5 -- it shrinks as node count n
-     grows, since the same viewport area has to fit more nodes. Multiplying
-     the tolerance by idealLength alone therefore made the threshold get
-     STRICTER on a bigger graph (a smaller and smaller average displacement
-     required to call it settled) at exactly the point where there's more
-     going on to average over -- more repulsion pairs, more Barnes-Hut
-     approximation error -- so a big graph's residual jitter had a harder
-     bar to clear, not an easier one. Multiplying back in sqrt(ids.length)
-     cancels that shrinkage (idealLength * sqrt(n) is flat in n, since
-     idealLength itself is proportional to 1/sqrt(n)), so the tolerance is a
-     roughly constant number of screen pixels of average residual pull
-     regardless of graph size, instead of one that keeps getting harder to
-     hit as the graph grows. The 0.01 constant (was 0.004) is the actual
-     "how close to zero counts as zero" tolerance increase. */
-  const convergeThreshold = idealLength * Math.sqrt(ids.length) * 0.04;
-  function step() {
-    const disp = new Map(ids.map(id => [id, { x: 0, y: 0 }]));
-    const tree = buildQuadTree(ids, positions);
-    ids.forEach(id => {
-      const p = positions.get(id), d = disp.get(id);
-      quadRepulsion(tree, id, p, idealLength2, d);
-    });
-    edgePairs.forEach(([s, t]) => {
-      const a = positions.get(s), b = positions.get(t);
-      if (!a || !b) return;
-      let dx = a.x - b.x, dy = a.y - b.y;
-      const dist = Math.hypot(dx, dy) || 0.01;
-      const force = ATTRACTION_MULT * (dist * dist) / idealLength;
-      dx = (dx / dist) * force; dy = (dy / dist) * force;
-      disp.get(s).x -= dx; disp.get(s).y -= dy;
-      disp.get(t).x += dx; disp.get(t).y += dy;
-    });
-    let cx = 0, cyy = 0;
-    positions.forEach(p => { cx += p.x; cyy += p.y; });
-    cx /= ids.length; cyy /= ids.length;
-    ids.forEach(id => {
-      const p = positions.get(id), d = disp.get(id);
-      const g = GRAVITY * gravityMult.get(id);
-      d.x += (cx - p.x) * g;
-      d.y += (cyy - p.y) * g;
-    });
-    let totalForceDisp = 0;
-    ids.forEach(id => {
-      const p = positions.get(id), d = disp.get(id);
-      const dlen = Math.hypot(d.x, d.y) || 0.01;
-      const capped = Math.min(dlen, temp);
-      p.x += (d.x / dlen) * capped;
-      p.y += (d.y / dlen) * capped;
-      totalForceDisp += dlen; // uncapped -- see convergeThreshold comment above
-    });
-    temp *= 0.96;
-    iter++;
-    return totalForceDisp / ids.length;
+  const index = new Map(ids.map((id, i) => [id, i]));
+  const pairs = [];
+  graphView.forEachEdge((id, a, s, t) => { pairs.push(index.get(s), index.get(t)); });
+  if (!layoutWorker) {
+    layoutWorker = new Worker("/static/graph-layout-worker.js");
+    layoutWorker.onmessage = onLayoutMessage;
   }
-  function frame() {
-    let avgDisp = convergeThreshold + 1; // stays above threshold if the loop below never runs a step
-    for (let i = 0; i < 3 && iter < COOLING_STEPS; i++) avgDisp = step();
-    cy.batch(() => { ids.forEach(id => { const ele = cy.getElementById(id); if (ele.length) ele.position(positions.get(id)); }); });
-    updateViewportCulling();
-    if (iter < COOLING_STEPS && avgDisp > convergeThreshold) requestAnimationFrame(frame);
-    /* Persisting here rather than in any particular caller's onDone: this is
-       the single point every settle path converges on -- the boot layoutstop
-       hook, a structural reload through mergeGraphElements, and the layout
-       selector all end up here -- and a settled graph is exactly the state
-       worth remembering. Debounced inside saveCachedLayout. */
-    else { setGraphSettled(true); graphSettling = false; saveCachedLayout(); onDone && onDone(); }
-  }
-  requestAnimationFrame(frame);
+  const run = ++settleRun;
+  activeSettle = { run, ids, onDone, latest: null, frame: 0 };
+  layoutWorker.postMessage({ type: "settle", run, xy, edges: Int32Array.from(pairs), area, mode }, [xy.buffer]);
+  if (document.hidden) layoutWorker.postMessage({ type: "pause" });
 }
+function onLayoutMessage(e) {
+  const msg = e.data;
+  if (!activeSettle || msg.run !== activeSettle.run) return; // superseded
+  activeSettle.latest = msg;
+  if (!activeSettle.frame) activeSettle.frame = requestAnimationFrame(applySettleFrame);
+}
+function applySettleFrame() {
+  const run = activeSettle;
+  if (!run) return;
+  run.frame = 0;
+  const msg = run.latest;
+  run.latest = null;
+  if (!msg) return;
+  graphView.setPositions(run.ids, msg.xy);
+  updateOnscreenCount();
+  if (!msg.done) return;
+  activeSettle = null;
+  /* Persisting here rather than in any particular caller's onDone: this is
+     the single point every settle path converges on -- the demo fallback, a
+     structural reload through mergeGraphElements, the re-settle button and
+     the layout selector all end up here -- and a settled graph is exactly
+     the state worth remembering. Debounced inside saveCachedLayout. */
+  setGraphSettled(true); graphSettling = false; saveCachedLayout(); run.onDone && run.onDone();
+}
+/* stops a settle in progress where it is, e.g. for a preset layout */
+function stopSettle() {
+  if (!activeSettle) return;
+  if (activeSettle.frame) cancelAnimationFrame(activeSettle.frame);
+  activeSettle = null;
+  layoutWorker.postMessage({ type: "stop" });
+  graphSettling = false;
+}
+document.addEventListener("visibilitychange", () => {
+  if (layoutWorker) layoutWorker.postMessage({ type: document.hidden ? "pause" : "resume" });
+});
 
 /* ── diff-merge instead of wipe-and-rebuild ─────────────────────────────
-   loadFullGraph used to do cy.elements().remove() + cy.add(elements) on
+   loadFullGraph used to remove every element and re-add the new set on
    every call, which re-creates every node from scratch with no position
    data at all — every existing node loses its place and the whole graph
    re-randomizes and re-settles from zero, every time. That's the exact
@@ -1879,11 +1836,9 @@ async function loadCachedLayout() {
 let saveLayoutTimer = null;
 function collectLayout() {
   const out = {};
-  cy.nodes().forEach(n => {
-    const id = n.id();
+  graphView.forEachPosition((id, x, y) => {
     if (!id.startsWith("live:")) return;
-    const p = n.position();
-    out[id] = [Math.round(p.x), Math.round(p.y)];
+    out[id] = [Math.round(x), Math.round(y)];
   });
   return out;
 }
@@ -1923,17 +1878,15 @@ function mergeGraphElements(elements, mode, opts) {
   const remove = opts ? !!opts.remove : true;
   const settle = opts ? !!opts.settle : true;
   const incoming = new Map(elements.map(el => [el.data.id, el]));
-  const existingIds = new Set(cy.elements().map(e => e.id()));
-  const toRemove = remove ? cy.elements().filter(e => !incoming.has(e.id())) : cy.collection();
-  const toAdd = [...incoming.values()].filter(el => !existingIds.has(el.data.id));
+  const toRemove = remove ? graphView.elementIds().filter(id => !incoming.has(id)) : [];
+  const toAdd = [...incoming.values()].filter(el => !graphView.has(el.data.id));
 
   /* Insights are recomputed independently of the structure, so a node already
      on the canvas can carry a new community under the same id. Update it
      before the identical-refetch bail-out below. */
   incoming.forEach((el, id) => {
-    if (!el.data.source) {
-      const n = cy.getElementById(id);
-      if (n.nonempty() && n.data("community") !== el.data.community) n.data("community", el.data.community);
+    if (!el.data.source && graphView.hasNode(id) && graphView.data(id, "community") !== el.data.community) {
+      graphView.setData(id, "community", el.data.community);
     }
   });
 
@@ -1943,12 +1896,12 @@ function mergeGraphElements(elements, mode, opts) {
      forceDirectedSettle()/focusRotation() below unconditionally, which
      visibly jiggled the whole graph (repositioned nothing, but still ran a
      settle pass and re-fit the camera) for a change that had zero actual
-     effect on the graph. Bail out before touching cy at all when nothing
+     effect on the graph. Bail out before touching the canvas at all when nothing
      is structurally different. */
-  if (!toAdd.length && toRemove.length === 0) return cy.elements().length > 0;
+  if (!toAdd.length && toRemove.length === 0) return graphView.elementCount() > 0;
 
-  toRemove.remove();
-  if (!toAdd.length && !cy.elements().length) return false;
+  toRemove.forEach(id => graphView.remove(id)); // a removed node takes its edges with it
+  if (!toAdd.length && !graphView.elementCount()) return false;
 
   // "Settle on addition/subtraction" -- when on, a real structural change
   // (something just added or removed, never a same-count update, which
@@ -1961,8 +1914,7 @@ function mergeGraphElements(elements, mode, opts) {
      opts back in: a removal still shrinks the graph, and re-centering it is
      what "settle on subtraction" means. */
   if (!toAdd.length) {
-    updateRenderQuality();
-    updateViewportCulling();
+    updateOnscreenCount();
     if (settleOnStructuralChange) {
       setGraphSettled(false);
       forceDirectedSettle(() => focusRotation(null, 60, 1000), mode || "light");
@@ -1973,10 +1925,9 @@ function mergeGraphElements(elements, mode, opts) {
 
   const newNodeEls = toAdd.filter(el => !el.data.source);
   const newEdgeEls = toAdd.filter(el => el.data.source);
-  cy.add(newNodeEls);
 
-  const rect = cy.container().getBoundingClientRect();
-  const bootstrapSpread = Math.sqrt(Math.max((rect.width||900)*(rect.height||600), 300000)) / 2;
+  const { width, height } = graphView.size();
+  const bootstrapSpread = Math.sqrt(Math.max((width||900)*(height||600), 300000)) / 2;
   /* node id -> the first incoming relationship that touches it, built once:
      looking it up per node by scanning every relationship was
      O(nodes x relationships), seconds to minutes on a large view. */
@@ -1989,24 +1940,22 @@ function mergeGraphElements(elements, mode, opts) {
   });
 
   /* Pass 1: place every node that has a saved position first, before any
-     neighbor lookup runs. A cold page reload starts this cy instance with
+     neighbor lookup runs. A cold page reload starts this canvas with
      zero nodes even when the repo has a full saved layout -- gating "is
-     there something real to anchor near" on cy.nodes().length before this
+     there something real to anchor near" on the node count before this
      add (as this used to) reads that as a from-scratch bootstrap and
      scatters every genuinely-new node from the origin instead of next to
      its already-cached neighbor. Doing the cached placements in their own
      pass first means pass 2 below can check each neighbor's actual current
      position, cached or pre-existing, without caring which one it was. */
+  /* where each new node goes; one still missing here is unplaced, as a node
+     at the origin is (see forceDirectedSettle) */
+  const placedAt = new Map();
   let uncachedEls = [];
   newNodeEls.forEach(el => {
-    const node = cy.getElementById(el.data.id);
     const cached = cachedPositions.get(el.data.id);
-    if (cached) {
-      node.position({ x: cached[0], y: cached[1] });
-      node.data("glow", 0);
-    } else {
-      uncachedEls.push(el);
-    }
+    if (cached) placedAt.set(el.data.id, { x: cached[0], y: cached[1] });
+    else uncachedEls.push(el);
   });
   const uncached = uncachedEls.length;
 
@@ -2015,19 +1964,22 @@ function mergeGraphElements(elements, mode, opts) {
      one, else near the center of whatever's already really positioned,
      else scatter from the origin -- a true from-scratch bootstrap, nothing
      positioned anywhere yet. */
-  const anchored = cy.nodes().some(n => n.position().x || n.position().y);
-  const bb = anchored ? cy.nodes().filter(n => n.position().x || n.position().y).boundingBox() : null;
-  const cx = bb ? (bb.x1 + bb.x2) / 2 : 0;
-  const cyy = bb ? (bb.y1 + bb.y2) / 2 : 0;
-  const nearbySpread = bb ? Math.max(90, Math.hypot(bb.w, bb.h) / 8) : bootstrapSpread;
+  const positionOf = id => placedAt.get(id) || (graphView.hasNode(id) ? graphView.position(id) : null);
+  let x1 = Infinity, y1 = Infinity, x2 = -Infinity, y2 = -Infinity;
+  const extend = p => { if (p.x || p.y) { x1 = Math.min(x1, p.x); x2 = Math.max(x2, p.x); y1 = Math.min(y1, p.y); y2 = Math.max(y2, p.y); } };
+  graphView.forEachPosition((id, x, y) => extend({ x, y }));
+  placedAt.forEach(extend);
+  const anchored = x1 <= x2;
+  const cx = anchored ? (x1 + x2) / 2 : 0;
+  const cyy = anchored ? (y1 + y2) / 2 : 0;
+  const nearbySpread = anchored ? Math.max(90, Math.hypot(x2 - x1, y2 - y1) / 8) : bootstrapSpread;
   uncachedEls.forEach(el => {
-    const node = cy.getElementById(el.data.id);
     let px, py;
     const link = firstLinkOf.get(el.data.id);
-    const other = link && cy.getElementById(link.data.source === el.data.id ? link.data.target : link.data.source);
-    if (anchored && other && other.length && (other.position().x || other.position().y)) {
-      px = other.position().x + (Math.random()-0.5) * 50;
-      py = other.position().y + (Math.random()-0.5) * 50;
+    const other = link && positionOf(link.data.source === el.data.id ? link.data.target : link.data.source);
+    if (anchored && other && (other.x || other.y)) {
+      px = other.x + (Math.random()-0.5) * 50;
+      py = other.y + (Math.random()-0.5) * 50;
     } else if (anchored) {
       px = cx + (Math.random()-0.5) * nearbySpread;
       py = cyy + (Math.random()-0.5) * nearbySpread;
@@ -2035,14 +1987,12 @@ function mergeGraphElements(elements, mode, opts) {
       px = (Math.random()-0.5) * bootstrapSpread;
       py = (Math.random()-0.5) * bootstrapSpread;
     }
-    node.position({ x: px, y: py });
-    node.data("glow", 0);
+    placedAt.set(el.data.id, { x: px, y: py });
   });
-  cy.add(newEdgeEls);
-  newEdgeEls.forEach(el => cy.getElementById(el.data.id).data("glow", 0));
+  newNodeEls.forEach(el => graphView.addNode(el.data.id, { ...el.data, glow: 0 }, placedAt.get(el.data.id)));
+  newEdgeEls.forEach(el => graphView.addEdge(el.data.id, el.data.source, el.data.target, { ...el.data, glow: 0 }));
 
-  updateRenderQuality();
-  updateViewportCulling();
+  updateOnscreenCount();
   if (settleOnStructuralChange) {
     /* Every new node came back with a cached position, so the layout on
        screen is already the settled one -- running the solver over it would
@@ -2054,7 +2004,7 @@ function mergeGraphElements(elements, mode, opts) {
       setGraphSettled(true);
       focusRotation(null, 60, 1000);
     } else {
-      const touchedRatio = uncached / Math.max(1, cy.elements().length);
+      const touchedRatio = uncached / Math.max(1, graphView.elementCount());
       forceDirectedSettle(() => focusRotation(null, 60, 1000),
         mode || (touchedRatio > 0.25 ? "full" : "light"));
     }
@@ -2064,203 +2014,133 @@ function mergeGraphElements(elements, mode, opts) {
 
 
 /* graph stage height = 80% of the viewport below the topnav, kept in sync on resize
-   so cytoscape's internal render size and the fit/pan math stay correct */
+   so the canvas's render size and the fit/pan math stay correct */
 const graphStage = document.getElementById("graphStage");
 
 function syncStageHeight() {
   const topbarH = document.querySelector(".topnav").offsetHeight;
   const h = Math.max(420, (window.innerHeight - topbarH) * 0.8);
   graphStage.style.height = h + "px";
-  cy.resize();
+  graphView.resize();
 }
 window.addEventListener("resize", syncStageHeight);
 syncStageHeight();
 
-/* pan/zoom-linked faint grid on the focus-window frame — dot radius scales with
-   zoom too, not just spacing, otherwise dots stay a fixed 1px and look
-   artificially dense when zoomed out. The graph itself lives on the fixed
-   #cy layer behind the whole page now, not inside this box. */
-function syncGrid() {
-  const z = cy.zoom(), p = cy.pan();
-  const r = Math.max(0.4, 1 * z).toFixed(2);
-  const spacing = Math.max(4, 24 * z).toFixed(2);
-  graphStage.style.backgroundImage = `radial-gradient(circle ${r}px, rgba(255,255,255,0.09) ${r}px, transparent 0)`;
-  graphStage.style.backgroundSize = `${spacing}px ${spacing}px`;
-  graphStage.style.backgroundPosition = `${p.x}px ${p.y}px`;
+/* The on-screen count is O(n), so it waits until the camera stops moving
+   rather than running on every frame of a pan or zoom animation. */
+const ONSCREEN_DEBOUNCE_MS = 150;
+let onscreenDebounceTimer = null;
+function scheduleOnscreenCount() {
+  if (onscreenDebounceTimer) clearTimeout(onscreenDebounceTimer);
+  onscreenDebounceTimer = setTimeout(() => { onscreenDebounceTimer = null; updateOnscreenCount(); }, ONSCREEN_DEBOUNCE_MS);
 }
-cy.on("pan zoom", syncGrid); syncGrid();
-/* Culling itself used to run synchronously on every "pan zoom" event -- for
-   an animated zoom (cy.animate fires one per frame) that's an O(n) culling
-   pass stacked on top of the zoom animation's own repaint, every frame, for
-   the whole 150ms+ duration -- exactly when the graph is already busiest.
-   Debounced instead: the real recompute only runs once events go quiet
-   (zoom/pan has actually stopped), so the animation itself pays nothing
-   extra. zoomBy() below covers the resulting staleness during the
-   transition with a one-off, generously-margined cull computed up front. */
-const CULL_DEBOUNCE_MS = 150;
-let cullDebounceTimer = null;
-function scheduleViewportCulling() {
-  if (cullDebounceTimer) clearTimeout(cullDebounceTimer);
-  cullDebounceTimer = setTimeout(() => { cullDebounceTimer = null; updateViewportCulling(); }, CULL_DEBOUNCE_MS);
-}
-cy.on("pan zoom", scheduleViewportCulling); updateViewportCulling();
+graphView.onCamera(scheduleOnscreenCount);
+updateOnscreenCount();
 
-/* ── manual zoom controls — scroll-to-zoom is deliberately off (see cy init),
-   these two buttons are the only way to zoom now, centered on the viewport. */
-/* Margin used for the one immediate, pre-animation cull below -- sized to
-   comfortably cover a single zoomBy() step (1.35x) in either direction, so
-   nothing that will end up on screen after the animation is hidden partway
-   through it, and nothing about to leave view pops out mid-transition.
-   Bigger than the steady-state VIEWPORT_CULL_MARGIN_FRAC on purpose: this
-   one has to hold for the whole animation, not just settle noise. The
-   debounced scheduleViewportCulling() above tightens it back to the normal
-   margin once the animation actually stops. */
-const ZOOM_TRANSIT_CULL_MARGIN_FRAC = 0.4;
+/* ── manual zoom controls — scroll-to-zoom is deliberately off (see
+   createGraphView), these two buttons are the only way to zoom, centered on
+   the viewport. */
+const MIN_ZOOM = 0.2, MAX_ZOOM = 3;
 function zoomBy(factor) {
-  const rect = cy.container().getBoundingClientRect();
-  const level = Math.min(cy.maxZoom(), Math.max(cy.minZoom(), cy.zoom() * factor));
-  updateViewportCulling(ZOOM_TRANSIT_CULL_MARGIN_FRAC);
-  cy.animate({ zoom: { level, renderedPosition: { x: rect.width/2, y: rect.height/2 } } }, { duration: 150 });
+  const level = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, graphView.zoom() * factor));
+  graphView.setView(null, level, 150);
 }
 document.getElementById("btnZoomIn").addEventListener("click", () => zoomBy(1.35));
 document.getElementById("btnZoomOut").addEventListener("click", () => zoomBy(1/1.35));
 
-/* ── slow ambient rotation: the whole graph spins around a fixed pivot — the
-   bounding-box center of the whole graph with no query active, or of the
-   current query's matched nodes when one is.
+/* ── slow ambient rotation: the camera turns about the middle of the
+   screen, where focusRotation() puts the pivot -- the bounding-box centre
+   of the whole graph with no query active, or of the current query's
+   matched nodes when one is.
 
-   This rotates node model positions, so Cytoscape re-renders each label
-   axis-aligned afterwards and text stays upright. Rotating the rendered
-   layer instead (a CSS transform on #cy) is far cheaper — the compositor
-   does it, Cytoscape repaints nothing — but it turns the finished picture,
-   and node labels are drawn into that picture: every label ends up leaning
-   at the rotation angle. It also has to fight the renderer for pointer
-   coordinates, since Cytoscape hit-tests raw clientX/clientY against a
-   container whose paint no longer matches its layout box. Neither is worth
-   an effect this subtle.
+   Turning the camera moves no node: the layout (and the layout cache) stay
+   as settled, and sigma draws labels upright whatever the camera's angle,
+   so text never leans. Under Cytoscape this rewrote node positions instead,
+   because rotating the rendered layer (a CSS transform on #cy) leaned every
+   label and broke hit-testing.
 
-   What made the original version expensive was the rate, not the technique:
-   it rewrote every node's position on every animation frame, forcing a full
-   canvas repaint at 60fps forever, long after the layout had settled and
-   nothing else was changing. At ROTATION_DEG_PER_SEC that frame-by-frame
-   precision buys nothing — a frame's worth of rotation is 0.005°, far below
-   anything visible. Ticking a few times a second instead covers the same
-   angle in steps still well under a pixel at any zoom this canvas allows,
-   for a fraction of the repaints.
-
-   Invariant: rotating rigidly around a fixed pivot preserves every node's
-   distance from it, so once the camera is framed to cover the pivot's radius
-   (+ margin) at fit time, the framed set can never drift out of view no
-   matter how long it spins — cheaper and more robust than recomputing a fit
-   every tick. Pauses while the user is interacting so it never fights a
-   drag, only runs while rotation can actually do something (a pivot exists
-   and there are nodes), and stops entirely while the tab is hidden. */
+   Invariant: rotating rigidly about the framed pivot preserves every node's
+   distance from it, so once the camera is framed to cover the pivot's
+   radius (+ margin), the framed set can never drift out of view no matter
+   how long it spins. Pauses while the user is interacting so it never
+   fights a drag, only runs while rotation can actually do something (a
+   pivot exists and there are nodes), and stops entirely while the tab is
+   hidden. */
 let rotationPivot = null;
-let rotationBasePositions = new Map(); // node id -> position at the moment the current pivot was set
-let rotationAngle = 0; // radians turned since rotationBasePositions was captured
+let rotationAngle = 0; // radians the camera has turned
 let userInteracting = false, lastRotationTime = performance.now();
-const ROTATION_CULL_INTERVAL_MS = 250; /* how often rotation re-checks on/off-screen membership -- see rotationTick */
-let lastRotationCullTime = 0;
 let rotationLoopArmed = false;
-cy.on("tapstart", () => { userInteracting = true; });
-cy.on("tapend", () => { userInteracting = false; lastRotationTime = performance.now(); armRotationLoop(); });
-function boundingCircle(nodesColl) {
-  if (!nodesColl.length) return null;
-  const bb = nodesColl.boundingBox();
-  const cx = (bb.x1+bb.x2)/2, cy0 = (bb.y1+bb.y2)/2;
+document.getElementById("cy").addEventListener("pointerdown", () => { userInteracting = true; });
+window.addEventListener("pointerup", () => {
+  if (!userInteracting) return;
+  userInteracting = false; lastRotationTime = performance.now(); armRotationLoop();
+});
+/* the centre of the ids' bounding box, and the farthest of them from it */
+function boundingCircle(ids) {
+  if (!ids.length) return null;
+  const pts = ids.map(id => graphView.position(id));
+  let x1 = Infinity, y1 = Infinity, x2 = -Infinity, y2 = -Infinity;
+  pts.forEach(p => { x1 = Math.min(x1, p.x); x2 = Math.max(x2, p.x); y1 = Math.min(y1, p.y); y2 = Math.max(y2, p.y); });
+  const cx = (x1 + x2) / 2, cy0 = (y1 + y2) / 2;
   let maxDist = 0;
-  nodesColl.forEach(n => { const p = n.position(); const d = Math.hypot(p.x-cx, p.y-cy0); if (d > maxDist) maxDist = d; });
+  pts.forEach(p => { const d = Math.hypot(p.x - cx, p.y - cy0); if (d > maxDist) maxDist = d; });
   return { cx, cy: cy0, radius: maxDist };
 }
 function fitToCircle(cx, cy0, radiusWithMargin, duration) {
-  const rect = cy.container().getBoundingClientRect();
-  if (!rect.width || !rect.height || !radiusWithMargin) return;
-  const level = Math.min(cy.maxZoom(), Math.max(cy.minZoom(), Math.min(rect.width, rect.height) / (radiusWithMargin * 2)));
-  cy.animate({ zoom: level, pan: { x: rect.width/2 - cx*level, y: rect.height/2 - cy0*level } }, { duration: duration ?? 450, easing: "ease-out" });
+  const { width, height } = graphView.size();
+  if (!width || !height || !radiusWithMargin) return;
+  const level = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, Math.min(width, height) / (radiusWithMargin * 2)));
+  graphView.setView({ x: cx, y: cy0 }, level, duration ?? 450);
 }
-/* nodesColl null/empty = whole-graph pivot; otherwise pivot on that set (a
+/* fits the ids' bounding box inside the screen less `padding` pixels a side */
+function fitToIds(ids, padding, duration) {
+  if (!ids.length) return;
+  const { width, height } = graphView.size();
+  let x1 = Infinity, y1 = Infinity, x2 = -Infinity, y2 = -Infinity;
+  ids.forEach(id => { const p = graphView.position(id); x1 = Math.min(x1, p.x); x2 = Math.max(x2, p.x); y1 = Math.min(y1, p.y); y2 = Math.max(y2, p.y); });
+  const level = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM,
+    Math.min((width - 2 * padding) / Math.max(x2 - x1, 1), (height - 2 * padding) / Math.max(y2 - y1, 1))));
+  graphView.setView({ x: (x1 + x2) / 2, y: (y1 + y2) / 2 }, level, duration);
+}
+/* ids null/empty = whole-graph pivot; otherwise pivot on those nodes (a
    cypher query match) — margin keeps the pivot's own set comfortably framed.
    duration is left at fitToCircle's normal snappy default for search/isolate
    focus jumps; forceDirectedSettle's post-settle reveal passes a slower one
    explicitly (see its call sites) so the final zoom-out reads as a deliberate
    pan-out rather than a snap-cut. */
-function focusRotation(nodesColl, margin, duration) {
-  const targets = (nodesColl && nodesColl.length) ? nodesColl : cy.nodes();
+function focusRotation(ids, margin, duration) {
+  const targets = (ids && ids.length) ? ids : graphView.nodeIds();
   const circle = boundingCircle(targets);
   if (!circle) { rotationPivot = null; return; }
   rotationPivot = { x: circle.cx, y: circle.cy };
-  /* Absolute-angle rotation model: every node's position is derived fresh
-     each tick from its position right now (the base) plus the total angle
-     turned since this pivot was set, rather than compounding small
-     relative rotations onto whatever the last tick left behind. That's
-     what lets rotationTick below update only the on-screen subset most
-     frames (recomputing from a stale base would drift) while still
-     catching every node up to the exact correct angle on the periodic full
-     pass -- see rotationTick. */
-  rotationBasePositions = new Map();
-  cy.nodes().forEach(n => { const p = n.position(); rotationBasePositions.set(n.id(), { x: p.x, y: p.y }); });
-  rotationAngle = 0;
   lastRotationTime = performance.now(); // don't let time paused/spent settling count as elapsed rotation
-  lastRotationCullTime = 0; // force a full pass (and a fresh on-screen cache) on the very next tick
   fitToCircle(circle.cx, circle.cy, circle.radius + margin, duration);
   armRotationLoop();
 }
 const ROTATION_DEG_PER_SEC = 0.3; /* ~20 minutes per revolution — meant to be almost imperceptible */
-/* Position rewrite (and so canvas repaint) runs every animation frame, not
-   throttled to a fixed tick -- a fixed tick banks up rotation and applies
-   it in one visible jump once the tick lands. But rewriting EVERY loaded
-   node's position every frame is an O(total graph size) JS loop -- on a
-   large graph that alone can blow the 16ms frame budget well before any
-   canvas paint even starts, which is what was still making rotation
-   jittery: the per-frame work scaled with total nodes, not with what's
-   actually visible.
-   Fixed by splitting the work into two passes against a single absolute
-   rotationAngle (see focusRotation, which resets it and captures each
-   node's base position whenever the pivot changes):
-     - most frames: recompute + repaint only cachedOnscreenNodes (the
-       culling pass's own on-screen list, already O(visible) and already
-       being maintained) -- this is the frame that has to be fast, and now
-       its cost tracks what's on screen, not the graph's total size.
-     - every ROTATION_CULL_INTERVAL_MS: recompute ALL nodes (so off-screen
-       ones stay correctly positioned for whenever they come back into
-       view) and re-run updateViewportCulling to refresh cachedOnscreenNodes
-       -- this is the one O(total) pass, same cadence as before, unchanged.
-   Positions are always derived from the fixed base + the total angle
-   turned (not compounded frame-to-frame), so alternating between the two
-   passes never drifts or double-applies rotation. */
+/* One camera-angle write per animation frame, computed from the time since
+   the last one (capped at a second, so a stalled frame never jumps). */
 function rotationTick(now) {
   if (!state.rotationEnabled) { rotationLoopArmed = false; return; } /* A1: off means off -- no further requestAnimationFrame, the loop actually ends here rather than idling */
   if (document.hidden) { rotationLoopArmed = false; return; } /* A3: stop entirely while backgrounded, resume via visibilitychange */
-  if (!rotationPivot || !cy.nodes().length) { rotationLoopArmed = false; return; } /* A2: nothing to do, idle instead of spinning the rAF loop forever */
+  if (!rotationPivot || !graphView.nodeCount()) { rotationLoopArmed = false; return; } /* A2: nothing to do, idle instead of spinning the rAF loop forever */
   const elapsed = now - lastRotationTime;
-  /* userInteracting also resets lastRotationTime on tapend, so a drag never
-     banks up rotation to apply in one jump when it ends. graphSettling
-     pauses the same way while a settle's own physics loop owns positions --
-     see forceDirectedSettle. */
+  /* userInteracting also resets lastRotationTime on pointerup, so a drag
+     never banks up rotation to apply in one jump when it ends. graphSettling
+     pauses the same way while a settle moves the nodes -- see
+     forceDirectedSettle. */
   if (!userInteracting && !graphSettling) {
     lastRotationTime = now;
     rotationAngle += ROTATION_DEG_PER_SEC * Math.min(1, elapsed / 1000) * Math.PI / 180;
-    const cosA = Math.cos(rotationAngle), sinA = Math.sin(rotationAngle);
-    const { x: px, y: py } = rotationPivot;
-    const doFullPass = now - lastRotationCullTime >= ROTATION_CULL_INTERVAL_MS;
-    const targets = doFullPass ? cy.nodes() : cachedOnscreenNodes;
-    cy.batch(() => {
-      targets.forEach(n => {
-        const base = rotationBasePositions.get(n.id());
-        if (!base) return; // a node added after this pivot was set -- picked up on the next focusRotation()
-        const dx = base.x - px, dy = base.y - py;
-        n.position({ x: px + dx * cosA - dy * sinA, y: py + dx * sinA + dy * cosA });
-      });
-    });
-    if (doFullPass) { lastRotationCullTime = now; updateViewportCulling(); }
+    graphView.setAngle(rotationAngle);
   }
   requestAnimationFrame(rotationTick);
 }
 /* single entry point for (re-)starting the loop -- safe to call whenever a
-   precondition might have just become true (focusRotation, tapend, tab
+   precondition might have just become true (focusRotation, pointerup, tab
    becoming visible again); a no-op if it's already running. */
 function armRotationLoop() {
-  if (!state.rotationEnabled || rotationLoopArmed || document.hidden || !rotationPivot || !cy.nodes().length) return;
+  if (!state.rotationEnabled || rotationLoopArmed || document.hidden || !rotationPivot || !graphView.nodeCount()) return;
   rotationLoopArmed = true;
   lastRotationTime = performance.now();
   requestAnimationFrame(rotationTick);
@@ -2271,7 +2151,7 @@ document.addEventListener("visibilitychange", () => {
      already-queued callback can remain armed without ever reaching
      rotationTick's hidden guard. Reset the clock unconditionally on resume:
      armRotationLoop may correctly decline to queue a duplicate callback, but
-     time spent backgrounded must never become catch-up model movement. */
+     time spent backgrounded must never become catch-up rotation. */
   lastRotationTime = performance.now();
   armRotationLoop();
 });
@@ -2280,12 +2160,13 @@ document.addEventListener("visibilitychange", () => {
    graph, so naming all of it at once is the mass of text the empty base
    label style exists to avoid. Names stay a single-node, on-demand thing. */
 function highlightType(label, on) {
-  cy.nodes().filter(n => nodeType(n) === label).forEach(n => n.toggleClass("hover-hl", on));
+  graphView.updateNodes((id, a) => { if (nodeType(a) === label) a.hoverHl = on; });
 }
-/* A relationship type is server text (a project schema can declare it), so it
-   is escaped into the Cytoscape selector rather than interpolated raw. */
-function relSelector(rel) { return `[label = "${String(rel).replace(/["\\]/g, "\\$&")}"]`; }
-function highlightRel(rel, on) { cy.edges(relSelector(rel)).toggleClass("hover-hl", on); }
+/* A relationship type is server text (a project schema can declare it); it
+   is only ever compared as a value, never built into a selector or query. */
+function highlightRel(rel, on) {
+  graphView.updateEdges((id, a) => { if (a.label === rel) a.hoverHl = on; });
+}
 
 /* ── smooth glow/deglow: animate each node/edge's "glow" data value toward a
    target (1 = matched by the active cypher query, 0 = not) over ~420ms, driving
@@ -2293,9 +2174,14 @@ function highlightRel(rel, on) { cy.edges(relSelector(rel)).toggleClass("hover-h
 let glowAnimId = null;
 function animateGlowTo(targetIds) {
   const targets = targetIds instanceof Set ? targetIds : new Set(targetIds);
-  const eles = cy.elements();
   const from = new Map();
-  eles.forEach(e => from.set(e.id(), e.data("glow") || 0));
+  graphView.forEachNode((id, a) => from.set(id, a.glow || 0));
+  graphView.forEachEdge((id, a) => from.set(id, a.glow || 0));
+  const glowAt = (id, a, eased) => {
+    const to = targets.has(id) ? 1 : 0;
+    const f = from.get(id) || 0;
+    a.glow = f + (to - f) * eased;
+  };
   const start = performance.now(), duration = 420;
   if (glowAnimId) cancelAnimationFrame(glowAnimId);
   function step(now) {
@@ -2303,12 +2189,8 @@ function animateGlowTo(targetIds) {
        can precede `start`, and a negative progress eases below zero */
     const t = Math.max(0, Math.min(1, (now - start) / duration));
     const eased = 1 - Math.pow(1 - t, 3);
-    eles.forEach(e => {
-      const to = targets.has(e.id()) ? 1 : 0;
-      const f = from.get(e.id()) || 0;
-      const v = f + (to - f) * eased;
-      e.data("glow", v);
-    });
+    graphView.updateNodes((id, a) => glowAt(id, a, eased));
+    graphView.updateEdges((id, a) => glowAt(id, a, eased));
     if (t < 1) { glowAnimId = requestAnimationFrame(step); } else { glowAnimId = null; }
   }
   glowAnimId = requestAnimationFrame(step);
@@ -2327,35 +2209,37 @@ function applyState(skipQueryBuild, runMode) {
   let relNodeIds = null;
   if (state.isolatedRel) {
     relNodeIds = new Set();
-    cy.edges(relSelector(state.isolatedRel)).forEach(e => { relNodeIds.add(e.source().id()); relNodeIds.add(e.target().id()); });
+    graphView.forEachEdge((id, a, source, target) => { if (a.label === state.isolatedRel) { relNodeIds.add(source); relNodeIds.add(target); } });
   }
-  /* .excluded (dimmed, still drawn) is deliberate context -- filtered out by
+  /* excluded (dimmed, still drawn) is deliberate context -- filtered out by
      type/relationship but left visible so the isolated set reads against the
-     rest of the graph. .culled (display:none, not drawn at all) is just
-     overflow past the ceiling -- there's no context value in a node nobody
-     asked to see and no reason to keep paying its draw cost every frame. */
-  let nSeen = 0;
-  cy.nodes().forEach(n => {
-    let on = !state.isolatedEntity || nodeType(n) === state.isolatedEntity;
-    if (on && relNodeIds) on = relNodeIds.has(n.id());
+     rest of the graph. culled (not drawn at all) is just overflow past the
+     ceiling -- there's no context value in a node nobody asked to see and no
+     reason to keep paying its draw cost every frame. */
+  let nSeen = 0, nShown = 0;
+  graphView.updateNodes((id, a) => {
+    let on = !state.isolatedEntity || nodeType(a) === state.isolatedEntity;
+    if (on && relNodeIds) on = relNodeIds.has(id);
     if (on) nSeen++;
-    n.toggleClass("excluded", !on);
-    n.toggleClass("culled", on && nSeen > state.nodeCeiling);
+    a.excluded = !on;
+    a.culled = on && nSeen > state.nodeCeiling;
+    if (on && !a.culled) nShown++;
   });
-  let rSeen = 0;
-  cy.edges().forEach(e => {
-    const label = e.data("label");
+  let rSeen = 0, rShown = 0;
+  graphView.updateEdges((id, a, source, target) => {
+    const label = a.label;
     const relOn = !state.isolatedRel || !label || label === state.isolatedRel;
     // An isolated entity should glow along with its own relationships, not
     // every edge in the graph -- an edge only qualifies if it actually
     // touches an isolated-type node (its far endpoint doesn't have to).
-    const entityOn = !state.isolatedEntity || nodeType(e.source()) === state.isolatedEntity || nodeType(e.target()) === state.isolatedEntity;
+    const entityOn = !state.isolatedEntity || nodeType(graphView.nodeData(source)) === state.isolatedEntity || nodeType(graphView.nodeData(target)) === state.isolatedEntity;
     const on = relOn && entityOn;
     if (on) rSeen++;
-    e.toggleClass("excluded", !on);
-    e.toggleClass("culled", on && rSeen > state.relCeiling);
+    a.excluded = !on;
+    a.culled = on && rSeen > state.relCeiling;
+    if (on && !a.culled) rShown++;
   });
-  document.getElementById("visibleCount").textContent = cy.nodes().filter(n=>!n.hasClass("excluded")&&!n.hasClass("culled")).length + " nodes · " + cy.edges().filter(e=>!e.hasClass("excluded")&&!e.hasClass("culled")).length + " edges";
+  document.getElementById("visibleCount").textContent = nShown + " nodes · " + rShown + " edges";
   if (!skipQueryBuild) buildQueryFromState(runMode);
 }
 /* runMode "full" actually executes and populates the results panel (used by
@@ -2456,7 +2340,7 @@ function renderResultTable(columns, rows) {
    across a reindex: _replace_file_nodes_tx DETACH DELETEs every node touched
    by a changed file, then MERGE-recreates them, so even an untouched
    function in that file gets a fresh internal id on every save. Keying
-   Cytoscape elements off that churned id made mergeGraphElements() (which is
+   canvas elements off that churned id made mergeGraphElements() (which is
    otherwise a correct diff) see "everything in this file was removed and
    re-added" on every edit -- full redraw/reposition of the file's nodes
    instead of an in-place update, and (for nodes with the same name in
@@ -2475,7 +2359,7 @@ function stableNodeId(n) {
   return n.key != null ? "live:" + n.key : "live-anon:" + n.id;
 }
 /* maps Neo4j's HTTP "graph" result format (real node/relationship objects
-   with real labels + properties) into Cytoscape elements */
+   with real labels + properties) into canvas elements ({data: {...}}) */
 function mapGraphResultToElements(results) {
   const nodeMap = new Map(), edges = [], idByInternalId = new Map();
   results.forEach(r => {
@@ -2514,7 +2398,7 @@ function extractGraphIds(results) {
   return { nodeIds, edgeIds };
 }
 /* companion to currentStateQuery(): that query returns `m` purely as edge
-   context (Cytoscape needs both endpoints to draw a line) alongside a
+   context (the canvas needs both endpoints to draw a line) alongside a
    `matchedId` column that names the actual isolated node per row — this
    pulls just that column out, so which nodes glow is driven entirely by
    what the cypher itself marked as matched, not re-derived client-side.
@@ -2579,7 +2463,7 @@ function escapeCypherStr(s) { return String(s).replace(/["\\]/g, "\\$&"); }
    silently dropping them, and the post-OPTIONAL-MATCH WHERE nulls out a
    non-matching relationship rather than discarding the row, so isolating a
    relationship type still shows every node while only that edge type glows.
-   `m` (the far end of the relationship) still has to come back -- Cytoscape
+   `m` (the far end of the relationship) still has to come back -- the canvas
    can't draw an edge to a node it's never seen -- but it's context, not a
    match: `id(n) AS matchedId` is what actually says "this row's isolated
    node is this one", as a plain integer the backend passes through
@@ -2703,7 +2587,7 @@ async function runQueryAndUpdateGraph(query, opts) {
   const result = json.results[0];
   const elements = mapGraphResultToElements(result.data);
   if (!elements.length) return { ok: false, json };
-  /* Supersession has to be decided BEFORE anything touches cy, not after.
+  /* Supersession has to be decided BEFORE anything touches the canvas, not after.
      This check used to sit below the merge, which meant a stale reply still
      got to mutate the canvas first: in replace mode ({remove, settle}) it
      removed every element the NEWER request had just added and re-settled
@@ -2716,11 +2600,10 @@ async function runQueryAndUpdateGraph(query, opts) {
   if (mySeq !== glowRequestSeq) return { ok: true, json, superseded: true };
   mergeGraphElements(elements, opts?.mode, { remove: !!opts?.replace, settle: !!opts?.replace });
   const matched = extractStateMatchedIds(json);
-  cy.nodes().forEach(n => n.toggleClass("excluded", !matched.nodeIds.has(n.id())));
-  cy.edges().forEach(e => e.toggleClass("excluded", !matched.edgeIds.has(e.id())));
-  document.getElementById("visibleCount").textContent =
-    cy.nodes().filter(n => !n.hasClass("excluded")).length + " nodes · " +
-    cy.edges().filter(e => !e.hasClass("excluded")).length + " edges";
+  let nShown = 0, eShown = 0;
+  graphView.updateNodes((id, a) => { a.excluded = !matched.nodeIds.has(id); if (!a.excluded) nShown++; });
+  graphView.updateEdges((id, a) => { a.excluded = !matched.edgeIds.has(id); if (!a.excluded) eShown++; });
+  document.getElementById("visibleCount").textContent = nShown + " nodes · " + eShown + " edges";
   animateGlowTo([...matched.nodeIds, ...matched.edgeIds]);
   // Auto-zoom to the bounds of what the cypher actually matched -- every
   // caller gets this, not just Run: isolating an entity or relationship,
@@ -2732,8 +2615,8 @@ async function runQueryAndUpdateGraph(query, opts) {
   // camera already frames the right spot as nodes converge into it" means,
   // not a conflict.
   if (matched.nodeIds.size) {
-    const focusColl = cy.collection([...matched.nodeIds].map(id => cy.getElementById(id)).filter(e => e.length));
-    if (focusColl.length) focusRotation(focusColl, opts?.focusMargin ?? 90);
+    const focusIds = [...matched.nodeIds].filter(id => graphView.hasNode(id));
+    if (focusIds.length) focusRotation(focusIds, opts?.focusMargin ?? 90);
   }
   return { ok: true, json };
 }
@@ -2824,7 +2707,7 @@ async function previewQueryGlow(text) {
     const { nodeIds, edgeIds } = extractGraphIds(json.results[0].data);
     animateGlowTo([...nodeIds, ...edgeIds]);
     if (nodeIds.size) {
-      const matched = cy.collection([...nodeIds].map(id => cy.getElementById(id)).filter(e => e.length));
+      const matched = [...nodeIds].filter(id => graphView.hasNode(id));
       if (matched.length) focusRotation(matched, 90);
     }
   } catch (e) { /* network hiccup mid-type — ignore, next keystroke retries */ }
@@ -2975,7 +2858,7 @@ async function bootConnect() {
     startMemoryPolling();
     // The registered repositories still list (the registry needs no Neo4j).
     try { await populateRealRepos(false); } catch (e2) { /* the dashboard server itself is gone */ }
-    cy.add(buildElements());
+    addElements(buildElements());
     forceDirectedSettle(() => focusRotation(null, 60));
   }
 }
@@ -3164,7 +3047,7 @@ btnRunCypher.addEventListener("click", () => runCypherAndDisplay(cypherInput.val
    there. Always runs regardless of the "Settle on addition/subtraction"
    toggle, since clicking this IS the explicit ask for one. */
 document.getElementById("btnGraphReload").addEventListener("click", () => {
-  if (cy.elements().length) forceDirectedSettle(() => focusRotation(null, 60, 1000), "full");
+  if (graphView.elementCount()) forceDirectedSettle(() => focusRotation(null, 60, 1000), "full");
 });
 document.querySelectorAll('#linkOpenConfig').forEach(l => l.addEventListener("click", e => { e.preventDefault(); document.getElementById("settingsOverlay").classList.add("open"); document.querySelector('[data-pane="config"]').click(); }));
 
@@ -3179,12 +3062,69 @@ document.getElementById("ctlRelCeiling").addEventListener("input", e => { state.
 document.getElementById("ctlNodeCeiling").addEventListener("change", e => { nodeCeilingUncapped = uncapRequested(+e.target.value, +e.target.max); if (neo4jConnected) refreshGraph(undefined, true); });
 document.getElementById("ctlRelCeiling").addEventListener("change", () => { if (neo4jConnected) refreshGraph(undefined, true); });
 
+/* The non-force layouts in the Layout menu: positions for every node,
+   centred on the origin, PRESET_LAYOUT_SPACING model units apart.
+   breadthfirst: each connected component as a tree of breadth-first levels
+   from its best-connected node, components side by side. concentric: rings
+   by degree, best connected in the middle. grid: rows, in node order. */
+const PRESET_LAYOUT_SPACING = 40;
+function presetLayout(name, ids, edges) {
+  const s = PRESET_LAYOUT_SPACING;
+  const adj = new Map(ids.map(id => [id, []]));
+  edges.forEach(([a, b]) => { if (a !== b && adj.has(a) && adj.has(b)) { adj.get(a).push(b); adj.get(b).push(a); } });
+  const degree = id => adj.get(id).length;
+  const out = {};
+  if (name === "grid") {
+    const cols = Math.ceil(Math.sqrt(ids.length * 16 / 9));
+    const rows = Math.ceil(ids.length / cols);
+    ids.forEach((id, i) => { out[id] = { x: (i % cols - (cols - 1) / 2) * s, y: (Math.floor(i / cols) - (rows - 1) / 2) * s }; });
+  } else if (name === "concentric") {
+    const sorted = [...ids].sort((a, b) => degree(b) - degree(a));
+    const maxDeg = Math.max(1, degree(sorted[0]));
+    const band = Math.max(1, maxDeg / 4);
+    const rings = [];
+    sorted.forEach(id => { const k = Math.floor((maxDeg - degree(id)) / band); (rings[k] = rings[k] || []).push(id); });
+    let r = 0;
+    rings.filter(Boolean).forEach((ring, k) => {
+      if (k || ring.length > 1) r = Math.max(r + s, ring.length * s / (2 * Math.PI));
+      ring.forEach((id, i) => { const t = 2 * Math.PI * i / ring.length; out[id] = { x: r * Math.cos(t), y: r * Math.sin(t) }; });
+    });
+  } else {
+    const seen = new Set();
+    const components = [];
+    [...ids].sort((a, b) => degree(b) - degree(a)).forEach(root => {
+      if (seen.has(root)) return;
+      seen.add(root);
+      const levels = [[root]];
+      for (let lv = 0; levels[lv].length; lv++) {
+        const next = [];
+        levels[lv].forEach(id => adj.get(id).forEach(n => { if (!seen.has(n)) { seen.add(n); next.push(n); } }));
+        levels.push(next);
+      }
+      levels.pop();
+      components.push(levels);
+    });
+    let x0 = 0;
+    components.forEach(levels => {
+      const width = Math.max(...levels.map(l => l.length));
+      levels.forEach((level, lv) => level.forEach((id, i) => {
+        out[id] = { x: x0 + (i - (level.length - 1) / 2 + (width - 1) / 2) * s, y: lv * s * 2 };
+      }));
+      x0 += width * s + s;
+    });
+    let maxY = 0;
+    Object.values(out).forEach(p => { maxY = Math.max(maxY, p.y); });
+    Object.values(out).forEach(p => { p.x -= (x0 - s) / 2; p.y -= maxY / 2; });
+  }
+  return out;
+}
 document.getElementById("layoutSelect").addEventListener("change", () => {
   const name = document.getElementById("layoutSelect").value;
-  if (name === "cose") { forceDirectedSettle(() => focusRotation(null, 60, 1000)); return; } /* "Force-directed" runs our own uniform settle, not cytoscape's cose */
-  const layout = cy.layout({ name, animate: true });
-  layout.one("layoutstop", () => focusRotation(null, 60));
-  layout.run();
+  if (name === "cose") { forceDirectedSettle(() => focusRotation(null, 60, 1000)); return; } /* "Force-directed" runs our own uniform settle */
+  stopSettle();
+  const edges = [];
+  graphView.forEachEdge((id, a, source, target) => edges.push([source, target]));
+  graphView.animatePositions(presetLayout(name, graphView.nodeIds(), edges), 500, () => focusRotation(null, 60));
 });
 
 document.getElementById("graphSearch").addEventListener("input", e => {
@@ -3192,10 +3132,14 @@ document.getElementById("graphSearch").addEventListener("input", e => {
   /* No re-adding show-label to every structural node here: the base label
      style already labels the structural nodes the current query matched, and
      forcing the class back on would relabel the unmatched ones too. */
-  cy.nodes().removeClass("faded highlighted show-label");
+  graphView.updateNodes((id, a) => { a.faded = false; a.highlighted = false; a.showLabel = false; });
   if (!q) return;
-  const matches = cy.nodes().filter(n => n.data("label").toLowerCase().includes(q));
-  if (matches.length) { cy.nodes().addClass("faded"); matches.removeClass("faded").addClass("highlighted show-label"); cy.animate({ fit: { eles: matches, padding: 80 } }, { duration: 300 }); }
+  const matches = new Set();
+  graphView.forEachNode((id, a) => { if (String(a.label).toLowerCase().includes(q)) matches.add(id); });
+  if (matches.size) {
+    graphView.updateNodes((id, a) => { if (matches.has(id)) { a.highlighted = true; a.showLabel = true; } else a.faded = true; });
+    fitToIds([...matches], 80, 300);
+  }
 });
 document.getElementById("pullTab").addEventListener("click", () => document.getElementById("controlFlyout").classList.toggle("open"));
 async function onRepoSelectChange(e) {

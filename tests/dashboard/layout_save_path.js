@@ -1,8 +1,8 @@
 /* Headless test of the layout save/load path, lifted verbatim out of
    index.html. collectLayout/saveCachedLayout/layoutScopeId only touch
-   cy.nodes(), n.id(), n.position(), document.getElementById and fetch, so a
+   graphView.forEachPosition, document.getElementById and fetch, so a
    handful of stubs is enough to exercise them for real -- no browser, no
-   cytoscape, deterministic, and re-runnable. */
+   canvas library, deterministic, and re-runnable. */
 const fs = require("fs");
 const path = require("path");
 
@@ -32,7 +32,7 @@ let nodes = [];
 const calls = [];
 const sandboxGlobals = {
   document: { getElementById: id => (id === "repoSelect" ? { value: selectedRepo } : null) },
-  cy: { nodes: () => ({ forEach: fn => nodes.forEach(fn) }) },
+  graphView: { forEachPosition: fn => nodes.forEach(n => fn(n.id, n.x, n.y)) },
   navigator: { sendBeacon: (url, blob) => { calls.push({ via: "beacon", url, size: blob.size }); return blob.size <= 64 * 1024; } },
   Blob: class { constructor(parts) { this.size = parts.join("").length; } },
   fetch: async (url, opts) => { calls.push({ via: "fetch", url, method: opts.method, body: opts.body, keepalive: !!opts.keepalive }); return { ok: true }; },
@@ -43,7 +43,7 @@ const runner = new Function(...Object.keys(sandboxGlobals),
 const api = runner(...Object.values(sandboxGlobals));
 
 // --- helpers ----------------------------------------------------------
-const mk = (id, x, y) => ({ id: () => id, position: () => ({ x, y }) });
+const mk = (id, x, y) => ({ id, x, y });
 const K = (name, file) => `live:Function\u001fdevgraph\u001f${name}\u001f${file}`;
 let failures = 0;
 const check = (label, cond, detail) => {
@@ -194,73 +194,80 @@ function runSyncChecks() {
 }
 
 /* ---------------------------------------------------------------------
-   Node labels. Text dominates the cost of a canvas repaint and the ambient
-   rotation repaints on a tick, so a label nothing is asking to read is pure
-   cost. The style mapper is the only thing deciding that, and it silently
-   degrades in both directions: too broad and every repaint pays for text
-   nobody wants, too narrow and structural nodes go unnamed. */
+   Node labels. Text dominates the cost of drawing the canvas, so a label
+   nothing is asking to read is pure cost. These decide that, and they
+   silently degrade in both directions: too broad and every frame pays for
+   text nobody wants, too narrow and a hovered node goes unnamed. */
 function runLabelChecks() {
-  check("no node carries a label by default",
-    /"label": "",/.test(html),
-    "the base node style labels something; every repaint would pay for that text");
-  check("a permanent label mapper has not crept back in",
-    !/"label": ele =>/.test(html),
-    "the base label is computed again, so some nodes are labelled without being asked for");
-  check("hover names a node (.show-label is what turns a label on)",
-    /selector: "node\.show-label", style: \{ "label": "data\(label\)" \}/.test(html),
-    "the .show-label rule is gone, so nothing could ever be named");
-  check("hovering a node adds show-label",
-    /cy\.on\("mouseover", "node", e => \{ e\.target\.addClass\("show-label hover-hl"\)/.test(html),
-    "node hover no longer labels");
-  check("hovering an entity type highlights without labelling the whole type",
-    /toggleClass\("hover-hl", on\)/.test(html) && !/toggleClass\("hover-hl show-label"/.test(html),
-    "highlightCat labels every node of a type, which is the mass of text the empty base label avoids");
-  check("mouseout releases the label unless a search is holding the node",
-    /if \(!e\.target\.hasClass\("highlighted"\)\) e\.target\.removeClass\("show-label"\);/.test(html),
-    "a hovered node's name would either stick after the pointer leaves, or be dropped mid-search");
-  check("the search handler does not force-label every structural node",
-    !/n\.addClass\("show-label"\); \}\);/.test(html),
-    "a blanket addClass(show-label) is back and would relabel the whole graph");
+  const lbl = new Function(grab(/^function nodeLabelShown\(/m, "}") + "\nreturn nodeLabelShown;")();
+  check("no node carries a label by default", lbl({}) === false && lbl({ hoverHl: true }) === false,
+    "a node is labelled without being asked to be");
+  check("showLabel is what names a node", lbl({ showLabel: true }) === true, "showLabel no longer labels");
+  check("the node style draws a label exactly when nodeLabelShown says so",
+    /labelVisibility: a => nodeLabelShown\(a\) \? "visible" : "hidden"/.test(html),
+    "the label visibility style no longer goes through nodeLabelShown");
+
+  const nodes = new Map([["n", { highlighted: false }], ["m", { highlighted: true }], ["f", { ntype: "Function" }], ["c", { ntype: "Class" }]]);
+  const view = {
+    data: (id, k) => nodes.get(id)[k],
+    setFlags: (id, flags) => Object.assign(nodes.get(id), flags),
+    updateNodes: fn => nodes.forEach((a, id) => fn(id, a)),
+  };
+  const api2 = new Function("graphView", "BUILTIN_NODE_TYPES", [
+    grab(/^function nodeType\(/m, "\n}"),
+    grab(/^function onNodeEnter\(/m, "\n"),
+    grab(/^function onNodeLeave\(/m, "\n}"),
+    grab(/^function highlightType\(/m, "\n}"),
+  ].join("\n") + "\nreturn { onNodeEnter, onNodeLeave, highlightType };")(view, []);
+  api2.onNodeEnter("n");
+  check("hovering a node names and highlights it", nodes.get("n").showLabel === true && nodes.get("n").hoverHl === true,
+    JSON.stringify(nodes.get("n")));
+  api2.onNodeLeave("n");
+  check("leaving it releases the label and the highlight", !nodes.get("n").showLabel && !nodes.get("n").hoverHl,
+    JSON.stringify(nodes.get("n")));
+  nodes.get("m").showLabel = true;
+  api2.onNodeEnter("m"); api2.onNodeLeave("m");
+  check("leaving a node a search is holding keeps its label", nodes.get("m").showLabel === true && !nodes.get("m").hoverHl,
+    JSON.stringify(nodes.get("m")));
+  api2.highlightType("Function", true);
+  check("hovering an entity type highlights that type without labelling it",
+    nodes.get("f").hoverHl === true && !nodes.get("f").showLabel && !nodes.get("c").hoverHl, JSON.stringify([...nodes]));
+  api2.highlightType("Function", false);
+  check("...and leaving the type clears it", !nodes.get("f").hoverHl, JSON.stringify(nodes.get("f")));
+  check("the search handler labels only its matches",
+    /if \(matches\.has\(id\)\) \{ a\.highlighted = true; a\.showLabel = true; \} else a\.faded = true;/.test(html),
+    "the search handler labels nodes other than its matches");
 }
 
 /* ---------------------------------------------------------------------
    Exercise the real rotation loop with a deterministic animation-frame queue.
-   Frames update visible nodes; periodic full passes catch off-screen nodes up
-   from their fixed base positions. Visibility changes stop and re-arm the loop. */
+   Rotation turns the camera (graphView.setAngle) from the time since the
+   last frame; it moves no node. Visibility changes stop and re-arm the loop,
+   and time spent hidden never becomes rotation. */
 function runRotationChecks() {
-  const pivot = { x: 100, y: 100 };
-  const nodeState = [];
-  const mkNode = (id, x, y) => {
-    const pos = { x, y };
-    nodeState.push(pos);
-    return { id: () => id, position: p => p === undefined ? { ...pos } : Object.assign(pos, p) };
-  };
-  const liveNodes = [mkNode("visible", 640, 100), mkNode("offscreen", 100, 640)];
-  const bases = new Map(liveNodes.map(n => [n.id(), n.position()]));
-  let styleWrites = 0, cullPasses = 0, now = 0;
+  const DEG = Math.PI / 180;
+  const angles = [];
+  let positionWrites = 0, now = 0;
   const pending = [];
   const listeners = {};
   const context = {
     document: { hidden: false, addEventListener: (event, fn) => { listeners[event] = fn; } },
     requestAnimationFrame: fn => pending.push(fn),
     performance: { now: () => now },
-    cy: {
-      nodes: () => liveNodes,
-      batch: fn => fn(),
-      container: () => ({ style: new Proxy({}, { set: () => (styleWrites++, true) }) }),
+    graphView: {
+      nodeCount: () => 2,
+      setAngle: a => angles.push(a),
+      setPositions: () => positionWrites++, setPosition: () => positionWrites++,
     },
     state: { rotationEnabled: true },
-    rotationPivot: pivot, rotationBasePositions: bases, rotationAngle: 0,
+    rotationPivot: { x: 100, y: 100 }, rotationAngle: 0,
     userInteracting: false, graphSettling: false,
-    lastRotationTime: 0, lastRotationCullTime: 0, rotationLoopArmed: false,
-    cachedOnscreenNodes: [liveNodes[0]],
-    updateViewportCulling: () => cullPasses++,
+    lastRotationTime: 0, rotationLoopArmed: false,
   };
   const rotSrc = [
-    grab(/^const ROTATION_CULL_INTERVAL_MS/m, ";"),
     grab(/^const ROTATION_DEG_PER_SEC/m, "\n}"),
     grab(/^function armRotationLoop\(\)/m, "\n}"),
-    grab(/^document.addEventListener\("visibilitychange"/m, "});"),
+    grab(/^document.addEventListener\("visibilitychange", \(\) => \{\n  if \(document.hidden\) return;/m, "});"),
   ].join("\n");
   const vm = require("vm");
   vm.createContext(context);
@@ -271,35 +278,20 @@ function runRotationChecks() {
     if (!callback) throw new Error("expected one scheduled animation frame");
     callback(now);
   };
-  const snapshot = () => JSON.stringify(nodeState);
-  const expected = (index, elapsedMs) => {
-    const base = bases.get(liveNodes[index].id());
-    const angle = 0.3 * elapsedMs / 1000 * Math.PI / 180;
-    return { x: pivot.x + (base.x - pivot.x) * Math.cos(angle) - (base.y - pivot.y) * Math.sin(angle),
-      y: pivot.y + (base.x - pivot.x) * Math.sin(angle) + (base.y - pivot.y) * Math.cos(angle) };
-  };
-  const matches = (index, elapsedMs) => {
-    const want = expected(index, elapsedMs), got = nodeState[index];
-    return Math.hypot(got.x - want.x, got.y - want.y) < 1e-8;
-  };
+  const angle = () => angles[angles.length - 1];
+  const turnedFor = ms => Math.abs(angle() - 0.3 * ms / 1000 * DEG) < 1e-12;
 
   context.armRotationLoop();
   context.armRotationLoop();
   check("repeated arming schedules only one rotation loop", pending.length === 1, pending.length);
   frame(10);
-  check("visible nodes rotate on the first animation frame", matches(0, 10) && nodeState[0].y > 100, snapshot());
-  check("off-screen nodes wait for a full culling pass", nodeState[1].x === 100 && cullPasses === 0, snapshot());
+  check("the first animation frame turns the camera by the time elapsed", turnedFor(10), angle());
   frame(26);
-  check("successive visible frames use the fixed base without compounding rotation", matches(0, 26), snapshot());
-  check("normal frames move the outermost visible node under one pixel",
-    Math.hypot(nodeState[0].x - 640, nodeState[0].y - 100) < 1, snapshot());
-  const interval = vm.runInContext("ROTATION_CULL_INTERVAL_MS", context);
-  frame(interval);
-  check("periodic full pass catches all nodes up to the same absolute angle",
-    matches(0, interval) && matches(1, interval) && cullPasses === 1, snapshot());
-  check("rigid rotation preserves every node's distance from the pivot",
-    nodeState.every(p => Math.abs(Math.hypot(p.x - pivot.x, p.y - pivot.y) - 540) < 1e-8), snapshot());
-  check("rotation never CSS-transforms the rendered labels", styleWrites === 0, styleWrites);
+  check("successive frames add up to the total time elapsed", turnedFor(26), angle());
+  check("a frame turns the outermost node of a 540-unit radius under one pixel", 540 * angle() < 1, angle());
+  check("rotation moves no node", positionWrites === 0, positionWrites);
+  check("rotation never CSS-transforms the rendered canvas",
+    !/getElementById\("cy"\)\.style\.transform|cyContainer\.style\.transform/.test(html), "a CSS transform of #cy is back");
 
   /* Chrome suspends requestAnimationFrame in a background tab, so model the
      normal case where the already-queued callback does not run while hidden.
@@ -314,16 +306,15 @@ function runRotationChecks() {
     pending.length === 1 && context.lastRotationTime === now,
     JSON.stringify({ pending: pending.length, lastRotationTime: context.lastRotationTime, now }));
   frame(now + 16);
-  check("resume excludes time spent suspended in the background",
-    matches(0, interval + 16) && matches(1, interval + 16), snapshot());
+  check("resume excludes time spent suspended in the background", turnedFor(26 + 16), angle());
 
   /* Also retain coverage for engines that do deliver one frame after hiding. */
-  const beforeHidden = snapshot();
+  const turnsBefore = angles.length;
   context.document.hidden = true;
   listeners.visibilitychange();
   frame(now + 32);
   check("a frame delivered while hidden stops rotation and leaves no callback pending",
-    snapshot() === beforeHidden && !context.rotationLoopArmed && pending.length === 0, snapshot());
+    angles.length === turnsBefore && !context.rotationLoopArmed && pending.length === 0, angles.length);
   now += 1000;
   context.document.hidden = false;
   listeners.visibilitychange();
@@ -332,18 +323,18 @@ function runRotationChecks() {
   frame(now + 16);
 
   for (const flag of ["userInteracting", "graphSettling"]) {
-    const beforePause = snapshot();
+    const turns = angles.length;
     context[flag] = true;
     frame(now + 16);
-    check(`${flag} pauses position updates while retaining one loop`,
-      snapshot() === beforePause && pending.length === 1, snapshot());
+    check(`${flag} pauses rotation while retaining one loop`,
+      angles.length === turns && pending.length === 1, angles.length);
     context[flag] = false;
   }
-  const beforeDisabled = snapshot();
+  const turns = angles.length;
   context.state.rotationEnabled = false;
   frame(now + 16);
-  check("disabled rotation stops scheduling and preserves positions",
-    snapshot() === beforeDisabled && pending.length === 0 && !context.rotationLoopArmed, snapshot());
+  check("disabled rotation stops scheduling and turns no further",
+    angles.length === turns && pending.length === 0 && !context.rotationLoopArmed, angles.length);
   context.armRotationLoop();
   check("disabled rotation cannot re-arm", pending.length === 0, pending.length);
 }

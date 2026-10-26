@@ -46,20 +46,35 @@ try {
         if (isGraph) { const oj = r.json.bind(r); r.json = async () => { const j = await oj(); mark("data"); return j; }; }
         return r;
       };
+      // the page's canvas: graphView (sigma) since the rework, cy (Cytoscape) before it
       const iv = setInterval(() => {
-        let c; try { c = cy; } catch { return; } // eslint-disable-line no-undef
-        if (!c || typeof c.nodes !== "function") return;
+        let v = null, c = null;
+        try { v = graphView; } catch { try { c = cy; } catch { return; } } // eslint-disable-line no-undef
+        if (v ? typeof v.nodeCount !== "function" : (!c || typeof c.nodes !== "function")) return;
         clearInterval(iv);
         const om = window.mapGraphResultToElements;
         window.mapGraphResultToElements = function () { const t = performance.now(); const r = om.apply(this, arguments); window.__B.info.mapMs = (window.__B.info.mapMs || 0) + performance.now() - t; return r; };
         const omg = window.mergeGraphElements;
         window.mergeGraphElements = function () { const t = performance.now(); const r = omg.apply(this, arguments); window.__B.info.mergeMs = (window.__B.info.mergeMs || 0) + performance.now() - t; requestAnimationFrame(() => requestAnimationFrame(() => mark("first"))); return r; };
         const s = setInterval(() => { let gs; try { gs = graphSettled; } catch { return; } if (window.__B.marks.first && gs) { mark("settled"); clearInterval(s); } }, 50); // eslint-disable-line no-undef
-        window.__B.pan = (dx, dy) => c.panBy({ x: dx, y: dy });
-        window.__B.getZoom = () => c.zoom();
-        window.__B.zoomTo = z => c.zoom({ level: z, renderedPosition: { x: c.width() / 2, y: c.height() / 2 } });
-        window.__B.nodeCount = () => c.nodes().length;
-        window.__B.allScreen = () => { const out = []; c.nodes().forEach(n => { const p = n.renderedPosition(); out.push(p.x, p.y); }); return out; };
+        if (v) {
+          window.__B.pan = (dx, dy) => { const { width, height } = v.size(); v.setView(v.toModel({ x: width / 2 - dx, y: height / 2 - dy })); };
+          window.__B.getZoom = () => v.zoom();
+          window.__B.zoomTo = z => v.setView(null, z);
+          window.__B.nodeCount = () => v.nodeCount();
+          window.__B.allScreen = () => { const out = []; v.forEachPosition((id, x, y) => { const p = v.toScreen({ x, y }); out.push(p.x, p.y); }); return out; };
+          let ids = null;
+          window.__B.nodeScreen = i => { ids = ids || v.nodeIds(); const p = v.toScreen(v.position(ids[i])); return [p.x, p.y]; };
+          // the node under the pointer, as the page's hover handler saw it (nodes overlap in a dense view)
+          window.__B.hovered = () => { ids = ids || v.nodeIds(); let h = -1; v.forEachNode((id, a) => { if (a.hoverHl) h = ids.indexOf(id); }); return h; };
+          Object.defineProperty(window.__B, "n", { get: () => v.nodeCount() });
+        } else {
+          window.__B.pan = (dx, dy) => c.panBy({ x: dx, y: dy });
+          window.__B.getZoom = () => c.zoom();
+          window.__B.zoomTo = z => c.zoom({ level: z, renderedPosition: { x: c.width() / 2, y: c.height() / 2 } });
+          window.__B.nodeCount = () => c.nodes().length;
+          window.__B.allScreen = () => { const out = []; c.nodes().forEach(n => { const p = n.renderedPosition(); out.push(p.x, p.y); }); return out; };
+        }
       }, 5);
     });
     await page.goto(`${BASE}/?variant=${REAL[renderer]}`, { waitUntil: "domcontentloaded" });
@@ -118,22 +133,31 @@ try {
     result.pan.moves = k;
   } else result.pan = null;
   result.zoom = await measure("zoom", 4000);
-  if (!real) {
-    // node drag through real mouse events on a node near the centre
+  if (await page.evaluate(() => typeof window.__B.nodeScreen === "function")) {
+    // node drag through real mouse events on a node near the centre (the
+    // Cytoscape page had node drag off)
     const pick = await page.evaluate((W, H) => {
       const B = window.__B; let best = -1, bd = Infinity;
       for (let k = 0; k < 400; k++) { const i = Math.floor(Math.random() * B.n); const [x, y] = B.nodeScreen(i); const dd = Math.hypot(x - W / 2, y - H / 2); if (dd < bd) { bd = dd; best = i; } }
       return { i: best, p: B.nodeScreen(best) };
     }, W, H);
+    await page.mouse.move(pick.p[0] - 3, pick.p[1] - 3); await page.mouse.move(pick.p[0], pick.p[1], { steps: 3 });
+    await new Promise(r => setTimeout(r, 200));
+    const hovered = await page.evaluate(() => window.__B.hovered ? window.__B.hovered() : -1);
+    if (hovered >= 0) pick.i = hovered; // follow the node actually grabbed
     await page.evaluate(() => { window.__dragFrames0 = window.__frames.length; window.__dragT0 = performance.now(); });
-    await page.mouse.move(pick.p[0], pick.p[1]); await page.mouse.down();
+    await page.mouse.down();
     const t0 = Date.now(); let k = 0;
-    while (Date.now() - t0 < 4000) { k++; await page.mouse.move(pick.p[0] + Math.cos(k / 8) * 120, pick.p[1] + Math.sin(k / 8) * 120, { steps: 1 }); await new Promise(r => setTimeout(r, 8)); }
+    // a 120 px circle that starts at the grab point, so the pointer never jumps
+    // away from the node (sigma only starts a drag after a few small moves)
+    const at = k => [pick.p[0] + (Math.cos(k / 8) - 1) * 120, pick.p[1] + Math.sin(k / 8) * 120];
+    while (Date.now() - t0 < 4000) { k++; await page.mouse.move(...at(k), { steps: 1 }); await new Promise(r => setTimeout(r, 8)); }
     const after = await page.evaluate(i => window.__B.nodeScreen(i), pick.i);
-    const target = [pick.p[0] + Math.cos(k / 8) * 120, pick.p[1] + Math.sin(k / 8) * 120];
+    const target = at(k);
     await page.mouse.up();
     result.drag = await page.evaluate(() => { const f = window.__frames.slice(window.__dragFrames0); const el = performance.now() - window.__dragT0; const g = f.slice(1).map((t, i) => t - f[i]).sort((a, b) => a - b); return { fps: +(g.length * 1000 / el).toFixed(1), p95: +(g[Math.floor(g.length * 0.95)] || 0).toFixed(1) }; });
     result.drag.nodeFollowedPx = +Math.hypot(after[0] - target[0], after[1] - target[1]).toFixed(0);
+    result.drag.grabbed = hovered >= 0;
   }
   result.errors = errors.slice(0, 5);
 } catch (e) { result.fatal = String(e).slice(0, 300); }

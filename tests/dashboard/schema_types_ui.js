@@ -28,7 +28,7 @@ const fnSrc = [
   grab(/^function nodeType\(/m, "\n}"),
   grab(/^function renderTypeLists\(/m, "\n}"),
   grab(/^function applySchemaTypes\(/m, "\n}"),
-  grab(/^function relSelector\(/m, "\n}"),
+  grab(/^function highlightRel\(/m, "\n}"),
   grab(/^let schemaRequestSeq = 0;/m, "\n}"),   // the sequence counter and loadSchemaTypes
   grab(/^\/\* ── Catch-up pill ── \*\//m, "/* ── end Catch-up pill ── */"),  // the live handler and repo switch update the pill
   grab(/^\/\* ── Live refresh ── \*\//m, "/* ── end Live refresh ── */"),  // reindex events refresh through it
@@ -147,6 +147,8 @@ const fetchGates = {};
 let eventSource = null;
 let order = [];
 let refreshes = 0, isolations = 0, styleUpdates = 0;
+/* the canvas's edges, for the relationship-type highlight */
+const canvasEdges = [];
 const state = { isolatedEntity: null, isolatedRel: null, nodeCeiling: 100, relCeiling: 100 };
 const timers = [];
 const runTimers = async () => { while (timers.length) await timers.shift()(); };
@@ -171,7 +173,10 @@ const globals = {
   loadGitHistory: () => {},
   highlightType: () => {}, highlightRel: () => {},
   isolateChanged: () => { isolations++; },
-  cy: { style: () => ({ update: () => { styleUpdates++; } }) },
+  graphView: {
+    restyle: () => { styleUpdates++; },
+    updateEdges: fn => canvasEdges.forEach(e => fn(e.id, e.attrs)),
+  },
   configModel: null, loadConfigPage: () => {},  // the Config page's live refresh, idle until it is opened
   CANVAS_NODE_CAP: 1500, scopeNodeTotal: 0,
   setTimeout: fn => { timers.push(fn); return timers.length; },  // live refreshes wait; runTimers fires them
@@ -180,7 +185,7 @@ const api = new Function(...Object.keys(globals),
   tablesSrc + "\n" + fnSrc +
   "\nreturn { NODE_TYPES, REL_TYPES, CAT_COLORS, BUILTIN_NODE_TYPES, renderTypeLists, applySchemaTypes," +
   " loadSchemaTypes, currentStateQuery, mapGraphResultToElements, acCandidates, onRepoSelectChange, refreshIsolateUI," +
-  " connectLiveEvents, relSelector, renderPropsRows, hiddenProps: () => HIDDEN_PROPS };")(
+  " connectLiveEvents, highlightRel, renderPropsRows, hiddenProps: () => HIDDEN_PROPS };")(
   ...Object.values(globals));
 
 // --- helpers ------------------------------------------------------------
@@ -399,11 +404,16 @@ const hintShown = () => els.schemaPendingHint.style.display !== "none";
   check("the count-row lookup escapes the label in its selector",
     /data-label="\$\{CSS\.escape\(t\.id\)\}"/.test(topologySrc), "loadTopologyCounts selector not escaped");
 
-  // 10b. relationship types are escaped into the Cytoscape selector
-  check("the relationship selector escapes quotes and backslashes",
-    api.relSelector('A"] , node[x = "\\') === '[label = "A\\"] , node[x = \\"\\\\"]', api.relSelector('A"] , node[x = "\\'));
-  check("the hover and isolate paths use the escaped selector",
-    !/\[label = "\$\{(?!String\(rel)/.test(html), "a raw [label = \"${...}\"] selector remains in index.html");
+  // 10b. a relationship type is matched by value, never built into a selector
+  const odd = 'A"] , node[x = "\\';
+  canvasEdges.push({ id: "e1", attrs: { label: odd } }, { id: "e2", attrs: { label: "A" } }, { id: "e3", attrs: { label: "CALLS" } });
+  api.highlightRel(odd, true);
+  check("hovering a relationship type with quotes and brackets highlights exactly its edges",
+    canvasEdges.map(e => !!e.attrs.hoverHl).join() === "true,false,false", JSON.stringify(canvasEdges));
+  api.highlightRel(odd, false);
+  check("...and leaving it clears them", canvasEdges.every(e => !e.attrs.hoverHl), JSON.stringify(canvasEdges));
+  check("no relationship type is interpolated into a selector string",
+    !/\[label = "\$\{/.test(html), "a [label = \"${...}\"] selector is back in index.html");
 
   // 10c. the node inspector hides the bookkeeping properties the schema route lists
   await api.loadSchemaTypes("alpha");

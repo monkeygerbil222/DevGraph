@@ -53,10 +53,10 @@ const globals = {
   NODE_TYPES: [{ id: "Function", cat: "code" }],
   stableNodeId: n => "s:" + n.id,
   state: { isolatedEntity: null },
-  cy: new Proxy({}, { get: (_, k) => cyStub[k] }),
+  graphView: new Proxy({}, { get: (_, k) => viewStub[k] }),
   console,
 };
-let cyStub = null;
+let viewStub = null;
 const api = new Function(...Object.keys(globals), src +
   "\nreturn { communityColor, COMMUNITY_PALETTE, loadInsights, recomputeInsights, mapGraphResultToElements, renderInsights, mergeGraphElements };")(
   ...Object.values(globals));
@@ -189,16 +189,14 @@ const COMPUTED = {
   check("a failed recompute says so", /failed/i.test(els.communityNote.textContent) && els.btnRecomputeInsights.disabled === false, els.communityNote.textContent);
 
   // 9b. community colours on nodes already on the canvas stay current
-  const mkNode = (id, community) => ({
-    id: () => id, nonempty: () => true,
-    data(k, v) { if (v !== undefined) this._d[k] = v; return this._d[k]; }, _d: { community },
-  });
-  const existing = mkNode("n1", null);
-  const list = [existing];
-  list.map = Array.prototype.map; list.filter = Array.prototype.filter;
-  cyStub = { elements: () => list, collection: () => [], getElementById: id => (id === "n1" ? existing : { nonempty: () => false }) };
+  const existing = { community: null };
+  viewStub = {
+    elementIds: () => ["n1"], elementCount: () => 1,
+    has: id => id === "n1", hasNode: id => id === "n1",
+    data: (id, k) => existing[k], setData: (id, k, v) => { existing[k] = v; },
+  };
   api.mergeGraphElements([{ data: { id: "n1", community: 4 } }], "light", { remove: false, settle: false });
-  check("mergeGraphElements updates community on an existing node", existing.data("community") === 4, String(existing.data("community")));
+  check("mergeGraphElements updates community on an existing node", existing.community === 4, String(existing.community));
 
   // 10. the GDS placeholder is gone
   check("no GDS probe remains", !/gds\.list/.test(html) && !/attemptCommunityDetection/.test(html), "index.html still probes for GDS");

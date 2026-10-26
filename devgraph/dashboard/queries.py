@@ -2,7 +2,7 @@
 
 Kept separate from `graph/engine.py` (general-purpose upsert/delete API) and
 from `mcp/tools.py` (MCP tool response shapes) since these are read queries
-built specifically for the dashboard's UI: a stat grid, a Cytoscape.js
+built specifically for the dashboard's UI: a stat grid, a graph-canvas
 node/edge payload, and a lightweight search-box row shape. Every query is
 hard-scoped to `repo_id`, same discipline as the rest of the codebase (see
 Design Brief Principle 3).

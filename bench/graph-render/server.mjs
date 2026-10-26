@@ -5,7 +5,7 @@
 // candidate libraries are served from /bench/.
 //   node server.mjs <port> [checkout root, default ../..]
 // Dataset: GET /bench/ds/<name> selects data/<name>.api.json for /api/cypher.
-// Variants of the real page: /?variant=v334 (Cytoscape 3.34, canvas),
+// Variants of the pre-rework (Cytoscape) page: /?variant=v334 (Cytoscape 3.34, canvas),
 //   /?variant=webgl (Cytoscape 3.34 with its WebGL renderer on).
 import http from "node:http";
 import fs from "node:fs";

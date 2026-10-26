@@ -21,38 +21,26 @@ const grab = (startRe, endMarker) => {
 };
 const src = grab(/^function mergeGraphElements\(/m, "\n}");
 
-// --- a minimal canvas: elements with ids, data and positions ------------
-const live = new Map();
-const mkNode = el => {
-  const data = { ...el.data }, pos = { x: 0, y: 0 };
-  return {
-    id: () => data.id, length: 1, nonempty: () => true,
-    data: (k, v) => (v === undefined ? data[k] : (data[k] = v)),
-    position: p => (p === undefined ? { ...pos } : Object.assign(pos, p)),
-  };
-};
-const coll = arr => ({
-  length: arr.length,
-  forEach: fn => arr.forEach(fn), map: fn => arr.map(fn), some: fn => arr.some(fn),
-  filter: fn => coll(arr.filter(fn)), remove: () => {},
-  boundingBox: () => {
-    const xs = arr.map(n => n.position().x), ys = arr.map(n => n.position().y);
-    const x1 = Math.min(...xs), x2 = Math.max(...xs), y1 = Math.min(...ys), y2 = Math.max(...ys);
-    return { x1, x2, y1, y2, w: x2 - x1, h: y2 - y1 };
-  },
-});
-const cy = {
-  elements: () => coll([...live.values()]),
-  nodes: () => coll([...live.values()].filter(e => !e.isEdge)),
-  collection: () => coll([]),
-  getElementById: id => live.get(id) || { length: 0, nonempty: () => false },
-  add: els => els.forEach(el => { const e = mkNode(el); e.isEdge = !!el.data.source; live.set(el.data.id, e); }),
-  container: () => ({ getBoundingClientRect: () => ({ width: 900, height: 600 }) }),
+// --- a minimal canvas: graphView over a Map of nodes and edges ----------
+const nodes = new Map(), edges = new Map();
+const graphView = {
+  has: id => nodes.has(id) || edges.has(id),
+  hasNode: id => nodes.has(id),
+  elementIds: () => [...nodes.keys(), ...edges.keys()],
+  elementCount: () => nodes.size + edges.size,
+  data: (id, k) => (nodes.get(id) || edges.get(id)).data[k],
+  setData: (id, k, v) => { (nodes.get(id) || edges.get(id)).data[k] = v; },
+  position: id => ({ ...nodes.get(id).pos }),
+  forEachPosition: fn => nodes.forEach((n, id) => fn(id, n.pos.x, n.pos.y)),
+  addNode: (id, data, p) => nodes.set(id, { data: { ...data }, pos: { ...p } }),
+  addEdge: (id, source, target, data) => edges.set(id, { data: { ...data }, source, target }),
+  remove: id => { nodes.delete(id); edges.delete(id); },
+  size: () => ({ width: 900, height: 600 }),
 };
 const globals = {
-  cy, cachedPositions: new Map(),
+  graphView, cachedPositions: new Map(),
   document: { getElementById: () => null },
-  updateRenderQuality: () => {}, updateViewportCulling: () => {},
+  updateOnscreenCount: () => {},
   setGraphSettled: () => {}, forceDirectedSettle: () => {}, focusRotation: () => {},
 };
 const mergeGraphElements = new Function(...Object.keys(globals), src + "\nreturn mergeGraphElements;")(
@@ -67,8 +55,7 @@ const check = (label, cond, detail) => {
 // An anchored canvas (one node already placed) and a large batch of new
 // nodes, each the far end of one relationship from the anchor's chain.
 const N = 3000;
-cy.add([{ data: { id: "n0" } }]);
-live.get("n0").position({ x: 500, y: -200 });
+graphView.addNode("n0", { id: "n0" }, { x: 500, y: -200 });
 let endpointReads = 0;
 const counted = (id, source, target) => ({
   data: {
@@ -84,8 +71,8 @@ for (let i = 1; i <= N; i++) elements.push(counted("e" + i, "n" + (i - 1), "n" +
 mergeGraphElements(elements, "light", { remove: false, settle: false });
 check(`neighbour lookup reads each relationship a bounded number of times (${endpointReads} reads for ${N} nodes and ${N} relationships)`,
   endpointReads < 20 * (2 * N), String(endpointReads));
-check("every new node is on the canvas", live.size === 2 * N + 1, String(live.size));
-const n1 = live.get("n1").position();
+check("every new node and edge is on the canvas", nodes.size + edges.size === 2 * N + 1, String(nodes.size + edges.size));
+const n1 = graphView.position("n1");
 check("a new node is still placed next to its already-placed neighbour",
   Math.abs(n1.x - 500) <= 25 && Math.abs(n1.y + 200) <= 25, JSON.stringify(n1));
 

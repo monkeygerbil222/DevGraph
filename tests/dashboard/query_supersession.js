@@ -1,6 +1,6 @@
 /* Headless test of out-of-order Cypher replies on the graph path, driving the
    real runQueryAndUpdateGraph/previewQueryGlow out of index.html against
-   stubs -- no browser, no cytoscape, no timers.
+   stubs -- no browser, no canvas library, no timers.
 
    The bug this exists to catch is invisible from the server side and looks
    like nothing at all in a screenshot: two overlapping requests (a repo
@@ -35,24 +35,10 @@ const src = [
 ].join("\n");
 
 // --- fake canvas ------------------------------------------------------
-/* Elements carry just what the code under test touches: id(), the excluded
-   class toggling, and `length` (a real cytoscape element is a collection of
-   one, which is what the focus filter tests). */
+/* Elements carry just what the code under test touches: their attributes
+   (the excluded flag), as graphView hands them to an update. */
 const canvas = new Map();
-const mkEle = (id, isEdge) => {
-  const classes = new Set();
-  return {
-    id: () => id, isEdge, length: 1,
-    toggleClass: (c, on) => { if (on) classes.add(c); else classes.delete(c); },
-    hasClass: c => classes.has(c),
-  };
-};
-const coll = arr => ({
-  length: arr.length,
-  forEach: fn => arr.forEach(fn),
-  filter: fn => coll(arr.filter(fn)),
-  map: fn => arr.map(fn),
-});
+const mkEle = (id, isEdge) => ({ id, isEdge, attrs: {} });
 const canvasIds = () => [...canvas.keys()].sort();
 
 // --- stubs ------------------------------------------------------------
@@ -86,12 +72,10 @@ const sandboxGlobals = {
       return null;
     },
   },
-  cy: {
-    nodes: () => coll([...canvas.values()].filter(e => !e.isEdge)),
-    edges: () => coll([...canvas.values()].filter(e => e.isEdge)),
-    elements: () => coll([...canvas.values()]),
-    collection: arr => coll(arr),
-    getElementById: id => canvas.get(id) || { length: 0 },
+  graphView: {
+    hasNode: id => canvas.has(id) && !canvas.get(id).isEdge,
+    updateNodes: fn => [...canvas.values()].filter(e => !e.isEdge).forEach(e => fn(e.id, e.attrs)),
+    updateEdges: fn => [...canvas.values()].filter(e => e.isEdge).forEach(e => fn(e.id, e.attrs)),
   },
   syncCypherHighlight: () => {},
   runCypher: (statement, opts) => cypherImpl(statement, opts),
@@ -223,7 +207,7 @@ const newB = node(22, "fresh_two", "new.py");
     merges[0] && merges[0].mode === "light" && merges[0].opts.remove === true && merges[0].opts.settle === true,
     JSON.stringify(merges[0]));
   check("unmatched elements are marked excluded, matched ones are not",
-    canvas.get(nodeId(newB)).hasClass("excluded") && !canvas.get(nodeId(newA)).hasClass("excluded"),
+    canvas.get(nodeId(newB)).attrs.excluded && !canvas.get(nodeId(newA)).attrs.excluded,
     JSON.stringify(canvasIds()));
   check("the visible count reflects only non-excluded elements",
     visibleCountText === "1 nodes · 0 edges", visibleCountText);

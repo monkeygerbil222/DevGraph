@@ -23,22 +23,22 @@ const src = [
 ].join("\n");
 
 const written = [];
-const mkEle = (id, isNode) => {
-  const data = { glow: 0 };
-  return {
-    id: () => id, isNode: () => isNode, hasClass: () => false,
-    data: (k, v) => { if (v === undefined) return data[k]; if (k === "glow") written.push(v); data[k] = v; },
-  };
-};
-const eles = [mkEle("a", true), mkEle("b", true), mkEle("e", false)];
+/* the canvas's elements: attribute objects, as graphView hands them out */
+const mk = (id, isNode) => ({ id, isNode, attrs: { glow: 0 } });
+const eles = [mk("a", true), mk("b", true), mk("e", false)];
+const record = (fn, list) => list.forEach(e => { fn(e.id, e.attrs); written.push(e.attrs.glow); });
 const frames = [];
 let now = 1000;
 const globals = {
-  cy: { elements: () => eles },
+  graphView: {
+    forEachNode: fn => eles.filter(e => e.isNode).forEach(e => fn(e.id, e.attrs)),
+    forEachEdge: fn => eles.filter(e => !e.isNode).forEach(e => fn(e.id, e.attrs)),
+    updateNodes: fn => record(fn, eles.filter(e => e.isNode)),
+    updateEdges: fn => record(fn, eles.filter(e => !e.isNode)),
+  },
   performance: { now: () => now },
   requestAnimationFrame: fn => { frames.push(fn); return frames.length; },
   cancelAnimationFrame: () => {},
-  setNodeGlowActive: () => {},
 };
 const animateGlowTo = new Function(...Object.keys(globals), src + "\nreturn animateGlowTo;")(...Object.values(globals));
 
@@ -56,8 +56,8 @@ check("a frame stamped before the animation started writes no negative glow",
 while (frames.length) frames.shift()(now += 100);
 check("every glow value written stays within [0, 1]", written.every(v => v >= 0 && v <= 1), JSON.stringify(written));
 check("matched elements end fully glowing, the rest dark",
-  eles[0].data("glow") === 1 && eles[2].data("glow") === 1 && eles[1].data("glow") === 0,
-  JSON.stringify(eles.map(e => e.data("glow"))));
+  eles[0].attrs.glow === 1 && eles[2].attrs.glow === 1 && eles[1].attrs.glow === 0,
+  JSON.stringify(eles.map(e => e.attrs.glow)));
 
 console.log(failures ? "\n" + failures + " FAILED" : "\nall passed");
 process.exit(failures ? 1 : 0);

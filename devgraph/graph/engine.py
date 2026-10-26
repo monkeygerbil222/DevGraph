@@ -2882,7 +2882,7 @@ class GraphEngine:
         graph structure instead of flattening records with `.data()`.
 
         Backs the dashboard's Cypher console (`dashboard/routes.py`'s
-        `/api/cypher`), which renders results onto the Cytoscape canvas the
+        `/api/cypher`), which renders results onto the graph canvas the
         same way Neo4j's HTTP transaction API's `resultDataContents:
         ["row","graph"]` shape does -- this mirrors that shape so the
         frontend needs no special-casing. Deliberately uses the *legacy*
