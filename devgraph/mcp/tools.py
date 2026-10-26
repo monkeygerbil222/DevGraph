@@ -11,7 +11,7 @@ All Cypher is parameterized — user input never concatenates directly into
 query strings.
 """
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import Path
@@ -1101,6 +1101,26 @@ def _node_ref(row: dict[str, Any]) -> dict[str, Any]:
     return ref
 
 
+def _without_constructors(
+    rows: list[dict[str, Any]], label_of: Callable[[dict[str, Any]], str] = lambda row: row["label"],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Name lookup candidates split into (the rest, the constructors): a
+    Function named like a Class candidate and owned by that class (its
+    owner the class's owner and name, `Outer.Order`; in the class's
+    repository), as a Java, C#, C++ or Kotlin constructor is. A class name
+    then means the class: describe_node and get_source answer with it, and
+    name its constructors, which `owner` reaches."""
+    classes = {
+        (row.get("repo_id"), f"{row['owner']}.{row['name']}" if row.get("owner") else row["name"])
+        for row in rows if label_of(row) == "Class" and row.get("file") is not None
+    }
+    constructors = [
+        row for row in rows
+        if label_of(row) == "Function" and (row.get("repo_id"), row.get("owner")) in classes
+    ]
+    return [row for row in rows if all(row is not each for each in constructors)], constructors
+
+
 def _unresolved_marked(ref: dict[str, Any]) -> dict[str, Any]:
     """A candidate ref, with `unresolved_handler: true` when it is a route's
     handler stub left visible because it folds into no single real Function
@@ -1177,7 +1197,9 @@ def describe_node(
 
     Returns:
         `{"status": "found", "node", "outgoing", "incoming", "groups_truncated"}`,
-        each group a `{count, results, truncated}` envelope of `{label, name, file}`
+        plus `constructors` (refs) when the node is a class whose name its
+        constructors share (`_without_constructors`: a Function named like a
+        Class candidate and owned by it is no candidate of its own), each group a `{count, results, truncated}` envelope of `{label, name, file}`
         refs (and `owner` for a method or nested class); or `{"status":
         "ambiguous", "count", "candidates", "truncated"}`.
         No match raises ToolError with suggestions. `Repository` nodes are never
@@ -1234,6 +1256,7 @@ def describe_node(
         message = f"no node named {_echo(name)}{filters} in repository {_echo(repo_id)}.{_did_you_mean(suggestions)}"
         raise ToolError(f"{message} {_DESCRIBE_HINT}.")
 
+    rows, constructors = _without_constructors(rows)
     if len(rows) > 1:
         candidates = sorted(
             (_unresolved_marked(_node_ref(row)) for row in rows),
@@ -1266,13 +1289,18 @@ def describe_node(
         refs = [_node_ref(ref) for ref in group["refs"]]
         target = outgoing if group["dir"] == "out" else incoming
         target[group["rel"]] = {"count": group["total"], "results": refs, "truncated": group["total"] > len(refs)}
-    return {
+    found = {
         "status": "found",
         "node": node,
         "outgoing": dict(sorted(outgoing.items())),
         "incoming": dict(sorted(incoming.items())),
         "groups_truncated": groups_truncated,
     }
+    if constructors:
+        found["constructors"] = sorted(
+            (_node_ref(row) for row in constructors), key=lambda r: (r.get("file") or "", r.get("owner") or "")
+        )
+    return found
 
 
 #: Most results god_nodes returns, whatever max_results asks for.
@@ -3093,7 +3121,11 @@ def get_source(
         read. When several nodes match, `source` is None and the dict adds
         `status: "ambiguous"`, `count`, `truncated` and `candidates`
         ({label, name, file, owner}; repo_id too when cross_repo): pass one's
-        `file` and `owner`. The result names its `owner` too. A route's
+        `file` and `owner`. The result names its `owner` too. A constructor (a
+        Function named like a Class candidate and owned by it,
+        `_without_constructors`) is no candidate of its own: a class's name
+        answers with the class, adding `constructors` ({name, file, owner}),
+        which `owner` reaches. A route's
         handler stub that folds into a real Function (`_fold_target`) is left
         out, so it never makes its handler ambiguous; any other stub is a
         candidate with file None.
@@ -3157,6 +3189,7 @@ def get_source(
     def label_of(row: dict[str, Any]) -> str:
         return next((label for label in row["labels"] if label in ("Function", "Class")), row["labels"][0])
 
+    results, constructors = _without_constructors(results, label_of)
     if len(results) > 1:
         candidates = [
             {
@@ -3225,6 +3258,11 @@ def get_source(
     }
     if row["owner"] is not None:
         result["owner"] = row["owner"]
+    if constructors:
+        result["constructors"] = [
+            {"name": c["name"], "file": c["file"], "owner": c["owner"], **({"repo_id": c["repo_id"]} if cross_repo else {})}
+            for c in constructors
+        ]
     if notice is not None:
         result["notice"] = notice
     return result

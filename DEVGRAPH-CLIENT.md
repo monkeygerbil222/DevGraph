@@ -301,6 +301,14 @@ several unrelated functions qualify) stays visible: `describe_node` and `get_sou
 `unresolved_handler: true` (file null), never folding it into an unrelated
 function of the same name.
 
+**A class's name means the class**: a Java, C# or C++ constructor is a
+function named like its class and owned by it, so `Order` names both.
+`describe_node` and `get_source` answer with the class (status `found`) and
+add `constructors`, the refs of its constructors ({label, name, file,
+owner} in `describe_node`, {name, file, owner} in `get_source`); pass
+`owner="Order"` or name it `Order.Order` to reach one. Two classes of one
+name are still `ambiguous`, their constructors left out of the candidates.
+
 **Where an answer is, and one class's method**: every `find_callers` row
 names the caller's `file`, `owner` (the classes or functions it is declared
 in, `""` at the top level) and `start_line`, so `A.run` and `B.run` of one

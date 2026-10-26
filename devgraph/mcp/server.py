@@ -1008,7 +1008,10 @@ def build_server(
         returns status "ambiguous" with candidates ({label, name, file, owner}) instead of
         picking one: pass the candidate's file (repo-relative path) and owner (the classes
         or functions it is declared in, "" at the top level) to choose. A method may also
-        be named with its class, "A.save" or "A::save". A route's handler stub never makes
+        be named with its class, "A.save" or "A::save". A class's name means the class,
+        never its constructor (a function named like it and owned by it, as in Java, C#
+        or C++): the answer names its constructors, which owner (the class's name)
+        reaches. A route's handler stub never makes
         the one function it stands for ambiguous; a stub standing for none is a
         candidate marked unresolved_handler. A file that is not valid UTF-8 is
         decoded with replacement characters, and a notice says so. An unknown name (or
@@ -1032,7 +1035,9 @@ def build_server(
         direction, with each neighbour's identity. A file, folder or docs node is named by
         its repo-relative path or id; a method may be named with its class, "A.save" or
         "A::save". An ambiguous name returns candidates; call again with label, file and
-        owner. A route handler answers as its real function, with its stub's
+        owner. A class's name means the class, never its constructor (a function named
+        like it and owned by it): the answer lists its constructors, reached with
+        "Order.Order" or owner. A route handler answers as its real function, with its stub's
         relationships folded in when the stub provably stands for it; a stub routes
         share because their handlers share a name is left out when each route resolved
         to its own function; any other stub is marked unresolved_handler. A code symbol's ref carries owner (the classes or functions it is declared
