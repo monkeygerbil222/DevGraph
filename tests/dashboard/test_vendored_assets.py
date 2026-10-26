@@ -77,3 +77,10 @@ def test_the_canvas_libraries_are_the_pinned_builds_and_noted():
         assert hashlib.sha256(path.read_bytes()).hexdigest() == sha256, name
         assert f"## {heading}" in notices and f"sha256 `{sha256}`" in notices
         assert f"devgraph/dashboard/static/vendor/{name}" in notices
+
+
+def test_the_layout_worker_is_package_data():
+    pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    patterns = pyproject["tool"]["setuptools"]["package-data"]["devgraph.dashboard"]
+    shipped = {p for pattern in patterns for p in (STATIC.parent).glob(pattern)}
+    assert STATIC / "graph-layout-worker.js" in shipped
