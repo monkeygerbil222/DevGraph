@@ -12,7 +12,7 @@ from neo4j.exceptions import ServiceUnavailable, SessionExpired
 
 from devgraph.agent.sync import FAILURE_RETRY_DELAY_S, RepoSync
 from devgraph.cli.main import _neo4j_problem
-from devgraph.graph.engine import EngineClosed, GraphEngine, provision_repository_schema
+from devgraph.graph.engine import EngineClosed, GraphEngine, IndexesNotReady, Neo4jNotAnswering, provision_repository_schema
 from devgraph.indexer import dispatch
 from devgraph.indexer.dispatch import Neo4jLost, catch_up, full_scan, index_outdated, index_paths
 from devgraph.registry.store import RepoRegistry
@@ -48,7 +48,11 @@ def _files(tmp_path, n=3):
     return paths
 
 
-@pytest.mark.parametrize("error", [ServiceUnavailable("connection lost"), SessionExpired("session expired")])
+@pytest.mark.parametrize("error", [
+    ServiceUnavailable("connection lost"), SessionExpired("session expired"),
+    # No pooled connection within the connection timeout (the engine's own type)
+    Neo4jNotAnswering("no connection within 5 s"),
+])
 def test_a_lost_connection_aborts_the_batch_at_the_first_file(tmp_path, monkeypatch, error):
     paths = _files(tmp_path)
     tried = []
@@ -82,14 +86,15 @@ def test_a_file_s_own_error_still_skips_only_that_file(tmp_path, monkeypatch):
     assert tried == ["m0.py", "m1.py", "m2.py"]
 
 
-def test_engine_closed_is_raised_as_itself(tmp_path, monkeypatch):
+@pytest.mark.parametrize("kind", [EngineClosed, IndexesNotReady])
+def test_engine_closed_is_raised_as_itself(tmp_path, monkeypatch, kind):
     paths = _files(tmp_path, 1)
 
     def closed(*args):
-        raise EngineClosed()
+        raise kind()
 
     stub(monkeypatch, dispatch, "_index_single_path", closed)
-    with pytest.raises(EngineClosed) as raised:
+    with pytest.raises(kind) as raised:
         index_paths(_QuietEngine(), "_unit_lost", tmp_path, paths)
     assert not isinstance(raised.value, Neo4jLost)
 

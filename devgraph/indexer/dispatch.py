@@ -133,8 +133,10 @@ class FullScanCancelled(BatchAborted):
 
 
 class Neo4jLost(BatchAborted, ServiceUnavailable):
-    """Neo4j stopped answering while a file was written (`ServiceUnavailable`
-    or `SessionExpired`, after the engine's and the driver's retries). Not
+    """Neo4j stopped answering while a file was written (`ServiceUnavailable`,
+    the engine's `Neo4jNotAnswering` among them, or `SessionExpired`, after
+    the engine's and the driver's retries; never the engine's own aborts,
+    `EngineClosed` and `IndexesNotReady`, which are raised as they are). Not
     that file's failure: every file after it would fail the same way, one
     retry budget each, and a batch carrying on would be stamped with files
     missing. A `ServiceUnavailable` too, so a caller reporting an unreachable
