@@ -42,11 +42,13 @@ def _bad_path(folder: Path, name: bytes = BAD) -> Path:
     return Path(os.fsdecode(raw))
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows names are UTF-16, so no name holds an undecodable byte")
 def test_printable_path_shows_each_undecodable_byte():
     assert printable_path(os.fsdecode(b"pkg/caf\xe9.py")) == "pkg/caf\\xe9.py"
     assert printable_path("pkg/plain.py") == "pkg/plain.py"
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows names are UTF-16, so no name holds an undecodable byte")
 def test_the_walk_leaves_an_unencodable_file_and_folder_out_and_reports_them(tmp_path):
     (tmp_path / "good.py").write_text("x = 1\n")
     _bad_path(tmp_path)
