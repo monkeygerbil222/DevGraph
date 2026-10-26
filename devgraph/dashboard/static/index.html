@@ -2398,7 +2398,9 @@ function animateGlowTo(targetIds) {
   const start = performance.now(), duration = 420;
   if (glowAnimId) cancelAnimationFrame(glowAnimId);
   function step(now) {
-    const t = Math.min(1, (now - start) / duration);
+    /* clamped at 0 too: a frame's timestamp is when the frame began, which
+       can precede `start`, and a negative progress eases below zero */
+    const t = Math.max(0, Math.min(1, (now - start) / duration));
     const eased = 1 - Math.pow(1 - t, 3);
     eles.forEach(e => {
       const to = targets.has(e.id()) ? 1 : 0;
