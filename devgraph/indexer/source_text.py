@@ -4,6 +4,9 @@ Every extractor works on text, and a byte it can't decode must not cost an
 identifier: `def café()` in a Latin-1 file read as UTF-8 with replacement
 characters became `caf`. The order, for every file:
 
+0. UTF-16 or UTF-32 (`decode_wide`): a file its byte-order mark names as
+   one (Visual Studio's "Unicode" save, PowerShell 5's `Out-File`), or one
+   whose NUL bytes fall on every other byte as UTF-16 text's do.
 1. Python only: the PEP 263 coding declaration on line 1 or 2, when it names
    a codec that decodes the file.
 2. UTF-8.
@@ -13,11 +16,22 @@ characters became `caf`. The order, for every file:
 
 from __future__ import annotations
 
+import codecs
 import io
 import tokenize
 from pathlib import Path
 
 _PYTHON_SUFFIXES = (".py", ".pyi", ".pyw")
+
+#: Byte-order marks, UTF-32's first: its little-endian mark begins with UTF-16's.
+_WIDE_BOMS = (
+    (codecs.BOM_UTF32_LE, "utf-32"), (codecs.BOM_UTF32_BE, "utf-32"),
+    (codecs.BOM_UTF16_LE, "utf-16"), (codecs.BOM_UTF16_BE, "utf-16"),
+)
+#: How much of a file without a mark is looked at to tell UTF-16 text.
+_WIDE_SNIFF_BYTES = 8192
+#: The control characters text without a mark may hold.
+_WHITESPACE = frozenset("\t\n\v\f\r")
 
 
 def decode_source(data: bytes, python: bool = False) -> str:
@@ -27,6 +41,9 @@ def decode_source(data: bytes, python: bool = False) -> str:
 
 def decode_source_as(data: bytes, python: bool = False) -> tuple[str, str]:
     """`decode_source`, with the codec that decoded it ("utf-8" for valid UTF-8)."""
+    wide = decode_wide(data)
+    if wide is not None:
+        return wide
     if python:
         declared = declared_encoding(data)
         if declared is not None:
@@ -62,3 +79,34 @@ def declared_encoding(data: bytes) -> str | None:
     except SyntaxError:  # an unknown codec, or one contradicting a BOM
         return None
     return None if encoding in ("utf-8", "utf-8-sig") else encoding
+
+
+def decode_wide(data: bytes) -> tuple[str, str] | None:
+    """`data` as text with its codec when it is UTF-16 or UTF-32, else None.
+
+    A UTF-16 or UTF-32 byte-order mark names the codec (the mark itself is
+    not part of the text). Without one, `data` is UTF-16 when, in its first
+    8 KiB, NUL bytes fall predominantly on one parity: at least 30% of that
+    parity's bytes, and the other parity holding at most an eighth as many
+    (ASCII-range code is NUL on one; a character such as U+4E00 puts a NUL
+    on the other), LE or BE by which parity; and the text holds no control
+    character but whitespace. Either way it must decode strictly,
+    to text holding no NUL, or it is not taken for one.
+    """
+    codec = next((name for bom, name in _WIDE_BOMS if data.startswith(bom)), None)
+    marked = codec is not None
+    if codec is None and len(data) >= 2 and len(data) % 2 == 0:
+        sample = data[:_WIDE_SNIFF_BYTES]
+        even, odd = sample[0::2].count(0), sample[1::2].count(0)
+        major, minor = max(even, odd), min(even, odd)
+        if major * 10 >= (len(sample) // 2) * 3 and minor * 8 <= major:
+            codec = "utf-16-le" if odd > even else "utf-16-be"
+    if codec is None:
+        return None
+    try:
+        text = data.decode(codec)
+    except UnicodeDecodeError:
+        return None
+    if "\0" in text or (not marked and any(c < " " and c not in _WHITESPACE for c in text[:_WIDE_SNIFF_BYTES])):
+        return None
+    return text, codec

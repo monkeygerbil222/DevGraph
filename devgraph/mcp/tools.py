@@ -3198,7 +3198,8 @@ def get_source(
         handler stub that folds into a real Function (`_fold_target`) is left
         out, so it never makes its handler ambiguous; any other stub is a
         candidate with file None.
-        A file is decoded as the indexer decodes it (`source_text`): a
+        A file is decoded as the indexer decodes it (`source_text`):
+        UTF-16 or UTF-32 by its byte-order mark or NUL pattern, else a
         Python coding line, else UTF-8, else cp1252 or Latin-1; when an
         undeclared file is not valid UTF-8, or a file isn't valid in its
         declared codec, the dict adds a `notice` saying how it was decoded.

@@ -7,10 +7,10 @@ import pytest
 
 from devgraph.indexer import dispatch
 from devgraph.indexer.dispatch import _gone_key, _present, remove_paths
-from tests.helpers import stub
+from tests.helpers import BatchMarkers, stub
 
 
-class _GraphFilesEngine:
+class _GraphFilesEngine(BatchMarkers):
     """Answers the graph-files query from a fixed list and records every delete."""
 
     def __init__(self, files):

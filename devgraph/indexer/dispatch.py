@@ -16,6 +16,7 @@ repo's own `record.path`).
 from __future__ import annotations
 
 import gc
+import itertools
 import logging
 import os
 import pickle
@@ -32,7 +33,7 @@ from collections import Counter
 from collections.abc import Callable, Mapping
 from contextlib import contextmanager
 from datetime import datetime
-from functools import partial
+from functools import partial, wraps
 from pathlib import Path
 from typing import NamedTuple
 
@@ -48,6 +49,9 @@ from devgraph.config.project_schema import (
     resolve_effective_schema,
     schema_file_hash,
 )
+from neo4j.exceptions import ServiceUnavailable, SessionExpired
+
+from devgraph.graph.engine import ABORTS_BATCH as _ENGINE_ABORTS
 from devgraph.graph.engine import (
     ABORTS_BATCH,
     OWNING_SERVICE_TARGETS,
@@ -100,6 +104,7 @@ from devgraph.indexer.walk import IGNORED_DIR_NAMES as IGNORED_DIR_NAMES
 from devgraph.indexer.walk import GITIGNORED, RepoRootEmpty, RepoRootUnavailable, check_repo_root, content_skip_reason
 from devgraph.indexer.walk import indexable_paths as _indexable_paths
 from devgraph.indexer.walk import forget_manifests, gitignore_hides_files, indexable_paths_under
+from devgraph.indexer.walk import UNENCODABLE_NAME, is_encodable, printable_path
 from devgraph.indexer.walk import is_ignored_dir_name as is_ignored_dir_name
 from devgraph.indexer.walk import is_ignored_path as is_ignored_path
 from devgraph.indexer.walk import is_indexable_file as _is_indexable_file
@@ -127,7 +132,83 @@ class FullScanCancelled(BatchAborted):
     watcher is stopping, or the repository is no longer watched."""
 
 
-ABORTS_BATCH = (*ABORTS_BATCH, BatchAborted)
+class Neo4jLost(BatchAborted, ServiceUnavailable):
+    """Neo4j stopped answering while a file was written (`ServiceUnavailable`
+    or `SessionExpired`, after the engine's and the driver's retries). Not
+    that file's failure: every file after it would fail the same way, one
+    retry budget each, and a batch carrying on would be stamped with files
+    missing. A `ServiceUnavailable` too, so a caller reporting an unreachable
+    Neo4j reports this one."""
+
+
+#: A lost connection or session, which no file causes (`Neo4jLost`).
+CONNECTION_LOST = (ServiceUnavailable, SessionExpired)
+
+#: What fails a whole batch or scan here: the engine's (a shutdown, an index
+#: still building), this module's own, and a lost connection to Neo4j, in a
+#: file's write or in any pass after the files.
+ABORTS_BATCH = (*ABORTS_BATCH, BatchAborted, *CONNECTION_LOST)
+
+#: This process's batches that failed since its last full scan of their
+#: repository, by their `batch_open` marker.
+_failed_batches: set[str] = set()
+_batch_serial = itertools.count(1)
+
+
+def _marks_open_batch(fn):
+    """Run `fn`, a batch that writes, under a `batch_open` marker on the
+    repository's Repository node: added by the batch's first write
+    transaction and removed by the engine's next write after the batch
+    finished (`GraphEngine.open_batch`, `finish_batch`: no round trip of its
+    own). A batch cut short (Neo4j lost after its files' nodes were written
+    but before other files' edges to them were relinked, a shutdown, the
+    process killed) leaves its marker, and the next `catch_up` rescans the
+    repository in full (`_unfinished_batches`): a retry could only diff
+    against nodes the cut-short batch had already written, find nothing
+    added, and leave those edges out. The marker is in the graph, so it
+    outlives the process."""
+
+    @wraps(fn)
+    def wrapper(engine, repo_id, *args, **kwargs):
+        token = f"{_SCAN_OWNER}#{next(_batch_serial)}"
+        engine.open_batch(repo_id, token)
+        try:
+            result = fn(engine, repo_id, *args, **kwargs)
+        except RepoRootUnavailable:
+            engine.finish_batch(repo_id, token)  # refused before any change
+            raise
+        except BaseException:
+            engine.forget_batch(token)  # a marker no write added yet is not needed
+            _failed_batches.add(token)
+            raise
+        engine.finish_batch(repo_id, token)
+        return result
+
+    return wrapper
+
+
+def _unfinished_batches(engine: GraphEngine, repo_id: str) -> list[str]:
+    """The repository's `batch_open` markers whose batch ended without
+    finishing: this process's that failed, or a process of this host that
+    has ended (a marker of the same pid but another process is an
+    earlier process's). A process that ended without closing its engine
+    (killed) may leave a finished batch's marker, still waiting for a write
+    to remove it: that costs one full rescan. Another host's are never
+    taken for ended: nothing here can tell whether that batch still runs."""
+    unfinished = []
+    for token in engine.open_batches(repo_id):
+        holder = token.rsplit("#", 1)[0]
+        if holder == _SCAN_OWNER:
+            ended = token in _failed_batches
+        else:
+            parts = _SCAN_OWNER_PARTS.match(holder)
+            same_pid = parts is not None and parts.group(2) == socket.gethostname() and \
+                int(parts.group(1)) == os.getpid()
+            ended = same_pid or _holder_gone(holder)
+        if ended:
+            unfinished.append(token)
+    return unfinished
+
 
 _CPP_SUFFIXES = {".cpp", ".cc", ".cxx", ".h", ".hpp"}
 
@@ -258,7 +339,11 @@ def _provider_specs(repo_root: Path) -> tuple[bool, filesystem.FilesystemSpec | 
 #: Go method call on a struct of the file whose embedded types are all
 #: structs of the file linked to its method or one promoted from them (Rust
 #: and Go `mkeys` and `heir_open`); a CONTAINS target matched on its own
-#: owner only.
+#: owner only; UTF-16 and UTF-32 source extracted instead of skipped as
+#: binary (an older index holds no nodes, and a skip mark, for such a file);
+#: C++ without a file-less Class per out-of-class method, with typed-receiver
+#: calls owned by the receiver's type (heir keys on a file's inherited
+#: methods), and an overload set kept at its first definition.
 #: An index stamped lower, or not at all, is rescanned automatically.
 INDEX_FORMAT = 23
 
@@ -441,10 +526,12 @@ def _disk_files(repo_root: Path) -> dict[str, Path]:
 
 def _is_provider_file(repo_root: Path, path: Path) -> bool:
     """A file the filesystem provider represents: what a full scan would index.
-    A .gitignore judges the file by its own path, as the walk and git do."""
+    A .gitignore judges the file by its own path, as the walk and git do; a
+    name that isn't valid UTF-8 is left out, as the walk leaves it out."""
     rel = _repo_relative(repo_root, path)
     return (
-        rel is not None and _is_indexable_file(path) and not is_ignored_path(Path(rel), repo_root)
+        rel is not None and is_encodable(rel) and is_encodable(os.fspath(path))
+        and _is_indexable_file(path) and not is_ignored_path(Path(rel), repo_root)
         and not is_gitignored(repo_root, _own_rel(repo_root, path) or rel)
     )
 
@@ -855,6 +942,7 @@ def _stale_mounts(state: dict, table: MountTable) -> set[str]:
     }
 
 
+@_marks_open_batch
 def index_paths(
     engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[Path], docs_path: str | None = None,
     mentions_enabled: bool = False, sync_provider: bool = True, relink_outside: bool = True,
@@ -969,8 +1057,16 @@ def _index_paths(
         if not is_within(resolved, root_resolved):
             continue
         rel = resolved.relative_to(root_resolved).as_posix()
+        own = _own_rel(repo_root, Path(path)) or rel
+        if not (is_encodable(rel) and is_encodable(own)):
+            # No query can carry the name: left out, as the walk leaves it out.
+            shown = printable_path(own)
+            logger.warning("%s: skipping %s (%s)", repo_id, shown, UNENCODABLE_NAME)
+            if skipped is not None:
+                skipped[shown] = UNENCODABLE_NAME
+            continue
         by_rel_path[rel] = resolved
-        supplied.setdefault(rel, []).append(_own_rel(repo_root, Path(path)) or rel)
+        supplied.setdefault(rel, []).append(own)
 
     max_bytes = _max_file_bytes()
     mounts = _Mounts(engine, repo_id)
@@ -982,10 +1078,11 @@ def _index_paths(
         nonlocal indexed
         if not resolved.exists() or not resolved.is_file():
             return
-        # One unparseable/locked file (or a transient Neo4j error mid-batch)
-        # must not abort the whole batch: a full scan or watcher batch would
-        # otherwise silently lose every file after the failure point. Log and
-        # skip the offending file so the rest of the batch still indexes.
+        # One unparseable/locked file must not abort the whole batch: a full
+        # scan or watcher batch would otherwise silently lose every file
+        # after the failure point. Log and skip the offending file so the
+        # rest of the batch still indexes. A lost connection to Neo4j is no
+        # file's failure, and aborts it (`Neo4jLost`).
         saved = _UNREAD
         try:
             spellings = sorted(supplied.get(rel_path, []))
@@ -1019,8 +1116,13 @@ def _index_paths(
                 count = _run_deep(single)
             indexed += 0 if rel_path in read else count
             read.add(rel_path)
-        except ABORTS_BATCH:
+        except (*_ENGINE_ABORTS, BatchAborted):
             raise  # shutdown or an index still building: leave the work, and its stamp, for later
+        except CONNECTION_LOST as exc:
+            raise Neo4jLost(
+                f"{repo_id}: Neo4j stopped answering while {rel_path} was indexed; the batch was given up "
+                f"and will be redone ({' '.join(str(exc).split())})"
+            ) from exc
         except RecursionError as exc:
             # Deeper than even `_run_deep` allows: left out of the graph and
             # reported, as a fresh scan leaves it, not kept as it was.
@@ -1758,8 +1860,8 @@ def _batch_nodes(
     code symbols and Modules, docs notes, Markdown Document nodes, compose
     Services and schema-provider nodes -- the same provenance, with the same
     `file`, that list_file_nodes snapshots. A shared node a batch file claims
-    (a `Datastore`, `Endpoint`, handler stub or C++ out-of-class method's
-    Class stub, or a compose/Containerfile `Container`) has `file` "", as
+    (a `Datastore`, `Endpoint`, handler stub, a C++ out-of-class method's
+    Class stub before index format 23, or a compose/Containerfile `Container`) has `file` "", as
     list_file_nodes gives it, so one whose last claim went and came back is
     added. Only a code symbol has an owner (common.member_owner); every
     other node's is ""."""
@@ -2321,6 +2423,7 @@ def _folders_above(rel: str) -> list[str]:
     return ["/".join(parts[:i]) for i in range(1, len(parts))]
 
 
+@_marks_open_batch
 def remove_paths(
     engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[Path], docs_path: str | None = None,
     mentions_enabled: bool = False,
@@ -2356,7 +2459,10 @@ def remove_paths(
             unmount can report every file gone); nothing is removed.
     """
     check_repo_root(repo_root)
-    keys = {key for p in paths if (key := _gone_key(repo_root, Path(p))) is not None and key != "."}
+    keys = {
+        key for p in paths
+        if (key := _gone_key(repo_root, Path(p))) is not None and key != "." and is_encodable(key)
+    }
     if not keys:
         return 0
     specs = _applied_provider_specs(engine, repo_id, repo_root)
@@ -2650,17 +2756,24 @@ def catch_up(
     see `_claim_full_scan`) ran meanwhile is not repeated. Last, a changed resolver configuration re-indexes its
     language's files (sync_resolver_config).
 
+    So does a repository with a batch that began and never finished
+    (`_unfinished_batches`): Neo4j lost partway through, or its process
+    killed. A retry could not tell which edges of other files that batch
+    left unwritten.
+
     A missing, unreadable or apparently unmounted root is refused as
     `prune_stale_files` refuses it (`force` as there), before any change.
     """
     check_repo_root(repo_root)
-    if index_outdated(engine, repo_id):
+    if _unfinished_batches(engine, repo_id) or index_outdated(engine, repo_id):
         # The repository is registered (the agent checks): a graph that lost
         # its Repository node (wiped) gets it back, or full_scan would take
         # it for removed and scan nothing.
         engine.upsert_repository(repo_id, repo_id, str(repo_root))
         with full_scan_turn(repo_id, while_waiting, engine):
-            if index_outdated(engine, repo_id):
+            if (unfinished := _unfinished_batches(engine, repo_id)) or index_outdated(engine, repo_id):
+                if unfinished:
+                    logger.info("%s: an update was cut short partway through; rescanning in full", repo_id)
                 indexed = full_scan(
                     engine, repo_id, repo_root, docs_path=docs_path, mentions_enabled=mentions_enabled, force=force
                 )
@@ -3064,9 +3177,13 @@ def full_scan(
         prune_stale_files(engine, repo_id, repo_root, docs_path=docs_path, mentions_enabled=mentions_enabled, force=force)
         engine.set_index_format(repo_id, 0)
         resolver = fingerprints(repo_root)  # before extraction reads the configuration
-        all_files = _indexable_paths(repo_root)
+        unencodable: list[str] = []
+        all_files = _indexable_paths(repo_root, unencodable=unencodable)
         applied, applied_docs = _apply_project_schema(engine, repo_id, repo_root)
         left_out: dict[str, str] = {} if skipped is None else skipped
+        for shown in unencodable:
+            logger.warning("%s: skipping %s (%s)", repo_id, shown, UNENCODABLE_NAME)
+            left_out[shown] = UNENCODABLE_NAME
         engine.update_skipped_files(repo_id, replace=True)  # every file is judged again below
         indexed = index_paths(
             engine, repo_id, repo_root, all_files, docs_path=docs_path, mentions_enabled=mentions_enabled,
@@ -3086,7 +3203,11 @@ def full_scan(
         engine.write_resolver_config(repo_id, resolver)
         _check_full_scan_claim(repo_id)  # taken over meanwhile: that scan stamps it
         engine.set_scan_options(repo_id, docs_path or "", mentions_enabled)
+        unfinished = _unfinished_batches(engine, repo_id)  # its own batches are finished by now
         engine.set_index_format(repo_id, INDEX_FORMAT)
+        # One write per scan, which also carries its own batch's pending removal.
+        engine.close_batch(repo_id, unfinished)
+        _failed_batches.difference_update(unfinished)
         return indexed
     finally:
         _release_full_scan_lock(repo_id, engine)

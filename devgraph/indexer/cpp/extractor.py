@@ -28,10 +28,15 @@ x = new T`, a field of a class declared in the file) -> this file for a
 class declared here with m, else the include named after the type or its
 namespace (`Inventory` -> `inventory.h`, `net::Connection` -> `net/conn.h`),
 else the type's conventional files (`/inventory.h`, `/inventory.cpp`) and
-every include; any other `f()` or `this->m()` -> every include. `std::` and
-an STL type (calls.STOP_TYPES["cpp"]) link nothing, nor does a call when
-the file includes nothing; an untyped receiver keeps a bare-name edge that
-never ends at its caller, unless its method is stoplisted
+every include, each narrowed to the type's own members (common.owned_pin;
+its owner as written, `Outer.Inner`, a `using a::T;` or namespace alias
+spelt out, and under each namespace the file opens or uses, since an out-of-class definition outside its namespace's
+block, `void geo::Circle::f()`, is owned by `geo.Circle`) or the members
+a class of their file inherits from another class there (heir keys); any
+other `f()` or `this->m()` -> every include. `std::` and an STL type
+(calls.STOP_TYPES["cpp"]) link nothing, nor does a call when the file
+includes nothing; an untyped receiver keeps a bare-name edge that never
+ends at its caller, unless its method is stoplisted
 (calls.STOP_METHODS["cpp"]). A declaration (a prototype) is no Function
 node, so only definitions are targets.
 
@@ -66,14 +71,14 @@ declarator, template arguments dropped (e.g. 'Outer::Inner::method' -> class
 final name, not the leftmost one, since the leftmost segment is more likely
 to be an enclosing namespace than the class itself. This is a textual
 heuristic, not a semantic one: it does not require (or verify) that a class
-named 'Inner' was actually declared in this same file. When it wasn't (e.g.
-the class lives in a header this file doesn't happen to also be extracting
-in the same batch), a minimal stub Class node is still emitted so the
-Function's CONTAINS edge has a real endpoint to MATCH onto. The stub is
-file-less and carries `source`, so it is a shared node the file claims
-(GraphEngine._claim_nodes_tx), like a route's handler stub: it never merges
-onto the header's own Class, whichever file is indexed first, and it goes
-with its last claimant.
+named 'Inner' was actually declared in this same file. When it wasn't (the
+class lives in a header), no Class node is made for it here: the header's
+Class is the one class of that name, and the method's CONTAINS edge from a
+Class of this file matches nothing (a known gap, see README).
+
+Two definitions of one name and owner in one file (overloads, `f()` and
+`f(int)`) are one node, the first definition, holding both bodies' calls
+(common.merge_same_nodes), as in every language.
 """
 
 from __future__ import annotations
@@ -88,7 +93,16 @@ import tree_sitter_cpp as tscpp
 from tree_sitter import Language, Node, Parser
 
 from devgraph.indexer.calls import STOP_METHODS, STOP_TYPES, CallSites, import_rows
-from devgraph.indexer.common import ExtractionResult, GraphNode, GraphRelationship, member_owner, own_edges
+from devgraph.indexer.common import (
+    ExtractionResult,
+    GraphNode,
+    GraphRelationship,
+    add_heir_keys,
+    class_member_pin,
+    member_owner,
+    merge_same_nodes,
+    own_edges,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -412,9 +426,30 @@ def _declared_name(node: Node | None, source: bytes) -> str | None:
     return _text(node, source) if node is not None else None
 
 
+def _scope_parts(text: str) -> tuple[str, ...]:
+    """`a::b` as ("a", "b")."""
+    return tuple(part.strip() for part in text.split("::") if part.strip())
+
+
+def _enclosing(node: Node, source: bytes) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """The namespaces and the classes `node` is declared in, outermost first."""
+    namespaces: list[str] = []
+    classes: list[str] = []
+    parent = node.parent
+    while parent is not None:
+        name = parent.child_by_field_name("name")
+        if name is not None and parent.type == "namespace_definition":
+            namespaces[:0] = _scope_parts(_text(name, source))
+        elif name is not None and parent.type in ("class_specifier", "struct_specifier"):
+            classes.insert(0, _class_name(name, source))
+        parent = parent.parent
+    return tuple(namespaces), tuple(classes)
+
+
 class _CppResolver:
     """What one C++ file's names refer to: its quoted includes, the
-    functions it defines and the classes it declares (methods and fields)."""
+    functions it defines, the classes it declares (methods, fields and the
+    owner of their members) and the namespaces it opens or uses."""
 
     def __init__(self, root: Node, source: bytes, file_path: str) -> None:
         self.source = source
@@ -424,10 +459,35 @@ class _CppResolver:
         self.functions: set[str] = set()
         self.methods: dict[str, set[str]] = {}
         self.fields: dict[str, dict[str, _CppType | None]] = {}
+        self.owners: dict[str, set[str]] = {}
+        self.scopes: set[tuple[str, ...]] = set()
+        # `using geo::Circle;`: Circle -> ("geo",); `namespace g = geo;`: g -> ("geo",).
+        self.using_types: dict[str, tuple[str, ...]] = {}
+        self.aliases: dict[str, tuple[str, ...]] = {}
         stack = [root]
         while stack:
             node = stack.pop()
-            if node.type == "preproc_include":
+            if node.type == "namespace_definition":
+                name = node.child_by_field_name("name")
+                if name is not None:
+                    # `namespace geo::render { ... }` opens geo too, as nested blocks would.
+                    chain = _enclosing(node, source)[0] + _scope_parts(_text(name, source))
+                    self.scopes.update(chain[:i] for i in range(1, len(chain) + 1))
+            elif node.type == "using_declaration" and node.parent is not None and \
+                    node.parent.type != "field_declaration_list":  # a class's `using Base::f;` names no type
+                target = next(iter(node.named_children), None)
+                if target is not None and any(c.type == "namespace" for c in node.children):
+                    self.scopes.add(_scope_parts(_text(target, source)))  # `using namespace a::b;`
+                elif target is not None and target.type == "qualified_identifier":
+                    parts = _scope_parts(_text(target, source))
+                    if len(parts) > 1:
+                        self.using_types[parts[-1]] = parts[:-1]
+            elif node.type == "namespace_alias_definition":
+                name = node.child_by_field_name("name")
+                target = next((c for c in node.named_children if c != name), None)
+                if name is not None and target is not None:
+                    self.aliases[_text(name, source)] = _scope_parts(_text(target, source))
+            elif node.type == "preproc_include":
                 path = next((c for c in node.named_children if c.type == "string_literal"), None)
                 content = next((c for c in path.named_children if c.type == "string_content"), None) \
                     if path is not None else None
@@ -449,6 +509,7 @@ class _CppResolver:
         if name is None or body is None:
             return
         cls = _class_name(name, self.source)
+        self.owners.setdefault(cls, set()).add(".".join((*_enclosing(node, self.source)[1], cls)))
         methods = self.methods.setdefault(cls, set())
         fields = self.fields.setdefault(cls, {})
         for member in body.named_children:
@@ -479,23 +540,44 @@ class _CppResolver:
         pins = [pin for each in self.includes if wanted & set(each.names) for pin in each.pins()]
         return pins or None
 
+    def type_owners(self, typed: _CppType) -> list[str]:
+        """The owners (common.member_owner) `typed`'s methods can have: the
+        type as written (a namespace alias spelt out, and a name a `using
+        a::T;` declares qualified by it) and each shorter tail of it
+        (`a::Outer::Inner`: `a.Outer.Inner`, `Outer.Inner`, `Inner`), each
+        under every namespace this file opens or uses, and a class of this
+        file's own owner."""
+        qualifier = tuple(part for part in typed.qualifier if part)
+        if qualifier and qualifier[0] in self.aliases:
+            qualifier = self.aliases[qualifier[0]] + qualifier[1:]
+        elif not qualifier:
+            qualifier = self.using_types.get(typed.name, ())
+        written = (*qualifier, typed.name)
+        found = {".".join(written[i:]) for i in range(len(written))}
+        found |= {".".join((*scope, *written)) for scope in self.scopes}
+        found |= self.owners.get(typed.name, set())
+        return sorted(found)
+
     def type_pins(self, typed: _CppType, method: str) -> list[str] | None:
         """Where a method of `typed` is: this file for a class declared
         here (and its same-stem sources, for a header), else the include
         named after the type or its namespace, else the type's conventional
-        files and every include; None for a library type."""
+        files and every include; each narrowed to the type's members
+        (`type_owners`, common.class_member_pin). None for a library type."""
         if typed.library:
             return None
         if typed.name in self.methods and (method in self.methods[typed.name] or method in self.functions):
-            return [self.file_path] + self.own_sources
-        found = self.named([typed.name, *typed.qualifier])
-        if found:
-            return found
-        conventional = [
-            f"/{variant}{ext}^" for variant in sorted(_variants(typed.name) | {typed.name})
-            for ext in (".h", ".hpp", ".cpp", ".cc")
-        ]
-        return conventional + self.included()
+            pins = [self.file_path] + self.own_sources
+        else:
+            pins = self.named([typed.name, *typed.qualifier])
+        if not pins:
+            conventional = [
+                f"/{variant}{ext}^" for variant in sorted(_variants(typed.name) | {typed.name})
+                for ext in (".h", ".hpp", ".cpp", ".cc")
+            ]
+            pins = conventional + self.included()
+        owners = self.type_owners(typed)
+        return list(dict.fromkeys(class_member_pin(pin, owner) for pin in pins for owner in owners))
 
 
 def _class_name(name_node: Node, source: bytes) -> str:
@@ -723,20 +805,8 @@ def extract_cpp_file(source_code: str, file_path: str, repo_id: str) -> Extracti
     # last; "" at the Module (a namespace is no owner).
     owners = [""]
 
-    classes_emitted: set[str] = set()
-
-    def _ensure_class_stub(class_name: str) -> None:
-        if class_name in classes_emitted:
-            return
-        classes_emitted.add(class_name)
-        result.nodes.append(
-            GraphNode(
-                label="Class",
-                repo_id=repo_id,
-                name=class_name,
-                properties={"type": "class", "source": file_path},
-            )
-        )
+    # The file's class declarations, for its heir keys (common.add_heir_keys).
+    class_decls: list[tuple[str, str, list[str], set[str]]] = []
 
     def visit_block(block: Node, parent_name: str | None, parent_label: str) -> None:
         for node in block.named_children:
@@ -791,10 +861,13 @@ def extract_cpp_file(source_code: str, file_path: str, repo_id: str) -> Extracti
             class_properties["description"] = _doc_summary(doc)
             class_properties["docstring_full"] = doc
 
-        classes_emitted.add(class_name)
         result.nodes.append(
             GraphNode(label="Class", repo_id=repo_id, name=class_name, properties=class_properties)
         )
+        class_decls.append((
+            class_name, member_owner("Class", class_name, owner),
+            [base.split("::")[-1] for base in base_classes], resolver.methods.get(class_name, set()),
+        ))
 
         result.relationships.append(
             GraphRelationship(
@@ -851,7 +924,6 @@ def extract_cpp_file(source_code: str, file_path: str, repo_id: str) -> Extracti
             class_properties["description"] = _doc_summary(doc)
             class_properties["docstring_full"] = doc
 
-        classes_emitted.add(class_name)
         result.nodes.append(
             GraphNode(label="Class", repo_id=repo_id, name=class_name, properties=class_properties)
         )
@@ -916,7 +988,6 @@ def extract_cpp_file(source_code: str, file_path: str, repo_id: str) -> Extracti
             return
 
         if class_name:
-            _ensure_class_stub(class_name)
             contains_label, contains_name = "Class", class_name
         else:
             contains_label, contains_name = parent_label, (parent_name if parent_name else file_path)
@@ -967,6 +1038,8 @@ def extract_cpp_file(source_code: str, file_path: str, repo_id: str) -> Extracti
 
     visit_block(root, None, "Module")
     result.relationships += sites.rows(file_path, repo_id)
+    merge_same_nodes(result)
+    add_heir_keys(result, class_decls)
 
     return own_edges(result, file_path)
 

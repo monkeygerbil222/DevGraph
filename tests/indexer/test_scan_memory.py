@@ -528,6 +528,7 @@ def test_a_catch_up_that_waited_does_not_scan_an_index_upgraded_meanwhile(busy_t
     (tmp_path / "a.py").write_text("x = 1\n")
     outdated = [True, False]  # outdated before the wait, upgraded by the scan it waited for
     stub(monkeypatch, dispatch, "index_outdated", lambda engine, repo_id: outdated.pop(0) if outdated else False)
+    stub(monkeypatch, dispatch, "_unfinished_batches", lambda engine, repo_id: [])
     scans = []
     stub(monkeypatch, dispatch, "full_scan", lambda *a, **k: scans.append(a) or 0)
     stub(monkeypatch, dispatch, "prune_stale_files", lambda *a, **k: 0)

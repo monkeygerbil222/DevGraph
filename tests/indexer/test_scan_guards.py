@@ -13,7 +13,7 @@ from devgraph.graph.engine import GraphEngine
 from devgraph.indexer import dispatch, walk
 from devgraph.indexer.dispatch import catch_up, full_scan, index_paths, remove_paths
 from devgraph.indexer.walk import BINARY, GENERATED, TOO_LARGE, content_skip_reason
-from tests.helpers import stub
+from tests.helpers import BatchMarkers, stub
 
 LIMIT = 4096
 
@@ -76,7 +76,7 @@ def test_the_size_limit_is_a_setting_with_a_one_mib_default(monkeypatch):
 # --- index_paths, with the graph stubbed -------------------------------------
 
 
-class _Engine:
+class _Engine(BatchMarkers):
     def route_mount_state(self, repo_id, names=None):
         return {}
 
@@ -132,7 +132,7 @@ def test_a_file_no_extractor_reads_is_not_judged_by_its_content(tmp_path, monkey
     assert skipped == {}
 
 
-class _CatchUpEngine:
+class _CatchUpEngine(BatchMarkers):
     def __init__(self, extracted=(), skips=None):
         self.extracted = set(extracted)
         self.skips = skips or {}

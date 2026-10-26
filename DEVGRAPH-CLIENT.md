@@ -557,15 +557,17 @@ Two things worth knowing about how they work:
   `caller_class` — pass `find_callers(..., scope_to_class="ThatClass")` to
   filter down to just that class's own callers. Graph insights (PageRank,
   communities) leave out `name` and `package` calls and `package`
-  imports. A method on a typed value links that type's method, not a
-  same-named method of another type in its file (in Rust; in Go only for a
-  struct the calling file declares whose embedded types are all structs of
-  that file: any other Go receiver links every method of the name in the
-  package, at `package`). A call through a Rust trait (`Local::hi(o)`)
-  links the implementations of that trait's file. What stays out of reach: a C# class in a file not named after it, two C# types of one name
-  in different namespaces (both get the edge), and a method a type inherits
-  from a base declared in another file (a Java or Python base, a Rust trait's
-  default method).
+  imports. A method on a typed value links that type's method (or one it
+  inherits from a base in the same file), not a same-named method of another
+  type in its file (in Rust and C++; in Go only for a struct the calling file
+  declares whose embedded types are all structs of that file: any other Go
+  receiver links every method of the name in the package, at `package`). A
+  call through a Rust trait (`Local::hi(o)`) links the implementations of
+  that trait's file. What stays out of reach: a C# class in a file not named
+  after it, two C# types of one name in different namespaces (both get the
+  edge), a method a type inherits from a base declared in another file (a
+  Java or Python base, a Rust trait's default method), and a C++ method
+  called on a value typed through an alias (`using Ref = Order;`).
 - **Import/include resolution reads only the importing file and the
   repository's resolver configuration** (tsconfig/jsconfig, go.mod/go.work,
   Cargo.toml). Python, JS/TS, Go, Java, Kotlin and Rust imports name files

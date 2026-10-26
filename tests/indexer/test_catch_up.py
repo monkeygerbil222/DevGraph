@@ -38,6 +38,7 @@ def stubbed(monkeypatch):
     stub(monkeypatch, dispatch, "prune_stale_files", lambda *a, **k: state["pruned"])
     stub(monkeypatch, dispatch, "schema_pending", lambda *a, **k: False)
     stub(monkeypatch, dispatch, "index_outdated", lambda *a, **k: False)
+    stub(monkeypatch, dispatch, "_unfinished_batches", lambda *a, **k: [])
     stub(monkeypatch, dispatch, "_graph_files", lambda *a, **k: set(state["known"]))
     stub(monkeypatch, dispatch, "_docs_note_files", lambda *a, **k: set(state["known"]))
     stub(monkeypatch, dispatch, "_extracted_files", lambda *a, **k: set(state["known"]))

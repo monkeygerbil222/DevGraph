@@ -19,6 +19,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 from devgraph.indexer import gitignore
+from devgraph.indexer.source_text import decode_wide
 from devgraph.paths import is_within
 
 logger = logging.getLogger(__name__)
@@ -83,6 +84,10 @@ TOO_LARGE = "too large"
 BINARY = "binary"
 GENERATED = "minified or generated"
 GITIGNORED = "ignored by .gitignore"
+#: A name the OS gave as bytes that aren't UTF-8 (a Latin-1 name from an old
+#: archive, say). Python keeps such a name as a string with lone surrogates,
+#: which no Neo4j query can carry, so the file is left out like an ignored one.
+UNENCODABLE_NAME = "file name is not valid UTF-8"
 
 #: The default of the `max_file_bytes` setting: larger files are not extracted.
 DEFAULT_MAX_FILE_BYTES = 1024 * 1024
@@ -97,10 +102,27 @@ AVERAGE_CHECK_BYTES = 4096
 _PROSE_SUFFIXES = {".md", ".markdown", ".txt", ".rst"}
 
 
+def is_encodable(rel: str) -> bool:
+    """Whether a repo-relative path can be written to the graph (`UNENCODABLE_NAME`)."""
+    try:
+        rel.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def printable_path(rel: str) -> str:
+    """`rel` safe to print or log: each byte of a name that isn't UTF-8 as `\\xNN`."""
+    return os.fsencode(rel).decode("utf-8", "backslashreplace")
+
+
 def content_skip_reason(path: Path, max_bytes: int) -> str | None:
     """Why the file at `path` should not be extracted -- `TOO_LARGE` (over
     `max_bytes`), `BINARY` (a NUL byte in the first 8 KiB) or `GENERATED`
     (a line over `MAX_LINE_BYTES`, or long lines on average) -- or None.
+
+    UTF-16 or UTF-32 text (`source_text.decode_wide`) is no binary: it is
+    judged by its lines as UTF-8, as the extractors read it.
 
     The size comes from a stat, so a too-large file is never read. Raises
     OSError when the file can't be read.
@@ -110,7 +132,10 @@ def content_skip_reason(path: Path, max_bytes: int) -> str | None:
     with open(path, "rb") as f:
         data = f.read(max_bytes + 1)
     if b"\0" in data[:BINARY_SNIFF_BYTES]:
-        return BINARY
+        wide = decode_wide(data)
+        if wide is None:
+            return BINARY
+        data = wide[0].encode("utf-8")
     if path.suffix.lower() in _PROSE_SUFFIXES:
         return None
     lines = data.splitlines() or [b""]
@@ -258,11 +283,14 @@ def is_indexable_file(path: Path) -> bool:
         return False
 
 
-def indexable_paths(repo_root: Path) -> set[Path]:
+def indexable_paths(repo_root: Path, unencodable: list[str] | None = None) -> set[Path]:
     """Every file under repo_root that a full scan would index: a regular
     file, not under an ignored directory nor ignored by a .gitignore. Shared by full_scan (which indexes
-    them) and prune_stale_files (which diffs them against the graph)."""
-    return {path for path, _, _ in _walk(repo_root)}
+    them) and prune_stale_files (which diffs them against the graph).
+
+    `unencodable`, when given, collects what the walk left out for its name
+    (see `_walk`)."""
+    return {path for path, _, _ in _walk(repo_root, unencodable=unencodable)}
 
 
 def indexable_paths_under(repo_root: Path, directory: Path) -> set[Path]:
@@ -295,14 +323,15 @@ def keyed_indexable_paths(
                 rel = path.resolve().relative_to(root).as_posix()
             except (OSError, ValueError):
                 continue
-            if not keep_ignored_targets and is_ignored_path(Path(rel), root):
+            if not is_encodable(rel) or (not keep_ignored_targets and is_ignored_path(Path(rel), root)):
                 continue
         keyed.append((path, rel))
     return keyed
 
 
 def _walk(
-    repo_root: Path, start: Path | None = None, unreadable: list[str] | None = None, honour_gitignore: bool = True
+    repo_root: Path, start: Path | None = None, unreadable: list[str] | None = None, honour_gitignore: bool = True,
+    unencodable: list[str] | None = None,
 ) -> Iterator[tuple[Path, str, bool]]:
     """(path, lexical repo-relative POSIX path, whether a link is on the way)
     for every indexable file: what `repo_root.rglob("*")` filtered by
@@ -322,6 +351,10 @@ def _walk(
     caller can tell "no files here" from "couldn't look".
 
     `honour_gitignore=False` walks as if there were no .gitignore files.
+
+    A file or folder whose name isn't valid UTF-8 is left out
+    (`UNENCODABLE_NAME`); when `unencodable` is given, its `printable_path`
+    is appended (a folder's with a trailing `/`).
     """
     if is_ignored_path(repo_root):
         return
@@ -366,6 +399,10 @@ def _walk(
             except OSError:
                 is_dir = False
             if chain and gitignore.matches(chain, prefix + entry.name, is_dir):
+                continue
+            if not is_encodable(entry.name):
+                if unencodable is not None:
+                    unencodable.append(printable_path(prefix + entry.name) + ("/" if is_dir else ""))
                 continue
             if is_dir:
                 junction = entry.is_junction()

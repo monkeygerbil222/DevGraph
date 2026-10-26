@@ -88,13 +88,14 @@ RESERVED_NODE_PROPERTIES: frozenset[str] = frozenset({
 
 # The pipeline's own bookkeeping among those, plus the Repository node's
 # `skipped_files` (the files a scan left out, see dispatch `_skip_marks`) and
-# its full-scan claim, `scan_owner` and `scan_heartbeat` (dispatch `_claim_full_scan`):
+# its full-scan claim, `scan_owner` and `scan_heartbeat` (dispatch `_claim_full_scan`),
+# and `batch_open`, the batches begun and not finished (dispatch `_marks_open_batch`):
 # hidden wherever a node's properties are shown (describe_node, the
 # dashboard's node inspector).
 INTERNAL_NODE_PROPERTIES: frozenset[str] = frozenset({
     "claims", "extractor", "name_refs", "name_ref_targets", "name_ref_sources", "name_ref_visible", "mkeys",
     "mkeys_stale", "shared_claims", "route_mounts", "route_exports", "route_prefixes", "skipped_files",
-    "heir_open", "scan_owner", "scan_heartbeat",
+    "heir_open", "scan_owner", "scan_heartbeat", "batch_open",
 })
 
 # An extracted edge's bookkeeping: `origins`, the files that wrote it
@@ -135,7 +136,8 @@ SOURCE_FILE_LABELS: tuple[str, ...] = (
 # Shared nodes several files can claim through `source`/`sources` (see
 # graph/engine.py `_claim_nodes_tx`): Container, Endpoint, a route's
 # file-less handler-stub Function, a C++ out-of-class method's file-less
-# Class stub, every datastore type (Cache included, though it is not in
+# Class stub (before index format 23: kept so an upgrade's writes unclaim
+# it), every datastore type (Cache included, though it is not in
 # NODE_LABELS), and the file-less Service an older index wrote. Every
 # claimed node has a `source` (its first claim's).
 CLAIMED_LABELS: tuple[str, ...] = (
