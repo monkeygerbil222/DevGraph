@@ -1,0 +1,57 @@
+<!doctype html><meta charset="utf-8"><title>Cytoscape 3.34 WebGL + worker layout</title>
+<style>html,body{margin:0;background:#08090a;overflow:hidden}#cy{width:100vw;height:100vh}</style>
+<div id="cy"></div>
+<script src="/bench/node_modules/cytoscape/dist/cytoscape.min.js"></script>
+<script src="/bench/pages/common.js"></script>
+<script>
+// The dashboard's own Cytoscape stylesheet (minus the shadow-* properties
+// Cytoscape 3.x doesn't have, and with solid target-coloured edges, which is
+// what the WebGL renderer draws), with the layout moved to a worker and
+// positions written back once per worker message.
+(async () => {
+  const d = await loadData();
+  const n = d.nodes.length, idx = new Map(d.nodes.map((x, i) => [x.id, i]));
+  const spread = Math.sqrt(n) * 20;
+  const xy = new Float32Array(2 * n); for (let i = 0; i < 2 * n; i++) xy[i] = (Math.random() - 0.5) * spread;
+  const els = d.nodes.map((x, i) => ({ data: { id: x.id, label: x.label, cat: x.cat }, position: { x: xy[2 * i], y: xy[2 * i + 1] } }))
+    .concat(d.edges.map(e => ({ data: { id: e.id, source: e.source, target: e.target, label: e.label, tcat: d.nodes[idx.get(e.target)].cat } })));
+  const cy = cytoscape({
+    container: document.getElementById("cy"), elements: els, layout: { name: "preset" },
+    webgl: params.get("webgl") !== "0", webglBgColor: [8, 9, 10], pixelRatio: 1, minZoom: 0.02, maxZoom: 3,
+    style: [
+      { selector: "node", style: { "background-color": e => catColor(e.data("cat")), "label": "", "color": "#8a8f98", "font-size": 7.5,
+        "width": e => nodeSize(e.data("cat")), "height": e => nodeSize(e.data("cat")), "border-width": 1, "border-color": "#08090a", "border-opacity": 0.1 } },
+      { selector: "node.show-label", style: { "label": "data(label)" } },
+      { selector: "node[cat='repo']", style: { "shape": "round-hexagon" } },
+      { selector: "edge", style: { "width": 1, "line-color": e => catColor(e.data("tcat")), "opacity": 0.35,
+        "curve-style": params.get("straight") ? "straight" : "unbundled-bezier", "control-point-distances": [16], "control-point-weights": [0.5],
+        "target-arrow-shape": "triangle", "target-arrow-color": e => catColor(e.data("tcat")), "arrow-scale": 0.55 } },
+    ],
+  });
+  cy.on("mouseover", "node", e => e.target.addClass("show-label"));
+  cy.on("mouseout", "node", e => e.target.removeClass("show-label"));
+  cy.one("render", () => mark("first"));
+  requestAnimationFrame(() => requestAnimationFrame(() => mark("first")));
+  cy.fit(undefined, 20);
+  const nodes = cy.nodes(); // same order as d.nodes
+  const links = new Int32Array(2 * d.edges.length); d.edges.forEach((e, k) => { links[2 * k] = idx.get(e.source); links[2 * k + 1] = idx.get(e.target); });
+  const worker = new Worker("/bench/pages/d3worker.js");
+  let pending = null, grabbed = -1;
+  worker.onmessage = e => { pending = e.data.xy; if (e.data.done) mark("settled"); };
+  (function apply() {
+    if (pending) { const p = pending; pending = null; cy.batch(() => nodes.forEach((nd, i) => { if (i !== grabbed) nd.position({ x: p[2 * i], y: p[2 * i + 1] }); })); }
+    requestAnimationFrame(apply);
+  })();
+  worker.postMessage({ type: "init", n, xy, links });
+  cy.on("grab", "node", e => { grabbed = nodes.indexOf(e.target); });
+  cy.on("drag", "node", e => { const p = e.target.position(); worker.postMessage({ type: "drag", i: grabbed, x: p.x, y: p.y }); });
+  cy.on("free", "node", () => { worker.postMessage({ type: "dragend", i: grabbed }); grabbed = -1; });
+  __B.pan = (dx, dy) => cy.panBy({ x: dx, y: dy });
+  __B.getZoom = () => cy.zoom();
+  __B.zoomTo = z => cy.zoom({ level: z, renderedPosition: { x: cy.width() / 2, y: cy.height() / 2 } });
+  __B.allScreen = () => { const out = []; nodes.forEach(nd => { const p = nd.renderedPosition(); out.push(p.x, p.y); }); return out; };
+  __B.nodeScreen = i => { const p = nodes[i].renderedPosition(); return [p.x, p.y]; };
+  __B.n = n;
+  window.cy = cy;
+})();
+</script>

@@ -1,0 +1,26 @@
+{
+  "name": "devgraph-graph-render-bench",
+  "private": true,
+  "description": "Isolated render benchmark for the dashboard graph canvas (see docs/graph-render-research.md). Not part of the app; nothing here is shipped.",
+  "type": "module",
+  "scripts": {
+    "build-sigma": "esbuild sigma-entry.js --bundle --minify --format=iife --outfile=vendor/sigma-bundle.min.js",
+    "data": "mkdir -p data && node gen.mjs 2000 data/synth2k && node gen.mjs 10000 data/synth10k && node gen.mjs 50000 data/synth50k",
+    "serve": "node server.mjs 8899",
+    "matrix": "./matrix.sh"
+  },
+  "devDependencies": {
+    "@cosmos.gl/graph": "3.5.1",
+    "cytoscape": "3.34.4",
+    "d3-dispatch": "3.0.1",
+    "d3-force": "3.0.0",
+    "d3-quadtree": "3.0.1",
+    "d3-timer": "3.0.1",
+    "esbuild": "0.28.2",
+    "force-graph": "1.52.0",
+    "graphology": "0.26.0",
+    "graphology-layout-forceatlas2": "0.10.1",
+    "puppeteer-core": "25.16.0",
+    "sigma": "4.0.3"
+  }
+}

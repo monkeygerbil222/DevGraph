@@ -1,0 +1,34 @@
+<!doctype html><meta charset="utf-8"><title>sigma + FA2 worker</title>
+<style>html,body{margin:0;background:#08090a;overflow:hidden}#g{width:100vw;height:100vh}</style>
+<div id="g"></div>
+<script src="/bench/vendor/sigma-bundle.min.js"></script>
+<script src="/bench/pages/common.js"></script>
+<script>
+(async () => {
+  const { Graph, Sigma, FA2Layout, forceAtlas2, DEFAULT_STYLES } = SigmaBundle;
+  const d = await loadData();
+  const g = new Graph({ multi: true, type: "directed" });
+  const spread = Math.sqrt(d.nodes.length) * 20;
+  const cat = new Map();
+  d.nodes.forEach(n => { cat.set(n.id, n.cat); g.addNode(n.id, { x: (Math.random() - 0.5) * spread, y: (Math.random() - 0.5) * spread, size: nodeSize(n.cat) / 2, color: catColor(n.cat), label: n.label }); });
+  d.edges.forEach(e => g.addEdgeWithKey(e.id, e.source, e.target, { color: catColor(cat.get(e.target)) + "59", size: 0.6 }));
+  const renderer = new Sigma(g, document.getElementById("g"), {
+    settings: { enableNodeDrag: true, labelRenderedSizeThreshold: 1e9, ...(params.get("pick") ? { pickingDownSizingRatio: +params.get("pick") } : {}), ...(params.get("hideEdgesOnMove") ? { hideEdgesOnMove: true } : {}) },
+    styles: { nodes: { ...DEFAULT_STYLES.nodes, labelVisibility: { whenState: "isHovered", then: "visible", else: "hidden" } }, edges: DEFAULT_STYLES.edges },
+  });
+  let first = false;
+  renderer.on("afterRender", () => { if (!first) { first = true; mark("first"); } });
+  const settings = forceAtlas2.inferSettings(g);
+  settings.barnesHutOptimize = d.nodes.length > 1000;
+  const layout = new FA2Layout(g, { settings });
+  layout.start();
+  const ids = g.nodes();
+  settleSampler(() => { const xy = new Float32Array(ids.length * 2); ids.forEach((k, i) => { xy[2 * i] = g.getNodeAttribute(k, "x"); xy[2 * i + 1] = g.getNodeAttribute(k, "y"); }); return xy; }, ids.length, () => { layout.stop(); mark("settled"); });
+  const cam = renderer.getCamera();
+  __B.pan = (dx, dy) => { const s = cam.getState(); const a = renderer.viewportToFramedGraph({ x: 0, y: 0 }), b = renderer.viewportToFramedGraph({ x: dx, y: dy }); cam.setState({ x: s.x - (b.x - a.x), y: s.y - (b.y - a.y) }); };
+  __B.getZoom = () => 1 / cam.getState().ratio;
+  __B.zoomTo = z => cam.setState({ ratio: 1 / z });
+  __B.nodeScreen = i => { const a = g.getNodeAttributes(ids[i]); const p = renderer.graphToViewport({ x: a.x, y: a.y }); return [p.x, p.y]; };
+  __B.n = ids.length;
+})();
+</script>

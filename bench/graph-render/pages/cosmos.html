@@ -1,0 +1,48 @@
+<!doctype html><meta charset="utf-8"><title>cosmos.gl</title>
+<style>html,body{margin:0;background:#08090a;overflow:hidden}#g{width:100vw;height:100vh}</style>
+<div id="g"></div>
+<script src="/bench/node_modules/@cosmos.gl/graph/dist/index.min.js"></script>
+<script src="/bench/pages/common.js"></script>
+<script>
+(async () => {
+  const d = await loadData();
+  const n = d.nodes.length, idx = new Map(d.nodes.map((x, i) => [x.id, i]));
+  const pos = new Float32Array(2 * n), colors = new Float32Array(4 * n), sizes = new Float32Array(n);
+  const spread = Math.sqrt(n) * 20;
+  d.nodes.forEach((x, i) => {
+    pos[2 * i] = 2048 + (Math.random() - 0.5) * spread; pos[2 * i + 1] = 2048 + (Math.random() - 0.5) * spread;
+    const [r, g, b] = hexRgb(catColor(x.cat)); colors.set([r / 255, g / 255, b / 255, 1], 4 * i);
+    sizes[i] = nodeSize(x.cat) * 0.6;
+  });
+  const links = new Float32Array(2 * d.edges.length), lcol = new Float32Array(4 * d.edges.length);
+  d.edges.forEach((e, k) => {
+    const s = idx.get(e.source), t = idx.get(e.target); links[2 * k] = s; links[2 * k + 1] = t;
+    const [r, g, b] = hexRgb(catColor(d.nodes[t].cat)); lcol.set([r / 255, g / 255, b / 255, 0.35], 4 * k);
+  });
+  const graph = new Cosmos.Graph(document.getElementById("g"), {
+    backgroundColor: "#08090a", spaceSize: 4096, linkDefaultArrows: true, curvedLinks: true,
+    enableDrag: true, fitViewOnInit: true, fitViewDelay: 0, scalePointsOnZoom: true, linkWidthScale: 1,
+    simulationRepulsion: 1, simulationGravity: 0.25, simulationLinkSpring: 1, simulationLinkDistance: 10, simulationDecay: 5000,
+    attribution: "", pixelRatio: 1,
+    onSimulationEnd: () => mark("settled"),
+  });
+  await graph.ready;
+  graph.setPointPositions(pos); graph.setPointColors(colors); graph.setPointSizes(sizes);
+  graph.setLinks(links); graph.setLinkColors(lcol);
+  graph.render();
+  requestAnimationFrame(() => requestAnimationFrame(() => mark("first")));
+  const canvas = document.querySelector("#g canvas");
+  __B.getZoom = () => graph.getZoomLevel();
+  __B.zoomTo = z => graph.setZoomLevel(z, 0, true);
+  __B.pan = (dx, dy) => {
+    // cosmos exposes no pan setter; drive it the way a user would, via d3-zoom on the canvas
+    const t = canvas.__zoom; const z = d3zoomTransform(t.k, t.x + dx, t.y + dy); canvas.__zoom = z;
+    graph.zoomInstance?.behavior?.transform?.(graph.canvasD3Selection, z);
+  };
+  function d3zoomTransform(k, x, y) { const T = canvas.__zoom.constructor; return new T(k, x, y); }
+  __B.nodeScreen = i => { const p = graph.getPointPositions(); return graph.spaceToScreenPosition([p[2 * i], p[2 * i + 1]]); };
+  __B.allScreen = () => { const p = graph.getPointPositions(), out = []; for (let i = 0; i < n; i++) out.push(...graph.spaceToScreenPosition([p[2 * i], p[2 * i + 1]])); return out; };
+  __B.n = n;
+  window.__graph = graph;
+})();
+</script>

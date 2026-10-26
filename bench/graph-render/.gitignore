@@ -1,0 +1,7 @@
+node_modules/
+package-lock.json
+vendor/
+data/
+shots/
+results/
+chrome-prof-*/

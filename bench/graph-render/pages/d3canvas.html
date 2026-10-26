@@ -1,0 +1,97 @@
+<!doctype html><meta charset="utf-8"><title>d3-force worker + canvas</title>
+<style>html,body{margin:0;background:#08090a;overflow:hidden}canvas{display:block}</style>
+<canvas id="c"></canvas>
+<script src="/bench/node_modules/d3-quadtree/dist/d3-quadtree.min.js"></script>
+<script src="/bench/pages/common.js"></script>
+<script>
+(async () => {
+  const d = await loadData();
+  const n = d.nodes.length, idx = new Map(d.nodes.map((x, i) => [x.id, i]));
+  const cats = [...new Set(d.nodes.map(x => x.cat))];
+  const ncat = Uint8Array.from(d.nodes, x => cats.indexOf(x.cat));
+  const nrad = Float32Array.from(d.nodes, x => nodeSize(x.cat) / 2);
+  const src = new Int32Array(d.edges.length), dst = new Int32Array(d.edges.length);
+  d.edges.forEach((e, k) => { src[k] = idx.get(e.source); dst[k] = idx.get(e.target); });
+  const spread = Math.sqrt(n) * 20;
+  let xy = new Float32Array(2 * n); for (let i = 0; i < 2 * n; i++) xy[i] = (Math.random() - 0.5) * spread;
+  const links = new Int32Array(2 * d.edges.length); for (let k = 0; k < src.length; k++) { links[2 * k] = src[k]; links[2 * k + 1] = dst[k]; }
+  const canvas = document.getElementById("c"), ctx = canvas.getContext("2d", { alpha: false });
+  let W, H; function resize() { W = canvas.width = innerWidth; H = canvas.height = innerHeight; dirty = true; }
+  let t = { k: 1, x: 0, y: 0 }, dirty = true, hover = -1;
+  resize(); addEventListener("resize", resize);
+  t = { k: Math.min(W, H) / (spread * 1.2), x: W / 2, y: H / 2 };
+  // edges grouped once by target colour so each colour is one stroke() call
+  const edgeByCat = cats.map(() => []); for (let k = 0; k < src.length; k++) edgeByCat[ncat[dst[k]]].push(k);
+  const nodeByCat = cats.map(() => []); for (let i = 0; i < n; i++) nodeByCat[ncat[i]].push(i);
+  function draw() {
+    dirty = false;
+    ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.fillStyle = BG; ctx.fillRect(0, 0, W, H);
+    ctx.setTransform(t.k, 0, 0, t.k, t.x, t.y);
+    const m = 40 / t.k, x1 = -t.x / t.k - m, y1 = -t.y / t.k - m, x2 = (W - t.x) / t.k + m, y2 = (H - t.y) / t.k + m;
+    const vis = i => { const x = xy[2 * i], y = xy[2 * i + 1]; return x > x1 && x < x2 && y > y1 && y < y2; };
+    ctx.lineWidth = 1 / t.k; ctx.globalAlpha = 0.35;
+    const curve = t.k > 0.5, arrows = t.k > 0.8;
+    edgeByCat.forEach((ks, c) => {
+      ctx.strokeStyle = catColor(cats[c]); ctx.beginPath();
+      for (const k of ks) {
+        const a = src[k], b = dst[k]; if (!vis(a) && !vis(b)) continue;
+        const ax = xy[2 * a], ay = xy[2 * a + 1], bx = xy[2 * b], by = xy[2 * b + 1];
+        ctx.moveTo(ax, ay);
+        if (curve) { const mx = (ax + bx) / 2, my = (ay + by) / 2, dx = bx - ax, dy = by - ay, l = Math.hypot(dx, dy) || 1; ctx.quadraticCurveTo(mx - dy / l * 16, my + dx / l * 16, bx, by); }
+        else ctx.lineTo(bx, by);
+      }
+      ctx.stroke();
+      if (arrows) {
+        ctx.fillStyle = ctx.strokeStyle; ctx.beginPath();
+        for (const k of ks) {
+          const a = src[k], b = dst[k]; if (!vis(b)) continue;
+          const ax = xy[2 * a], ay = xy[2 * a + 1], bx = xy[2 * b], by = xy[2 * b + 1], dx = bx - ax, dy = by - ay, l = Math.hypot(dx, dy) || 1, ux = dx / l, uy = dy / l;
+          const r = nrad[b], tx = bx - ux * r, ty = by - uy * r;
+          ctx.moveTo(tx, ty); ctx.lineTo(tx - ux * 4 - uy * 2, ty - uy * 4 + ux * 2); ctx.lineTo(tx - ux * 4 + uy * 2, ty - uy * 4 - ux * 2);
+        }
+        ctx.fill();
+      }
+    });
+    ctx.globalAlpha = 1;
+    nodeByCat.forEach((is, c) => {
+      ctx.fillStyle = catColor(cats[c]); ctx.beginPath();
+      for (const i of is) {
+        if (!vis(i)) continue; const r = nrad[i], x = xy[2 * i], y = xy[2 * i + 1];
+        if (r * t.k < 2) ctx.rect(x - r, y - r, 2 * r, 2 * r); else { ctx.moveTo(x + r, y); ctx.arc(x, y, r, 0, 6.2832); }
+      }
+      ctx.fill();
+    });
+    if (hover >= 0) {
+      const x = xy[2 * hover], y = xy[2 * hover + 1];
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      const sx = x * t.k + t.x, sy = y * t.k + t.y;
+      ctx.font = "11px monospace"; ctx.fillStyle = "#fff"; ctx.fillText(d.nodes[hover].label, sx + 10, sy + 4);
+    }
+    if (!__B.marks.first) mark("first");
+  }
+  (function frame() { if (dirty) draw(); requestAnimationFrame(frame); })();
+  // quadtree hit-testing, rebuilt lazily when positions changed
+  let qt = null, qtStale = true;
+  function find(sx, sy) {
+    if (qtStale) { qt = d3.quadtree().x(i => xy[2 * i]).y(i => xy[2 * i + 1]).addAll(Array.from({ length: n }, (_, i) => i)); qtStale = false; }
+    const gx = (sx - t.x) / t.k, gy = (sy - t.y) / t.k; const i = qt.find(gx, gy, 10 / t.k + 8); return i == null ? -1 : i;
+  }
+  const worker = new Worker("/bench/pages/d3worker.js");
+  worker.onmessage = e => { xy = e.data.xy; dirty = true; qtStale = true; if (e.data.done) mark("settled"); };
+  worker.postMessage({ type: "init", n, xy, links });
+  let drag = null;
+  canvas.addEventListener("pointerdown", e => { const i = find(e.offsetX, e.offsetY); drag = i >= 0 ? { node: i } : { pan: [e.offsetX, e.offsetY] }; });
+  addEventListener("pointermove", e => {
+    if (drag?.node != null) { const gx = (e.offsetX - t.x) / t.k, gy = (e.offsetY - t.y) / t.k; xy[2 * drag.node] = gx; xy[2 * drag.node + 1] = gy; worker.postMessage({ type: "drag", i: drag.node, x: gx, y: gy }); dirty = true; }
+    else if (drag?.pan) { t.x += e.offsetX - drag.pan[0]; t.y += e.offsetY - drag.pan[1]; drag.pan = [e.offsetX, e.offsetY]; dirty = true; }
+    else { const h = find(e.offsetX, e.offsetY); if (h !== hover) { hover = h; dirty = true; } }
+  });
+  addEventListener("pointerup", () => { if (drag?.node != null) worker.postMessage({ type: "dragend", i: drag.node }); drag = null; });
+  canvas.addEventListener("wheel", e => { e.preventDefault(); const f = Math.exp(-e.deltaY * 0.002); t.x = e.offsetX - (e.offsetX - t.x) * f; t.y = e.offsetY - (e.offsetY - t.y) * f; t.k *= f; dirty = true; }, { passive: false });
+  __B.pan = (dx, dy) => { t.x += dx; t.y += dy; dirty = true; };
+  __B.getZoom = () => t.k;
+  __B.zoomTo = z => { const f = z / t.k; t.x = W / 2 - (W / 2 - t.x) * f; t.y = H / 2 - (H / 2 - t.y) * f; t.k = z; dirty = true; };
+  __B.nodeScreen = i => [xy[2 * i] * t.k + t.x, xy[2 * i + 1] * t.k + t.y];
+  __B.n = n;
+})();
+</script>

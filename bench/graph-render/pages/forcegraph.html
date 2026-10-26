@@ -1,0 +1,33 @@
+<!doctype html><meta charset="utf-8"><title>force-graph</title>
+<style>html,body{margin:0;background:#08090a;overflow:hidden}#g{width:100vw;height:100vh}</style>
+<div id="g"></div>
+<script src="/bench/node_modules/force-graph/dist/force-graph.min.js"></script>
+<script src="/bench/pages/common.js"></script>
+<script>
+(async () => {
+  const d = await loadData();
+  const idx = new Map(d.nodes.map((n, i) => [n.id, i]));
+  const nodes = d.nodes.map(n => ({ id: n.id, label: n.label, cat: n.cat }));
+  const links = d.edges.map(e => ({ source: e.source, target: e.target, color: catColor(d.nodes[idx.get(e.target)].cat) + "59" }));
+  let hover = null;
+  const fg = new ForceGraph(document.getElementById("g"))
+    .backgroundColor("#08090a")
+    .nodeRelSize(1).nodeVal(n => (nodeSize(n.cat) / 2) ** 2)
+    .nodeColor(n => catColor(n.cat)).nodeLabel(n => n.label)
+    .linkColor(l => l.color).linkWidth(1)
+    .linkDirectionalArrowLength(3).linkDirectionalArrowRelPos(1)
+    .linkCurvature(0.15)
+    .cooldownTime(120000)
+    .onNodeHover(n => { hover = n; })
+    .onEngineStop(() => mark("settled"))
+    .graphData({ nodes, links });
+  let first = false;
+  fg.onRenderFramePost(() => { if (!first) { first = true; mark("first"); } });
+  __B.pan = (dx, dy) => { const c = fg.centerAt(), z = fg.zoom(); fg.centerAt(c.x - dx / z, c.y - dy / z); };
+  __B.getZoom = () => fg.zoom();
+  __B.zoomTo = z => fg.zoom(z);
+  __B.fit = () => fg.zoomToFit(0, 20);
+  __B.nodeScreen = i => { const n = nodes[i]; const p = fg.graph2ScreenCoords(n.x, n.y); return [p.x, p.y]; };
+  __B.n = nodes.length;
+})();
+</script>
