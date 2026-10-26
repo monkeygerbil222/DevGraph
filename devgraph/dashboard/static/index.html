@@ -1806,6 +1806,7 @@ function applySettleFrame() {
    worker next time. */
 function onLayoutError(e) {
   console.error("graph layout worker failed:", e && (e.message || e));
+  if (layoutWorker) layoutWorker.terminate();
   layoutWorker = null;
   const run = activeSettle;
   activeSettle = null;
