@@ -92,6 +92,24 @@ def resolve_session_repo(registry: Any, env: Mapping[str, str], cwd: Path) -> tu
     return (match, "cwd") if match is not None else (None, "none")
 
 
+def session_rescoper(
+    registry: Any, env: Mapping[str, str], cwd: Path
+) -> Callable[[], tuple[Any | None, str] | None]:
+    """For a session that started without a repository: a function that resolves
+    it again (`resolve_session_repo`), once the registry's change marker has
+    moved since the last call; None while it hasn't. The first call resolves."""
+    seen: list[Any] = [object()]
+
+    def rescope() -> tuple[Any | None, str] | None:
+        marker = registry.last_changed_at()
+        if marker == seen[0]:
+            return None
+        seen[0] = marker
+        return resolve_session_repo(registry, env, cwd)
+
+    return rescope
+
+
 def _inactive_match(registry: Any | None, pinned: str) -> Any | None:
     """The inactive registered repository a pin names (by id or absolute path), if any."""
     if registry is None or not pinned:
@@ -589,15 +607,19 @@ def tools_fingerprint(repo_path: Path | str) -> bytes | str | UntrustedTools:
 class ProjectToolPlane:
     """The session's served project and global tools, reloadable when either file changes.
 
-    The scope (`repo`) never changes; only the project tools file and the global
-    store are re-read, under the same rules as at startup.
+    A scope (`repo`) never changes once set; only the project tools file and
+    the global store are re-read, under the same rules as at startup. A
+    session without one, given `rescope` (see `session_rescoper`), takes the
+    repository it resolves to once that is registered, and loads its tools.
     """
 
     def __init__(self, server: Any, engine: Any, repo: Any | None, status: ToolPlaneStatus, *,
                  instrument: Callable[[Callable[..., Any]], Callable[..., Any]], annotations: Any,
-                 fingerprint: bytes | str | None = None, global_fingerprint: bytes | str | None = None) -> None:
+                 fingerprint: bytes | str | None = None, global_fingerprint: bytes | str | None = None,
+                 rescope: Callable[[], tuple[Any | None, str] | None] | None = None) -> None:
         """The fingerprints are the files as the initial load read them (see `register_project_tools`)."""
         self.server, self.engine, self.repo, self.status = server, engine, repo, status
+        self._rescope = rescope if repo is None else None
         self._instrument, self._annotations = instrument, annotations
         self._fingerprint, self._global_fingerprint = fingerprint, global_fingerprint
         # The tools the initial load served from each file (re-parsed from the same bytes),
@@ -608,17 +630,36 @@ class ProjectToolPlane:
         if status.global_tools_file is not None and global_fingerprint is not None:
             self._global_last_good = _parse_bytes(global_tools_path(), global_fingerprint)
 
+    @property
+    def can_rescope(self) -> bool:
+        """Whether a session without a repository may still get one (and tools with it)."""
+        return self._rescope is not None
+
     def _resolved(self) -> dict[str, tuple[str, CypherTool]]:
         return {name: (self.status.origins[name], self.status.definitions[name]) for name in self.status.served}
 
+    def _take_new_scope(self) -> bool:
+        """For a session without a repository: take the one `rescope` now resolves to, if any."""
+        if self._rescope is None:
+            return False
+        found = self._rescope()
+        if found is None or found[0] is None:
+            return False
+        self.repo, self._rescope = found[0], None
+        self.status.repo_id, self.status.source = self.repo.repo_id, found[1]
+        logger.info("this session's repository %r is registered now; serving its project and global tools",
+                    self.repo.repo_id)
+        return True
+
     def reload_if_changed(self) -> bool:
-        """Re-resolve the tools if either file's bytes changed. True when the served tools changed.
+        """Re-resolve the tools if either file's bytes changed, or the session just got
+        its repository. True when the served tools changed.
 
         Both files are parsed before any served tool is removed. If anything fails
         unexpectedly, the tools served before stay served (with a notice and a
         warning) and the reload is retried at the next poll.
         """
-        if self.repo is None:
+        if self.repo is None and not self._take_new_scope():
             return False
         fingerprint, global_fingerprint = tools_fingerprint(self.repo.path), global_tools_fingerprint()
         if (fingerprint, global_fingerprint) == (self._fingerprint, self._global_fingerprint):

@@ -73,6 +73,7 @@ from devgraph.mcp.tool_plane import (
     _inactive_match,
     register_project_tools,
     resolve_session_repo,
+    session_rescoper,
     tools_fingerprint,
 )
 from devgraph.mcp.tool_reload import run_stdio
@@ -514,6 +515,7 @@ def build_server(
     session_source: str = "none",
     session_pinned: str | None = None,
     provision_schema: bool = False,
+    rescope: Callable[[], tuple[Any | None, str] | None] | None = None,
 ) -> MCPServer:
     """Construct an MCPServer with every DevGraph tool registered against `engine`.
 
@@ -527,6 +529,10 @@ def build_server(
     `devgraph://project-tools` resource. `session_pinned` is the raw
     DEVGRAPH_MCP_REPO value, used only in the unmatched-value notice and the
     no-session error.
+
+    `rescope` (see `tool_plane.session_rescoper`) lets a session without a
+    repository serve project and global tools once its folder is registered;
+    the built-in tools' default `repo_id` stays as it started.
 
     `provision_schema` (the server started with Neo4j down) makes the first
     built-in call that finds Neo4j reachable run `init_schema` first; see
@@ -1056,7 +1062,7 @@ def build_server(
     # main() polls this for tools-file and global-store reloads.
     server.devgraph_tool_plane = ProjectToolPlane(  # type: ignore[attr-defined]
         server, engine, session_repo, status, instrument=_served, annotations=_READ_ONLY,
-        fingerprint=fingerprint, global_fingerprint=global_fingerprint,
+        fingerprint=fingerprint, global_fingerprint=global_fingerprint, rescope=rescope,
     )
 
     @server.resource(
@@ -1209,6 +1215,7 @@ def main() -> None:
             session_source=source,
             session_pinned=os.environ.get(SESSION_REPO_ENV),
             provision_schema=provision_schema,
+            rescope=session_rescoper(registry, os.environ, Path.cwd()) if session_repo is None else None,
         )
         anyio.run(run_stdio, server)
     finally:

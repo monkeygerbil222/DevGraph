@@ -82,9 +82,10 @@ def initialization_options(server: Any, *, tools_changed: bool) -> Any:
 
 
 async def run_stdio(server: Any) -> None:
-    """`MCPServer.run_stdio_async`, plus project-tool reloads when the session has a repository."""
+    """`MCPServer.run_stdio_async`, plus project-tool reloads when the session has a
+    repository, or may get one (registered after the session started)."""
     plane: ProjectToolPlane = server.devgraph_tool_plane
-    scoped = plane.repo is not None
+    scoped = plane.repo is not None or plane.can_rescope
     notifier = ToolListNotifier(server) if scoped else None
     async with stdio_server() as (read_stream, write_stream):
         async with anyio.create_task_group() as tasks:

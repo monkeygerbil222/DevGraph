@@ -239,8 +239,10 @@ The server instructions name it, and so does `devgraph://project-tools`.
   as given.
 - If the session has no repository, a call without `repo_id` fails. The
   error lists the active registered repositories; pass one of them as `repo_id`.
-  A repository registered after the server started is only picked up once
-  the MCP server restarts.
+  A repository registered after the server started becomes the built-in
+  tools' default only once the MCP server restarts; its project and global
+  tools are served within 2 seconds of the registration (the tool list
+  changes), and `devgraph://project-tools` then names it.
 
 Never pass `cross_repo: true` unless the user explicitly asks for a
 cross-repository answer — the default is (and must stay) scoped to one
