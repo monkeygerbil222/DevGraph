@@ -171,6 +171,23 @@ const checks = {
     check("no page errors", !errors.length, errors.join(" | "));
     await browser.close();
   },
+  /* Every node carries a dark hairline at its edge (Cytoscape's 1-unit
+     border in the background colour), so touching nodes stay apart. */
+  async separator() {
+    const { browser, page, errors } = await open("synth2k");
+    await settled(page); await sleep(1500);
+    const n = await loneNode(page);
+    const r = await page.evaluate(id => (STRUCTURAL_CATS.has(graphView.data(id, "cat")) ? 7.5 : 4.5) * graphView.zoom(), n.id);
+    const row = await pixels(page, { x: n.x - Math.ceil(r) - 3, y: n.y, width: 2 * Math.ceil(r) + 7, height: 1 });
+    const lum = i => row[4 * i] + row[4 * i + 1] + row[4 * i + 2];
+    const mid = lum(Math.ceil(r) + 3);
+    // the left edge's darkest pixel: antialiasing alone leaves it at about
+    // 85% of the middle's brightness, the hairline at about half
+    let darkest = Infinity; for (let i = 0; i < row.length / 4 / 2; i++) if (lum(i) > 100) darkest = Math.min(darkest, lum(i));
+    check("a node's edge carries a dark hairline", darkest < mid * 0.7, JSON.stringify({ mid, darkest, r }));
+    check("no page errors", !errors.length, errors.join(" | "));
+    await browser.close();
+  },
 };
 
 const wanted = process.argv.slice(2).length ? process.argv.slice(2) : Object.keys(checks);

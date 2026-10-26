@@ -1339,7 +1339,7 @@ function createGraphView(container) {
   const { FLOAT, UNSIGNED_BYTE } = WebGL2RenderingContext;
   /* One node layer: the fill (transparent for a hollow, excluded node) and
      a ring just inside the outline (the excluded node's outline, the search
-     match's accent). ringWidth is a fraction of the node's radius, so the
+     match's accent, else a dark separator). ringWidth is a fraction of the node's radius, so the
      ring scales with zoom as the node does, but never thinner than a pixel. */
   const nodeLayer = { name: "dgnode", uniforms: [], attributes: [
     { name: "fillColor", size: 4, type: UNSIGNED_BYTE, normalized: true, source: "color" },
@@ -1391,9 +1391,11 @@ vec4 layer_dgnode(vec4 fillColor, float fillAlpha, vec4 ringColor, float ringWid
         shape: a => a.cat === "repo" ? "hexagon" : a.cat === "service" ? "diamond" : "circle",
         color: a => nodeFillColor(a),
         fillAlpha: a => a.excluded ? 0 : 1,
-        ringColor: a => a.highlighted ? SEARCH_RING_COLOR : catColor(a.cat),
-        // Cytoscape's border widths (1.5 and 1.3 units) over the node's radius
-        ringWidth: a => (a.highlighted ? 1.5 : a.excluded ? 1.3 : 0) / (STRUCTURAL_CATS.has(a.cat) ? 7.5 : 4.5),
+        /* else a dark hairline at the edge, as Cytoscape's 1-unit border in the
+           background colour, so touching nodes in a dense cluster stay apart */
+        ringColor: a => a.highlighted ? SEARCH_RING_COLOR : a.excluded ? catColor(a.cat) : "rgba(8,9,10,0.25)",
+        // Cytoscape's border widths (1.5, 1.3 and 1 units) over the node's radius
+        ringWidth: a => (a.highlighted ? 1.5 : a.excluded ? 1.3 : 1) / (STRUCTURAL_CATS.has(a.cat) ? 7.5 : 4.5),
         opacity: a => a.faded ? 0.07 : a.excluded ? 0.45 : 1,
         visibility: a => a.culled ? "hidden" : "visible",
         zIndex: a => a.hoverHl ? 20 : a.highlighted ? 10 : 0,
