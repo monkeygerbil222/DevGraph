@@ -52,3 +52,28 @@ def test_the_vendored_file_is_the_pinned_build():
     notices = (ROOT / "THIRD_PARTY_NOTICES.md").read_text(encoding="utf-8")
     assert f"sha256 `{VENDORED_SHA256}`" in notices
     assert "npm tarball integrity" in notices
+
+
+# the graph canvas's libraries: file -> (sha256 of the vendored file, its notice heading)
+CANVAS_VENDORED = {
+    "graphology-0.26.0.umd.min.js": (
+        "dc337efa23903f61e064c8e7e7f93a429e6855dccfc2458802b4ed30c621c087", "graphology 0.26.0"),
+    "sigma-4.0.3.min.js": (
+        "694694451bff0ebb4301768e14344c4601de2e52e180a655e4ceaf1644cf43b2", "sigma.js 4.0.3"),
+}
+
+
+def test_the_canvas_libraries_are_the_pinned_builds_and_noted():
+    pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    patterns = pyproject["tool"]["setuptools"]["package-data"]["devgraph.dashboard"]
+    shipped = {p for pattern in patterns for p in (STATIC.parent).glob(pattern)}
+    notices = (ROOT / "THIRD_PARTY_NOTICES.md").read_text(encoding="utf-8")
+    assert "Alexis Jacomy, Guillaume Plique, Benoît Simard" in notices  # sigma.js
+    for name, (sha256, heading) in CANVAS_VENDORED.items():
+        import hashlib
+
+        path = STATIC / "vendor" / name
+        assert path in shipped
+        assert hashlib.sha256(path.read_bytes()).hexdigest() == sha256, name
+        assert f"## {heading}" in notices and f"sha256 `{sha256}`" in notices
+        assert f"devgraph/dashboard/static/vendor/{name}" in notices
