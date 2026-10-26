@@ -48,6 +48,9 @@ from devgraph.config.project_schema import (
     resolve_effective_schema,
     schema_file_hash,
 )
+from neo4j.exceptions import ServiceUnavailable, SessionExpired
+
+from devgraph.graph.engine import ABORTS_BATCH as _ENGINE_ABORTS
 from devgraph.graph.engine import (
     ABORTS_BATCH,
     OWNING_SERVICE_TARGETS,
@@ -128,7 +131,22 @@ class FullScanCancelled(BatchAborted):
     watcher is stopping, or the repository is no longer watched."""
 
 
-ABORTS_BATCH = (*ABORTS_BATCH, BatchAborted)
+class Neo4jLost(BatchAborted, ServiceUnavailable):
+    """Neo4j stopped answering while a file was written (`ServiceUnavailable`
+    or `SessionExpired`, after the engine's and the driver's retries). Not
+    that file's failure: every file after it would fail the same way, one
+    retry budget each, and a batch carrying on would be stamped with files
+    missing. A `ServiceUnavailable` too, so a caller reporting an unreachable
+    Neo4j reports this one."""
+
+
+#: A lost connection or session, which no file causes (`Neo4jLost`).
+CONNECTION_LOST = (ServiceUnavailable, SessionExpired)
+
+#: What fails a whole batch or scan here: the engine's (a shutdown, an index
+#: still building), this module's own, and a lost connection to Neo4j, in a
+#: file's write or in any pass after the files.
+ABORTS_BATCH = (*ABORTS_BATCH, BatchAborted, *CONNECTION_LOST)
 
 _CPP_SUFFIXES = {".cpp", ".cc", ".cxx", ".h", ".hpp"}
 
@@ -989,10 +1007,11 @@ def _index_paths(
         nonlocal indexed
         if not resolved.exists() or not resolved.is_file():
             return
-        # One unparseable/locked file (or a transient Neo4j error mid-batch)
-        # must not abort the whole batch: a full scan or watcher batch would
-        # otherwise silently lose every file after the failure point. Log and
-        # skip the offending file so the rest of the batch still indexes.
+        # One unparseable/locked file must not abort the whole batch: a full
+        # scan or watcher batch would otherwise silently lose every file
+        # after the failure point. Log and skip the offending file so the
+        # rest of the batch still indexes. A lost connection to Neo4j is no
+        # file's failure, and aborts it (`Neo4jLost`).
         saved = _UNREAD
         try:
             spellings = sorted(supplied.get(rel_path, []))
@@ -1026,8 +1045,13 @@ def _index_paths(
                 count = _run_deep(single)
             indexed += 0 if rel_path in read else count
             read.add(rel_path)
-        except ABORTS_BATCH:
+        except (*_ENGINE_ABORTS, BatchAborted):
             raise  # shutdown or an index still building: leave the work, and its stamp, for later
+        except CONNECTION_LOST as exc:
+            raise Neo4jLost(
+                f"{repo_id}: Neo4j stopped answering while {rel_path} was indexed; the batch was given up "
+                f"and will be redone ({' '.join(str(exc).split())})"
+            ) from exc
         except RecursionError as exc:
             # Deeper than even `_run_deep` allows: left out of the graph and
             # reported, as a fresh scan leaves it, not kept as it was.
