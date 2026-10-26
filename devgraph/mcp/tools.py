@@ -192,7 +192,9 @@ CALL (shown) {{
 def _impact_expansion(cross_repo: bool, with_ids: bool = False) -> str:
     """Cypher continuing from `WITH collect(n) AS l0` (the changed nodes): one
     CALL per hop collecting the distinct nodes with a CALLS/USES/DEPENDS_ON edge
-    into the previous hop's nodes, never one seen at an earlier hop, then
+    into the previous hop's nodes, or a subclass's EXTENDS edge (the schema's
+    one inheritance edge: extends, implements, a Rust trait impl), never one
+    seen at an earlier hop, then
     returning `direct_dependents` (hop 1), `transitive_dependents` (hops 2 to
     `IMPACT_MAX_DEPTH`), `direct_count`, `matched` (the changed nodes' {name, file, owner})
     and `endpoint_nodes`: the Endpoints that IMPLEMENTS a changed node or a
@@ -201,21 +203,31 @@ def _impact_expansion(cross_repo: bool, with_ids: bool = False) -> str:
     `direct_count` leaves them out. `with_ids` adds each dependent's `id` (its
     elementId).
 
+    A changed Class stands with the Functions it CONTAINS (its methods,
+    constructors included): hop 0 is the class and its `members`, so a
+    caller of one of its methods is a direct dependent, and a direct
+    dependent lists in `via` the members it depends on (`Cart.go`; empty for
+    one that depends on the class itself, such as a subclass).
+
     Expanding distinct nodes hop by hop does work proportional to the nodes
     and edges within reach; a variable-length path enumerates every path, which
     times out on a common name like `get` in a real repository.
     """
     scope = _cross_scope("d", "AND") if cross_repo else "AND d.repo_id = $repo_id"
-    parts = []
+    parts = [
+        "CALL (l0) { UNWIND l0 AS c MATCH (c:Class)-[:CONTAINS]->(f:Function) WHERE NOT f IN l0 "
+        "RETURN collect(DISTINCT f) AS members }"
+    ]
     for hop in range(1, IMPACT_MAX_DEPTH + 1):
-        seen = [f"l{k}" for k in range(hop)]
+        seen = ["l0", "members"] + [f"l{k}" for k in range(1, hop)]
+        previous = "l0 + members" if hop == 1 else f"l{hop - 1}"
         parts.append(
-            f"CALL ({', '.join(seen)}) {{ UNWIND l{hop - 1} AS m "
-            f"MATCH (d)-[:CALLS|USES|DEPENDS_ON]->(m) WHERE true {scope} "
+            f"CALL ({', '.join(seen)}) {{ UNWIND {previous} AS m "
+            f"MATCH (d)-[:CALLS|USES|DEPENDS_ON|EXTENDS]->(m) WHERE true {scope} "
             f"AND {' AND '.join(f'NOT d IN {s}' for s in seen)} "
             f"RETURN collect(DISTINCT d) AS l{hop} }}"
         )
-    levels = [f"l{k}" for k in range(IMPACT_MAX_DEPTH + 1)]
+    levels = ["members"] + [f"l{k}" for k in range(IMPACT_MAX_DEPTH + 1)]
     endpoint_scope = _cross_scope("e", "AND") if cross_repo else "AND e.repo_id = $repo_id"
     parts.append(
         f"CALL ({', '.join(levels)}) {{ UNWIND {' + '.join(levels)} AS m "
@@ -227,8 +239,9 @@ def _impact_expansion(cross_repo: bool, with_ids: bool = False) -> str:
         "{name: d.name, type: labels(d)[0], file: coalesce(d.file, d.source_file), owner: "
         + _OWNER_OF.format(v="d") + (", id: elementId(d)}" if with_ids else "}")
     )
+    via = "via: [(d)-[:CALLS|USES|DEPENDS_ON]->(x) WHERE x IN members | coalesce(x.owner, '') + '.' + x.name], "
     parts.append(
-        f"RETURN [d IN l1 | {ref}] AS direct_dependents, "
+        f"RETURN [d IN l1 | {ref[:1] + via + ref[1:]}] AS direct_dependents, "
         f"[d IN {transitive} | {ref}] AS transitive_dependents, "
         "size(l1) AS direct_count, [n IN l0 | {name: n.name, file: n.file, owner: coalesce(n.owner, '')}] AS matched, "
         "endpoint_nodes"
@@ -252,6 +265,14 @@ def _located(row: dict[str, Any]) -> dict[str, Any]:
     and `start_line` dropped when None (a Module has no owner, a Service no
     line); `file` is always kept, null for a file-less node."""
     return {k: v for k, v in row.items() if v is not None or k not in ("owner", "start_line")}
+
+
+def _dependent(row: dict[str, Any]) -> dict[str, Any]:
+    """An impact dependent row `_located`, its `via` (the target class's
+    members it depends on, `_impact_expansion`) sorted and distinct, or
+    left out when there are none."""
+    via = sorted(set(row.pop("via", None) or []))
+    return {**_located(row), **({"via": via} if via else {})}
 
 
 @contextmanager
@@ -1730,6 +1751,15 @@ def get_service_dependencies(
     return results[0]
 
 
+#: Cypher binding `callee` for each `target`: the target itself, and, when it
+#: is a Class, each Function it CONTAINS (its methods, constructors included).
+_CLASS_MEMBERS = """CALL (target) {
+      RETURN target AS callee
+      UNION
+      MATCH (target:Class)-[:CONTAINS]->(callee:Function) RETURN callee
+    }"""
+
+
 def find_callers(
     engine: GraphEngine,
     repo_id: str,
@@ -1756,7 +1786,10 @@ def find_callers(
     edge written before index format 4 (Python), 6 (JS/TS), 7 (Go, Java,
     Kotlin) or 8 (Rust, C#, C++) carries none until the automatic rescan.
     Each caller is returned once, with its best confidence, and
-    resolved callers come first. When a method-body call's enclosing class
+    resolved callers come first. A Class is called through the Functions it
+    CONTAINS: its callers are theirs, each with `via` (the methods it calls,
+    `Cart.total`), leaving out the class's own members, and its `routed_by`
+    the routes they handle. When a method-body call's enclosing class
     is known at index time, the edge carries a `caller_class` property
     recording it — pass scope_to_class to narrow results to callers made
     from within a specific class's own methods (opt-in; omitted, behavior is
@@ -1821,27 +1854,34 @@ def find_callers(
     class_filter = "AND rel.caller_class = $scope_to_class" if scope_to_class else ""
     recency_filter = "AND target.last_modified_at >= $cutoff" if cutoff is not None else ""
     resolved_filter = "AND rel.confidence IN ['resolved', 'package']" if resolved_only else ""
+    # A class is called through its members (`_CLASS_MEMBERS`), as
+    # impact_analysis counts it; a call between its own members is not one.
     callers = f"""
     {_named_nodes(labels, "target_name", cross_repo, "target")}
-    MATCH (caller)-[rel:CALLS]->(target)
-    WHERE true
-    {class_filter}
+    WITH target WHERE true
     {recency_filter}
-    {resolved_filter}
     AND ($file IS NULL OR target.file = $file)
     AND {_OWNER_MATCH.replace("n.", "target.")}
+    {_CLASS_MEMBERS}
+    MATCH (caller)-[rel:CALLS]->(callee)
+    WHERE (callee = target OR NOT (caller = target OR (target)-[:CONTAINS]->(caller)))
+    {class_filter}
+    {resolved_filter}
     """
     is_test = "coalesce(caller.file, caller.source_file, '') =~ $test_path"
     cypher = f"""
     {callers}
     WITH caller, min(CASE rel.confidence WHEN 'resolved' THEN 0 WHEN 'package' THEN 1 WHEN 'name' THEN 3
-                     ELSE 2 END) AS rank{target_files}
+                     ELSE 2 END) AS rank,
+         collect(DISTINCT CASE WHEN callee <> target THEN coalesce(callee.owner, '') + '.' + callee.name END)
+         AS via{target_files}
     WITH *, {is_test} AS is_test
     WHERE $include_tests OR NOT is_test
     RETURN caller.name as name, labels(caller) as type, caller.repo_id as repo_id,
            coalesce(caller.file, caller.source_file) as file,
            {_OWNER_OF.format(v="caller")} as owner, caller.start_line as start_line,
-           CASE rank WHEN 0 THEN 'resolved' WHEN 1 THEN 'package' WHEN 3 THEN 'name' END as confidence{target_files and ", target_files"}
+           CASE rank WHEN 0 THEN 'resolved' WHEN 1 THEN 'package' WHEN 3 THEN 'name' END as confidence,
+           via{target_files and ", target_files"}
     ORDER BY is_test, rank, name, file
     LIMIT {LIST_ROW_LIMIT + 1}
     """
@@ -1861,18 +1901,19 @@ def find_callers(
     # A route reaches its handler by IMPLEMENTS, not CALLS: listed apart.
     routes = f"""
     {_named_nodes(labels, "target_name", cross_repo, "target")}
-    MATCH (e:Endpoint)-[:IMPLEMENTS]->(target)
-    WHERE true
+    WITH target WHERE true
     {recency_filter}
     AND ($file IS NULL OR target.file = $file)
     AND {_OWNER_MATCH.replace("n.", "target.")}
-    WITH collect({{e: e, file: target.file}}) AS pairs
+    {_CLASS_MEMBERS}
+    MATCH (e:Endpoint)-[:IMPLEMENTS]->(callee)
+    WITH collect(DISTINCT {{e: e, file: target.file}}) AS pairs
     {_capped_endpoints("pairs")}
     RETURN endpoint_count, endpoints
     """
     routed_by = next(iter(_query(engine, routes, {**params, "max_results": max_results})), None)
     results, more = _list_query(engine, cypher, params)
-    results = [_located(row) for row in results]
+    results = [_dependent(row) for row in results]
     if ambiguous:
         results = [_with_target_files(row, row["target_files"]) for row in results]
     envelope = _capped_envelope(results, more, max_results)
@@ -2167,7 +2208,10 @@ def impact_analysis(
 
     Every CALLS edge counts as a dependency whatever its `confidence` (see
     find_callers), so a Python method called on an untyped receiver keeps
-    its by-name dependents: impact errs toward listing too much.
+    its by-name dependents: impact errs toward listing too much. A Class is
+    traced with the Functions it CONTAINS (`_impact_expansion`): the callers
+    of its methods and its subclasses (EXTENDS) are direct dependents, each
+    caller with `via`, the methods it calls.
 
     Args:
         engine: GraphEngine instance
@@ -2251,8 +2295,8 @@ def impact_analysis(
     if not split:
         row = results[0]
         answer = {
-            "direct_dependents": dependents_envelope([_located(d) for d in row["direct_dependents"]]),
-            "transitive_dependents": dependents_envelope([_located(d) for d in row["transitive_dependents"]]),
+            "direct_dependents": dependents_envelope([_dependent(d) for d in row["direct_dependents"]]),
+            "transitive_dependents": dependents_envelope([_dependent(d) for d in row["transitive_dependents"]]),
             "endpoints": _endpoints_envelope(answer_row, max_results),
             "risk_level": _risk_level(row["direct_count"]),
         }
@@ -2272,9 +2316,11 @@ def impact_analysis(
             for d in row[key]:
                 if key == "transitive_dependents" and d["id"] in direct_ids:
                     continue
-                located = _located({k: v for k, v in d.items() if k != "id"})
+                located = _dependent({k: v for k, v in d.items() if k != "id"})
                 entry = dependents.setdefault(d["id"], {"key": key, "row": located, "files": []})
                 entry["files"].append(row["target_file"])
+                if located.get("via"):
+                    entry["row"]["via"] = sorted({*entry["row"].get("via", []), *located["via"]})
     lists = {
         key: [_with_target_files(d["row"], d["files"]) for d in dependents.values() if d["key"] == key]
         for key in ("direct_dependents", "transitive_dependents")
@@ -2352,7 +2398,8 @@ def impact_analysis_for_diff(
     `git diff base_ref...head_ref`, what a pull request shows) the way
     compare_branches does: git objects read in memory, never fetched, under its
     ref rules and caps. Functions and classes changed or removed are traced to
-    their dependents with impact_analysis's bounded hop expansion; added ones
+    their dependents with impact_analysis's bounded hop expansion (a class with
+    its methods and subclasses); added ones
     are listed apart, since nothing depends on new code yet. Every indexed
     function and class of a changed code file counts as changed, with a notice,
     when its symbols weren't diffed: it is past the 200-file detail cap, its
@@ -2482,8 +2529,8 @@ def impact_analysis_for_diff(
         "changed_symbols": symbols["changed"],
         "removed_symbols": symbols["removed"],
         "changed_components": sorted({m["name"] for m in row["matched"] if m["name"] is not None}),
-        "direct_dependents": _envelope([_located(d) for d in row["direct_dependents"]], max_results),
-        "transitive_dependents": _envelope([_located(d) for d in row["transitive_dependents"]], max_results),
+        "direct_dependents": _envelope([_dependent(d) for d in row["direct_dependents"]], max_results),
+        "transitive_dependents": _envelope([_dependent(d) for d in row["transitive_dependents"]], max_results),
         "endpoints": _endpoints_envelope(row, max_results),
         "risk_level": _risk_level(row["direct_count"]),
         "truncated": bool(reasons),

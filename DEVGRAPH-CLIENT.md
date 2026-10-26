@@ -325,6 +325,20 @@ Each is a `{count, results, truncated}` envelope of rows shaped as
 Where dependents or callers carry `target_files` (several same-named
 targets), so does each endpoint.
 
+**A class's impact and callers**: a class stands with the methods it
+contains (constructors included). `impact_analysis` and
+`impact_analysis_for_diff` count as its direct dependents the callers of its
+methods, its subclasses (an `EXTENDS` edge, which records extends,
+implements and a Rust trait impl alike) and its `USES`/`DEPENDS_ON`
+dependents; a subclass's subclass and a method caller's callers are
+transitive. A direct dependent reached through a method names it in `via`
+(`["Cart.total"]`), and `risk_level` counts them all. `find_callers` on a
+class lists the callers of its methods, each with its `via`, leaving out
+calls between the class's own methods, and `routed_by` and `endpoints`
+include the routes its methods handle. Instantiation (`Cart()`,
+`new Invoice()`) writes no edge yet, so a function that only creates an
+instance is not counted.
+
 **Response shape (`count`/`results`/`truncated`)**: `search_component`,
 `find_callers`, `list_services`, `list_endpoints`, `find_related_prs`, `issue_history_for`,
 `find_requirements_for` and `blame_component` return
