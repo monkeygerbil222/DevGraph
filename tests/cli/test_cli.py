@@ -133,6 +133,7 @@ def _mock_settings(db_path):
     settings.neo4j_uri = "bolt://127.0.0.1:7687"
     settings.neo4j_user = "neo4j"
     settings.neo4j_password = "devgraph-local-dev"
+    settings.neo4j_probe_timeout_s = 5.0
     settings.enable_run_cypher = False
     return settings
 

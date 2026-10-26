@@ -63,7 +63,7 @@ from devgraph.agent import lifecycle
 from devgraph.config.global_tools import GLOBAL_TOOLS_FILENAME, global_tools_fingerprint
 from devgraph.config.project_tools import TOOLS_FILENAME
 from devgraph.config.settings import get_settings
-from devgraph.graph.engine import GraphEngine
+from devgraph.graph.engine import GraphEngine, QueryNotAnswered
 from devgraph.mcp import tools as devgraph_tools
 from devgraph.mcp.catalog import TOOL_CATALOG as _TOOL_CATALOG
 from devgraph.mcp.catalog import builtin_tool_names  # noqa: F401  (re-exported)
@@ -73,6 +73,7 @@ from devgraph.mcp.tool_plane import (
     _inactive_match,
     register_project_tools,
     resolve_session_repo,
+    session_rescoper,
     tools_fingerprint,
 )
 from devgraph.mcp.tool_reload import run_stdio
@@ -320,6 +321,9 @@ def _with_neo4j_errors(fn: Callable[..., Any], uri: str) -> Callable[..., Any]:
     def wrapper(*args: Any, **kwargs: Any) -> Any:
         try:
             return fn(*args, **kwargs)
+        except QueryNotAnswered as exc:
+            # Neo4j is up: not the "start Neo4j" advice of an unreachable one.
+            raise ToolError(f"{exc} (at {uri}); it is running but slow or stalled: retry, or narrow the request") from exc
         except Exception as exc:
             error = devgraph_tools.neo4j_unavailable(exc, uri)
             if error is None:
@@ -514,6 +518,7 @@ def build_server(
     session_source: str = "none",
     session_pinned: str | None = None,
     provision_schema: bool = False,
+    rescope: Callable[[], tuple[Any | None, str] | None] | None = None,
 ) -> MCPServer:
     """Construct an MCPServer with every DevGraph tool registered against `engine`.
 
@@ -527,6 +532,10 @@ def build_server(
     `devgraph://project-tools` resource. `session_pinned` is the raw
     DEVGRAPH_MCP_REPO value, used only in the unmatched-value notice and the
     no-session error.
+
+    `rescope` (see `tool_plane.session_rescoper`) lets a session without a
+    repository serve project and global tools once its folder is registered;
+    the built-in tools' default `repo_id` stays as it started.
 
     `provision_schema` (the server started with Neo4j down) makes the first
     built-in call that finds Neo4j reachable run `init_schema` first; see
@@ -1072,7 +1081,7 @@ def build_server(
     # main() polls this for tools-file and global-store reloads.
     server.devgraph_tool_plane = ProjectToolPlane(  # type: ignore[attr-defined]
         server, engine, session_repo, status, instrument=_served, annotations=_READ_ONLY,
-        fingerprint=fingerprint, global_fingerprint=global_fingerprint,
+        fingerprint=fingerprint, global_fingerprint=global_fingerprint, rescope=rescope,
     )
 
     @server.resource(
@@ -1148,22 +1157,18 @@ def build_server(
     return server
 
 
-#: How long the MCP server's engine may take to get a connection (see
-#: `GraphEngine`, which it runs `fail_fast`: a read that failed once connected
-#: is retried once, one that could not connect is not). With Neo4j down a call
-#: fails in about this long on every platform, not after the driver's default
-#: 30 s of retries.
-MCP_CONNECTION_TIMEOUT_S = 2.0
-
-
 def mcp_engine(settings: Any) -> GraphEngine:
-    """The MCP server's engine: `settings`' Neo4j, with the short limits above."""
+    """The MCP server's engine: `settings`' Neo4j, run `fail_fast` (a read that
+    failed once connected is retried once, one that could not connect is not;
+    see `GraphEngine`) with `settings.mcp_connection_timeout_s` (default 2 s)
+    to get a connection. With Neo4j down a call fails in about that long on
+    every platform, not after the driver's default 30 s of retries."""
     return GraphEngine(
         settings.neo4j_uri,
         settings.neo4j_user,
         settings.neo4j_password,
         fail_fast=True,
-        connection_timeout_s=MCP_CONNECTION_TIMEOUT_S,
+        connection_timeout_s=settings.mcp_connection_timeout_s,
     )
 
 
@@ -1229,6 +1234,7 @@ def main() -> None:
             session_source=source,
             session_pinned=os.environ.get(SESSION_REPO_ENV),
             provision_schema=provision_schema,
+            rescope=session_rescoper(registry, os.environ, Path.cwd()) if session_repo is None else None,
         )
         anyio.run(run_stdio, server)
     finally:

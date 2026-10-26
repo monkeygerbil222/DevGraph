@@ -83,9 +83,10 @@ def _is_login_refusal(exc: Exception) -> bool:
 
 def _neo4j_problem(exc: Exception, settings) -> str:
     """One line for a failed Neo4j call, naming the setting to check and the file it lives in."""
-    from neo4j.exceptions import AuthError, ServiceUnavailable
+    from neo4j.exceptions import AuthError, IncompleteCommit, ServiceUnavailable
 
     from devgraph.config.settings import devgraph_home
+    from devgraph.graph.engine import EngineClosed, IndexesNotReady
 
     env_file = devgraph_home() / ".env"
     if isinstance(exc, AuthError):
@@ -100,7 +101,9 @@ def _neo4j_problem(exc: Exception, settings) -> str:
             f"Neo4j at {settings.neo4j_uri} refused the login ({reason}); check "
             f"DEVGRAPH_NEO4J_USER and DEVGRAPH_NEO4J_PASSWORD in {env_file} (or the environment)"
         )
-    if isinstance(exc, ServiceUnavailable):
+    # A closing engine, an index still being built, or a commit whose outcome
+    # is unknown are ServiceUnavailable too, but Neo4j answered: say what happened.
+    if isinstance(exc, ServiceUnavailable) and not isinstance(exc, (EngineClosed, IndexesNotReady, IncompleteCommit)):
         return (
             f"nothing answers at {settings.neo4j_uri}; start Neo4j, or set DEVGRAPH_NEO4J_URI in {env_file} "
             "(or the environment)"
@@ -469,7 +472,7 @@ def rescan(
         console.print(f"[red][X] Error:[/red] {escape(str(e))}", soft_wrap=True)
         raise typer.Exit(code=1)
     except Exception as e:
-        console.print(f"[red][X] Error:[/red] {escape(str(e))}")
+        console.print(f"[red][X] Error:[/red] {escape(_neo4j_problem(e, get_settings()))}", soft_wrap=True)
         raise typer.Exit(code=1)
 
 
@@ -503,7 +506,7 @@ def insights(repo_id: str) -> None:
     except typer.Exit:
         raise
     except Exception as e:
-        console.print(f"[red][X] Error:[/red] {escape(str(e))}")
+        console.print(f"[red][X] Error:[/red] {escape(_neo4j_problem(e, get_settings()))}", soft_wrap=True)
         raise typer.Exit(code=1)
     console.print(
         f"[green][OK][/green] Insights for {escape(repo_id)}: {summary['community_count']} communities "
@@ -906,6 +909,16 @@ def _print_unwatched_repos(settings, mark: str) -> tuple[int, int]:
     return len(unwatched), len(partly)
 
 
+def _probe_engine(settings) -> GraphEngine:
+    """The engine `status` and `doctor` check Neo4j with: one connection try,
+    bounded by `neo4j_probe_timeout_s`, so a Neo4j gone behind a forwarder
+    that still accepts connections is reported, not waited on."""
+    return GraphEngine(
+        settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password,
+        fail_fast=True, connection_timeout_s=settings.neo4j_probe_timeout_s,
+    )
+
+
 @app.command()
 def status() -> None:
     """Check DevGraph status: Neo4j connectivity and repository counts.
@@ -917,7 +930,7 @@ def status() -> None:
 
     # Check Neo4j connectivity
     console.print("[bold]Neo4j Connection[/bold]")
-    engine = GraphEngine(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password)
+    engine = _probe_engine(settings)
     try:
         engine.verify_connectivity()
         console.print(f"  [green][OK] Reachable[/green] at {escape(str(settings.neo4j_uri))}")
@@ -1361,7 +1374,7 @@ def doctor(
     neo4j_reachable = False
     # Neo4j answers but refuses the login: running, so Podman is not the problem.
     neo4j_answers = False
-    engine = GraphEngine(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password)
+    engine = _probe_engine(settings)
     try:
         if wait > 0:
             _wait_for_neo4j(settings, wait)
@@ -1970,7 +1983,11 @@ def mcp_add(
     """Register DevGraph as an MCP server for every Claude Code project (runs 'claude mcp add -s user')."""
     claude_path = shutil.which("claude")
     if claude_path is None:
-        console.print("[red][X] Error:[/red] 'claude' not found on PATH")
+        console.print(
+            "[red][X] Error:[/red] 'claude' not found on PATH. This command registers DevGraph with Claude Code; "
+            "for VS Code or another MCP client, 'devgraph client-config' prints the server entry to add.",
+            soft_wrap=True,
+        )
         raise typer.Exit(code=1)
     if not _run_claude_mcp_add(claude_path, resolve_venv_python(), resolve_repo_root(), replace=replace):
         raise typer.Exit(code=1)
@@ -2174,7 +2191,7 @@ def stats(
     try:
         engine.verify_connectivity()
     except Exception as e:
-        console.print(f"[red][X] Neo4j not reachable:[/red] {escape(str(e))}")
+        console.print(f"[red][X] Error:[/red] {escape(_neo4j_problem(e, settings))}", soft_wrap=True)
         raise typer.Exit(code=1)
 
     try:
@@ -2335,7 +2352,9 @@ _UPDATE_WAIT_PID = "DEVGRAPH_UPDATE_WAIT_PID"
 @app.command()
 def update(
     force: bool = typer.Option(
-        False, "--force", help="Allow update with a dirty working tree (stash first)."
+        False, "--force",
+        help="Skip the local-changes check. Nothing is stashed: git pull --ff-only still refuses "
+        "when a change touches a file it updates.",
     ),
     branch: str = typer.Option(
         "origin/master", "--branch", help="Remote branch to pull from."
@@ -3754,7 +3773,7 @@ def prune(
     try:
         engine.verify_connectivity()
     except Exception as e:
-        console.print(f"[red][X] Neo4j not reachable:[/red] {escape(str(e))}")
+        console.print(f"[red][X] Error:[/red] {escape(_neo4j_problem(e, settings))}", soft_wrap=True)
         raise typer.Exit(code=1)
 
     try:
@@ -3822,7 +3841,7 @@ def self_test(
     try:
         engine.verify_connectivity()
     except Exception as e:
-        console.print(f"[red][X] Neo4j not reachable:[/red] {escape(str(e))}")
+        console.print(f"[red][X] Error:[/red] {escape(_neo4j_problem(e, settings))}", soft_wrap=True)
         raise typer.Exit(code=1)
 
     registry = _get_registry()
@@ -3959,7 +3978,7 @@ def export(
     try:
         engine.verify_connectivity()
     except Exception as e:
-        console.print(f"[red][X] Neo4j not reachable:[/red] {escape(str(e))}")
+        console.print(f"[red][X] Error:[/red] {escape(_neo4j_problem(e, settings))}", soft_wrap=True)
         raise typer.Exit(code=1)
 
     try:

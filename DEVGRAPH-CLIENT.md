@@ -239,8 +239,10 @@ The server instructions name it, and so does `devgraph://project-tools`.
   as given.
 - If the session has no repository, a call without `repo_id` fails. The
   error lists the active registered repositories; pass one of them as `repo_id`.
-  A repository registered after the server started is only picked up once
-  the MCP server restarts.
+  A repository registered after the server started becomes the built-in
+  tools' default only once the MCP server restarts; its project and global
+  tools are served within 2 seconds of the registration (the tool list
+  changes), and `devgraph://project-tools` then names it.
 
 Never pass `cross_repo: true` unless the user explicitly asks for a
 cross-repository answer — the default is (and must stay) scoped to one
@@ -473,9 +475,12 @@ argument below its minimum (`max_results`, `within_commits`,
 `modified_within_commits`, `members_per_community`, `max_per_type` below 1,
 `max_length` below 2) fails and names the argument.
 
-If Neo4j is down, every tool fails within a few seconds with `Neo4j isn't
+If Neo4j is down (or gone behind a forwarder that still accepts connections),
+every tool fails within a few seconds with `Neo4j isn't
 reachable at <uri>; start Neo4j ...`: tell the user to start Neo4j (or run
-`devgraph doctor`) rather than retrying the call in a loop.
+`devgraph doctor`) rather than retrying the call in a loop. A tool that says
+`Neo4j accepted the query but didn't answer within 35 s ...` means Neo4j is up
+but slow or stalled: retry once, or narrow the request.
 
 If a tool returns empty/sparse results, check whether the repo has actually
 been scanned (step 1/2) before concluding the graph has nothing to say — an
