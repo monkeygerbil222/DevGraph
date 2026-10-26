@@ -1011,11 +1011,15 @@ def _print_dashboard_status(settings) -> None:
 
 def _pending_rescans(engine: GraphEngine, repos: list[Any]) -> list[Any]:
     """The active, indexed `repos` whose graph index predates the current
-    format (or is gone: a wiped graph), and so await a rescan. A never-indexed
-    repo's first scan (add/rescan) stamps the format."""
-    from devgraph.indexer.dispatch import index_outdated
+    format (or is gone: a wiped graph), or whose update was cut short (an
+    unfinished `batch_open` marker, by catch-up's own rule), and so await a
+    rescan. A never-indexed repo's first scan (add/rescan) stamps the format."""
+    from devgraph.indexer.dispatch import _unfinished_batches, index_outdated
 
-    return [r for r in repos if r.active and r.last_indexed and index_outdated(engine, r.repo_id)]
+    return [
+        r for r in repos
+        if r.active and r.last_indexed and (index_outdated(engine, r.repo_id) or _unfinished_batches(engine, r.repo_id))
+    ]
 
 
 def _rescan_hint(repo: Any) -> str:
@@ -1025,15 +1029,20 @@ def _rescan_hint(repo: Any) -> str:
     return "(not watched: run 'devgraph rescan')"
 
 
+#: `_index_state` of a current index whose last update was cut short.
+INTERRUPTED_BATCH = "interrupted batch"
+
+
 def _index_state(engine: GraphEngine, repo_id: str) -> str:
     """Why a repository's graph index awaits a rescan (`_pending_rescans`): its
     recorded format is older than the current one; it records none (an index
-    from before formats were stamped); or it is gone (a wiped graph)."""
+    from before formats were stamped); it is gone (a wiped graph); or, the
+    format current, an update was cut short (`INTERRUPTED_BATCH`)."""
     from devgraph.indexer.dispatch import INDEX_FORMAT
 
     found = engine.index_format(repo_id)
     if found is not None:
-        return f"index format {found} < {INDEX_FORMAT}"
+        return f"index format {found} < {INDEX_FORMAT}" if found < INDEX_FORMAT else INTERRUPTED_BATCH
     rows = engine.run_cypher(
         "MATCH (r:Repository {repo_id: $repo_id}) RETURN count(r) > 0 AS present", {"repo_id": repo_id}
     )
@@ -1042,7 +1051,10 @@ def _index_state(engine: GraphEngine, repo_id: str) -> str:
 
 def _print_graph_index(engine: GraphEngine) -> None:
     """The `status` "Graph Index" section: active, indexed repositories whose
-    index predates the current format and so await an automatic rescan."""
+    index predates the current format, or whose update was cut short, and so
+    await a rescan (`_pending_rescans`)."""
+    from devgraph.indexer.dispatch import index_outdated
+
     console.print("[bold]Graph Index[/bold]")
     try:
         registry = _get_registry()
@@ -1051,11 +1063,13 @@ def _print_graph_index(engine: GraphEngine) -> None:
         finally:
             registry.close()
         pending = _pending_rescans(engine, repos)
+        interrupted = {r.repo_id for r in pending if not index_outdated(engine, r.repo_id)}
     except Exception as e:
         console.print(f"  [red]Error:[/red] {escape(str(e))}")
         return
     for repo in pending:
-        console.print(f"  [yellow]{escape(repo.repo_id)}: rescan pending[/yellow] {_rescan_hint(repo)}")
+        why = f" ({INTERRUPTED_BATCH})" if repo.repo_id in interrupted else ""
+        console.print(f"  [yellow]{escape(repo.repo_id)}: rescan pending{why}[/yellow] {_rescan_hint(repo)}")
     if not pending:
         console.print("  up to date")
 
@@ -1659,9 +1673,10 @@ def doctor(
                 soft_wrap=True,
             )
 
-    # 7f. Each indexed repository's graph index: wiped, or older than the
-    # current format, it answers from nothing or from outdated extraction
-    # until rescanned (`status` says so too). Needs the graph.
+    # 7f. Each indexed repository's graph index: wiped, older than the
+    # current format, or with an update cut short, it answers from nothing,
+    # from outdated extraction or with edges missing until rescanned
+    # (`status` says so too). Needs the graph.
     console.print("[bold]Graph index[/bold]")
     pending_rescans: list[Any] = []
     if not neo4j_reachable:
@@ -1682,9 +1697,10 @@ def doctor(
             current = f"every indexed repository is at index format {INDEX_FORMAT}"
             console.print(f"  [green][OK][/green] {escape(current if present_repos else nothing_to_check)}")
         for repo in pending_rescans:
-            state = escape(states[repo.repo_id])
+            state = states[repo.repo_id]
+            why = f"rescan pending ({state})" if state == INTERRUPTED_BATCH else f"{escape(state)}, rescan pending"
             console.print(
-                f"  [yellow][!] {escape(repo.repo_id)}:[/yellow] {state}, rescan pending {_rescan_hint(repo)}",
+                f"  [yellow][!] {escape(repo.repo_id)}:[/yellow] {why} {_rescan_hint(repo)}",
                 soft_wrap=True,
             )
 
