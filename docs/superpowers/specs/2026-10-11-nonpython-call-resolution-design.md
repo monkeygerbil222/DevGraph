@@ -498,13 +498,29 @@ Tiers, first match wins:
    `db`). The method resolves to this file when its type and the method are
    declared here, else to the type's package directory at package confidence
    (`~`: methods are named bare, so another type of the package can have one
-   of the name). An unqualified exported type the file doesn't declare,
+   of the name). The call of a struct the file declares whose embedded
+   types are all structs of the file (index format 23, audit 11 item 4 and
+   its review F2) names the struct and each of those structs (directly or
+   through them) as owners, one owned pin each: its methods are its own and
+   those promoted from them, wherever in the package (`Inner.Hello` in
+   hello.go for `Outer struct{ Inner }` in types.go). Any other type keeps the owner-less pin: another file's
+   type may embed a type of a third file, whose promoted method an owner
+   would lose, or be an interface, whose implementers' methods are any of
+   the name; so does a struct embedding another file's or package's type,
+   an interface, or a type the file can't name (`Box[int]`), directly or
+   through a struct of the file. An unqualified exported type the file doesn't declare,
    and what an unqualified function of another file returned, may be a
    dot-imported package's (`import . "pkg"`, index format 18): that
    package's directory at package confidence too. A builtin or external
    type links nothing.
 5. Anything else: a bare-name row that never ends at its caller, unless the
    method is in `STOP_METHODS["go"]`.
+
+A file's structs are its heir declarations (common.add_heir_keys): each
+with its methods, its bases the structs of its file it embeds, so the
+embedded struct's method carries the embedder's heir key (`<Order` on
+`Base.ID` for `type Order struct{ Base }`). An embedded type of another
+file or package is no base, so no Go type is open.
 
 Function nodes are keyed by (name, file), with no receiver, so the
 directory pin of a bare `f()` (tiers 2 and 3) also matches a method `T.f`
@@ -661,7 +677,21 @@ name give no edge, and a `use` of an inline module of the file none.
    field of a struct declared in the file, the element of a `for` loop over
    a `Vec<T>`, slice or array (`for order in &self.orders`); `Box`, `Rc` and
    `Arc` are seen through. This file when the type and the method are
-   declared here, else the type's module; a library type links nothing.
+   declared here, else the type's module; a library type links nothing. In
+   the type's module the call names the type as its owner (index format 23,
+   audit 11 item 4; common.class_member_pin), as `Type::f()` and `Self::f()`
+   do, so `o.total()` on an `Order` links `Order::total`, not `Invoice::total`
+   of the same file: its own method, or a default method of a trait of that
+   file it implements (each type's heir declaration has the traits of its
+   file it implements as bases, so `Priced::doubled` carries `<Order`). A
+   call through a trait (`Local::hi(o)`, owned by `Local`) links the
+   implementations of that trait's file: a type's method implementing a
+   method the trait declares carries the trait's heir key (`<Local` on
+   `Order::hi` for `impl Local for Order`), as the owner-less pin to that
+   file reached them before (audit 11 review F4). A
+   trait of another file is no base (its default methods are in its own
+   file), so no Rust type is open; a default method of another file's trait,
+   or a method an `impl` in another file adds, is not reached, as before.
 4. Anything else: a bare-name row off its caller, unless the method is in
    `STOP_METHODS["rust"]`.
 
@@ -1060,7 +1090,7 @@ list), and a resolver that knows the owner of a call's target names it: a
 typed receiver's or `this`/`self` call to a class declared in the file
 links that class's member (Python, JS/TS, Java, Kotlin, C#, Go, Rust; C++
 resolves by function name alone and still links every same-named member of
-the file); across files, an imported top-level function (a Python
+the file; a Rust type of another file since index format 23); across files, an imported top-level function (a Python
 from-import or module attribute, a JS/TS ES named import or namespace
 member, a Go package's function) links the top-level one, never a method
 of its name. A method of another file's Python, JS/TS or Java class names

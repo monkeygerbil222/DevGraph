@@ -251,9 +251,16 @@ def _provider_specs(repo_root: Path) -> tuple[bool, filesystem.FilesystemSpec | 
 #: (`scan_options_pending`), its mentions Documents deleted with mentions
 #: off and its docs notes with no docs path; docs notes and front matter
 #: read after a UTF-8 byte-order mark; and a docs note's `links` naming a
-#: Service as well as a Module.
+#: Service as well as a Module; 23: a Rust method call on a typed value of
+#: another file's type, and a `Type::f()` path, linked to that type's member
+#: only (owned pins), a trait's default method a member of each type of its
+#: file implementing it and a trait's implementations members of it, and a
+#: Go method call on a struct of the file whose embedded types are all
+#: structs of the file linked to its method or one promoted from them (Rust
+#: and Go `mkeys` and `heir_open`); a CONTAINS target matched on its own
+#: owner only.
 #: An index stamped lower, or not at all, is rescanned automatically.
-INDEX_FORMAT = 22
+INDEX_FORMAT = 23
 
 
 def index_outdated(engine: GraphEngine, repo_id: str) -> bool:

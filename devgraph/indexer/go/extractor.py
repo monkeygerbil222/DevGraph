@@ -37,7 +37,12 @@ adapted to Go's grammar. Extracts:
     x T`, `x := T{}`/`&T{}`/`new(T)`, a struct field of this file, what an
     in-file function returns, or what a package's function returned) ->
     this file when the type and `m` are declared here, else the type's
-    package directory at package confidence (`~`); an untyped receiver ->
+    package directory at package confidence (`~`), owned by the type when it
+    is a struct of this file whose embedded types are all structs of this
+    file (an owned pin for it and each of them: its own method, or one
+    promoted from them, wherever in the package), any method
+    of the name otherwise (an interface's implementers, or a method promoted
+    from a type embedded from elsewhere); an untyped receiver ->
     a bare-name edge that never ends at the caller, nothing for a
     stoplisted method (calls.STOP_METHODS["go"]). Pins to the package's
     own files leave tests out from a non-test file; an external test
@@ -68,6 +73,7 @@ from devgraph.indexer.common import (
     ExtractionResult,
     GraphNode,
     GraphRelationship,
+    add_heir_keys,
     own_edges,
     owned_pin,
 )
@@ -297,6 +303,10 @@ class _GoResolver:
         self.types: set[str] = set()
         self.methods: dict[str, set[str]] = {}
         self.fields: dict[str, dict[str, Node]] = {}
+        # Each struct's embedded types (`struct { Animal; pkg.Other }`), and
+        # the structs embedding one this file doesn't declare.
+        self.embeds: dict[str, list[str]] = {}
+        self.foreign_embeds: set[str] = set()
         for node in root.named_children:
             if node.type == "function_declaration":
                 name_node = node.child_by_field_name("name")
@@ -319,6 +329,10 @@ class _GoResolver:
                     body = spec.child_by_field_name("type")
                     if body is not None and body.type == "struct_type":
                         self.fields[type_name] = _struct_fields(body, source)
+                        local, other = _struct_embeds(body, source)
+                        self.embeds[type_name] = local
+                        if other:
+                            self.foreign_embeds.add(type_name)
         # An unaliased in-repo import whose path name the file never uses as
         # a qualifier is used by its package clause's name instead (every
         # import must be used). An unknown qualifier (no import, type or name
@@ -350,6 +364,14 @@ class _GoResolver:
         self.renamed = sorted({folder for name, folder in unnamed if name not in qualifiers})
         unknown = qualifiers - self.bindings.keys() - self.types - declared - set(self.functions)
         self.renamed_loose = len(unknown) != len(self.renamed)
+        # A struct embedding a type other than a struct of this file (an
+        # interface, another file's), or a struct of this file that does.
+        self.foreign_embeds |= {name for name, local in self.embeds.items() if any(e not in self.fields for e in local)}
+        while grown := {
+            name for name, local in self.embeds.items()
+            if name not in self.foreign_embeds and any(e in self.foreign_embeds for e in local)
+        }:
+            self.foreign_embeds |= grown
 
     # --- pins ----------------------------------------------------------------
 
@@ -362,10 +384,20 @@ class _GoResolver:
 
     def method_pins(self, go_type: GoType, method: str) -> list[str] | None:
         """Where `method` of `go_type` can be declared; None when nowhere in
-        the repository (a builtin or external type)."""
+        the repository (a builtin or external type). A struct of this file
+        whose embedded types are all structs of this file has only its own
+        methods and those promoted from them, wherever in the package: its
+        call is owned by it and by each of them (common.owned_pin,
+        `embedded_closure`), still at package confidence. Any
+        other type's may be an interface's (its implementers') or promoted
+        from a type embedded from elsewhere: any method of the name."""
         if go_type[0] == "local":
             if method in self.methods.get(go_type[1], ()):
                 return [owned_pin(self.file_path, go_type[1])]  # the type's own method
+            if go_type[1] in self.fields and go_type[1] not in self.foreign_embeds:
+                # Its own method, or one promoted from a struct it embeds,
+                # declared anywhere in the package: one owned pin each.
+                return [owned_pin(self._own_dir(loose=True), owner) for owner in self.embedded_closure(go_type[1])]
             pins = [self._own_dir(loose=True)]
             if go_type[1] not in self.types and (not go_type[1] or go_type[1][:1].isupper()):
                 # An exported type the file doesn't declare (or what an
@@ -375,6 +407,24 @@ class _GoResolver:
         if go_type[0] == "pkg":
             return [pin for folder in go_type[1] for pin in self._package_pins(folder, loose=True)]
         return None
+
+    def embedded_closure(self, name: str) -> list[str]:
+        """`name` and the structs of this file it embeds, directly or through
+        them, nearest first."""
+        found = [name]
+        for each in found:
+            found += [e for e in self.embeds.get(each, []) if e in self.fields and e not in found]
+        return found
+
+    def heir_decls(self) -> list[tuple[str, str, list[str], set[str]]]:
+        """The file's types as common.add_heir_keys takes them: each with
+        its methods here and, as its bases, the structs of this file it
+        embeds, whose methods are promoted to it (an embedded type of
+        another file is left out: its methods are in its own file)."""
+        return [
+            (name, name, [e for e in self.embeds.get(name, []) if e in self.fields], self.methods.get(name, set()))
+            for name in sorted(self.types | set(self.methods))
+        ]
 
     def qualifier_dirs(self, qualifier: str) -> tuple[str, ...] | None:
         """The package directories a qualifier `q.` (not a local name) can
@@ -548,6 +598,23 @@ def _first_result(func: Node) -> Node | None:
         first = next((c for c in result.named_children if c.type == "parameter_declaration"), None)
         return first.child_by_field_name("type") if first is not None else None
     return result
+
+
+def _struct_embeds(struct: Node, source: bytes) -> tuple[list[str], bool]:
+    """A struct type's embedded types of its own package (`Animal`,
+    `*Animal`), and whether it embeds another one: another package's
+    (`pkg.Other`), or one it can't name (`Gen[int]`)."""
+    body = next((c for c in struct.named_children if c.type == "field_declaration_list"), None)
+    local, other = [], False
+    for decl in body.named_children if body is not None else []:
+        if decl.type != "field_declaration" or decl.child_by_field_name("name") is not None:
+            continue
+        name = _embedded_field_type_name(decl, source)
+        if name and not any(c.type == "qualified_type" for c in decl.named_children):
+            local.append(name)
+        else:
+            other = True
+    return local, other
 
 
 def _struct_fields(struct: Node, source: bytes) -> dict[str, Node]:
@@ -1264,6 +1331,7 @@ def extract_go_file(
             _visit_method(node)
     result.relationships += sites.rows(file_path, repo_id)
     _go_routes(route_calls, root, source_bytes, resolver, result, file_path, repo_id)
+    add_heir_keys(result, resolver.heir_decls())
 
     return own_edges(result, file_path)
 

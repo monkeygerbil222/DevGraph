@@ -301,6 +301,14 @@ several unrelated functions qualify) stays visible: `describe_node` and `get_sou
 `unresolved_handler: true` (file null), never folding it into an unrelated
 function of the same name.
 
+**A class's name means the class**: a Java, C# or C++ constructor is a
+function named like its class and owned by it, so `Order` names both.
+`describe_node` and `get_source` answer with the class (status `found`) and
+add `constructors`, the refs of its constructors ({label, name, file,
+owner} in `describe_node`, {name, file, owner} in `get_source`); pass
+`owner="Order"` or name it `Order.Order` to reach one. Two classes of one
+name are still `ambiguous`, their constructors left out of the candidates.
+
 **Where an answer is, and one class's method**: every `find_callers` row
 names the caller's `file`, `owner` (the classes or functions it is declared
 in, `""` at the top level) and `start_line`, so `A.run` and `B.run` of one
@@ -324,6 +332,28 @@ Each is a `{count, results, truncated}` envelope of rows shaped as
 `trace_request_flow` takes. `risk_level` still counts direct dependents only.
 Where dependents or callers carry `target_files` (several same-named
 targets), so does each endpoint.
+
+**A class's impact and callers**: a class stands with the methods it
+contains (constructors included). `impact_analysis` and
+`impact_analysis_for_diff` count as its direct dependents the callers of its
+methods, its subclasses (an `EXTENDS` edge, which records extends,
+implements and a Rust trait impl alike) and its `USES`/`DEPENDS_ON`
+dependents; a subclass's subclass and a method caller's callers are
+transitive. A direct dependent reached through a method names it in `via`
+(`["Cart.total"]`; at most five, with `via_count`, how many there are, past
+that). A call on a value nothing types links every member of
+its name, so a dependent reached only by such by-name (`name` confidence)
+calls is marked `name_only: true` and counted in `name_only_dependents`, for
+information: a class's `risk_level` counts every direct dependent, as a
+function's and `impact_analysis_for_diff`'s do; a by-name call of a dunder
+method (`super().__init__()`) or of a library-like name (`get`, `append`)
+is not counted at all. A function's impact counts every caller, as before. `find_callers` on a
+class lists the callers of its methods, each with its `via`, leaving out
+calls between the class's own methods and those by-name calls of dunder
+and library-like names, and `routed_by` and `endpoints`
+include the routes its methods handle. Instantiation (`Cart()`,
+`new Invoice()`) writes no edge yet, so a function that only creates an
+instance is not counted.
 
 **Response shape (`count`/`results`/`truncated`)**: `search_component`,
 `find_callers`, `list_services`, `list_endpoints`, `find_related_prs`, `issue_history_for`,
@@ -522,9 +552,15 @@ Two things worth knowing about how they work:
   `caller_class` — pass `find_callers(..., scope_to_class="ThatClass")` to
   filter down to just that class's own callers. Graph insights (PageRank,
   communities) leave out `name` and `package` calls and `package`
-  imports. What stays out of reach: a C# class in a file not named after it, two C# types of one name
+  imports. A method on a typed value links that type's method, not a
+  same-named method of another type in its file (in Rust; in Go only for a
+  struct the calling file declares whose embedded types are all structs of
+  that file: any other Go receiver links every method of the name in the
+  package, at `package`). A call through a Rust trait (`Local::hi(o)`)
+  links the implementations of that trait's file. What stays out of reach: a C# class in a file not named after it, two C# types of one name
   in different namespaces (both get the edge), and a method a type inherits
-  from a base declared in another file.
+  from a base declared in another file (a Java or Python base, a Rust trait's
+  default method).
 - **Import/include resolution reads only the importing file and the
   repository's resolver configuration** (tsconfig/jsconfig, go.mod/go.work,
   Cargo.toml). Python, JS/TS, Go, Java, Kotlin and Rust imports name files

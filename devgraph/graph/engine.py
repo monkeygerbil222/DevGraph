@@ -1161,16 +1161,20 @@ def _shadow_free(ref: str, var: str, label: str) -> str:
     )
 
 
-def _owner_test(ref: str, end: str, var: str, label: str) -> str:
+def _owner_test(ref: str, end: str, var: str, label: str, inherit: bool = True) -> str:
     """Cypher keeping the node `var` when the end's `{end}_owner` is unset
     or names it: its own owner, or, for a target, a class of its file that
     inherits it (the node's heir key, graph/schema.py `HEIR_KEY`), or, for a
     target Function, an *open* class of its file (its Module's `heir_open`)
     when no Function of its name there is that class's own or inherited
     member: what an owner-less end linked. devgraph/indexer/common.py
-    `owner_matches` mirrors this."""
+    `owner_matches` mirrors this. Without `inherit` (a CONTAINS target: a
+    class contains its own members only) the owner alone counts: an
+    inherited member's heir key, which its file's re-index rewrites after
+    the edges, left a stale CONTAINS from an heir that came to define the
+    member itself."""
     owner = f"{ref}.{end}_owner"
-    if end != "to":
+    if end != "to" or not inherit:
         return f"({owner} IS NULL OR {var}.owner = {owner})"
     heir = f" OR '{HEIR_KEY}' + {owner} IN coalesce({var}.mkeys, [])"
     if label == "Function":
@@ -1188,7 +1192,9 @@ def _owner_test(ref: str, end: str, var: str, label: str) -> str:
     return f"({owner} IS NULL OR {var}.owner = {owner}{heir})"
 
 
-def _end_match(var: str, label: str, end: str, pin: str, ref: str = "row", also: str | None = None) -> str:
+def _end_match(
+    var: str, label: str, end: str, pin: str, ref: str = "row", also: str | None = None, inherit: bool = True,
+) -> str:
     """The MATCH for one end of an edge row (`pin` from `_pin`), reading its
     `{end}_name`/`{end}_file` off `ref` (the row, or one of its targets). An
     end of a file-scoped label is hinted to seek its index: the (repo_id,
@@ -1209,7 +1215,7 @@ def _end_match(var: str, label: str, end: str, pin: str, ref: str = "row", also:
     the match. An end pinned to a file or a path with an `{end}_owner` keeps
     only the nodes of that `owner` (two classes' same-named methods in one
     file), or a target its heir keys say that owner inherits
-    (`_owner_test`). A path-pinned end of a file-scoped label keeps only the nodes
+    (`_owner_test`; not with `inherit` False). A path-pinned end of a file-scoped label keeps only the nodes
     visible to the row's project (`_visible`). A path pin marked `_TIERED`
     also keeps only the nodes its tiers do not shadow (`_shadow_free`)."""
     conditions = [also] if also else []
@@ -1238,7 +1244,7 @@ def _end_match(var: str, label: str, end: str, pin: str, ref: str = "row", also:
                 match += f"USING INDEX SEEK {var}:{label}(repo_id, name) "
             if label in FILE_SCOPED_LABELS:
                 # The members of one owner in the files the pin matches, when the row names it.
-                conditions.append(_owner_test(ref, end, var, label))
+                conditions.append(_owner_test(ref, end, var, label, inherit))
                 conditions.append(_visible(var))
         conditions[:0] = _path_pin_conditions(ref, path, var)
         return match + "WHERE " + " AND ".join(conditions) + " " + (_shadow_free(ref, var, label) if tiered else "")
@@ -1252,7 +1258,7 @@ def _end_match(var: str, label: str, end: str, pin: str, ref: str = "row", also:
             # owner; every one of them otherwise. A node an index older than
             # owners wrote is left out until the upgrade rescan gives it one.
             conditions[:0] = [
-                f"{var}.owner IS NOT NULL", _owner_test(ref, end, var, label),
+                f"{var}.owner IS NOT NULL", _owner_test(ref, end, var, label, inherit),
             ]
     else:
         match = f"MATCH ({var}:{label} {{repo_id: row.repo_id, name: {ref}.{end}_name}}) "
@@ -1267,7 +1273,10 @@ def _upsert_relationships_tx(tx, rels: list[dict[str, Any]]) -> None:
             "UNWIND $rows AS row "
             + _end_match("a", from_label, "from", from_pin)
             + "UNWIND row.targets AS t "
-            + _end_match("b", to_label, "to", to_pin, "t", also="(NOT t.no_self OR a <> b)" if to_pin == "name" else None)
+            + _end_match(
+                "b", to_label, "to", to_pin, "t", also="(NOT t.no_self OR a <> b)" if to_pin == "name" else None,
+                inherit=rel_type != "CONTAINS",
+            )
             + f"MERGE (a)-[r:{rel_type}]->(b) "
             "SET r += row.properties " + _ADD_ORIGIN,
             rows=rows,

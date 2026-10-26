@@ -791,7 +791,10 @@ def build_server(
         come after all others; test_count says how many there are, and
         include_tests=false leaves them out. An API route reaches its handler by
         IMPLEMENTS, not a call: routed_by lists the target's endpoints apart, a
-        {count, results, truncated} envelope of rows as list_endpoints gives them."""
+        {count, results, truncated} envelope of rows as list_endpoints gives them. A
+        class is called through its methods: its callers are theirs (calls between its
+        own methods left out), each naming the methods it calls in via ("Cart.total"),
+        and its routes are theirs."""
         return devgraph_tools.find_callers(
             engine, repo_id, target_name, cross_repo, max_results, scope_to_class, modified_within_commits,
             resolved_only, file, declared(repo_id, cross_repo), owner, include_tests,
@@ -840,7 +843,8 @@ def build_server(
         repo_id: str, component_name: str, cross_repo: bool = False, max_results: int = 15, file: str | None = None,
         owner: str | None = None, include_tests: bool = True,
     ) -> dict[str, Any]:
-        """Analyze component impact: direct dependents (one CALLS/USES/DEPENDS_ON hop) and
+        """Analyze component impact: direct dependents (one CALLS/USES/DEPENDS_ON hop, or a
+        subclass's EXTENDS) and
         transitive ones (two to four hops; further ones are not followed), each {name, type,
         file, owner} (owner left out and file null when it has none), wrapped in {count,
         results, truncated} envelopes. Pass owner, or name a method "A.run", to pick one
@@ -854,7 +858,13 @@ def build_server(
         each list, which adds test_count; include_tests=false leaves them out.
         endpoints lists the API routes whose handler is the component or a dependent
         (rows as list_endpoints gives them, in an envelope); they are not dependents,
-        so risk_level, from the direct dependents, leaves them out."""
+        so risk_level, from the direct dependents, leaves them out. A class is traced with
+        the methods it contains: the callers of its methods, its subclasses (EXTENDS,
+        which records extends, implements and trait impls) and their subclasses count,
+        and a direct dependent reached through a method names it in via ("Cart.total").
+        For a class, a dependent reached only by by-name calls (a value nothing types) is
+        marked name_only and counted in name_only_dependents (risk_level counts them
+        too); a by-name call of a dunder or library-like method is not counted."""
         return devgraph_tools.impact_analysis(
             engine, repo_id, component_name, cross_repo, max_results, file, declared(repo_id, cross_repo), owner,
             include_tests,
@@ -873,7 +883,8 @@ def build_server(
         request shows), as compare_branches does, and lists the functions and classes
         added, changed and removed (added_symbols, changed_symbols, removed_symbols).
         Dependents of the changed and removed ones are traced, direct (one
-        CALLS/USES/DEPENDS_ON hop) and transitive (two to four hops); added ones have no
+        CALLS/USES/DEPENDS_ON hop, or a subclass's EXTENDS) and transitive (two to four
+        hops), a class with its methods as impact_analysis traces it; added ones have no
         dependents yet. A changed code file whose symbols weren't diffed (past the
         200-file cap, unreadable, or renamed) counts every indexed symbol in it, with a
         notice; a changed symbol the index doesn't have is named in a notice. Never fetches; same ref rules and caps as
@@ -1000,7 +1011,10 @@ def build_server(
         returns status "ambiguous" with candidates ({label, name, file, owner}) instead of
         picking one: pass the candidate's file (repo-relative path) and owner (the classes
         or functions it is declared in, "" at the top level) to choose. A method may also
-        be named with its class, "A.save" or "A::save". A route's handler stub never makes
+        be named with its class, "A.save" or "A::save". A class's name means the class,
+        never its constructor (a function named like it and owned by it, as in Java, C#
+        or C++): the answer names its constructors, which owner (the class's name)
+        reaches. A route's handler stub never makes
         the one function it stands for ambiguous; a stub standing for none is a
         candidate marked unresolved_handler. A file that is not valid UTF-8 is
         decoded with replacement characters, and a notice says so. An unknown name (or
@@ -1024,7 +1038,9 @@ def build_server(
         direction, with each neighbour's identity. A file, folder or docs node is named by
         its repo-relative path or id; a method may be named with its class, "A.save" or
         "A::save". An ambiguous name returns candidates; call again with label, file and
-        owner. A route handler answers as its real function, with its stub's
+        owner. A class's name means the class, never its constructor (a function named
+        like it and owned by it): the answer lists its constructors, reached with
+        "Order.Order" or owner. A route handler answers as its real function, with its stub's
         relationships folded in when the stub provably stands for it; a stub routes
         share because their handlers share a name is left out when each route resolved
         to its own function; any other stub is marked unresolved_handler. A code symbol's ref carries owner (the classes or functions it is declared

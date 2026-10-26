@@ -382,7 +382,8 @@ def owner_matches(
     one its heir keys (`heir_keys`) say inherits it, or an open class of its
     file (`open_owners`, its Module's `heir_open`) none of the Functions of
     its name there (`siblings`: their (owner, mkeys)) is or inherits. The
-    engine's Cypher mirrors this (graph/engine.py `_owner_test`)."""
+    engine's Cypher mirrors this (graph/engine.py `_owner_test`); a
+    CONTAINS target is tested on its own owner alone."""
     keys, open_owners = set(keys), set(open_owners)
     siblings = [(owner, set(each)) for owner, each in siblings]
     return any(

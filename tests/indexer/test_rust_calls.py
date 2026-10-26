@@ -560,7 +560,9 @@ def test_an_associated_call_through_a_reexport_names_its_type(tmp_path):
     owners = {(r.to_file, r.to_owner) for r in rows}
     assert ("crates/core/src/net/mod.rs", "Client") in owners
     assert ("crates/core/src/net/client.rs", "Client") in owners
-    assert ("crates/core/src/lib.rs", None) in owners
+    # The type's own module names it too (audit 11 item 4): no `new` of lib.rs but Client's.
+    assert ("crates/core/src/lib.rs", "Client") in owners
+    assert all(owner == "Client" for _file, owner in owners)
 
 
 def test_reexport_cycles_and_external_paths_end(tmp_path):
