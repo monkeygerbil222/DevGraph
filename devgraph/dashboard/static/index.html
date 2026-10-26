@@ -1759,6 +1759,7 @@ function forceDirectedSettle(onDone, mode) {
   if (!layoutWorker) {
     layoutWorker = new Worker("/static/graph-layout-worker.js");
     layoutWorker.onmessage = onLayoutMessage;
+    layoutWorker.onerror = onLayoutError;
   }
   const run = ++settleRun;
   activeSettle = { run, ids, onDone, latest: null, frame: 0 };
@@ -1788,6 +1789,20 @@ function applySettleFrame() {
      the layout selector all end up here -- and a settled graph is exactly
      the state worth remembering. Debounced inside saveCachedLayout. */
   setGraphSettled(true); graphSettling = false; saveCachedLayout(); run.onDone && run.onDone();
+}
+/* The worker failed (couldn't load, or threw): leave the nodes where they
+   are, end the settle as if it had finished -- so rotation and the camera's
+   framing resume -- without saving the half-settled layout, and start a new
+   worker next time. */
+function onLayoutError(e) {
+  console.error("graph layout worker failed:", e && (e.message || e));
+  layoutWorker = null;
+  const run = activeSettle;
+  activeSettle = null;
+  graphSettling = false;
+  if (!run) return;
+  if (run.frame) cancelAnimationFrame(run.frame);
+  run.onDone && run.onDone();
 }
 /* stops a settle in progress where it is, e.g. for a preset layout */
 function stopSettle() {

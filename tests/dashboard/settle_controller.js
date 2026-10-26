@@ -109,5 +109,25 @@ context.document.hidden = true;
 context.forceDirectedSettle(() => {}, "full");
 check("a settle started in a hidden tab starts paused", workers[0].sent.at(-1).type === "pause", JSON.stringify(workers[0].sent.at(-1)));
 
+// the worker fails: the settle ends as if done, without saving, and the
+// next settle starts a new worker
+context.document.hidden = false;
+const logged = [];
+context.console = { error: (...a) => logged.push(a.join(" ")) };
+let failedDone = 0;
+calls.length = 0;
+context.forceDirectedSettle(() => failedDone++, "full");
+const failing = workers[workers.length - 1];
+failing.onerror({ message: "boom" });
+check("a failed worker ends the settle: settling stops and its callback runs once",
+  context.graphSettling === false && failedDone === 1, JSON.stringify({ settling: context.graphSettling, failedDone }));
+check("...the half-settled layout is not saved", !calls.includes("save"), JSON.stringify(calls));
+check("...the failure is logged", logged.some(l => /boom/.test(l)), JSON.stringify(logged));
+reply(failing.sent.at(-1).run, [1, 2, 3, 4, 5, 6], true);
+runFrames();
+check("...a late reply from it changes nothing", failedDone === 1 && !calls.includes("save"), JSON.stringify(calls));
+context.forceDirectedSettle(() => {}, "full");
+check("the next settle starts a new worker", workers.length === 2 && workers[1].sent[0].type === "settle", workers.length);
+
 console.log(failures ? "\n" + failures + " FAILED" : "\nall passed");
 process.exit(failures ? 1 : 0);
