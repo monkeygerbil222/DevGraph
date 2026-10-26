@@ -3,7 +3,8 @@ review F1): a CONTAINS edge's target end ignores heir keys and open
 classes, which only calls follow. When an heir that inherited a member
 comes to define it itself, its file's re-index must not keep a CONTAINS
 from the heir to the base's member (written while the base's member still
-carried the heir's key), in Python, Rust and Go: live indexing equals a
+carried the heir's key), in Python, Rust, Go and C++ (whose extractor writes
+heir keys too since audit 11's C++ receiver change): live indexing equals a
 fresh scan."""
 
 import textwrap
@@ -82,8 +83,21 @@ GO = ("model/model.go", """\
     """, "type Order struct{ Base }\n", "type Order struct{ Base }\n\nfunc (o *Order) ID() int { return 1 }\n",
     "Order", "ID")
 
+CPP = ("shop.hpp", """\
+    class Base {
+    public:
+        int save() { return 1; }
+    };
 
-@pytest.mark.parametrize("case", [PYTHON, RUST, GO], ids=["python", "rust", "go"])
+    class Sub : public Base {
+    public:
+        int other() { return 2; }
+    };
+    """, "    int other() { return 2; }\n", "    int other() { return 2; }\n    int save() { return 3; }\n",
+    "Sub", "save")
+
+
+@pytest.mark.parametrize("case", [PYTHON, RUST, GO, CPP], ids=["python", "rust", "go", "cpp"])
 def test_an_heir_defining_an_inherited_member_contains_only_its_own(engine, repo_id, tmp_path, case):
     rel, text, old, new, heir, member = case
     _write(tmp_path, "Cargo.toml", '[package]\nname = "shop"\nversion = "0.1.0"\n')
