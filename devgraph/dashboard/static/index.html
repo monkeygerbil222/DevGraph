@@ -2729,7 +2729,12 @@ function currentStateQuery() {
   const nodeLimited = state.nodeCeiling < +nodeSlider.max;
   const relLimited = state.relCeiling < +relSlider.max;
   let q = `MATCH (n)\nWHERE ${nodeWhere.join(" AND ")}`;
-  if (nodeLimited) q += `\nWITH n LIMIT ${state.nodeCeiling}`;
+  /* The ceiling bounds every node drawn, not just the matched ones: a
+     relationship's far end `m` is kept only when it is one of the capped
+     nodes too. Without that, each capped node brought every neighbour along
+     (django's default view asked for 1,500 nodes and drew 8,204). */
+  const farEnd = nodeLimited ? "m IN capped" : null;
+  if (nodeLimited) q += `\nWITH n LIMIT ${state.nodeCeiling}\nWITH collect(n) AS capped\nUNWIND capped AS n`;
   if (state.isolatedRel && !isolatedEntityId) {
     // Isolating a relationship type with no entity isolated alongside it:
     // OPTIONAL MATCH + "type(r) = X OR r IS NULL" (the branch below) only
@@ -2744,6 +2749,7 @@ function currentStateQuery() {
     // Node inclusion here IS the relationship, so a zero relationship
     // ceiling correctly means zero nodes -- nothing to special-case below.
     q += `\nMATCH (n)-[r]-(m)\nWHERE type(r) = "${escapeCypherStr(state.isolatedRel)}"`;
+    if (farEnd) q += ` AND ${farEnd}`;
     q += `\nRETURN n, r, m, id(n) AS matchedId`;
     if (relLimited) q += `\nLIMIT ${state.relCeiling}`;
   } else if (state.relCeiling === 0) {
@@ -2760,7 +2766,11 @@ function currentStateQuery() {
     q += `\nRETURN n, null AS r, null AS m, id(n) AS matchedId`;
   } else {
     q += `\nOPTIONAL MATCH (n)-[r]-(m)`;
-    if (state.isolatedRel) q += `\nWHERE type(r) = "${escapeCypherStr(state.isolatedRel)}" OR r IS NULL`;
+    /* An OPTIONAL MATCH whose WHERE fails nulls r and m but keeps the row, so
+       a capped node with no relationship inside the cap is still drawn. */
+    const relWhere = state.isolatedRel ? `type(r) = "${escapeCypherStr(state.isolatedRel)}" OR r IS NULL` : null;
+    if (relWhere && farEnd) q += `\nWHERE (${relWhere}) AND ${farEnd}`;
+    else if (relWhere || farEnd) q += `\nWHERE ${relWhere || farEnd}`;
     q += `\nRETURN n, r, m, id(n) AS matchedId`;
     if (relLimited) q += `\nLIMIT ${state.relCeiling}`;
   }
