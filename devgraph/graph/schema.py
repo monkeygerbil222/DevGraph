@@ -135,7 +135,8 @@ SOURCE_FILE_LABELS: tuple[str, ...] = (
 # Shared nodes several files can claim through `source`/`sources` (see
 # graph/engine.py `_claim_nodes_tx`): Container, Endpoint, a route's
 # file-less handler-stub Function, a C++ out-of-class method's file-less
-# Class stub, every datastore type (Cache included, though it is not in
+# Class stub (before index format 23: kept so an upgrade's writes unclaim
+# it), every datastore type (Cache included, though it is not in
 # NODE_LABELS), and the file-less Service an older index wrote. Every
 # claimed node has a `source` (its first claim's).
 CLAIMED_LABELS: tuple[str, ...] = (
