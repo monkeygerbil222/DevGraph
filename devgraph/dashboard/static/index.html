@@ -2015,7 +2015,16 @@ function mergeGraphElements(elements, mode, opts) {
 
   const rect = cy.container().getBoundingClientRect();
   const bootstrapSpread = Math.sqrt(Math.max((rect.width||900)*(rect.height||600), 300000)) / 2;
-  const allIncomingEdges = [...incoming.values()].filter(el => el.data.source);
+  /* node id -> the first incoming relationship that touches it, built once:
+     looking it up per node by scanning every relationship was
+     O(nodes x relationships), seconds to minutes on a large view. */
+  const firstLinkOf = new Map();
+  incoming.forEach(el => {
+    const { source, target } = el.data;
+    if (!source) return;
+    if (!firstLinkOf.has(source)) firstLinkOf.set(source, el);
+    if (!firstLinkOf.has(target)) firstLinkOf.set(target, el);
+  });
 
   /* Pass 1: place every node that has a saved position first, before any
      neighbor lookup runs. A cold page reload starts this cy instance with
@@ -2052,7 +2061,7 @@ function mergeGraphElements(elements, mode, opts) {
   uncachedEls.forEach(el => {
     const node = cy.getElementById(el.data.id);
     let px, py;
-    const link = allIncomingEdges.find(e => e.data.source === el.data.id || e.data.target === el.data.id);
+    const link = firstLinkOf.get(el.data.id);
     const other = link && cy.getElementById(link.data.source === el.data.id ? link.data.target : link.data.source);
     if (anchored && other && other.length && (other.position().x || other.position().y)) {
       px = other.position().x + (Math.random()-0.5) * 50;
