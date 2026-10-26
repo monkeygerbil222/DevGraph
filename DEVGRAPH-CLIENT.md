@@ -536,9 +536,14 @@ Two things worth knowing about how they work:
   `caller_class` — pass `find_callers(..., scope_to_class="ThatClass")` to
   filter down to just that class's own callers. Graph insights (PageRank,
   communities) leave out `name` and `package` calls and `package`
-  imports. What stays out of reach: a C# class in a file not named after it, two C# types of one name
+  imports. A method on a typed value links that type's method, not a
+  same-named method of another type in its file (in Rust, and in Go for a
+  concrete value: a pointer, a composite literal, `new(T)`; a Go value whose
+  type may be an interface links every method of the name in the package, at
+  `package`). What stays out of reach: a C# class in a file not named after it, two C# types of one name
   in different namespaces (both get the edge), and a method a type inherits
-  from a base declared in another file.
+  from a base declared in another file (a Java or Python base, a Rust trait's
+  default method, a struct a Go struct embeds).
 - **Import/include resolution reads only the importing file and the
   repository's resolver configuration** (tsconfig/jsconfig, go.mod/go.work,
   Cargo.toml). Python, JS/TS, Go, Java, Kotlin and Rust imports name files

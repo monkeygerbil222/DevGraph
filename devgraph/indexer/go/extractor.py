@@ -37,7 +37,11 @@ adapted to Go's grammar. Extracts:
     x T`, `x := T{}`/`&T{}`/`new(T)`, a struct field of this file, what an
     in-file function returns, or what a package's function returned) ->
     this file when the type and `m` are declared here, else the type's
-    package directory at package confidence (`~`); an untyped receiver ->
+    package directory at package confidence (`~`), owned by the type when it
+    is concrete (a pointer, a composite literal, `new(T)`, a struct of this
+    file: its own method, or one promoted from a struct of its file it
+    embeds, heir keys), any method of the name otherwise (an interface's
+    implementers); an untyped receiver ->
     a bare-name edge that never ends at the caller, nothing for a
     stoplisted method (calls.STOP_METHODS["go"]). Pins to the package's
     own files leave tests out from a non-test file; an external test
@@ -68,6 +72,7 @@ from devgraph.indexer.common import (
     ExtractionResult,
     GraphNode,
     GraphRelationship,
+    add_heir_keys,
     own_edges,
     owned_pin,
 )
@@ -241,12 +246,22 @@ def _dir_pin(folder: str, only: str, not_suffix: str = "", loose: bool = False) 
     return pin + ("~" if loose else "") + f"?{only}" + (f"!{not_suffix}" if not_suffix else "")
 
 
-# A type, as the resolver knows it: ("local", T) a type named T of the file's
-# own package; ("pkg", directories, T or None) a type of an imported in-repo
-# package, which the directories can hold (None: some type of it, such as
-# what its function returned); ("ext",) a builtin or external type, whose
-# methods link nothing.
+# A type, as the resolver knows it: ("local", T, concrete) a type named T of
+# the file's own package; ("pkg", directories, T or None, concrete) a type of
+# an imported in-repo package, which the directories can hold (None: some
+# type of it, such as what its function returned); ("ext",) a builtin or
+# external type, whose methods link nothing. `concrete` marks a type that is
+# not an interface (`_concrete`: a pointer's, a composite literal's or
+# `new`'s), whose methods are its own (owned by T).
 GoType = tuple
+
+
+def _concrete(go_type: GoType | None) -> GoType | None:
+    """`go_type` marked concrete: a pointer to it, a composite literal of it
+    or `new(T)` (a pointer to an interface is all but unheard of)."""
+    if go_type is not None and go_type[0] in ("local", "pkg"):
+        return (*go_type[:-1], True)
+    return go_type
 
 
 class _GoResolver:
@@ -297,6 +312,8 @@ class _GoResolver:
         self.types: set[str] = set()
         self.methods: dict[str, set[str]] = {}
         self.fields: dict[str, dict[str, Node]] = {}
+        # The types of this file each struct of it embeds (`struct { Animal }`).
+        self.embeds: dict[str, list[str]] = {}
         for node in root.named_children:
             if node.type == "function_declaration":
                 name_node = node.child_by_field_name("name")
@@ -319,6 +336,7 @@ class _GoResolver:
                     body = spec.child_by_field_name("type")
                     if body is not None and body.type == "struct_type":
                         self.fields[type_name] = _struct_fields(body, source)
+                        self.embeds[type_name] = _embedded_local_types(body, source)
         # An unaliased in-repo import whose path name the file never uses as
         # a qualifier is used by its package clause's name instead (every
         # import must be used). An unknown qualifier (no import, type or name
@@ -362,19 +380,37 @@ class _GoResolver:
 
     def method_pins(self, go_type: GoType, method: str) -> list[str] | None:
         """Where `method` of `go_type` can be declared; None when nowhere in
-        the repository (a builtin or external type)."""
+        the repository (a builtin or external type). A concrete type's
+        method (`_concrete`, or a struct of this file) is its own: owned by
+        it (common.owned_pin), or one a struct of its file it embeds has
+        (`heir_decls`), still at package confidence; any other type's (an
+        interface's, its implementers') is any method of the name."""
         if go_type[0] == "local":
-            if method in self.methods.get(go_type[1], ()):
-                return [owned_pin(self.file_path, go_type[1])]  # the type's own method
+            _kind, name, concrete = go_type
+            if method in self.methods.get(name, ()):
+                return [owned_pin(self.file_path, name)]  # the type's own method
+            owner = name if name and (concrete or name in self.fields) else None
             pins = [self._own_dir(loose=True)]
-            if go_type[1] not in self.types and (not go_type[1] or go_type[1][:1].isupper()):
+            if name not in self.types and (not name or name[:1].isupper()):
                 # An exported type the file doesn't declare (or what an
                 # unqualified function returned) can be a dot-imported package's.
                 pins += [pin for folder in self.dot_dirs for pin in self._package_pins(folder, loose=True)]
-            return pins
+            return [owned_pin(pin, owner) for pin in pins]
         if go_type[0] == "pkg":
-            return [pin for folder in go_type[1] for pin in self._package_pins(folder, loose=True)]
+            _kind, folders, name, concrete = go_type
+            owner = name if name and concrete else None
+            return [owned_pin(pin, owner) for folder in folders for pin in self._package_pins(folder, loose=True)]
         return None
+
+    def heir_decls(self) -> list[tuple[str, str, list[str], set[str]]]:
+        """The file's types as common.add_heir_keys takes them: each with
+        its methods here and, as its bases, the structs of this file it
+        embeds, whose methods it is promoted (an embedded type of another
+        file is left out: its methods are in its own file)."""
+        return [
+            (name, name, [e for e in self.embeds.get(name, []) if e in self.types], self.methods.get(name, set()))
+            for name in sorted(self.types | set(self.methods))
+        ]
 
     def qualifier_dirs(self, qualifier: str) -> tuple[str, ...] | None:
         """The package directories a qualifier `q.` (not a local name) can
@@ -412,21 +448,23 @@ class _GoResolver:
         """A type expression as a GoType; None when it is not one."""
         if node is None:
             return None
-        if node.type in ("pointer_type", "parenthesized_type"):
+        if node.type == "pointer_type":
+            return _concrete(self.type_of(node.named_children[-1] if node.named_children else None))
+        if node.type == "parenthesized_type":
             inner = node.named_children[-1] if node.named_children else None
             return self.type_of(inner)
         if node.type == "generic_type":
             return self.type_of(node.child_by_field_name("type"))
         if node.type == "type_identifier":
             name = _text(node, self.source)
-            return ("ext",) if name in _BUILTIN_TYPES else ("local", name)
+            return ("ext",) if name in _BUILTIN_TYPES else ("local", name, False)
         if node.type == "qualified_type":
             package = node.child_by_field_name("package")
             name = node.child_by_field_name("name")
             if package is None or name is None:
                 return None
             folders = self.qualifier_dirs(_text(package, self.source))
-            return ("pkg", folders, _text(name, self.source)) if folders else ("ext",)
+            return ("pkg", folders, _text(name, self.source), False) if folders else ("ext",)
         if node.type in ("slice_type", "array_type", "map_type", "channel_type", "function_type",
                          "interface_type", "struct_type"):
             return ("ext",)
@@ -441,7 +479,7 @@ class _GoResolver:
         if node.type == "unary_expression":
             return self.value_type(node.child_by_field_name("operand"), scope)
         if node.type == "composite_literal":
-            return self.type_of(node.child_by_field_name("type"))
+            return _concrete(self.type_of(node.child_by_field_name("type")))
         if node.type == "identifier":
             return scope.get(_text(node, self.source))
         if node.type == "selector_expression":
@@ -454,7 +492,8 @@ class _GoResolver:
                 name = _text(func, self.source)
                 if name == "new":
                     args = node.child_by_field_name("arguments")
-                    return self.type_of(args.named_children[0]) if args is not None and args.named_children else None
+                    return _concrete(self.type_of(args.named_children[0])) if args is not None and args.named_children \
+                        else None
                 if name in scope:
                     return None
                 if name in self.functions:
@@ -462,7 +501,7 @@ class _GoResolver:
                 if name in _BUILTIN_FUNCS:
                     return ("ext",)
                 # A function of the package declared elsewhere: some type of it.
-                return ("local", "")
+                return ("local", "", False)
             if func.type == "selector_expression":
                 operand = func.child_by_field_name("operand")
                 if operand is not None and operand.type == "identifier":
@@ -470,7 +509,7 @@ class _GoResolver:
                     if qualifier not in scope and qualifier not in self.types:
                         folders = self.qualifier_dirs(qualifier)
                         if folders is not None:
-                            return ("pkg", folders, None) if folders else ("ext",)
+                            return ("pkg", folders, None, False) if folders else ("ext",)
         return None
 
     def field_type(self, node: Node, scope: dict[str, GoType | None]) -> GoType | None:
@@ -486,7 +525,7 @@ class _GoResolver:
                 # A package-level variable of another package.
                 folders = self.qualifier_dirs(qualifier)
                 if folders is not None:
-                    return ("pkg", folders, None) if folders else ("ext",)
+                    return ("pkg", folders, None, False) if folders else ("ext",)
         owner = self.value_type(operand, scope)
         if owner is None or owner[0] != "local" or owner[1] not in self.fields:
             return None if owner is None or owner[0] != "ext" else ("ext",)
@@ -523,7 +562,7 @@ class _GoResolver:
             qualifier = _text(operand, self.source)
             if qualifier not in scope:
                 if qualifier in self.types:
-                    return name, self.method_pins(("local", qualifier), name), True
+                    return name, self.method_pins(("local", qualifier, False), name), True
                 folders = self.qualifier_dirs(qualifier)
                 if folders is not None:
                     loose = self.qualifier_loose(qualifier)
@@ -548,6 +587,18 @@ def _first_result(func: Node) -> Node | None:
         first = next((c for c in result.named_children if c.type == "parameter_declaration"), None)
         return first.child_by_field_name("type") if first is not None else None
     return result
+
+
+def _embedded_local_types(struct: Node, source: bytes) -> list[str]:
+    """The types of the struct's own package it embeds (`Animal`,
+    `*Animal`), not another package's (`pkg.Other`)."""
+    body = next((c for c in struct.named_children if c.type == "field_declaration_list"), None)
+    return [
+        _embedded_field_type_name(decl, source) for decl in (body.named_children if body is not None else [])
+        if decl.type == "field_declaration" and decl.child_by_field_name("name") is None
+        and _embedded_field_type_name(decl, source)
+        and not any(c.type == "qualified_type" for c in decl.named_children)
+    ]
 
 
 def _struct_fields(struct: Node, source: bytes) -> dict[str, Node]:
@@ -1264,6 +1315,7 @@ def extract_go_file(
             _visit_method(node)
     result.relationships += sites.rows(file_path, repo_id)
     _go_routes(route_calls, root, source_bytes, resolver, result, file_path, repo_id)
+    add_heir_keys(result, resolver.heir_decls())
 
     return own_edges(result, file_path)
 

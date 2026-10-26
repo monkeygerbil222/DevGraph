@@ -70,7 +70,9 @@ package confidence.
   on a typed receiver (a parameter, `let x: T`, `let x = T::new()` or
   `T { .. }`, a field of a struct declared here, the element of a `for`
   loop over a `Vec<T>` or slice) -> this file when the type and the method
-  are declared here, else the type's module; a std type (calls.STOP_TYPES)
+  are declared here, else the type's module, owned by the type (its own
+  method, or a default method of a trait of that file it implements: heir
+  keys), as `Type::f()` there is; a std type (calls.STOP_TYPES)
   or a path outside the repository links nothing, and neither does a bare
   `f()` nothing declares or imports; an untyped receiver keeps a bare-name
   edge that never ends at its caller, unless its method is stoplisted
@@ -99,7 +101,16 @@ import tree_sitter_rust as tsrust
 from tree_sitter import Language, Node, Parser
 
 from devgraph.indexer.calls import STOP_METHODS, STOP_TYPES, CallSites, import_rows
-from devgraph.indexer.common import ExtractionResult, GraphNode, GraphRelationship, member_owner, own_edges, owned_pin
+from devgraph.indexer.common import (
+    ExtractionResult,
+    GraphNode,
+    GraphRelationship,
+    add_heir_keys,
+    class_member_pin,
+    member_owner,
+    own_edges,
+    owned_pin,
+)
 from devgraph.indexer.resolver_config import ResolverConfig
 
 logger = logging.getLogger(__name__)
@@ -459,6 +470,8 @@ class _RustResolver:
         # The methods an `impl` or trait of the type defines with a body here:
         # Functions owned by the type (common.member_owner).
         self.bodied: dict[str, set[str]] = {}
+        # The traits each type implements here (`impl Trait for Type`).
+        self.trait_impls: dict[str, list[str]] = {}
         self.fields: dict[str, dict[str, _Type]] = {}
         self.uses: list[tuple[tuple, list[str], str | None, bool]] = []  # (scope, segs, binding, glob)
         self.mod_decls: list[tuple[tuple, str]] = []
@@ -506,7 +519,12 @@ class _RustResolver:
                 if kind == "trait_item":
                     self._collect_methods(child, _text(name, self.source) if name is not None else None)
             elif kind == "impl_item":
-                self._collect_methods(child, _type_name(child.child_by_field_name("type"), self.source))
+                type_name = _type_name(child.child_by_field_name("type"), self.source)
+                trait = child.child_by_field_name("trait")
+                trait_name = _type_name(trait, self.source) if trait is not None else None
+                if type_name and trait_name:
+                    self.trait_impls.setdefault(type_name, []).append(trait_name)
+                self._collect_methods(child, type_name)
             elif kind == "function_item":
                 self._collect_functions(child)
 
@@ -774,7 +792,10 @@ class _RustResolver:
             # A function bound or re-exported under another name (`use a::f as
             # g;`, `pub use a::f as g;`) is called by its own.
             found.setdefault(rest[-1], [])
-            found[rest[-1]] += [pin for pin in self.pins(module) if pin not in found[rest[-1]]]
+            # `Order::new()`: the type's own associated function, not every
+            # `new` of its module (common.class_member_pin).
+            pins = [class_member_pin(pin, rest[0]) if len(rest) == 2 else pin for pin in self.pins(module)]
+            found[rest[-1]] += [pin for pin in pins if pin not in found[rest[-1]]]
             for target, item, glob in self.reexported(module, rest[0]):
                 callee = item if len(rest) == 1 else rest[-1]
                 pins = self._reexport_pins(target, glob)
@@ -820,6 +841,26 @@ class _RustResolver:
         for module, rest in self._walk(start, types=True):
             found += [pin for pin in (self._item_pins(module, rest[0]) if rest else []) if pin not in found]
         return found or None
+
+    def member_pins(self, pins: list[str] | None, declared: _Type) -> list[str] | None:
+        """`type_pins`' pins narrowed to the members of the type (its
+        methods, and a trait default method it inherits from a trait of
+        its file: common.class_member_pin, `heir_decls`), so a call on an
+        `Order` links `Order::total`, not every `total` of its module."""
+        return [class_member_pin(pin, declared.segs[-1]) for pin in pins] if pins else pins
+
+    def heir_decls(self) -> list[tuple[str, str, list[str], set[str]]]:
+        """The file's types as common.add_heir_keys takes them: each type
+        or trait with the methods it defines here and, as its bases, the
+        traits of this file it implements, so a trait's default method is
+        a member of each type of the file implementing it. A trait of
+        another file is left out: its default methods are in its own file,
+        and as an unknown base it would make the type open to any member."""
+        names = sorted(self.types | set(self.bodied))
+        return [
+            (name, name, [t for t in self.trait_impls.get(name, []) if t in self.types], self.bodied.get(name, set()))
+            for name in names
+        ]
 
     # --- types ---------------------------------------------------------------------
 
@@ -1039,7 +1080,7 @@ class _CallCollector:
             name = segs[-1]
             if segs[0] == "Self":
                 pins = resolver.type_pins(self.self_type, self.scope) if self.self_type is not None else None
-                targets = [(name, pins)]
+                targets = [(name, resolver.member_pins(pins, self.self_type))]
             else:
                 targets = resolver.path_targets(segs, self.scope) or []
             for callee, pins in targets:
@@ -1063,7 +1104,7 @@ class _CallCollector:
                         return
                     # A trait's method, or one an impl in another file adds.
                 else:
-                    pins = resolver.type_pins(typed, self.scope)
+                    pins = resolver.member_pins(resolver.type_pins(typed, self.scope), typed)
                     if pins:
                         self.found.append((name, pins, False))
                     return
@@ -1320,6 +1361,7 @@ def extract_rust_file(
 
     visit_block(root, None, "Module", resolver.module)
     result.relationships += sites.rows(file_path, repo_id)
+    add_heir_keys(result, resolver.heir_decls())
 
     return own_edges(result, file_path)
 
