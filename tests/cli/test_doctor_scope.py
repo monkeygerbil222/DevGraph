@@ -25,7 +25,7 @@ def _settings(tmp_path):
     return SimpleNamespace(
         registry_db_path=tmp_path / "registry.sqlite3",
         neo4j_uri="bolt://127.0.0.1:7687", neo4j_user="neo4j", neo4j_password="devgraph-local-dev",
-        health_check_interval_s=30,
+        health_check_interval_s=30, neo4j_probe_timeout_s=5.0,
     )
 
 

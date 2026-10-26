@@ -98,6 +98,13 @@ class Settings(BaseSettings):
     # or a generated module would otherwise become tens of thousands of nodes).
     max_file_bytes: int = 1024 * 1024
     health_check_interval_s: int = 30
+    # How long an MCP server may take to get a Neo4j connection (opening one,
+    # or checking a pooled one still answers). With Neo4j down, or gone behind
+    # a forwarder that still accepts, a tool call fails in about this long.
+    mcp_connection_timeout_s: float = 2.0
+    # How long `devgraph status` and `devgraph doctor` wait for Neo4j to answer
+    # their connection check (one try) before reporting it not reachable.
+    neo4j_probe_timeout_s: float = 5.0
 
     log_file: Path | None = None
 

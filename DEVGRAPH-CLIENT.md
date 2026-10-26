@@ -443,7 +443,8 @@ argument below its minimum (`max_results`, `within_commits`,
 `modified_within_commits`, `members_per_community`, `max_per_type` below 1,
 `max_length` below 2) fails and names the argument.
 
-If Neo4j is down, every tool fails within a few seconds with `Neo4j isn't
+If Neo4j is down (or gone behind a forwarder that still accepts connections),
+every tool fails within a few seconds with `Neo4j isn't
 reachable at <uri>; start Neo4j ...`: tell the user to start Neo4j (or run
 `devgraph doctor`) rather than retrying the call in a loop.
 

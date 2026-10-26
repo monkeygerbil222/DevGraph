@@ -1132,22 +1132,18 @@ def build_server(
     return server
 
 
-#: How long the MCP server's engine may take to get a connection (see
-#: `GraphEngine`, which it runs `fail_fast`: a read that failed once connected
-#: is retried once, one that could not connect is not). With Neo4j down a call
-#: fails in about this long on every platform, not after the driver's default
-#: 30 s of retries.
-MCP_CONNECTION_TIMEOUT_S = 2.0
-
-
 def mcp_engine(settings: Any) -> GraphEngine:
-    """The MCP server's engine: `settings`' Neo4j, with the short limits above."""
+    """The MCP server's engine: `settings`' Neo4j, run `fail_fast` (a read that
+    failed once connected is retried once, one that could not connect is not;
+    see `GraphEngine`) with `settings.mcp_connection_timeout_s` (default 2 s)
+    to get a connection. With Neo4j down a call fails in about that long on
+    every platform, not after the driver's default 30 s of retries."""
     return GraphEngine(
         settings.neo4j_uri,
         settings.neo4j_user,
         settings.neo4j_password,
         fail_fast=True,
-        connection_timeout_s=MCP_CONNECTION_TIMEOUT_S,
+        connection_timeout_s=settings.mcp_connection_timeout_s,
     )
 
 

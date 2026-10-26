@@ -906,6 +906,16 @@ def _print_unwatched_repos(settings, mark: str) -> tuple[int, int]:
     return len(unwatched), len(partly)
 
 
+def _probe_engine(settings) -> GraphEngine:
+    """The engine `status` and `doctor` check Neo4j with: one connection try,
+    bounded by `neo4j_probe_timeout_s`, so a Neo4j gone behind a forwarder
+    that still accepts connections is reported, not waited on."""
+    return GraphEngine(
+        settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password,
+        fail_fast=True, connection_timeout_s=settings.neo4j_probe_timeout_s,
+    )
+
+
 @app.command()
 def status() -> None:
     """Check DevGraph status: Neo4j connectivity and repository counts.
@@ -917,7 +927,7 @@ def status() -> None:
 
     # Check Neo4j connectivity
     console.print("[bold]Neo4j Connection[/bold]")
-    engine = GraphEngine(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password)
+    engine = _probe_engine(settings)
     try:
         engine.verify_connectivity()
         console.print(f"  [green][OK] Reachable[/green] at {escape(str(settings.neo4j_uri))}")
@@ -1361,7 +1371,7 @@ def doctor(
     neo4j_reachable = False
     # Neo4j answers but refuses the login: running, so Podman is not the problem.
     neo4j_answers = False
-    engine = GraphEngine(settings.neo4j_uri, settings.neo4j_user, settings.neo4j_password)
+    engine = _probe_engine(settings)
     try:
         if wait > 0:
             _wait_for_neo4j(settings, wait)

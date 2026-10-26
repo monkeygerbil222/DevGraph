@@ -19,7 +19,9 @@ from collections.abc import Callable, Iterable
 from typing import TYPE_CHECKING, Any
 
 from neo4j import Driver, GraphDatabase, NotificationDisabledClassification, Query, READ_ACCESS, unit_of_work
-from neo4j.exceptions import Neo4jError, ServiceUnavailable, SessionExpired, TransientError
+from neo4j.exceptions import (
+    ConnectionAcquisitionTimeoutError, Neo4jError, ServiceUnavailable, SessionExpired, TransientError,
+)
 from neo4j.graph import Node, Relationship
 
 from devgraph.graph.schema import (
@@ -573,6 +575,36 @@ _BASE_DELAY_S = 0.5
 FAIL_FAST_RETRY_PAUSE_S = 0.5
 
 
+#: How much longer than its transaction timeout a fail-fast
+#: `GraphEngine.run_read_cypher` waits for its answer before giving up on it
+#: as `Neo4jNotAnswering`. The transaction timeout is enforced by the server,
+#: so a connection whose server is gone (a forwarder still accepting) would
+#: otherwise wait for the server's receive-timeout hint (120 s), or forever.
+READ_DEADLINE_MARGIN_S = 5.0
+
+
+def _within(deadline_s: float, fn: Callable[[], Any]) -> Any:
+    """`fn()`, run in a daemon thread, or `Neo4jNotAnswering` once it has taken
+    `deadline_s`. The abandoned thread ends when its socket does (its session
+    keeps `GraphEngine.close` waiting only up to its timeout)."""
+    outcome: dict[str, Any] = {}
+
+    def target() -> None:
+        try:
+            outcome["value"] = fn()
+        except BaseException as exc:  # re-raised in the caller's thread
+            outcome["error"] = exc
+
+    worker = threading.Thread(target=target, name="devgraph-read", daemon=True)
+    worker.start()
+    worker.join(deadline_s)
+    if worker.is_alive():
+        raise Neo4jNotAnswering(f"Neo4j did not answer within {deadline_s:.0f} s")
+    if "error" in outcome:
+        raise outcome["error"]
+    return outcome["value"]
+
+
 #: How long `GraphEngine.close` waits, by default, for open sessions to end.
 CLOSE_WAIT_S = 5.0
 
@@ -583,6 +615,13 @@ class EngineClosed(ServiceUnavailable):
     A `ServiceUnavailable`, so callers already treating the database as
     unavailable handle it; never retried as a transient blip.
     """
+
+
+class Neo4jNotAnswering(ServiceUnavailable):
+    """No connection could be had within the connection timeout (the driver's
+    `ConnectionAcquisitionTimeoutError`, which is no `ServiceUnavailable`), or
+    a fail-fast read got no answer by its deadline: Neo4j isn't reachable, the
+    way a refused connection says so."""
 
 
 class IndexesNotReady(ServiceUnavailable):
@@ -685,6 +724,8 @@ class _GatedDriver:
         try:
             with self._driver.session(**kwargs) as session:
                 yield _IndexWaitingSession(session)
+        except ConnectionAcquisitionTimeoutError as exc:
+            raise Neo4jNotAnswering(str(exc)) from exc
         finally:
             self._exit()
 
@@ -692,6 +733,8 @@ class _GatedDriver:
         self._enter()
         try:
             self._driver.verify_connectivity()
+        except ConnectionAcquisitionTimeoutError as exc:
+            raise Neo4jNotAnswering(str(exc)) from exc
         finally:
             self._exit()
 
@@ -1441,13 +1484,18 @@ class GraphEngine:
         retried for up to 30 s, and getting a connection may take 30-60 s.
 
         `connection_timeout_s` bounds getting a connection: opening it, the Bolt
-        handshake, or waiting for a pooled one. `fail_fast` turns the driver's
-        retries off; `run_read_cypher` then retries a read once,
-        `FAIL_FAST_RETRY_PAUSE_S` later, when it failed once connected (a
-        transient error, an expired session, the connection lost mid-query),
-        and never when no connection could be had at all (refused, timed out).
-        The MCP server sets both, so a request fails within a few seconds when
-        Neo4j is down."""
+        handshake, or waiting for a pooled one; a pooled connection is also
+        checked (a RESET) before each use, within that time, so one whose
+        server is gone behind a forwarder that still accepts is replaced, not
+        used. Running out of it raises `Neo4jNotAnswering`. `fail_fast` turns
+        the driver's retries off, and `verify_connectivity`'s; `run_read_cypher`
+        then retries a read once, `FAIL_FAST_RETRY_PAUSE_S` later, when it
+        failed once connected (a transient error, an expired session, the
+        connection lost mid-query), and never when no connection could be had
+        at all (refused, timed out), and gives up on a read with no answer
+        `READ_DEADLINE_MARGIN_S` past its timeout. The MCP server sets both,
+        so a request fails within a few seconds when Neo4j is down, and so do
+        `devgraph status` and `doctor` for their connection check."""
         self.uri = uri
         self._fail_fast = fail_fast
         limits: dict[str, float] = {}
@@ -1458,6 +1506,7 @@ class GraphEngine:
         if connection_timeout_s is not None:
             limits["connection_timeout"] = connection_timeout_s
             limits["connection_acquisition_timeout"] = connection_timeout_s
+            limits["liveness_check_timeout"] = 0
         # (repo_id, owner) of the full-scan claims taken through this engine
         # and not yet released: `close` releases them.
         self._held_scan_claims: set[tuple[str, str]] = set()
@@ -1485,6 +1534,9 @@ class GraphEngine:
         self._driver.close(timeout)
 
     def verify_connectivity(self) -> None:
+        if self._fail_fast:
+            self._driver.verify_connectivity()
+            return
         _retry_transient(self._driver.verify_connectivity)
 
     def init_schema(self, effective: EffectiveSchema | None = None, wait: bool = True) -> None:
@@ -2903,9 +2955,20 @@ class GraphEngine:
         Read access mode makes the server refuse any write; the transaction
         timeout bounds the time; rows stop being pulled after `max_rows`, and
         the second value says whether more existed. Used by the MCP tool
-        plane for `devgraph.tools.yaml` tools.
+        plane for `devgraph.tools.yaml` tools. On a fail-fast engine, the
+        client also gives up `READ_DEADLINE_MARGIN_S` past the timeout (see
+        `_within`), since the server enforcing it may be gone.
         """
+        if not self._fail_fast:
+            return self._read_cypher(query, parameters, timeout_s=timeout_s, max_rows=max_rows)
+        return _within(
+            timeout_s + READ_DEADLINE_MARGIN_S,
+            lambda: self._read_cypher(query, parameters, timeout_s=timeout_s, max_rows=max_rows),
+        )
 
+    def _read_cypher(
+        self, query: str, parameters: dict[str, Any], *, timeout_s: float, max_rows: int
+    ) -> tuple[list[dict], bool]:
         connected = []
 
         @unit_of_work(timeout=timeout_s)
