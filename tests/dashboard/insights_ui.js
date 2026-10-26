@@ -194,6 +194,7 @@ const COMPUTED = {
     elementIds: () => ["n1"], elementCount: () => 1,
     has: id => id === "n1", hasNode: id => id === "n1",
     data: (id, k) => existing[k], setData: (id, k, v) => { existing[k] = v; },
+    batch: fn => fn(),
   };
   api.mergeGraphElements([{ data: { id: "n1", community: 4 } }], "light", { remove: false, settle: false });
   check("mergeGraphElements updates community on an existing node", existing.community === 4, String(existing.community));

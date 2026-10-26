@@ -102,6 +102,31 @@ const checks = {
     check("...and the canvas area says the graph needs WebGL 2", /WebGL 2/.test(r.msg || ""), JSON.stringify(r.msg));
     await browser.close();
   },
+  /* A 2k-node canvas refreshed into a 10k-node one (a repository switch or
+     a released ceiling) must not freeze the page: sigma redrew per added or
+     removed element, about two minutes of a frozen tab here. */
+  async grow() {
+    const { browser, page, errors } = await open("synth2k");
+    await settled(page); await sleep(1500);
+    await page.evaluate(() => { window.__long = []; new PerformanceObserver(l => l.getEntries().forEach(e => window.__long.push(e.duration))).observe({ entryTypes: ["longtask"] }); });
+    await fetch(`${BASE}/bench/ds/synth10k`);
+    const t0 = Date.now();
+    await page.evaluate(() => { refreshGraph("full", true, true); });
+    await page.waitForFunction(() => graphView.nodeCount() === 10000, { timeout: 300000, polling: 100 });
+    const grownMs = Date.now() - t0;
+    const r = await page.evaluate(() => ({ longest: Math.round(Math.max(0, ...window.__long)), total: Math.round(window.__long.reduce((a, b) => a + b, 0)) }));
+    console.log(`        2k -> 10k: on the canvas after ${grownMs} ms; longest task ${r.longest} ms, long tasks ${r.total} ms in all`);
+    check("growing 2k nodes into 10k is done within 10 s", grownMs < 10000, grownMs);
+    check("...with no task blocking the page for more than 2 s", r.longest < 2000, r.longest);
+    await fetch(`${BASE}/bench/ds/synth2k`);
+    const t1 = Date.now();
+    await page.evaluate(() => { refreshGraph("full", true, true); });
+    await page.waitForFunction(() => graphView.nodeCount() === 2000, { timeout: 300000, polling: 100 });
+    console.log(`        10k -> 2k: on the canvas after ${Date.now() - t1} ms`);
+    check("shrinking it back is done within 10 s", Date.now() - t1 < 10000, Date.now() - t1);
+    check("no page errors", !errors.length, errors.join(" | "));
+    await browser.close();
+  },
 };
 
 const wanted = process.argv.slice(2).length ? process.argv.slice(2) : Object.keys(checks);

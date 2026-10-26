@@ -35,6 +35,7 @@ const graphView = {
   addNode: (id, data, p) => nodes.set(id, { data: { ...data }, pos: { ...p } }),
   addEdge: (id, source, target, data) => edges.set(id, { data: { ...data }, source, target }),
   remove: id => { nodes.delete(id); edges.delete(id); },
+  batch: fn => fn(),
   size: () => ({ width: 900, height: 600 }),
 };
 const globals = {

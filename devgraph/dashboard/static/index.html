@@ -1464,6 +1464,14 @@ vec4 layer_dgnode(vec4 fillColor, float fillAlpha, vec4 ringColor, float ringWid
       graph.addEdgeWithKey(id, source, target, { ...data, tcat: graph.getNodeAttribute(target, "cat") });
     },
     remove(id) { if (graph.hasEdge(id)) graph.dropEdge(id); else if (graph.hasNode(id)) graph.dropNode(id); },
+    /* Runs fn (adding and removing elements) with sigma detached from the
+       graph, then redraws once. Attached, sigma reindexes on every added or
+       removed element: growing a 2k-node canvas into a 10k-node one froze
+       the page for about two minutes. */
+    batch(fn) {
+      renderer.setGraph(new graphology.Graph({ multi: true, type: "directed", allowSelfLoops: true }));
+      try { fn(); } finally { renderer.setGraph(graph); }
+    },
     /* an element's data value (node or edge), and setting one */
     data(id, k) { return graph.hasNode(id) ? graph.getNodeAttribute(id, k) : graph.getEdgeAttribute(id, k); },
     setData(id, k, v) { if (graph.hasNode(id)) graph.setNodeAttribute(id, k, v); else graph.setEdgeAttribute(id, k, v); },
@@ -1544,7 +1552,7 @@ function createNullGraphView() {
   return {
     hasNode: () => false, hasEdge: () => false, has: () => false,
     nodeCount: () => 0, edgeCount: () => 0, elementCount: () => 0, nodeIds: () => [], elementIds: () => [],
-    addNode: none, addEdge: none, remove: none, data: () => undefined, setData: none, setFlags: none,
+    addNode: none, addEdge: none, remove: none, batch: fn => fn(), data: () => undefined, setData: none, setFlags: none,
     updateNodes: none, updateEdges: none, nodeData: () => ({}), forEachNode: none, forEachEdge: none,
     element: id => ({ id: () => id, data: () => undefined }),
     position: () => ({ x: 0, y: 0 }), setPosition: none, forEachPosition: none, setPositions: none,
@@ -1570,9 +1578,11 @@ const graphView = (() => {
 /* Adds element literals ({data: {...}}; an edge has
    source/target) -- the demo graph's shape. Edges without an id get one. */
 function addElements(els) {
-  els.filter(el => !el.data.source).forEach(el => graphView.addNode(el.data.id, el.data, el.position || { x: 0, y: 0 }));
-  els.filter(el => el.data.source).forEach((el, i) =>
-    graphView.addEdge(el.data.id || `demo-e:${i}`, el.data.source, el.data.target, el.data));
+  graphView.batch(() => {
+    els.filter(el => !el.data.source).forEach(el => graphView.addNode(el.data.id, el.data, el.position || { x: 0, y: 0 }));
+    els.filter(el => el.data.source).forEach((el, i) =>
+      graphView.addEdge(el.data.id || `demo-e:${i}`, el.data.source, el.data.target, el.data));
+  });
 }
 
 /* ── on-screen count ─────────────────────────────────────────────────────
@@ -1931,7 +1941,7 @@ function mergeGraphElements(elements, mode, opts) {
      is structurally different. */
   if (!toAdd.length && toRemove.length === 0) return graphView.elementCount() > 0;
 
-  toRemove.forEach(id => graphView.remove(id)); // a removed node takes its edges with it
+  if (toRemove.length) graphView.batch(() => toRemove.forEach(id => graphView.remove(id))); // a removed node takes its edges with it
   if (!toAdd.length && !graphView.elementCount()) return false;
 
   // "Settle on addition/subtraction" -- when on, a real structural change
@@ -2020,8 +2030,10 @@ function mergeGraphElements(elements, mode, opts) {
     }
     placedAt.set(el.data.id, { x: px, y: py });
   });
-  newNodeEls.forEach(el => graphView.addNode(el.data.id, { ...el.data, glow: 0 }, placedAt.get(el.data.id)));
-  newEdgeEls.forEach(el => graphView.addEdge(el.data.id, el.data.source, el.data.target, { ...el.data, glow: 0 }));
+  graphView.batch(() => {
+    newNodeEls.forEach(el => graphView.addNode(el.data.id, { ...el.data, glow: 0 }, placedAt.get(el.data.id)));
+    newEdgeEls.forEach(el => graphView.addEdge(el.data.id, el.data.source, el.data.target, { ...el.data, glow: 0 }));
+  });
 
   updateOnscreenCount();
   if (settleOnStructuralChange) {
