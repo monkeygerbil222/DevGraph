@@ -28,6 +28,7 @@ const workers = [];
 class FakeWorker {
   constructor(url) { this.url = url; this.sent = []; workers.push(this); }
   postMessage(msg) { this.sent.push(msg); }
+  terminate() { this.terminated = true; }
 }
 const frames = [];
 const listeners = {};
@@ -123,6 +124,7 @@ check("a failed worker ends the settle: settling stops and its callback runs onc
   context.graphSettling === false && failedDone === 1, JSON.stringify({ settling: context.graphSettling, failedDone }));
 check("...the half-settled layout is not saved", !calls.includes("save"), JSON.stringify(calls));
 check("...the failure is logged", logged.some(l => /boom/.test(l)), JSON.stringify(logged));
+check("...the failed worker is terminated", failing.terminated === true, String(failing.terminated));
 reply(failing.sent.at(-1).run, [1, 2, 3, 4, 5, 6], true);
 runFrames();
 check("...a late reply from it changes nothing", failedDone === 1 && !calls.includes("save"), JSON.stringify(calls));
