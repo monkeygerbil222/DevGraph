@@ -47,6 +47,12 @@ def test_the_layout_worker_is_served_from_the_package():
     assert (STATIC / "graph-layout-worker.js").is_file()
 
 
+def test_nothing_vendored_is_left_unused():
+    html = _html()
+    for path in (STATIC / "vendor").iterdir():
+        assert f"/static/vendor/{path.name}" in html, f"{path.name} is vendored but nothing loads it"
+
+
 def test_the_vendored_files_are_package_data():
     pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     patterns = pyproject["tool"]["setuptools"]["package-data"]["devgraph.dashboard"]
@@ -73,14 +79,3 @@ def test_the_vendored_files_are_the_pinned_builds():
         data = (STATIC / "vendor" / name).read_bytes()
         assert hashlib.sha256(data).hexdigest() == sha256, name
         assert f"sha256 `{sha256}`" in notices
-
-
-# Cytoscape.js stays in the package until nothing loads it
-CYTOSCAPE_SHA256 = "83e8c54a6bec655bfd81df07df605649c268af69aeca67a5ea2da54ea42dac81"
-
-
-def test_the_vendored_cytoscape_is_still_its_pinned_build():
-    data = (STATIC / "vendor" / "cytoscape-3.30.2.min.js").read_bytes()
-    assert hashlib.sha256(data).hexdigest() == CYTOSCAPE_SHA256
-    notices = (ROOT / "THIRD_PARTY_NOTICES.md").read_text(encoding="utf-8")
-    assert f"sha256 `{CYTOSCAPE_SHA256}`" in notices and "The Cytoscape Consortium" in notices
