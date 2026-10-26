@@ -523,8 +523,11 @@ Two things worth knowing about how they work:
   filter down to just that class's own callers. Graph insights (PageRank,
   communities) leave out `name` and `package` calls and `package`
   imports. What stays out of reach: a C# class in a file not named after it, two C# types of one name
-  in different namespaces (both get the edge), and a method a type inherits
-  from a base declared in another file.
+  in different namespaces (both get the edge), a method a type inherits
+  from a base declared in another file, and a C++ method called on a value
+  typed through an alias (`using Ref = Order;`). A method call on a typed
+  value links only that type's method (or one it inherits from a base in
+  the same file), never a same-named method of another class in the file.
 - **Import/include resolution reads only the importing file and the
   repository's resolver configuration** (tsconfig/jsconfig, go.mod/go.work,
   Cargo.toml). Python, JS/TS, Go, Java, Kotlin and Rust imports name files

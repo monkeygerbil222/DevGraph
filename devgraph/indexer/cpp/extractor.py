@@ -28,10 +28,15 @@ x = new T`, a field of a class declared in the file) -> this file for a
 class declared here with m, else the include named after the type or its
 namespace (`Inventory` -> `inventory.h`, `net::Connection` -> `net/conn.h`),
 else the type's conventional files (`/inventory.h`, `/inventory.cpp`) and
-every include; any other `f()` or `this->m()` -> every include. `std::` and
-an STL type (calls.STOP_TYPES["cpp"]) link nothing, nor does a call when
-the file includes nothing; an untyped receiver keeps a bare-name edge that
-never ends at its caller, unless its method is stoplisted
+every include, each narrowed to the type's own members (common.owned_pin;
+its owner as written, `Outer.Inner`, and under each namespace the file
+opens or uses, since an out-of-class definition outside its namespace's
+block, `void geo::Circle::f()`, is owned by `geo.Circle`) or the members
+a class of their file inherits from another class there (heir keys); any
+other `f()` or `this->m()` -> every include. `std::` and an STL type
+(calls.STOP_TYPES["cpp"]) link nothing, nor does a call when the file
+includes nothing; an untyped receiver keeps a bare-name edge that never
+ends at its caller, unless its method is stoplisted
 (calls.STOP_METHODS["cpp"]). A declaration (a prototype) is no Function
 node, so only definitions are targets.
 
@@ -84,7 +89,15 @@ import tree_sitter_cpp as tscpp
 from tree_sitter import Language, Node, Parser
 
 from devgraph.indexer.calls import STOP_METHODS, STOP_TYPES, CallSites, import_rows
-from devgraph.indexer.common import ExtractionResult, GraphNode, GraphRelationship, member_owner, own_edges
+from devgraph.indexer.common import (
+    ExtractionResult,
+    GraphNode,
+    GraphRelationship,
+    add_heir_keys,
+    class_member_pin,
+    member_owner,
+    own_edges,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -408,9 +421,30 @@ def _declared_name(node: Node | None, source: bytes) -> str | None:
     return _text(node, source) if node is not None else None
 
 
+def _scope_parts(text: str) -> tuple[str, ...]:
+    """`a::b` as ("a", "b")."""
+    return tuple(part.strip() for part in text.split("::") if part.strip())
+
+
+def _enclosing(node: Node, source: bytes) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """The namespaces and the classes `node` is declared in, outermost first."""
+    namespaces: list[str] = []
+    classes: list[str] = []
+    parent = node.parent
+    while parent is not None:
+        name = parent.child_by_field_name("name")
+        if name is not None and parent.type == "namespace_definition":
+            namespaces[:0] = _scope_parts(_text(name, source))
+        elif name is not None and parent.type in ("class_specifier", "struct_specifier"):
+            classes.insert(0, _class_name(name, source))
+        parent = parent.parent
+    return tuple(namespaces), tuple(classes)
+
+
 class _CppResolver:
     """What one C++ file's names refer to: its quoted includes, the
-    functions it defines and the classes it declares (methods and fields)."""
+    functions it defines, the classes it declares (methods, fields and the
+    owner of their members) and the namespaces it opens or uses."""
 
     def __init__(self, root: Node, source: bytes, file_path: str) -> None:
         self.source = source
@@ -420,10 +454,20 @@ class _CppResolver:
         self.functions: set[str] = set()
         self.methods: dict[str, set[str]] = {}
         self.fields: dict[str, dict[str, _CppType | None]] = {}
+        self.owners: dict[str, set[str]] = {}
+        self.scopes: set[tuple[str, ...]] = set()
         stack = [root]
         while stack:
             node = stack.pop()
-            if node.type == "preproc_include":
+            if node.type == "namespace_definition":
+                name = node.child_by_field_name("name")
+                if name is not None:
+                    self.scopes.add(_enclosing(node, source)[0] + _scope_parts(_text(name, source)))
+            elif node.type == "using_declaration" and any(c.type == "namespace" for c in node.children):
+                target = next(iter(node.named_children), None)  # `using namespace a::b;`
+                if target is not None:
+                    self.scopes.add(_scope_parts(_text(target, source)))
+            elif node.type == "preproc_include":
                 path = next((c for c in node.named_children if c.type == "string_literal"), None)
                 content = next((c for c in path.named_children if c.type == "string_content"), None) \
                     if path is not None else None
@@ -445,6 +489,7 @@ class _CppResolver:
         if name is None or body is None:
             return
         cls = _class_name(name, self.source)
+        self.owners.setdefault(cls, set()).add(".".join((*_enclosing(node, self.source)[1], cls)))
         methods = self.methods.setdefault(cls, set())
         fields = self.fields.setdefault(cls, {})
         for member in body.named_children:
@@ -475,23 +520,37 @@ class _CppResolver:
         pins = [pin for each in self.includes if wanted & set(each.names) for pin in each.pins()]
         return pins or None
 
+    def type_owners(self, typed: _CppType) -> list[str]:
+        """The owners (common.member_owner) `typed`'s methods can have: the
+        type as written and each shorter tail of it (`a::Outer::Inner`:
+        `a.Outer.Inner`, `Outer.Inner`, `Inner`), each under every namespace
+        this file opens or uses, and a class of this file's own owner."""
+        written = (*(part for part in typed.qualifier if part), typed.name)
+        found = {".".join(written[i:]) for i in range(len(written))}
+        found |= {".".join((*scope, *written)) for scope in self.scopes}
+        found |= self.owners.get(typed.name, set())
+        return sorted(found)
+
     def type_pins(self, typed: _CppType, method: str) -> list[str] | None:
         """Where a method of `typed` is: this file for a class declared
         here (and its same-stem sources, for a header), else the include
         named after the type or its namespace, else the type's conventional
-        files and every include; None for a library type."""
+        files and every include; each narrowed to the type's members
+        (`type_owners`, common.class_member_pin). None for a library type."""
         if typed.library:
             return None
         if typed.name in self.methods and (method in self.methods[typed.name] or method in self.functions):
-            return [self.file_path] + self.own_sources
-        found = self.named([typed.name, *typed.qualifier])
-        if found:
-            return found
-        conventional = [
-            f"/{variant}{ext}^" for variant in sorted(_variants(typed.name) | {typed.name})
-            for ext in (".h", ".hpp", ".cpp", ".cc")
-        ]
-        return conventional + self.included()
+            pins = [self.file_path] + self.own_sources
+        else:
+            pins = self.named([typed.name, *typed.qualifier])
+        if not pins:
+            conventional = [
+                f"/{variant}{ext}^" for variant in sorted(_variants(typed.name) | {typed.name})
+                for ext in (".h", ".hpp", ".cpp", ".cc")
+            ]
+            pins = conventional + self.included()
+        owners = self.type_owners(typed)
+        return list(dict.fromkeys(class_member_pin(pin, owner) for pin in pins for owner in owners))
 
 
 def _class_name(name_node: Node, source: bytes) -> str:
@@ -719,6 +778,9 @@ def extract_cpp_file(source_code: str, file_path: str, repo_id: str) -> Extracti
     # last; "" at the Module (a namespace is no owner).
     owners = [""]
 
+    # The file's class declarations, for its heir keys (common.add_heir_keys).
+    class_decls: list[tuple[str, str, list[str], set[str]]] = []
+
     def visit_block(block: Node, parent_name: str | None, parent_label: str) -> None:
         for node in block.named_children:
             if node.type in ("class_specifier", "struct_specifier"):
@@ -775,6 +837,10 @@ def extract_cpp_file(source_code: str, file_path: str, repo_id: str) -> Extracti
         result.nodes.append(
             GraphNode(label="Class", repo_id=repo_id, name=class_name, properties=class_properties)
         )
+        class_decls.append((
+            class_name, member_owner("Class", class_name, owner),
+            [base.split("::")[-1] for base in base_classes], resolver.methods.get(class_name, set()),
+        ))
 
         result.relationships.append(
             GraphRelationship(
@@ -945,6 +1011,7 @@ def extract_cpp_file(source_code: str, file_path: str, repo_id: str) -> Extracti
 
     visit_block(root, None, "Module")
     result.relationships += sites.rows(file_path, repo_id)
+    add_heir_keys(result, class_decls)
 
     return own_edges(result, file_path)
 
