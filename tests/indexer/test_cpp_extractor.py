@@ -53,11 +53,11 @@ int free_func(int a) {
 
 
 def test_out_of_class_method_attributed_when_class_not_declared_in_file():
-    """A .cpp implementing a class declared only in a header it doesn't
-    happen to be extracted alongside still attributes the method to a Class
-    node (a stub, per the module docstring's heuristic) rather than dropping
-    it or hoisting it to Module scope.
-    """
+    """A .cpp implementing a class declared only in a header attributes the
+    method to that class (its owner, and a CONTAINS from a Class of the
+    name) rather than dropping it or hoisting it to Module scope, and makes
+    no file-less stub Class of its own: the header's is the class (audit 11
+    item 5)."""
     source_code = """
 void Widget::render() {
     draw();
@@ -66,8 +66,9 @@ void Widget::render() {
     result = extract_cpp_file(source_code, "src/widget.cpp", "test_repo")
 
     node_names = {(n.label, n.name) for n in result.nodes}
-    assert ("Class", "Widget") in node_names
+    assert not [n for n in result.nodes if n.label == "Class"]
     assert ("Function", "render") in node_names
+    assert next(n for n in result.nodes if n.name == "render").properties["owner"] == "Widget"
 
     rel_tuples = {
         (r.from_label, r.from_name, r.rel_type, r.to_label, r.to_name) for r in result.relationships
@@ -383,6 +384,7 @@ template<typename T> void Stack<T>::push(T v) {}
 template<typename K> int Stack<std::map<K, int>>::size() { return 0; }
 """
     result = extract_cpp_file(source_code, "src/stack.cpp", "test_repo")
-    assert {(n.label, n.name) for n in result.nodes if n.label == "Class"} == {("Class", "Stack")}
+    assert not [n for n in result.nodes if n.label == "Class"]  # the class is the header's
+    assert {n.properties["owner"] for n in result.nodes if n.label == "Function"} == {"Stack"}
     rels = {(r.from_name, r.rel_type, r.to_name) for r in result.relationships}
     assert {("Stack", "CONTAINS", "push"), ("Stack", "CONTAINS", "size")} <= rels

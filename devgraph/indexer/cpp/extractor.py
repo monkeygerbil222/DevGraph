@@ -66,14 +66,10 @@ declarator, template arguments dropped (e.g. 'Outer::Inner::method' -> class
 final name, not the leftmost one, since the leftmost segment is more likely
 to be an enclosing namespace than the class itself. This is a textual
 heuristic, not a semantic one: it does not require (or verify) that a class
-named 'Inner' was actually declared in this same file. When it wasn't (e.g.
-the class lives in a header this file doesn't happen to also be extracting
-in the same batch), a minimal stub Class node is still emitted so the
-Function's CONTAINS edge has a real endpoint to MATCH onto. The stub is
-file-less and carries `source`, so it is a shared node the file claims
-(GraphEngine._claim_nodes_tx), like a route's handler stub: it never merges
-onto the header's own Class, whichever file is indexed first, and it goes
-with its last claimant.
+named 'Inner' was actually declared in this same file. When it wasn't (the
+class lives in a header), no Class node is made for it here: the header's
+Class is the one class of that name, and the method's CONTAINS edge from a
+Class of this file matches nothing (a known gap, see README).
 """
 
 from __future__ import annotations
@@ -723,21 +719,6 @@ def extract_cpp_file(source_code: str, file_path: str, repo_id: str) -> Extracti
     # last; "" at the Module (a namespace is no owner).
     owners = [""]
 
-    classes_emitted: set[str] = set()
-
-    def _ensure_class_stub(class_name: str) -> None:
-        if class_name in classes_emitted:
-            return
-        classes_emitted.add(class_name)
-        result.nodes.append(
-            GraphNode(
-                label="Class",
-                repo_id=repo_id,
-                name=class_name,
-                properties={"type": "class", "source": file_path},
-            )
-        )
-
     def visit_block(block: Node, parent_name: str | None, parent_label: str) -> None:
         for node in block.named_children:
             if node.type in ("class_specifier", "struct_specifier"):
@@ -791,7 +772,6 @@ def extract_cpp_file(source_code: str, file_path: str, repo_id: str) -> Extracti
             class_properties["description"] = _doc_summary(doc)
             class_properties["docstring_full"] = doc
 
-        classes_emitted.add(class_name)
         result.nodes.append(
             GraphNode(label="Class", repo_id=repo_id, name=class_name, properties=class_properties)
         )
@@ -851,7 +831,6 @@ def extract_cpp_file(source_code: str, file_path: str, repo_id: str) -> Extracti
             class_properties["description"] = _doc_summary(doc)
             class_properties["docstring_full"] = doc
 
-        classes_emitted.add(class_name)
         result.nodes.append(
             GraphNode(label="Class", repo_id=repo_id, name=class_name, properties=class_properties)
         )
@@ -916,7 +895,6 @@ def extract_cpp_file(source_code: str, file_path: str, repo_id: str) -> Extracti
             return
 
         if class_name:
-            _ensure_class_stub(class_name)
             contains_label, contains_name = "Class", class_name
         else:
             contains_label, contains_name = parent_label, (parent_name if parent_name else file_path)
