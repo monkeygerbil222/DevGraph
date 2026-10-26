@@ -1159,27 +1159,17 @@ def _without_constructors(
     owner the class's owner and name, `Outer.Order`; in the class's
     repository), as a Java, C#, C++ or Kotlin constructor is. A class name
     then means the class: describe_node and get_source answer with it, and
-    name its constructors, which `owner` reaches. A C++ class's owner leaves
-    its namespace out while an out-of-class definition's names it
-    (`shop::Ledger::Ledger()` is owned by `shop.Ledger`), so a C++ Function
-    whose owner ends with the class's owner and name is its constructor too."""
-    from devgraph.indexer.symbols import language_for
-
+    name its constructors, which `owner` reaches. A C++ class in a namespace
+    is owned by it, so its constructor, in its class or out of it
+    (`shop::Ledger::Ledger()`), is owned by `shop.Ledger`."""
     classes = {
         (row.get("repo_id"), f"{row['owner']}.{row['name']}" if row.get("owner") else row["name"])
         for row in rows if label_of(row) == "Class" and row.get("file") is not None
     }
-
-    def owned_by_a_class(row: dict[str, Any]) -> bool:
-        repo_id, owner = row.get("repo_id"), row.get("owner") or ""
-        if (repo_id, owner) in classes:
-            return True
-        if language_for(row.get("file") or "") != "cpp":
-            return False
-        parts = owner.split(".")
-        return any((repo_id, ".".join(parts[i:])) in classes for i in range(1, len(parts)))
-
-    constructors = [row for row in rows if label_of(row) == "Function" and owned_by_a_class(row)]
+    constructors = [
+        row for row in rows
+        if label_of(row) == "Function" and (row.get("repo_id"), row.get("owner")) in classes
+    ]
     return [row for row in rows if all(row is not each for each in constructors)], constructors
 
 
