@@ -75,6 +75,10 @@ named 'Inner' was actually declared in this same file. When it wasn't (the
 class lives in a header), no Class node is made for it here: the header's
 Class is the one class of that name, and the method's CONTAINS edge from a
 Class of this file matches nothing (a known gap, see README).
+
+Two definitions of one name and owner in one file (overloads, `f()` and
+`f(int)`) are one node, the first definition, holding both bodies' calls
+(common.merge_same_nodes), as in every language.
 """
 
 from __future__ import annotations
@@ -96,6 +100,7 @@ from devgraph.indexer.common import (
     add_heir_keys,
     class_member_pin,
     member_owner,
+    merge_same_nodes,
     own_edges,
 )
 
@@ -1011,6 +1016,7 @@ def extract_cpp_file(source_code: str, file_path: str, repo_id: str) -> Extracti
 
     visit_block(root, None, "Module")
     result.relationships += sites.rows(file_path, repo_id)
+    merge_same_nodes(result)
     add_heir_keys(result, class_decls)
 
     return own_edges(result, file_path)
