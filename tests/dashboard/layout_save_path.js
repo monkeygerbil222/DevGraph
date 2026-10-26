@@ -241,12 +241,12 @@ function runLabelChecks() {
 
 /* ---------------------------------------------------------------------
    Exercise the real rotation loop with a deterministic animation-frame queue.
-   Rotation turns the camera (graphView.setAngle) from the time since the
+   Rotation turns the camera (graphView.rotateAbout) from the time since the
    last frame; it moves no node. Visibility changes stop and re-arm the loop,
    and time spent hidden never becomes rotation. */
 function runRotationChecks() {
   const DEG = Math.PI / 180;
-  const angles = [];
+  const angles = [], pivots = [];
   let positionWrites = 0, now = 0;
   const pending = [];
   const listeners = {};
@@ -256,7 +256,7 @@ function runRotationChecks() {
     performance: { now: () => now },
     graphView: {
       nodeCount: () => 2,
-      setAngle: a => angles.push(a),
+      rotateAbout: (p, a) => { pivots.push(p); angles.push(a); },
       setPositions: () => positionWrites++, setPosition: () => positionWrites++,
     },
     state: { rotationEnabled: true },
@@ -290,6 +290,7 @@ function runRotationChecks() {
   check("successive frames add up to the total time elapsed", turnedFor(26), angle());
   check("a frame turns the outermost node of a 540-unit radius under one pixel", 540 * angle() < 1, angle());
   check("rotation moves no node", positionWrites === 0, positionWrites);
+  check("...and turns about the pivot", pivots.every(p => p === context.rotationPivot) && pivots.length > 0, JSON.stringify(pivots));
   check("rotation never CSS-transforms the rendered canvas",
     !/getElementById\("cy"\)\.style\.transform|cyContainer\.style\.transform/.test(html), "a CSS transform of #cy is back");
 

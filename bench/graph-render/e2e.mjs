@@ -152,6 +152,25 @@ const checks = {
     check("no page errors", !errors.length, errors.join(" | "));
     await browser.close();
   },
+  /* The ambient rotation turns about its pivot, not the middle of the
+     screen: with the view panned away, the pivot stays where it is. */
+  async rotate() {
+    const { browser, page, errors } = await open("synth2k");
+    await settled(page); await sleep(2500);
+    const r = await page.evaluate(() => {
+      const { width, height } = graphView.size();
+      graphView.setView(graphView.toModel({ x: width / 2 - 250, y: height / 2 - 120 })); // pan away
+      const pivot = rotationPivot, far = graphView.nodeIds()[0];
+      const p0 = graphView.toScreen(pivot), f0 = graphView.toScreen(graphView.position(far));
+      graphView.rotateAbout(pivot, graphView.angle() + 0.6);
+      const p1 = graphView.toScreen(pivot), f1 = graphView.toScreen(graphView.position(far));
+      return { pivotShift: Math.hypot(p1.x - p0.x, p1.y - p0.y), farShift: Math.hypot(f1.x - f0.x, f1.y - f0.y), pivotOnScreen: p0 };
+    });
+    check("rotating keeps the pivot in place on screen after a pan", r.pivotShift < 1, JSON.stringify(r));
+    check("...while the rest of the graph turns", r.farShift > 5, JSON.stringify(r));
+    check("no page errors", !errors.length, errors.join(" | "));
+    await browser.close();
+  },
 };
 
 const wanted = process.argv.slice(2).length ? process.argv.slice(2) : Object.keys(checks);

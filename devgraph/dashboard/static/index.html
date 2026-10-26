@@ -1511,7 +1511,15 @@ vec4 layer_dgnode(vec4 fillColor, float fillAlpha, vec4 ringColor, float ringWid
       camera.setState(target);
     },
     angle: () => camera.angle,
-    setAngle(angle) { camera.setState({ angle }); },
+    /* turns the camera to `angle` about the model point `pivot`: the pivot
+       keeps its place on screen, wherever the view has been panned to */
+    rotateAbout(pivot, angle) {
+      const before = view.toScreen(pivot);
+      camera.setState({ angle });
+      const after = view.toScreen(pivot);
+      const { width, height } = renderer.getDimensions();
+      view.setView(view.toModel({ x: width / 2 + after.x - before.x, y: height / 2 + after.y - before.y }));
+    },
     on(event, fn) { renderer.on(event, fn); },
     onCamera(fn) { camera.on("updated", fn); },
     restyle() { renderer.refresh(); },
@@ -1535,7 +1543,7 @@ function createNullGraphView() {
     size: () => ({ width: 0, height: 0 }), zoom: () => 1, pan: () => ({ x: 0, y: 0 }),
     toScreen: () => ({ x: 0, y: 0 }), toModel: () => ({ x: 0, y: 0 }),
     extent: () => ({ x1: 0, x2: 0, y1: 0, y2: 0, w: 0, h: 0 }),
-    setView: none, angle: () => 0, setAngle: none, on: none, onCamera: none,
+    setView: none, angle: () => 0, rotateAbout: none, on: none, onCamera: none,
     restyle: none, resize: none,
   };
 }
@@ -2078,10 +2086,11 @@ function zoomBy(factor) {
 document.getElementById("btnZoomIn").addEventListener("click", () => zoomBy(1.35));
 document.getElementById("btnZoomOut").addEventListener("click", () => zoomBy(1/1.35));
 
-/* ── slow ambient rotation: the camera turns about the middle of the
-   screen, where focusRotation() puts the pivot -- the bounding-box centre
-   of the whole graph with no query active, or of the current query's
-   matched nodes when one is.
+/* ── slow ambient rotation: the camera turns about a fixed pivot -- the
+   bounding-box centre of the whole graph with no query active, or of the
+   current query's matched nodes when one is (focusRotation frames it
+   mid-screen). The pivot stays put on screen even after the view is
+   panned away from it, as under Cytoscape.
 
    Turning the camera moves no node: the layout (and the layout cache) stay
    as settled, and sigma draws labels upright whatever the camera's angle,
@@ -2162,7 +2171,7 @@ function rotationTick(now) {
   if (!userInteracting && !graphSettling) {
     lastRotationTime = now;
     rotationAngle += ROTATION_DEG_PER_SEC * Math.min(1, elapsed / 1000) * Math.PI / 180;
-    graphView.setAngle(rotationAngle);
+    graphView.rotateAbout(rotationPivot, rotationAngle);
   }
   requestAnimationFrame(rotationTick);
 }
