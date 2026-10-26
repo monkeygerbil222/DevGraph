@@ -583,7 +583,7 @@ FAIL_FAST_RETRY_PAUSE_S = 0.5
 READ_DEADLINE_MARGIN_S = 5.0
 
 
-class QueryNotAnswered(TimeoutError):
+class QueryNotAnswered(Exception):
     """Neo4j accepted a fail-fast read's transaction (it answered the BEGIN)
     but sent no answer by the read's deadline. Neo4j is up, so this is no
     `ServiceUnavailable`: it is not reported as Neo4j being down."""
