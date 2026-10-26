@@ -32,7 +32,7 @@ from collections import Counter
 from collections.abc import Callable, Mapping
 from contextlib import contextmanager
 from datetime import datetime
-from functools import partial
+from functools import partial, wraps
 from pathlib import Path
 from typing import NamedTuple
 
@@ -57,6 +57,7 @@ from devgraph.graph.engine import (
     SERVICE_API_SUFFIXES,
     EngineClosed,
     GraphEngine,
+    IndexesNotReady,
     provision_repository_schema,
 )
 from devgraph.graph.schema import FILE_SCOPED_LABELS, HEIR_KEY, NODE_LABELS, RELATIONSHIP_TYPES, pin_kind, split_pin
@@ -147,6 +148,31 @@ CONNECTION_LOST = (ServiceUnavailable, SessionExpired)
 #: still building), this module's own, and a lost connection to Neo4j, in a
 #: file's write or in any pass after the files.
 ABORTS_BATCH = (*ABORTS_BATCH, BatchAborted, *CONNECTION_LOST)
+
+#: Repositories an incremental batch lost Neo4j partway through, since this
+#: process's last full scan of them. Such a batch may have written its files'
+#: nodes and not yet relinked the edges other files hold to them; a retry
+#: diffs against those nodes, finds nothing added, and would leave the edges
+#: out. So the next `catch_up` rescans the repository in full instead.
+_lost_batches: set[str] = set()
+
+
+def _rescans_if_lost(fn):
+    """Record the repository in `_lost_batches` when `fn` (a batch that
+    writes) loses its connection to Neo4j; a shutdown or an index still
+    building writes nothing that needs it."""
+
+    @wraps(fn)
+    def wrapper(engine, repo_id, *args, **kwargs):
+        try:
+            return fn(engine, repo_id, *args, **kwargs)
+        except (EngineClosed, IndexesNotReady):
+            raise
+        except CONNECTION_LOST:
+            _lost_batches.add(repo_id)
+            raise
+
+    return wrapper
 
 _CPP_SUFFIXES = {".cpp", ".cc", ".cxx", ".h", ".hpp"}
 
@@ -874,6 +900,7 @@ def _stale_mounts(state: dict, table: MountTable) -> set[str]:
     }
 
 
+@_rescans_if_lost
 def index_paths(
     engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[Path], docs_path: str | None = None,
     mentions_enabled: bool = False, sync_provider: bool = True, relink_outside: bool = True,
@@ -2357,6 +2384,7 @@ def _folders_above(rel: str) -> list[str]:
     return ["/".join(parts[:i]) for i in range(1, len(parts))]
 
 
+@_rescans_if_lost
 def remove_paths(
     engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[Path], docs_path: str | None = None,
     mentions_enabled: bool = False,
@@ -2689,17 +2717,23 @@ def catch_up(
     see `_claim_full_scan`) ran meanwhile is not repeated. Last, a changed resolver configuration re-indexes its
     language's files (sync_resolver_config).
 
+    So does a repository an incremental batch of this process lost Neo4j
+    partway through (`_lost_batches`): its retry could not tell which edges
+    of other files that batch left unwritten.
+
     A missing, unreadable or apparently unmounted root is refused as
     `prune_stale_files` refuses it (`force` as there), before any change.
     """
     check_repo_root(repo_root)
-    if index_outdated(engine, repo_id):
+    if repo_id in _lost_batches or index_outdated(engine, repo_id):
         # The repository is registered (the agent checks): a graph that lost
         # its Repository node (wiped) gets it back, or full_scan would take
         # it for removed and scan nothing.
         engine.upsert_repository(repo_id, repo_id, str(repo_root))
         with full_scan_turn(repo_id, while_waiting, engine):
-            if index_outdated(engine, repo_id):
+            if repo_id in _lost_batches or index_outdated(engine, repo_id):
+                if repo_id in _lost_batches:
+                    logger.info("%s: an update lost Neo4j partway through; rescanning in full", repo_id)
                 indexed = full_scan(
                     engine, repo_id, repo_root, docs_path=docs_path, mentions_enabled=mentions_enabled, force=force
                 )
@@ -3130,6 +3164,7 @@ def full_scan(
         _check_full_scan_claim(repo_id)  # taken over meanwhile: that scan stamps it
         engine.set_scan_options(repo_id, docs_path or "", mentions_enabled)
         engine.set_index_format(repo_id, INDEX_FORMAT)
+        _lost_batches.discard(repo_id)
         return indexed
     finally:
         _release_full_scan_lock(repo_id, engine)
