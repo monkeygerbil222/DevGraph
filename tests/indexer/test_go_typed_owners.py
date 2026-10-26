@@ -1,9 +1,11 @@
-"""A Go method call on a value of a concrete type of another package (a
-pointer, a composite literal, `new(T)`) links that type's method only (audit
-11 item 4), still at package confidence; a struct's method promoted from a
-struct of its file it embeds is reached through it (heir keys). A value
-whose type may be an interface (`o model.Order`) keeps linking every method
-of the name in the package. Live indexing equals a fresh scan."""
+"""A Go method call on a value of a struct its file declares links that
+struct's method only (audit 11 item 4, narrowed by review F2), still at
+package confidence, when every type the struct embeds is a struct of the
+file too: its methods are then its own and those promoted from them (heir
+keys). Any other receiver keeps linking every method of the name in the
+package: another file's type may embed a type of a third file, whose
+promoted method the owner would lose, or be an interface. Live indexing
+equals a fresh scan."""
 
 import textwrap
 import uuid
@@ -19,7 +21,7 @@ from tests.watcher.live_helpers import fresh_snapshot, graph_snapshot, snapshot_
 
 GO_MOD = "module example.com/shop\n\ngo 1.22\n"
 
-MODEL = """\
+USE = """\
     package model
 
     type Base struct{}
@@ -27,14 +29,16 @@ MODEL = """\
     func (b *Base) ID() int { return 0 }
 
     type Order struct{ Base }
+    type Plain struct{}
+    type Cross struct{ Remote }
+    type Wrapped struct{ Cross }
+    type Generic struct{ Box[int] }
 
-    func (o *Order) Total() int { return 1 }
-
-    type Invoice struct{}
-
-    func (i *Invoice) Total() int { return 2 }
-
-    func (i *Invoice) ID() int { return 3 }
+    func UseOrder() int { o := &Order{}; return o.Total() + o.ID() }
+    func UsePlain() int { p := Plain{}; return p.Total() }
+    func UseCross() int { c := &Cross{}; return c.Total() }
+    func UseWrapped() int { w := Wrapped{}; return w.Total() }
+    func UseGeneric() int { g := Generic{}; return g.Total() }
     """
 
 SVC = """\
@@ -42,37 +46,38 @@ SVC = """\
 
     import "example.com/shop/model"
 
-    func GA(o *model.Order) int { return o.Total() }
-    func GB() int { i := &model.Invoice{}; return i.Total() }
-    func GC() int { i := new(model.Invoice); return i.Total() }
-    func GD() int { o := model.Order{}; return o.ID() }
-    func GE(o model.Order) int { return o.Total() }
+    func PromotedCross() int { o := &model.Order{}; return o.ID() }
     """
 
 
-def _owners(tmp_path, caller, callee):
+def _owners(tmp_path, source, path, caller, callee):
     (tmp_path / "go.mod").write_text(GO_MOD)
-    result = extract_go_file(textwrap.dedent(SVC), "svc/svc.go", "repo", ResolverConfig(tmp_path))
+    result = extract_go_file(textwrap.dedent(source), path, "repo", ResolverConfig(tmp_path))
     return {(r.to_owner, r.properties["confidence"]) for r in result.relationships
             if r.rel_type == "CALLS" and (r.from_name, r.to_name) == (caller, callee)}
 
 
-def test_a_concrete_receiver_links_only_its_own_types_method(tmp_path):
-    assert _owners(tmp_path, "GA", "Total") == {("Order", "package")}
-    assert _owners(tmp_path, "GB", "Total") == {("Invoice", "package")}
-    assert _owners(tmp_path, "GC", "Total") == {("Invoice", "package")}
-    assert _owners(tmp_path, "GD", "ID") == {("Order", "package")}
-    # A value of a type that may be an interface: any Total of the package.
-    assert _owners(tmp_path, "GE", "Total") == {(None, "package")}
+def test_a_struct_of_the_file_with_known_embeds_links_only_its_own_method(tmp_path):
+    def owners(caller, callee="Total"):
+        return _owners(tmp_path, USE, "model/use.go", caller, callee)
 
-
-def test_an_embedded_structs_method_is_a_member_of_its_embedder():
-    result = extract_go_file(textwrap.dedent(MODEL), "model/model.go", "repo")
-    base_id = next(n for n in result.nodes if n.label == "Function" and n.name == "ID"
-                   and n.properties["owner"] == "Base")
+    assert owners("UseOrder") == {("Order", "package")}
+    assert owners("UseOrder", "ID") == {("Order", "package")}
+    assert owners("UsePlain") == {("Plain", "package")}
+    # Embedding another file's type, directly or through a struct of the
+    # file, or one it can't name: any Total of the package.
+    assert owners("UseCross") == {(None, "package")}
+    assert owners("UseWrapped") == {(None, "package")}
+    assert owners("UseGeneric") == {(None, "package")}
+    # Base.ID is promoted to Order: its heir key.
+    result = extract_go_file(textwrap.dedent(USE), "model/use.go", "repo")
+    base_id = next(n for n in result.nodes if n.label == "Function" and n.name == "ID")
     assert base_id.properties["mkeys"] == ["<Order"]
-    module = next(n for n in result.nodes if n.label == "Module")
-    assert module.properties["heir_open"] == []
+    assert next(n for n in result.nodes if n.label == "Module").properties["heir_open"] == []
+
+
+def test_another_files_type_keeps_every_method_of_the_name(tmp_path):
+    assert _owners(tmp_path, SVC, "svc/svc.go", "PromotedCross", "ID") == {(None, "package")}
 
 
 # --- live --------------------------------------------------------------------------
@@ -118,21 +123,35 @@ def _callers(engine, repo_id, name, owner):
     return sorted((row["name"], row["confidence"]) for row in result["results"])
 
 
-def test_find_callers_tells_two_types_same_named_methods_apart(engine, repo_id, tmp_path):
+PLAIN = """\
+    package model
+
+    type Plain struct{}
+
+    func UsePlain() int { p := Plain{}; return p.Total() }
+    """
+
+
+def test_find_callers_and_promotion_across_files(engine, repo_id, tmp_path):
     _write(tmp_path, "go.mod", GO_MOD)
-    model = _write(tmp_path, "model/model.go", MODEL)
+    _write(tmp_path, "model/base.go", "package model\n\ntype Base struct{}\n\nfunc (b *Base) ID() int { return 0 }\n")
+    _write(tmp_path, "model/order.go", "package model\n\ntype Order struct{ Base }\n")
+    _write(tmp_path, "model/other.go", "package model\n\ntype Other struct{}\n\nfunc (o Other) Total() int { return 2 }\n")
+    _write(tmp_path, "model/methods.go", "package model\n\nfunc (p Plain) Total() int { return 1 }\n")
+    plain = _write(tmp_path, "model/plain.go", PLAIN)
     _write(tmp_path, "svc/svc.go", SVC)
     provision_repository_schema(engine, tmp_path)
     engine.upsert_repository(repo_id, repo_id, str(tmp_path))
     full_scan(engine, repo_id, tmp_path)
-    assert _callers(engine, repo_id, "Total", "Invoice") == [("GB", "package"), ("GC", "package"), ("GE", "package")]
-    assert _callers(engine, repo_id, "Total", "Order") == [("GA", "package"), ("GE", "package")]
-    assert _callers(engine, repo_id, "ID", "Base") == [("GD", "package")]
-    assert _callers(engine, repo_id, "ID", "Invoice") == []
+    # A method promoted from a struct of another file is still reached.
+    assert _callers(engine, repo_id, "ID", "Base") == [("PromotedCross", "package")]
+    # Plain's own method, defined in another file of its package; not Other's.
+    assert _callers(engine, repo_id, "Total", "Plain") == [("UsePlain", "package")]
+    assert _callers(engine, repo_id, "Total", "Other") == []
     _equals_fresh(engine, repo_id, tmp_path)
 
-    # Order stops embedding Base: `o.ID()` no longer reaches Base's.
-    model.write_text(textwrap.dedent(MODEL).replace("type Order struct{ Base }", "type Order struct{}"))
-    index_paths(engine, repo_id, tmp_path, {model})
-    assert _callers(engine, repo_id, "ID", "Base") == []
+    # Plain comes to embed Other (another file's): any Total of the package.
+    plain.write_text(textwrap.dedent(PLAIN).replace("type Plain struct{}", "type Plain struct{ Other }"))
+    index_paths(engine, repo_id, tmp_path, {plain})
+    assert _callers(engine, repo_id, "Total", "Other") == [("UsePlain", "package")]
     _equals_fresh(engine, repo_id, tmp_path)

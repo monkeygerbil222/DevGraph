@@ -254,10 +254,11 @@ def _provider_specs(repo_root: Path) -> tuple[bool, filesystem.FilesystemSpec | 
 #: Service as well as a Module; 23: a Rust method call on a typed value of
 #: another file's type, and a `Type::f()` path, linked to that type's member
 #: only (owned pins), a trait's default method a member of each type of its
-#: file implementing it, and a Go method call on a concrete value (a
-#: pointer, a composite literal, `new(T)`, a struct of the file) linked to
-#: its type's method or one promoted from a struct of its file it embeds
-#: (Rust and Go `mkeys` and `heir_open`).
+#: file implementing it, and a
+#: Go method call on a struct of the file whose embedded types are all
+#: structs of the file linked to its method or one promoted from them (Rust
+#: and Go `mkeys` and `heir_open`); a CONTAINS target matched on its own
+#: owner only.
 #: An index stamped lower, or not at all, is rescanned automatically.
 INDEX_FORMAT = 23
 

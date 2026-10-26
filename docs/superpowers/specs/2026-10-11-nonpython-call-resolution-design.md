@@ -498,15 +498,16 @@ Tiers, first match wins:
    `db`). The method resolves to this file when its type and the method are
    declared here, else to the type's package directory at package confidence
    (`~`: methods are named bare, so another type of the package can have one
-   of the name). A concrete type's call there (index format 23, audit 11
-   item 4: a pointer `*T`, a composite literal `T{}`/`&T{}`, `new(T)`, or a
-   struct the file declares) names the type as its owner, so it links `T`'s
-   method, or one promoted from a struct of its file `T` embeds (heir keys,
-   below), never another type's; a value `x T` of another file's type may be
-   an interface, whose implementers' methods are any of the name, and keeps
-   the owner-less pin. A method promoted from a struct embedded from another
-   file is not reached through the embedder (as a Java method inherited from
-   another file's class is not). An unqualified exported type the file doesn't declare,
+   of the name). The call of a struct the file declares whose embedded
+   types are all structs of the file (index format 23, audit 11 item 4 and
+   its review F2) names the struct as its owner: its methods are its own,
+   wherever in the package, and those promoted from those structs (heir
+   keys, below). Any other type keeps the owner-less pin: another file's
+   type may embed a type of a third file, whose promoted method an owner
+   would lose, or be an interface, whose implementers' methods are any of
+   the name; so does a struct embedding another file's or package's type,
+   an interface, or a type the file can't name (`Box[int]`), directly or
+   through a struct of the file. An unqualified exported type the file doesn't declare,
    and what an unqualified function of another file returned, may be a
    dot-imported package's (`import . "pkg"`, index format 18): that
    package's directory at package confidence too. A builtin or external
@@ -1083,8 +1084,7 @@ list), and a resolver that knows the owner of a call's target names it: a
 typed receiver's or `this`/`self` call to a class declared in the file
 links that class's member (Python, JS/TS, Java, Kotlin, C#, Go, Rust; C++
 resolves by function name alone and still links every same-named member of
-the file; a Rust type of another file, and a Go concrete type of another
-file, since index format 23); across files, an imported top-level function (a Python
+the file; a Rust type of another file since index format 23); across files, an imported top-level function (a Python
 from-import or module attribute, a JS/TS ES named import or namespace
 member, a Go package's function) links the top-level one, never a method
 of its name. A method of another file's Python, JS/TS or Java class names
