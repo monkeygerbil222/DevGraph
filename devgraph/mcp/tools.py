@@ -30,6 +30,7 @@ from devgraph.config.project_schema import (
 )
 from devgraph.config.project_tools import DEFAULT_TIMEOUT_S
 from devgraph.graph.engine import GraphEngine
+from devgraph.indexer.calls import STOP_METHODS
 from devgraph.graph import schema
 from devgraph.indexer.source_text import decode_source_as, declared_encoding, is_python_path
 from devgraph.paths import is_within
@@ -189,6 +190,23 @@ CALL (shown) {{
 """
 
 
+#: The member names whose by-name callers say little about a class: a
+#: library container's or a language's own method names in any language
+#: (calls.STOP_METHODS), which a value nothing types calls on anything.
+#: Dunder methods (`__init__`, `__eq__`) are matched by shape.
+NOISY_MEMBER_NAMES = sorted(frozenset().union(*STOP_METHODS.values()))
+
+
+def _noisy_member_call(r: str, m: str) -> str:
+    """Cypher: the edge `r` into the class member `m` is a by-name call
+    (`confidence` "name") of a noisy name (`NOISY_MEMBER_NAMES`, `$noisy_members`)
+    or a dunder method: `super().__init__()` linking every `__init__`."""
+    return (
+        f"(type({r}) = 'CALLS' AND {r}.confidence = 'name' AND ({m}.name IN $noisy_members "
+        f"OR ({m}.name STARTS WITH '__' AND {m}.name ENDS WITH '__')))"
+    )
+
+
 def _impact_expansion(cross_repo: bool, with_ids: bool = False) -> str:
     """Cypher continuing from `WITH collect(n) AS l0` (the changed nodes): one
     CALL per hop collecting the distinct nodes with a CALLS/USES/DEPENDS_ON edge
@@ -207,7 +225,12 @@ def _impact_expansion(cross_repo: bool, with_ids: bool = False) -> str:
     constructors included): hop 0 is the class and its `members`, so a
     caller of one of its methods is a direct dependent, and a direct
     dependent lists in `via` the members it depends on (`Cart.go`; empty for
-    one that depends on the class itself, such as a subclass).
+    one that depends on the class itself, such as a subclass). A by-name
+    call of a noisy member (`_noisy_member_call`) is no edge into it, and a
+    direct dependent whose every edge into hop 0 is a by-name call of a
+    member is `name_only`: `firm_count` counts the others (all of them for
+    a Function target, which has no members), and `has_members` says
+    whether there were members.
 
     Expanding distinct nodes hop by hop does work proportional to the nodes
     and edges within reach; a variable-length path enumerates every path, which
@@ -221,9 +244,10 @@ def _impact_expansion(cross_repo: bool, with_ids: bool = False) -> str:
     for hop in range(1, IMPACT_MAX_DEPTH + 1):
         seen = ["l0", "members"] + [f"l{k}" for k in range(1, hop)]
         previous = "l0 + members" if hop == 1 else f"l{hop - 1}"
+        noisy = f"AND NOT (m IN members AND {_noisy_member_call('r', 'm')}) " if hop == 1 else ""
         parts.append(
             f"CALL ({', '.join(seen)}) {{ UNWIND {previous} AS m "
-            f"MATCH (d)-[:CALLS|USES|DEPENDS_ON|EXTENDS]->(m) WHERE true {scope} "
+            f"MATCH (d)-[r:CALLS|USES|DEPENDS_ON|EXTENDS]->(m) WHERE true {scope} {noisy}"
             f"AND {' AND '.join(f'NOT d IN {s}' for s in seen)} "
             f"RETURN collect(DISTINCT d) AS l{hop} }}"
         )
@@ -239,11 +263,20 @@ def _impact_expansion(cross_repo: bool, with_ids: bool = False) -> str:
         "{name: d.name, type: labels(d)[0], file: coalesce(d.file, d.source_file), owner: "
         + _OWNER_OF.format(v="d") + (", id: elementId(d)}" if with_ids else "}")
     )
-    via = "via: [(d)-[:CALLS|USES|DEPENDS_ON]->(x) WHERE x IN members | coalesce(x.owner, '') + '.' + x.name], "
+    parts.append(
+        "WITH *, [d IN l1 WHERE NOT EXISTS { MATCH (d)-[r:CALLS|USES|DEPENDS_ON|EXTENDS]->(x) "
+        "WHERE (x IN l0 OR x IN members) AND NOT (x IN members AND type(r) = 'CALLS' AND r.confidence = 'name') }] "
+        "AS name_only"
+    )
+    via = (
+        "via: [(d)-[:CALLS|USES|DEPENDS_ON]->(x) WHERE x IN members | coalesce(x.owner, '') + '.' + x.name], "
+        "name_only: d IN name_only, "
+    )
     parts.append(
         f"RETURN [d IN l1 | {ref[:1] + via + ref[1:]}] AS direct_dependents, "
         f"[d IN {transitive} | {ref}] AS transitive_dependents, "
-        "size(l1) AS direct_count, [n IN l0 | {name: n.name, file: n.file, owner: coalesce(n.owner, '')}] AS matched, "
+        "size(l1) AS direct_count, size(l1) - size(name_only) AS firm_count, size(members) > 0 AS has_members, "
+        "[n IN l0 | {name: n.name, file: n.file, owner: coalesce(n.owner, '')}] AS matched, "
         "endpoint_nodes"
     )
     return "\n".join(parts)
@@ -270,9 +303,10 @@ def _located(row: dict[str, Any]) -> dict[str, Any]:
 def _dependent(row: dict[str, Any]) -> dict[str, Any]:
     """An impact dependent row `_located`, its `via` (the target class's
     members it depends on, `_impact_expansion`) sorted and distinct, or
-    left out when there are none."""
+    left out when there are none, and `name_only` kept only when true."""
     via = sorted(set(row.pop("via", None) or []))
-    return {**_located(row), **({"via": via} if via else {})}
+    name_only = row.pop("name_only", False)
+    return {**_located(row), **({"via": via} if via else {}), **({"name_only": True} if name_only else {})}
 
 
 @contextmanager
@@ -1892,7 +1926,8 @@ def find_callers(
     AND {_OWNER_MATCH.replace("n.", "target.")}
     {_CLASS_MEMBERS}
     MATCH (caller)-[rel:CALLS]->(callee)
-    WHERE (callee = target OR NOT (caller = target OR (target)-[:CONTAINS]->(caller)))
+    WHERE (callee = target OR NOT (caller = target OR (target)-[:CONTAINS]->(caller)
+                                   OR {_noisy_member_call("rel", "callee")}))
     {class_filter}
     {resolved_filter}
     """
@@ -1915,7 +1950,7 @@ def find_callers(
     """
     params = {
         "target_name": target_name, "file": file, "owner": owner, "test_path": TEST_PATH_CYPHER,
-        "include_tests": include_tests,
+        "include_tests": include_tests, "noisy_members": NOISY_MEMBER_NAMES,
     }
     if not cross_repo:
         params["repo_id"] = repo_id
@@ -2239,7 +2274,10 @@ def impact_analysis(
     its by-name dependents: impact errs toward listing too much. A Class is
     traced with the Functions it CONTAINS (`_impact_expansion`): the callers
     of its methods and its subclasses (EXTENDS) are direct dependents, each
-    caller with `via`, the methods it calls.
+    caller with `via`, the methods it calls. For a class, a dependent reached
+    only by by-name calls is marked `name_only` and the dict adds
+    `name_only_dependents`, their count; risk_level counts the others (a
+    function's counts every dependent).
 
     Args:
         engine: GraphEngine instance
@@ -2306,7 +2344,8 @@ def impact_analysis(
     {_impact_expansion(cross_repo, with_ids=split)}
     }}
     WITH collect({{target_file: target_file, direct_dependents: direct_dependents,
-                  transitive_dependents: transitive_dependents, direct_count: direct_count}}) AS rows,
+                  transitive_dependents: transitive_dependents, direct_count: direct_count,
+                  firm_count: firm_count, has_members: has_members}}) AS rows,
          collect([e IN endpoint_nodes | {{e: e, file: target_file}}]) AS nested
     WITH rows, reduce(acc = [], each IN nested | acc + each) AS pairs
     {_capped_endpoints("pairs")}
@@ -2314,6 +2353,7 @@ def impact_analysis(
     """
     params = {
         "component_name": component_name, "file": file, "owner": owner, "split": split, "max_results": max_results,
+        "noisy_members": NOISY_MEMBER_NAMES,
     }
     if not cross_repo:
         params["repo_id"] = repo_id
@@ -2326,8 +2366,10 @@ def impact_analysis(
             "direct_dependents": dependents_envelope([_dependent(d) for d in row["direct_dependents"]]),
             "transitive_dependents": dependents_envelope([_dependent(d) for d in row["transitive_dependents"]]),
             "endpoints": _endpoints_envelope(answer_row, max_results),
-            "risk_level": _risk_level(row["direct_count"]),
+            "risk_level": _risk_level(row["firm_count"]),
         }
+        if row["has_members"]:
+            answer["name_only_dependents"] = row["direct_count"] - row["firm_count"]
         if ambiguous:
             answer["ambiguous_targets"] = ambiguous
             answer["notices"] = [
@@ -2349,16 +2391,21 @@ def impact_analysis(
                 entry["files"].append(row["target_file"])
                 if located.get("via"):
                     entry["row"]["via"] = sorted({*entry["row"].get("via", []), *located["via"]})
+                if not located.get("name_only"):
+                    entry["row"].pop("name_only", None)
     lists = {
         key: [_with_target_files(d["row"], d["files"]) for d in dependents.values() if d["key"] == key]
         for key in ("direct_dependents", "transitive_dependents")
     }
-    return {
+    answer = {
         **{key: dependents_envelope(rows) for key, rows in lists.items()},
         "endpoints": _endpoints_envelope(answer_row, max_results, tagged=True),
-        "risk_level": _risk_level(max(row["direct_count"] for row in results)),
+        "risk_level": _risk_level(max(row["firm_count"] for row in results)),
         "ambiguous_targets": ambiguous,
     }
+    if any(row["has_members"] for row in results):
+        answer["name_only_dependents"] = sum(1 for row in lists["direct_dependents"] if row.get("name_only"))
+    return answer
 
 
 def _risk_level(direct_count: int) -> str:
@@ -2527,17 +2574,21 @@ def impact_analysis_for_diff(
     files = list(dict.fromkeys(f for paths in fallback.values() for f in paths))
 
     row = {
-        "direct_dependents": [], "transitive_dependents": [], "direct_count": 0, "matched": [],
-        "endpoint_count": 0, "endpoints": [],
+        "direct_dependents": [], "transitive_dependents": [], "direct_count": 0, "firm_count": 0,
+        "has_members": False, "matched": [], "endpoint_count": 0, "endpoints": [],
     }
     if targets or files:
         cypher = (
             f"CALL () {{\n{_DIFF_TARGETS_CYPHER}{_impact_expansion(cross_repo)}\n}}\n"
             "WITH *, [e IN endpoint_nodes | {e: e, file: null}] AS pairs\n"
             f"{_capped_endpoints('pairs')}"
-            "RETURN direct_dependents, transitive_dependents, direct_count, matched, endpoint_count, endpoints"
+            "RETURN direct_dependents, transitive_dependents, direct_count, firm_count, has_members, matched, "
+            "endpoint_count, endpoints"
         )
-        params = {"repo_id": repo_id, "targets": targets, "files": files, "max_results": max_results}
+        params = {
+            "repo_id": repo_id, "targets": targets, "files": files, "max_results": max_results,
+            "noisy_members": NOISY_MEMBER_NAMES,
+        }
         rows = _query(engine, cypher, params)
         if rows:
             row = rows[0]
@@ -2560,7 +2611,8 @@ def impact_analysis_for_diff(
         "direct_dependents": _envelope([_dependent(d) for d in row["direct_dependents"]], max_results),
         "transitive_dependents": _envelope([_dependent(d) for d in row["transitive_dependents"]], max_results),
         "endpoints": _endpoints_envelope(row, max_results),
-        "risk_level": _risk_level(row["direct_count"]),
+        "risk_level": _risk_level(row["firm_count"]),
+        **({"name_only_dependents": row["direct_count"] - row["firm_count"]} if row["has_members"] else {}),
         "truncated": bool(reasons),
         "truncated_reasons": list(reasons),
         "notices": notices,

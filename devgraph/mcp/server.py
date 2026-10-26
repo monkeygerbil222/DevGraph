@@ -861,7 +861,10 @@ def build_server(
         so risk_level, from the direct dependents, leaves them out. A class is traced with
         the methods it contains: the callers of its methods, its subclasses (EXTENDS,
         which records extends, implements and trait impls) and their subclasses count,
-        and a direct dependent reached through a method names it in via ("Cart.total")."""
+        and a direct dependent reached through a method names it in via ("Cart.total").
+        For a class, a dependent reached only by by-name calls (a value nothing types) is
+        marked name_only and counted in name_only_dependents, and risk_level counts the
+        others; a by-name call of a dunder or library-like method is not counted."""
         return devgraph_tools.impact_analysis(
             engine, repo_id, component_name, cross_repo, max_results, file, declared(repo_id, cross_repo), owner,
             include_tests,
