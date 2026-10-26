@@ -616,6 +616,15 @@ def _try_accepted() -> None:
         progress.accepted = True
 
 
+def _answered() -> None:
+    """Neo4j answered the current try (accepted its transaction, or sent a
+    row): its deadline counts from now, so a read only ever waits that long
+    in silence."""
+    progress = getattr(_read_progress, "current", None)
+    if progress is not None:
+        progress.started, progress.accepted = time.monotonic(), True
+
+
 def _within(deadline_s: float, fn: Callable[[], Any]) -> Any:
     """`fn()`, run in a daemon thread, given up once its current try (see
     `_ReadProgress`) has taken `deadline_s`: `QueryNotAnswered` when Neo4j had
@@ -646,6 +655,17 @@ def _within(deadline_s: float, fn: Callable[[], Any]) -> Any:
     if "error" in outcome:
         raise outcome["error"]
     return outcome["value"]
+
+
+#: Neo4j's time limit on reading a repository's stored insight summary (one
+#: node); the client gives up on a try `READ_DEADLINE_MARGIN_S` past it.
+INSIGHT_SUMMARY_TIMEOUT_S = 30.0
+
+#: How long one try of `GraphEngine.load_insight_graph` may go without an
+#: answer (the transaction accepted, or a row) before it is given up. The load
+#: has no limit of its own: it is legitimately long on a large graph, and runs
+#: as long as rows keep coming.
+INSIGHT_LOAD_QUIET_S = 60.0
 
 
 #: A pooled connection idle at least this long is checked (a RESET) before use,
@@ -3106,18 +3126,27 @@ class GraphEngine:
         IMPORTS edges of confidence "package", in any language.
 
         Identity is `elementId`, which is only promised stable within a
-        transaction; it is used for the `write_insights` that immediately
-        follows, and a node deleted in between is simply not matched there.
+        transaction; both are read in one, and it is used for the
+        `write_insights` that immediately follows, where a node deleted in
+        between is simply not matched.
+
+        Each try is given up after `INSIGHT_LOAD_QUIET_S` without an answer
+        (see `_bounded_read`), however long the rows keep coming.
         """
-        with self._driver.session() as session:
-            edge_result = _run_records(
-                session, _LOAD_INSIGHT_EDGES_CYPHER, repo_id=repo_id, types=list(relationship_types)
-            )
-            edges = [record.data() for record in edge_result or []]
+
+        def work(tx):
+            edges = []
+            for record in tx.run(_LOAD_INSIGHT_EDGES_CYPHER, repo_id=repo_id, types=list(relationship_types)):
+                _answered()
+                edges.append(record.data())
             ids = sorted({e["source"] for e in edges} | {e["target"] for e in edges})
-            node_result = _run_records(session, _LOAD_INSIGHT_NODES_CYPHER, repo_id=repo_id, ids=ids)
-            nodes = [record.data() for record in node_result or []]
-        return nodes, edges
+            nodes = []
+            for record in tx.run(_LOAD_INSIGHT_NODES_CYPHER, repo_id=repo_id, ids=ids):
+                _answered()
+                nodes.append(record.data())
+            return nodes, edges
+
+        return self._bounded_read(work, INSIGHT_LOAD_QUIET_S)
 
     def write_insights(self, repo_id: str, rows: list[dict[str, Any]], summary: dict[str, Any]) -> None:
         """Replace a repository's insight properties (see `_write_insights_tx`)."""
@@ -3125,11 +3154,39 @@ class GraphEngine:
             session.execute_write(_write_insights_tx, repo_id, rows, summary)
 
     def read_insights_summary(self, repo_id: str) -> dict[str, Any] | None:
-        """The Repository node's insight summary, or None if never computed."""
-        with self._driver.session() as session:
-            result = _run_records(session, _READ_INSIGHTS_SUMMARY_CYPHER, repo_id=repo_id)
-            records = [record.data() for record in result or []]
+        """The Repository node's insight summary, or None if never computed.
+        Neo4j's limit is `INSIGHT_SUMMARY_TIMEOUT_S`; a try is given up
+        `READ_DEADLINE_MARGIN_S` past it (see `_bounded_read`)."""
+
+        def work(tx):
+            return [record.data() for record in tx.run(_READ_INSIGHTS_SUMMARY_CYPHER, repo_id=repo_id)]
+
+        records = self._bounded_read(
+            work, INSIGHT_SUMMARY_TIMEOUT_S + READ_DEADLINE_MARGIN_S, timeout_s=INSIGHT_SUMMARY_TIMEOUT_S
+        )
         return records[0] if records else None
+
+    def _bounded_read(self, work: Callable[[Any], Any], deadline_s: float, timeout_s: float | None = None) -> Any:
+        """`work` run as a read transaction (Neo4j's limit `timeout_s`, if
+        given) under `_within`, on any engine: a try with no answer for
+        `deadline_s` is given up, as `QueryNotAnswered` once Neo4j accepted
+        its transaction (slow, not gone), else as `Neo4jNotAnswering`. The
+        agent's engine retries as the driver does; a fail-fast one does not."""
+
+        @unit_of_work(timeout=timeout_s)
+        def tried(tx):
+            _answered()  # the driver runs this once Neo4j answered the BEGIN
+            try:
+                return work(tx)
+            except BaseException:
+                _new_try()  # the driver's retry, if any, is not accepted yet
+                raise
+
+        def read():
+            with self._driver.session(default_access_mode=READ_ACCESS) as session:
+                return session.execute_read(tried)
+
+        return _within(deadline_s, read)
 
     def run_cypher(self, query: str, parameters: dict[str, Any] | None = None) -> list[dict]:
         """Advanced escape hatch. Callers must gate this behind explicit config
