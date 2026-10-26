@@ -553,8 +553,9 @@ Renderer-independent fixes from step 0, each with a regression test:
 - The `shadow-*` styles and the "Node/edge shadows" switch are gone; so is
   the node-glow overlay canvas and its "Node glow" switch: it was drawn every
   frame behind `#cy`, whose background is opaque, so its halos were never
-  visible. For the same reason the dot grid that followed the camera is no
-  longer moved every frame. The compact payload (item 5) was not done.
+  visible. The same holds for the dot grid on the graph stage, so it is no
+  longer moved with the camera every frame (it stays as invisible as it
+  always was). The compact payload (item 5) was not done.
 
 Things found while porting:
 
@@ -562,34 +563,49 @@ Things found while porting:
   detailed path in the program needs (16 curved, 32 for self-loops by
   default), for every edge: django's default view panned at about 40 frames
   per second with the defaults and at 60 with 8 segments each.
-- sigma's own node drag re-processes every node on each move (about 28 FPS
-  at 8k nodes); the adapter drags with a partial redraw of the dragged node
-  and its edges and refreshes once when it is let go (about 50 FPS).
-- The ambient rotation turns sigma's camera instead of rewriting node
-  positions; labels stay upright, and the layout cache never stores rotated
-  positions.
+- sigma reindexes the whole canvas on every element added or removed:
+  growing a 2,000-node canvas into a 10,000-node one froze the page for
+  121 s (the Cytoscape page took about 13 s). The diff merge now changes the
+  graph with sigma detached (`graphView.batch`) and redraws once: 1.9 s to
+  grow, 1.4 s to shrink back, no task over about a second.
+- Nodes can't be dragged, as under Cytoscape (`autoungrabify`): pressing on
+  a node pans the view and saves no layout. (sigma's own node drag also
+  re-processed every node on each move.)
+- Without WebGL 2 sigma can't start; the page then uses a stand-in canvas
+  that holds nothing, so the repository list, console and panels still
+  work, and the canvas area says the graph view needs WebGL 2.
+- The ambient rotation turns sigma's camera about the rotation pivot (the
+  camera is shifted to keep the pivot in place, also after a pan) instead of
+  rewriting node positions; labels stay upright, and the layout cache never
+  stores rotated positions.
 - The Hierarchical, Radial and Grid layouts were Cytoscape's; the page now
   computes them itself (`presetLayout`).
 - Look: colours, sizes, the repository's rounded hexagon (a custom sigma node
   shape) and the service diamond, hollow dimmed excluded nodes, curved
   source-to-target gradient edges with arrows, labels only on hover or
-  search, all kept. Differences: excluded edges are solid grey rather than
-  dashed, labels are a fixed 12 px rather than scaling with zoom, and the
-  layout is mirrored vertically on screen relative to Cytoscape's (sigma's y
-  axis points up; the stored coordinates are unchanged).
+  search, the dark hairline round every node, all kept. Differences:
+  excluded edges are solid grey rather than dashed, and labels are a fixed
+  12 px rather than scaling with zoom. The picture's orientation is
+  Cytoscape's: sigma's y axis points up, and the adapter flips y, so stored
+  coordinates and the screen agree as before.
 
 The benchmark harness now drives the real page through `graphView` (it still
-drives the pre-rework page through `cy`), measures node drag on the real page,
-and drags along a circle that starts at the grab point (sigma only starts a
-drag after a few small moves, so jumping 120 px on the first move measured
-the grab offset rather than the drag).
+drives the pre-rework page through `cy`). Its "node drag" case presses on a
+node and moves along a circle that starts at the grab point; on the real page
+that pans the view, since nodes don't drag. `bench/graph-render/e2e.mjs` adds
+real-browser checks that read the screen: hovering a node brightens and names
+it, the page works with WebGL off, growing 2k nodes into 10k doesn't freeze
+it, pressing on a node pans, the rotation keeps its pivot, nodes carry their
+hairline. Its screen reads use full-page screenshots: a clipped screenshot in
+headless Chrome can return an older frame of the WebGL canvas, which is what
+once made a hover look like it drew nothing.
 
 Before and after, the real page with the browser's normal frame-rate limit,
 same machine (Intel HD Graphics 5500, load average under 2), one fresh
 browser per run. "First frame" is from navigation; "settled" is from data
 arrival to the layout's stop; FPS figures are frames per second.
 
-| Dataset | Page | First frame (s) | Layout settled (s) | FPS while settling | Pan FPS (drag) | Zoom FPS | Node drag FPS | JS heap (MB) |
+| Dataset | Page | First frame (s) | Layout settled (s) | FPS while settling | Pan FPS (drag) | Zoom FPS | Node drag FPS* | JS heap (MB) |
 |---|---|---:|---:|---:|---:|---:|---:|---:|
 | Synthetic 2k (2,000 / 4,683) | before (Cytoscape) | 4.8 | 63 | 1.0 | 9.9 | 2.0 | — (off) | 34 |
 | Synthetic 2k (2,000 / 4,683) | after (sigma) | 4.9 | 4.3 | 48 | 60 | 59 | 57 | 12 |
@@ -599,14 +615,19 @@ arrival to the layout's stop; FPS figures are frames per second.
 | Synthetic 10k (10,000 / 23,362) | after | 5.5 | 24 | 49 | 47 | 32 | 49 | 46 |
 | Synthetic 50k (50,000 / 116,836) | before (first table above) | 180 | > 240 | 0.0 | 0.0 | — (tab died) | — | 761 |
 | Synthetic 50k (50,000 / 116,836) | after | 12.9 | 149 | 46 | 8.9 | 4.9 | 10 | 210 |
+| django default view (8,204 / 27,975) | after the review fixes | 6.8 | 20 | 49 | 53 | 58 | 49 (pans) | 49 |
+| Synthetic 10k (10,000 / 23,362) | after the review fixes | 5.3 | 24 | 48 | 49 | 35 | 46 (pans) | 46 |
+
+\* The "after" rows above the last two were measured while the page still
+let nodes be dragged; the last two press on a node, which now pans.
 
 With the frame-rate limit off (the first table's setting) the new page drew
 django's default view at 212 FPS panning through the API (62 with the mouse,
 whose events arrive at about that rate), 137 zooming and 64 dragging; the
 10k view at 230, 155 and 58; and the 50k view at 51, 34 and 59.
 
-Targets met at the sizes the canvas shows: at 8-10k nodes, pan, zoom and drag
-are at 32-58 FPS with the frame-rate limit on (at least 30), and the page
+Targets met at the sizes the canvas shows: at 8-10k nodes, pan and zoom (and
+pressing on a node) are at 35-58 FPS with the frame-rate limit on (at least 30), and the page
 stays at about 48 FPS while the layout settles, where it was at 0.1. At 50k
 nodes the GPU, not JavaScript, is the limit (single-digit FPS), as the
 research predicted; the node ceiling and the server's row cap keep the canvas
