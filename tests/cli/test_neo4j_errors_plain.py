@@ -10,11 +10,12 @@ import subprocess
 from unittest.mock import patch
 
 import pytest
-from neo4j.exceptions import AuthError, Neo4jError, ServiceUnavailable
+from neo4j.exceptions import AuthError, IncompleteCommit, Neo4jError, ServiceUnavailable
 from typer.testing import CliRunner
 
 from devgraph.cli import main as cli_main
 from devgraph.config.settings import Settings
+from devgraph.graph.engine import EngineClosed, IndexesNotReady, Neo4jNotAnswering
 from devgraph.registry.store import RepoRegistry
 
 URI = "bolt://127.0.0.1:9"
@@ -86,3 +87,22 @@ def test_a_neo4j_failure_is_one_plain_line(command, error, settings, repo):
     (line,) = [line for line in result.output.splitlines() if "[X]" in line]
     assert phrase in line
     assert "DEVGRAPH_NEO4J" in line
+
+
+@pytest.mark.parametrize("make", [
+    lambda: IndexesNotReady("a graph index was still being built after 300 s"),
+    lambda: EngineClosed("the graph engine is closed"),
+    lambda: IncompleteCommit("the commit's outcome is unknown"),
+], ids=["IndexesNotReady", "EngineClosed", "IncompleteCommit"])
+def test_service_unavailable_subclasses_that_are_not_neo4j_down_keep_their_own_message(make, settings, repo):
+    exc = make()
+    assert "nothing answers" not in cli_main._neo4j_problem(exc, settings)
+    with patch.object(cli_main, "GraphEngine", _Failing(exc)):
+        result = CliRunner().invoke(cli_main.app, ["rescan", repo], terminal_width=400)
+    assert result.exit_code == 1
+    (line,) = [line for line in result.output.splitlines() if "[X]" in line]
+    assert "nothing answers" not in line and str(exc) in line
+
+
+def test_a_neo4j_that_does_not_answer_is_still_reported_as_down(settings):
+    assert "nothing answers" in cli_main._neo4j_problem(Neo4jNotAnswering("no answer within 5 s"), settings)

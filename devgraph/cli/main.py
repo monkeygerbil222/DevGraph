@@ -83,9 +83,10 @@ def _is_login_refusal(exc: Exception) -> bool:
 
 def _neo4j_problem(exc: Exception, settings) -> str:
     """One line for a failed Neo4j call, naming the setting to check and the file it lives in."""
-    from neo4j.exceptions import AuthError, ServiceUnavailable
+    from neo4j.exceptions import AuthError, IncompleteCommit, ServiceUnavailable
 
     from devgraph.config.settings import devgraph_home
+    from devgraph.graph.engine import EngineClosed, IndexesNotReady
 
     env_file = devgraph_home() / ".env"
     if isinstance(exc, AuthError):
@@ -100,7 +101,9 @@ def _neo4j_problem(exc: Exception, settings) -> str:
             f"Neo4j at {settings.neo4j_uri} refused the login ({reason}); check "
             f"DEVGRAPH_NEO4J_USER and DEVGRAPH_NEO4J_PASSWORD in {env_file} (or the environment)"
         )
-    if isinstance(exc, ServiceUnavailable):
+    # A closing engine, an index still being built, or a commit whose outcome
+    # is unknown are ServiceUnavailable too, but Neo4j answered: say what happened.
+    if isinstance(exc, ServiceUnavailable) and not isinstance(exc, (EngineClosed, IndexesNotReady, IncompleteCommit)):
         return (
             f"nothing answers at {settings.neo4j_uri}; start Neo4j, or set DEVGRAPH_NEO4J_URI in {env_file} "
             "(or the environment)"
