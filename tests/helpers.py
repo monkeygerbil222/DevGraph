@@ -41,10 +41,17 @@ def _call_text(args, kwargs) -> str:
 
 class BatchMarkers:
     """The Repository node's `batch_open` markers (dispatch
-    `_marks_open_batch`) for a fake engine: kept in `batch_open`."""
+    `_marks_open_batch`) for a fake engine: kept in `batch_open`, written at
+    once rather than with the next write."""
 
     def open_batch(self, repo_id, token):
         self.__dict__.setdefault("batch_open", []).append(token)
+
+    def finish_batch(self, repo_id, token):
+        self.close_batch(repo_id, [token])
+
+    def forget_batch(self, token):
+        pass
 
     def close_batch(self, repo_id, tokens):
         self.batch_open = [t for t in self.__dict__.get("batch_open", []) if t not in tokens]

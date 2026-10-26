@@ -149,35 +149,39 @@ CONNECTION_LOST = (ServiceUnavailable, SessionExpired)
 #: file's write or in any pass after the files.
 ABORTS_BATCH = (*ABORTS_BATCH, BatchAborted, *CONNECTION_LOST)
 
-#: This process's batches running now, by their `batch_open` marker.
-_running_batches: set[str] = set()
+#: This process's batches that failed since its last full scan of their
+#: repository, by their `batch_open` marker.
+_failed_batches: set[str] = set()
 _batch_serial = itertools.count(1)
 
 
 def _marks_open_batch(fn):
     """Run `fn`, a batch that writes, under a `batch_open` marker on the
-    repository's Repository node: added before the batch's first write and
-    removed once it has finished. A batch cut short (Neo4j lost after its
-    files' nodes were written but before other files' edges to them were
-    relinked, a shutdown, the process killed) leaves its marker, and the
-    next `catch_up` rescans the repository in full (`_unfinished_batches`):
-    a retry could only diff against nodes the cut-short batch had already
-    written, find nothing added, and leave those edges out. The marker is
-    in the graph, so it outlives the process."""
+    repository's Repository node: added by the batch's first write
+    transaction and removed by the engine's next write after the batch
+    finished (`GraphEngine.open_batch`, `finish_batch`: no round trip of its
+    own). A batch cut short (Neo4j lost after its files' nodes were written
+    but before other files' edges to them were relinked, a shutdown, the
+    process killed) leaves its marker, and the next `catch_up` rescans the
+    repository in full (`_unfinished_batches`): a retry could only diff
+    against nodes the cut-short batch had already written, find nothing
+    added, and leave those edges out. The marker is in the graph, so it
+    outlives the process."""
 
     @wraps(fn)
     def wrapper(engine, repo_id, *args, **kwargs):
         token = f"{_SCAN_OWNER}#{next(_batch_serial)}"
         engine.open_batch(repo_id, token)
-        _running_batches.add(token)
         try:
             result = fn(engine, repo_id, *args, **kwargs)
         except RepoRootUnavailable:
-            engine.close_batch(repo_id, [token])  # refused before any change
+            engine.finish_batch(repo_id, token)  # refused before any change
             raise
-        finally:
-            _running_batches.discard(token)
-        engine.close_batch(repo_id, [token])
+        except BaseException:
+            engine.forget_batch(token)  # a marker no write added yet is not needed
+            _failed_batches.add(token)
+            raise
+        engine.finish_batch(repo_id, token)
         return result
 
     return wrapper
@@ -185,15 +189,17 @@ def _marks_open_batch(fn):
 
 def _unfinished_batches(engine: GraphEngine, repo_id: str) -> list[str]:
     """The repository's `batch_open` markers whose batch ended without
-    finishing: this process's not running now, or a process of this host
-    that has ended (a marker of the same pid but another process is an
-    earlier process's). Another host's are never taken for ended: nothing
-    here can tell whether that batch still runs."""
+    finishing: this process's that failed, or a process of this host that
+    has ended (a marker of the same pid but another process is an
+    earlier process's). A process that ended without closing its engine
+    (killed) may leave a finished batch's marker, still waiting for a write
+    to remove it: that costs one full rescan. Another host's are never
+    taken for ended: nothing here can tell whether that batch still runs."""
     unfinished = []
     for token in engine.open_batches(repo_id):
         holder = token.rsplit("#", 1)[0]
         if holder == _SCAN_OWNER:
-            ended = token not in _running_batches
+            ended = token in _failed_batches
         else:
             parts = _SCAN_OWNER_PARTS.match(holder)
             same_pid = parts is not None and parts.group(2) == socket.gethostname() and \
@@ -3193,8 +3199,9 @@ def full_scan(
         engine.set_scan_options(repo_id, docs_path or "", mentions_enabled)
         unfinished = _unfinished_batches(engine, repo_id)  # its own batches are finished by now
         engine.set_index_format(repo_id, INDEX_FORMAT)
-        if unfinished:
-            engine.close_batch(repo_id, unfinished)
+        # One write per scan, which also carries its own batch's pending removal.
+        engine.close_batch(repo_id, unfinished)
+        _failed_batches.difference_update(unfinished)
         return indexed
     finally:
         _release_full_scan_lock(repo_id, engine)

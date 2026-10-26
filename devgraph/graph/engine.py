@@ -631,12 +631,86 @@ def _wait_for_indexes(fn, *args, **kwargs):
             time.sleep(_INDEX_POLL_S)
 
 
+_BATCH_MARKER_STATEMENT = (
+    "UNWIND $rows AS row MATCH (r:Repository {repo_id: row.repo_id}) "
+    "SET r.batch_open = [t IN coalesce(r.batch_open, []) WHERE NOT t IN row.add AND NOT t IN row.remove] "
+    "+ [t IN row.add WHERE NOT t IN row.remove]"
+)
+
+
+class _BatchMarkers:
+    """The `batch_open` marker changes waiting to ride on the engine's next
+    write transaction (dispatch `_marks_open_batch`): a batch's marker is
+    added by its first write, and removed by the next write after it
+    finished, so a save costs no round trip of its own. The statement runs
+    first in that transaction, unconsumed, so the driver sends it with the
+    transaction's own first query (Bolt 4+ pipelines them)."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._adds: dict[str, str] = {}  # token -> repo_id
+        self._removes: dict[str, str] = {}
+        self._in_flight: dict[str, int] = {}  # tokens being added by a running transaction
+
+    def open(self, repo_id: str, token: str) -> None:
+        with self._lock:
+            self._adds[token] = repo_id
+
+    def close(self, repo_id: str, token: str) -> None:
+        """The batch finished: its marker goes, unless no write ever added it."""
+        with self._lock:
+            if token in self._adds and not self._in_flight.get(token):
+                del self._adds[token]  # never written
+            else:
+                self._adds.pop(token, None)
+                self._removes[token] = repo_id
+
+    def forget(self, token: str) -> None:
+        """The batch failed: a marker no write added yet is never written."""
+        with self._lock:
+            if not self._in_flight.get(token):
+                self._adds.pop(token, None)
+
+    def pending(self) -> bool:
+        with self._lock:
+            return bool(self._adds or self._removes)
+
+    def take(self) -> tuple[list[dict], dict[str, str], dict[str, str]]:
+        """The statement's rows, and the adds and removes they apply."""
+        with self._lock:
+            adds, removes = dict(self._adds), dict(self._removes)
+            for token in adds:
+                self._in_flight[token] = self._in_flight.get(token, 0) + 1
+        rows: dict[str, dict] = {}
+        for token, repo_id in adds.items():
+            rows.setdefault(repo_id, {"repo_id": repo_id, "add": [], "remove": []})["add"].append(token)
+        for token, repo_id in removes.items():
+            rows.setdefault(repo_id, {"repo_id": repo_id, "add": [], "remove": []})["remove"].append(token)
+        return list(rows.values()), adds, removes
+
+    def settle(self, adds: dict[str, str], removes: dict[str, str], applied: bool) -> None:
+        """After the transaction: what it applied is no longer pending."""
+        with self._lock:
+            for token in adds:
+                self._in_flight[token] -= 1
+                if not self._in_flight[token]:
+                    del self._in_flight[token]
+                if applied:
+                    self._adds.pop(token, None)
+            if applied:
+                for token in removes:
+                    self._removes.pop(token, None)
+
+
 class _IndexWaitingSession:
     """A session whose queries wait for an index still being built (see
-    `_wait_for_indexes`); everything else is the driver's session."""
+    `_wait_for_indexes`), and whose write transactions carry the pending
+    `batch_open` marker changes (`_BatchMarkers`); everything else is the
+    driver's session."""
 
-    def __init__(self, session) -> None:
+    def __init__(self, session, markers: _BatchMarkers | None = None) -> None:
         self._session = session
+        self._markers = markers
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._session, name)
@@ -644,8 +718,22 @@ class _IndexWaitingSession:
     def run(self, *args: Any, **kwargs: Any):
         return _wait_for_indexes(self._session.run, *args, **kwargs)
 
-    def execute_write(self, *args: Any, **kwargs: Any):
-        return _wait_for_indexes(self._session.execute_write, *args, **kwargs)
+    def execute_write(self, fn, *args: Any, **kwargs: Any):
+        rows, adds, removes = self._markers.take() if self._markers is not None else ([], {}, {})
+        if not rows:
+            return _wait_for_indexes(self._session.execute_write, fn, *args, **kwargs)
+
+        def with_markers(tx, *a: Any, **k: Any):
+            tx.run(_BATCH_MARKER_STATEMENT, rows=rows)  # pipelined with fn's first query, consumed at commit
+            return fn(tx, *a, **k)
+
+        applied = False
+        try:
+            result = _wait_for_indexes(self._session.execute_write, with_markers, *args, **kwargs)
+            applied = True
+            return result
+        finally:
+            self._markers.settle(adds, removes, applied)
 
     def execute_read(self, *args: Any, **kwargs: Any):
         return _wait_for_indexes(self._session.execute_read, *args, **kwargs)
@@ -664,6 +752,7 @@ class _GatedDriver:
 
     def __init__(self, driver: Driver) -> None:
         self._driver = driver
+        self.markers = _BatchMarkers()
         self._cond = threading.Condition()
         self._active = 0
         self._closing = False
@@ -684,7 +773,7 @@ class _GatedDriver:
         self._enter()
         try:
             with self._driver.session(**kwargs) as session:
-                yield _IndexWaitingSession(session)
+                yield _IndexWaitingSession(session, self.markers)
         finally:
             self._exit()
 
@@ -1480,8 +1569,15 @@ class GraphEngine:
     def close(self, timeout: float = CLOSE_WAIT_S) -> None:
         """Release the full-scan claims still held, then refuse new sessions,
         wait up to `timeout` for open ones, and close the driver (see
-        `_GatedDriver`). Safe to call again after a timeout."""
+        `_GatedDriver`). Safe to call again after a timeout. Marker changes
+        still waiting for a write (`_BatchMarkers`) are written first."""
         self._release_held_scan_claims()
+        if self._driver.markers.pending():
+            try:
+                with self._driver.session() as session:
+                    session.execute_write(lambda tx: None)  # carries the pending markers
+            except Exception:
+                logger.debug("could not write the pending batch markers while closing", exc_info=True)
         self._driver.close(timeout)
 
     def verify_connectivity(self) -> None:
@@ -1850,25 +1946,26 @@ class GraphEngine:
             )
 
     def open_batch(self, repo_id: str, token: str) -> None:
-        """Add `token` to the repository's `batch_open` markers before a batch
-        writes (see dispatch `_marks_open_batch`); a repository with no
-        Repository node gets none."""
-        with self._driver.session() as session:
-            _run(
-                session,
-                "MATCH (r:Repository {repo_id: $repo_id}) WHERE NOT $token IN coalesce(r.batch_open, []) "
-                "SET r.batch_open = coalesce(r.batch_open, []) + $token",
-                repo_id=repo_id, token=token,
-            )
+        """Add `token` to the repository's `batch_open` markers with the
+        batch's first write transaction (`_BatchMarkers`; dispatch
+        `_marks_open_batch`); a repository with no Repository node gets none."""
+        self._driver.markers.open(repo_id, token)
+
+    def finish_batch(self, repo_id: str, token: str) -> None:
+        """The batch of `token` finished: its marker goes with the next write
+        transaction (or `close`), and none is written if no write added it."""
+        self._driver.markers.close(repo_id, token)
+
+    def forget_batch(self, token: str) -> None:
+        """The batch of `token` failed: a marker not yet written never is."""
+        self._driver.markers.forget(token)
 
     def close_batch(self, repo_id: str, tokens: list[str]) -> None:
-        """Remove `tokens` from the repository's `batch_open` markers."""
+        """Remove `tokens` from the repository's `batch_open` markers now,
+        with any marker changes still pending."""
         with self._driver.session() as session:
-            _run(
-                session,
-                "MATCH (r:Repository {repo_id: $repo_id}) WHERE r.batch_open IS NOT NULL "
-                "SET r.batch_open = [t IN r.batch_open WHERE NOT t IN $tokens]",
-                repo_id=repo_id, tokens=tokens,
+            session.execute_write(
+                lambda tx: tx.run(_BATCH_MARKER_STATEMENT, rows=[{"repo_id": repo_id, "add": [], "remove": tokens}]).consume()
             )
 
     def open_batches(self, repo_id: str) -> list[str]:
