@@ -921,7 +921,9 @@ def test_report_never_echoes_an_unprintable_path(tmp_path):
     details = [line["detail"] for line in lines]
     assert all(detail.isprintable() for detail in details)
     assert "Runbook: runbooks/a\\x1b[31m.md: missing required 'owner'" in details
-    assert "Runbook: runbooks/\\udcff.md: missing required 'owner'" in details
+    # A name that isn't valid UTF-8 is never indexed (audit 11 item 2;
+    # `add`/`rescan` list it), so the report leaves it out too.
+    assert not any("udcff" in detail or "xff" in detail for detail in details)
 
 
 def test_report_is_empty_without_docs_sources(tmp_path):
