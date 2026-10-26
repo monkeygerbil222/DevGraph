@@ -127,6 +127,31 @@ const checks = {
     check("no page errors", !errors.length, errors.join(" | "));
     await browser.close();
   },
+  /* Nodes can't be dragged (as under Cytoscape, autoungrabify): pressing on
+     one and moving pans the camera, moves no node and saves no layout. */
+  async press() {
+    const { browser, page, errors, requests } = await open("synth2k");
+    await settled(page); await sleep(3000);
+    const n = await loneNode(page);
+    const before = await page.evaluate(() => { const o = {}; graphView.forEachPosition((id, x, y) => { o[id] = [x, y]; }); return o; });
+    for (const d of [4, 2, 0]) { await page.mouse.move(n.x + d, n.y + d); await sleep(150); }
+    const puts0 = requests.filter(r => r.startsWith("PUT") && r.includes("/layout")).length;
+    await page.mouse.down();
+    await page.mouse.move(n.x + 120, n.y + 60, { steps: 12 });
+    await page.mouse.up();
+    await sleep(2500); // past the layout save's debounce
+    const moved = await page.evaluate(before => { let k = 0; graphView.forEachPosition((id, x, y) => { const b = before[id]; if (Math.hypot(b[0] - x, b[1] - y) > 0.5) k++; }); return k; }, before);
+    const p = await page.evaluate(id => graphView.toScreen(graphView.position(id)), n.id);
+    const puts = requests.filter(r => r.startsWith("PUT") && r.includes("/layout")).length - puts0;
+    check("pressing on a node and moving moves no node", moved === 0, moved);
+    // with the pointer, plus sigma's pan inertia after the release
+    const dx = p.x - n.x, dy = p.y - n.y;
+    check("...it pans the camera with the pointer", Math.hypot(dx, dy) > 120 && (dx * 120 + dy * 60) / (Math.hypot(dx, dy) * Math.hypot(120, 60)) > 0.98,
+      JSON.stringify({ from: n, to: p }));
+    check("...and saves no layout", puts === 0, puts);
+    check("no page errors", !errors.length, errors.join(" | "));
+    await browser.close();
+  },
 };
 
 const wanted = process.argv.slice(2).length ? process.argv.slice(2) : Object.keys(checks);

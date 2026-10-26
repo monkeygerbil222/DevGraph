@@ -1360,7 +1360,9 @@ vec4 layer_dgnode(vec4 fillColor, float fillAlpha, vec4 ringColor, float ringWid
       autoRescale: false, // model coordinates are the camera's: fitting is the page's own (fitToCircle)
       itemSizesReference: "positions", zoomToSizeRatioFunction: r => r, // sizes scale with zoom
       minCameraRatio: 1 / 3, maxCameraRatio: 5, // zoom 0.2 to 3
-      enableEdgeEvents: true, enableNodeDrag: false, enableCameraMouseRotation: false, // node drag: below
+      /* dragging nodes is off entirely, as it was under Cytoscape
+         (autoungrabify): pressing on a node pans like the background */
+      enableEdgeEvents: true, enableNodeDrag: false, enableCameraMouseRotation: false,
       doubleClickZoomingRatio: 1, minEdgeThickness: 0.6, stagePadding: 0,
       labelRenderedSizeThreshold: 0, labelDensity: 1,
     },
@@ -1422,32 +1424,6 @@ vec4 layer_dgnode(vec4 fillColor, float fillAlpha, vec4 ringColor, float ringWid
   const camera = renderer.getCamera();
   // scroll-to-zoom stays off deliberately -- the +/- controls zoom instead
   renderer.getMouseCaptor().on("wheel", e => e.preventSigmaDefault());
-  /* Node drag is done here rather than by sigma's own (enableNodeDrag), which
-     re-processes every node on each move of the dragged one: that held
-     django's default view to under 30 frames per second. This redraws only
-     the dragged node and its edges while it moves, and refreshes everything
-     once when it is let go. */
-  let dragged = null, dragMoved = false;
-  const dragEndCallbacks = [];
-  renderer.on("downNode", e => { dragged = e.node; dragMoved = false; e.preventSigmaDefault(); });
-  renderer.on("moveBody", e => {
-    if (!dragged) return;
-    const p = renderer.viewportToGraph(e.event);
-    const a = graph.getNodeAttributes(dragged);
-    a.x = p.x; a.y = p.y; // in place, without a graph event: the partial refresh below is the redraw
-    dragMoved = true;
-    renderer.refresh({ partialGraph: { nodes: [dragged], edges: graph.edges(dragged) }, skipIndexation: true, schedule: true });
-    e.preventSigmaDefault(); // the camera stays put
-    e.event.original.preventDefault();
-  });
-  const endDrag = () => {
-    const id = dragged, moved = dragMoved;
-    dragged = null; dragMoved = false;
-    if (id && moved) { renderer.refresh(); dragEndCallbacks.forEach(fn => fn(id)); }
-  };
-  renderer.on("upNode", endDrag);
-  renderer.on("upStage", endDrag);
-  window.addEventListener("pointerup", endDrag); // let go outside the canvas
   const toScreen = (x, y) => renderer.graphToViewport({ x, y: -y });
   const view = {
     renderer, graph, camera,
@@ -1538,7 +1514,6 @@ vec4 layer_dgnode(vec4 fillColor, float fillAlpha, vec4 ringColor, float ringWid
     setAngle(angle) { camera.setState({ angle }); },
     on(event, fn) { renderer.on(event, fn); },
     onCamera(fn) { camera.on("updated", fn); },
-    onNodeDragEnd(fn) { dragEndCallbacks.push(fn); },
     restyle() { renderer.refresh(); },
     resize() { renderer.resize(); },
   };
@@ -1560,7 +1535,7 @@ function createNullGraphView() {
     size: () => ({ width: 0, height: 0 }), zoom: () => 1, pan: () => ({ x: 0, y: 0 }),
     toScreen: () => ({ x: 0, y: 0 }), toModel: () => ({ x: 0, y: 0 }),
     extent: () => ({ x1: 0, x2: 0, y1: 0, y2: 0, w: 0, h: 0 }),
-    setView: none, angle: () => 0, setAngle: none, on: none, onCamera: none, onNodeDragEnd: none,
+    setView: none, angle: () => 0, setAngle: none, on: none, onCamera: none,
     restyle: none, resize: none,
   };
 }
@@ -1626,9 +1601,6 @@ function onNodeLeave(id) {
 }
 graphView.on("enterNode", e => onNodeEnter(e.node));
 graphView.on("leaveNode", e => onNodeLeave(e.node));
-/* A node the user moved stays where they put it: the layout is saved as
-   after a settle. */
-graphView.onNodeDragEnd(() => saveCachedLayout());
 
 /* ── node/relationship inspector: tap an element for its real properties ──
    Canvas elements only carry a curated {id, label, cat} — enough for the graph
