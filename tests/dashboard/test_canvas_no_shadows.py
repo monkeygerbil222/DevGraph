@@ -26,3 +26,14 @@ def test_there_is_no_shadow_switch():
     assert "ctlShadowsEnabled" not in html
     assert "shadowsEnabled" not in html
     assert "Node/edge shadows" not in html
+
+
+def test_there_is_no_hidden_glow_overlay():
+    """The node-glow overlay canvas sat behind #cy, whose background is
+    opaque, so its halos were never visible while every frame paid to draw
+    them; it and its "Node glow" switch are gone. A query match still glows
+    in through the edges' opacity."""
+    html = _html()
+    assert 'id="glowCanvas"' not in html
+    assert "ctlGlowEnabled" not in html and "Node glow" not in html
+    assert "function animateGlowTo(" in html
