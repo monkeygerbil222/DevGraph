@@ -1007,7 +1007,6 @@ def _index_paths(
     # already let through (a .gitignore change is followed by a catch-up,
     # whose prune handles them).
     supplied: dict[str, list[str]] = {}
-    accepted: set[Path] = set()
     for path in paths:
         try:
             resolved = Path(path).resolve()
@@ -1024,10 +1023,8 @@ def _index_paths(
             if skipped is not None:
                 skipped[shown] = UNENCODABLE_NAME
             continue
-        accepted.add(path)
         by_rel_path[rel] = resolved
         supplied.setdefault(rel, []).append(own)
-    paths = accepted
 
     max_bytes = _max_file_bytes()
     mounts = _Mounts(engine, repo_id)
