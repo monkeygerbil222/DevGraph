@@ -300,13 +300,28 @@ def _located(row: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in row.items() if v is not None or k not in ("owner", "start_line")}
 
 
-def _dependent(row: dict[str, Any]) -> dict[str, Any]:
+#: Most members a dependent's or caller's `via` names; past it the row adds `via_count`.
+_VIA_MAX = 5
+
+
+def _capped_via(row: dict[str, Any]) -> dict[str, Any]:
+    """`row` with its `via` cut to the first `_VIA_MAX`, and `via_count`
+    (how many there are) when that cut any."""
+    via = row.get("via", [])
+    if len(via) <= _VIA_MAX:
+        return row
+    return {**row, "via": via[:_VIA_MAX], "via_count": len(via)}
+
+
+def _dependent(row: dict[str, Any], cap: bool = True) -> dict[str, Any]:
     """An impact dependent row `_located`, its `via` (the target class's
     members it depends on, `_impact_expansion`) sorted and distinct, or
-    left out when there are none, and `name_only` kept only when true."""
+    left out when there are none, capped unless not `cap` (`_capped_via`),
+    and `name_only` kept only when true."""
     via = sorted(set(row.pop("via", None) or []))
     name_only = row.pop("name_only", False)
-    return {**_located(row), **({"via": via} if via else {}), **({"name_only": True} if name_only else {})}
+    found = {**_located(row), **({"via": via} if via else {}), **({"name_only": True} if name_only else {})}
+    return _capped_via(found) if cap else found
 
 
 @contextmanager
@@ -2386,7 +2401,7 @@ def impact_analysis(
             for d in row[key]:
                 if key == "transitive_dependents" and d["id"] in direct_ids:
                     continue
-                located = _dependent({k: v for k, v in d.items() if k != "id"})
+                located = _dependent({k: v for k, v in d.items() if k != "id"}, cap=False)
                 entry = dependents.setdefault(d["id"], {"key": key, "row": located, "files": []})
                 entry["files"].append(row["target_file"])
                 if located.get("via"):
@@ -2394,7 +2409,7 @@ def impact_analysis(
                 if not located.get("name_only"):
                     entry["row"].pop("name_only", None)
     lists = {
-        key: [_with_target_files(d["row"], d["files"]) for d in dependents.values() if d["key"] == key]
+        key: [_with_target_files(_capped_via(d["row"]), d["files"]) for d in dependents.values() if d["key"] == key]
         for key in ("direct_dependents", "transitive_dependents")
     }
     answer = {

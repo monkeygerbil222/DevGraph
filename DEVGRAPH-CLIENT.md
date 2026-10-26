@@ -340,7 +340,8 @@ methods, its subclasses (an `EXTENDS` edge, which records extends,
 implements and a Rust trait impl alike) and its `USES`/`DEPENDS_ON`
 dependents; a subclass's subclass and a method caller's callers are
 transitive. A direct dependent reached through a method names it in `via`
-(`["Cart.total"]`). A call on a value nothing types links every member of
+(`["Cart.total"]`; at most five, with `via_count`, how many there are, past
+that). A call on a value nothing types links every member of
 its name, so a dependent reached only by such by-name (`name` confidence)
 calls is marked `name_only: true` and counted in `name_only_dependents`, and
 a class's `risk_level` counts only the others; a by-name call of a dunder
