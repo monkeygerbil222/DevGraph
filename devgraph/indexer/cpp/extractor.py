@@ -29,8 +29,8 @@ class declared here with m, else the include named after the type or its
 namespace (`Inventory` -> `inventory.h`, `net::Connection` -> `net/conn.h`),
 else the type's conventional files (`/inventory.h`, `/inventory.cpp`) and
 every include, each narrowed to the type's own members (common.owned_pin;
-its owner as written, `Outer.Inner`, and under each namespace the file
-opens or uses, since an out-of-class definition outside its namespace's
+its owner as written, `Outer.Inner`, a `using a::T;` or namespace alias
+spelt out, and under each namespace the file opens or uses, since an out-of-class definition outside its namespace's
 block, `void geo::Circle::f()`, is owned by `geo.Circle`) or the members
 a class of their file inherits from another class there (heir keys); any
 other `f()` or `this->m()` -> every include. `std::` and an STL type
@@ -461,17 +461,32 @@ class _CppResolver:
         self.fields: dict[str, dict[str, _CppType | None]] = {}
         self.owners: dict[str, set[str]] = {}
         self.scopes: set[tuple[str, ...]] = set()
+        # `using geo::Circle;`: Circle -> ("geo",); `namespace g = geo;`: g -> ("geo",).
+        self.using_types: dict[str, tuple[str, ...]] = {}
+        self.aliases: dict[str, tuple[str, ...]] = {}
         stack = [root]
         while stack:
             node = stack.pop()
             if node.type == "namespace_definition":
                 name = node.child_by_field_name("name")
                 if name is not None:
-                    self.scopes.add(_enclosing(node, source)[0] + _scope_parts(_text(name, source)))
-            elif node.type == "using_declaration" and any(c.type == "namespace" for c in node.children):
-                target = next(iter(node.named_children), None)  # `using namespace a::b;`
-                if target is not None:
-                    self.scopes.add(_scope_parts(_text(target, source)))
+                    # `namespace geo::render { ... }` opens geo too, as nested blocks would.
+                    chain = _enclosing(node, source)[0] + _scope_parts(_text(name, source))
+                    self.scopes.update(chain[:i] for i in range(1, len(chain) + 1))
+            elif node.type == "using_declaration" and node.parent is not None and \
+                    node.parent.type != "field_declaration_list":  # a class's `using Base::f;` names no type
+                target = next(iter(node.named_children), None)
+                if target is not None and any(c.type == "namespace" for c in node.children):
+                    self.scopes.add(_scope_parts(_text(target, source)))  # `using namespace a::b;`
+                elif target is not None and target.type == "qualified_identifier":
+                    parts = _scope_parts(_text(target, source))
+                    if len(parts) > 1:
+                        self.using_types[parts[-1]] = parts[:-1]
+            elif node.type == "namespace_alias_definition":
+                name = node.child_by_field_name("name")
+                target = next((c for c in node.named_children if c != name), None)
+                if name is not None and target is not None:
+                    self.aliases[_text(name, source)] = _scope_parts(_text(target, source))
             elif node.type == "preproc_include":
                 path = next((c for c in node.named_children if c.type == "string_literal"), None)
                 content = next((c for c in path.named_children if c.type == "string_content"), None) \
@@ -527,10 +542,17 @@ class _CppResolver:
 
     def type_owners(self, typed: _CppType) -> list[str]:
         """The owners (common.member_owner) `typed`'s methods can have: the
-        type as written and each shorter tail of it (`a::Outer::Inner`:
-        `a.Outer.Inner`, `Outer.Inner`, `Inner`), each under every namespace
-        this file opens or uses, and a class of this file's own owner."""
-        written = (*(part for part in typed.qualifier if part), typed.name)
+        type as written (a namespace alias spelt out, and a name a `using
+        a::T;` declares qualified by it) and each shorter tail of it
+        (`a::Outer::Inner`: `a.Outer.Inner`, `Outer.Inner`, `Inner`), each
+        under every namespace this file opens or uses, and a class of this
+        file's own owner."""
+        qualifier = tuple(part for part in typed.qualifier if part)
+        if qualifier and qualifier[0] in self.aliases:
+            qualifier = self.aliases[qualifier[0]] + qualifier[1:]
+        elif not qualifier:
+            qualifier = self.using_types.get(typed.name, ())
+        written = (*qualifier, typed.name)
         found = {".".join(written[i:]) for i in range(len(written))}
         found |= {".".join((*scope, *written)) for scope in self.scopes}
         found |= self.owners.get(typed.name, set())
