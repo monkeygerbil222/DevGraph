@@ -31,6 +31,7 @@ ALLOWED = {
     ("indexer/test_git_compare.py", "symlinks, exec bits and kill_after_timeout are POSIX"): 5,
     # Real file names, modes and change times.
     ("indexer/test_docs_provider.py", "POSIX file names"): 1,
+    ("indexer/test_unencodable_names.py", "Windows names are UTF-16, so no name holds an undecodable byte"): 2,
     ("config/test_edits.py", "POSIX permission bits"): 1,
     ("dashboard/test_db_metrics.py", "chmod cannot make a directory unreadable on Windows"): 1,
     ("dashboard/test_db_metrics.py", "root can read anything"): 1,
