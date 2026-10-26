@@ -100,6 +100,7 @@ from devgraph.indexer.walk import IGNORED_DIR_NAMES as IGNORED_DIR_NAMES
 from devgraph.indexer.walk import GITIGNORED, RepoRootEmpty, RepoRootUnavailable, check_repo_root, content_skip_reason
 from devgraph.indexer.walk import indexable_paths as _indexable_paths
 from devgraph.indexer.walk import forget_manifests, gitignore_hides_files, indexable_paths_under
+from devgraph.indexer.walk import UNENCODABLE_NAME, is_encodable, printable_path
 from devgraph.indexer.walk import is_ignored_dir_name as is_ignored_dir_name
 from devgraph.indexer.walk import is_ignored_path as is_ignored_path
 from devgraph.indexer.walk import is_indexable_file as _is_indexable_file
@@ -434,10 +435,12 @@ def _disk_files(repo_root: Path) -> dict[str, Path]:
 
 def _is_provider_file(repo_root: Path, path: Path) -> bool:
     """A file the filesystem provider represents: what a full scan would index.
-    A .gitignore judges the file by its own path, as the walk and git do."""
+    A .gitignore judges the file by its own path, as the walk and git do; a
+    name that isn't valid UTF-8 is left out, as the walk leaves it out."""
     rel = _repo_relative(repo_root, path)
     return (
-        rel is not None and _is_indexable_file(path) and not is_ignored_path(Path(rel), repo_root)
+        rel is not None and is_encodable(rel) and is_encodable(os.fspath(path))
+        and _is_indexable_file(path) and not is_ignored_path(Path(rel), repo_root)
         and not is_gitignored(repo_root, _own_rel(repo_root, path) or rel)
     )
 
@@ -954,6 +957,7 @@ def _index_paths(
     # already let through (a .gitignore change is followed by a catch-up,
     # whose prune handles them).
     supplied: dict[str, list[str]] = {}
+    accepted: set[Path] = set()
     for path in paths:
         try:
             resolved = Path(path).resolve()
@@ -962,8 +966,18 @@ def _index_paths(
         if not is_within(resolved, root_resolved):
             continue
         rel = resolved.relative_to(root_resolved).as_posix()
+        own = _own_rel(repo_root, Path(path)) or rel
+        if not (is_encodable(rel) and is_encodable(own)):
+            # No query can carry the name: left out, as the walk leaves it out.
+            shown = printable_path(own)
+            logger.warning("%s: skipping %s (%s)", repo_id, shown, UNENCODABLE_NAME)
+            if skipped is not None:
+                skipped[shown] = UNENCODABLE_NAME
+            continue
+        accepted.add(path)
         by_rel_path[rel] = resolved
-        supplied.setdefault(rel, []).append(_own_rel(repo_root, Path(path)) or rel)
+        supplied.setdefault(rel, []).append(own)
+    paths = accepted
 
     max_bytes = _max_file_bytes()
     mounts = _Mounts(engine, repo_id)
@@ -2349,7 +2363,10 @@ def remove_paths(
             unmount can report every file gone); nothing is removed.
     """
     check_repo_root(repo_root)
-    keys = {key for p in paths if (key := _gone_key(repo_root, Path(p))) is not None and key != "."}
+    keys = {
+        key for p in paths
+        if (key := _gone_key(repo_root, Path(p))) is not None and key != "." and is_encodable(key)
+    }
     if not keys:
         return 0
     specs = _applied_provider_specs(engine, repo_id, repo_root)
@@ -3057,9 +3074,13 @@ def full_scan(
         prune_stale_files(engine, repo_id, repo_root, docs_path=docs_path, mentions_enabled=mentions_enabled, force=force)
         engine.set_index_format(repo_id, 0)
         resolver = fingerprints(repo_root)  # before extraction reads the configuration
-        all_files = _indexable_paths(repo_root)
+        unencodable: list[str] = []
+        all_files = _indexable_paths(repo_root, unencodable=unencodable)
         applied, applied_docs = _apply_project_schema(engine, repo_id, repo_root)
         left_out: dict[str, str] = {} if skipped is None else skipped
+        for shown in unencodable:
+            logger.warning("%s: skipping %s (%s)", repo_id, shown, UNENCODABLE_NAME)
+            left_out[shown] = UNENCODABLE_NAME
         engine.update_skipped_files(repo_id, replace=True)  # every file is judged again below
         indexed = index_paths(
             engine, repo_id, repo_root, all_files, docs_path=docs_path, mentions_enabled=mentions_enabled,
