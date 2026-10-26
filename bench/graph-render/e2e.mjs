@@ -80,6 +80,28 @@ const checks = {
     check("no page errors", !errors.length, errors.join(" | "));
     await browser.close();
   },
+  /* Without WebGL 2 the canvas can't be drawn, but the rest of the
+     dashboard (repositories, console, panels) must still work, and the
+     canvas area says why it is empty. */
+  async nowebgl() {
+    const { browser, page, errors } = await open("synth2k", ["--disable-webgl", "--disable-3d-apis"]);
+    await sleep(8000);
+    const r = await page.evaluate(() => {
+      const msg = document.getElementById("graphUnavailable");
+      return {
+        repos: [...document.getElementById("repoSelect").options].map(o => o.value),
+        msg: msg && !msg.hidden ? msg.textContent : null,
+        status: document.getElementById("neo4jStatus")?.textContent,
+        query: document.getElementById("cypherInput").value,
+        settled: (() => { try { return graphSettled; } catch { return "throws"; } })(),
+      };
+    });
+    check("without WebGL the page runs: no uncaught errors", !errors.length, errors.join(" | "));
+    check("...the repository list loads", r.repos.includes("zz-render-synth"), JSON.stringify(r.repos));
+    check("...the canvas query still runs (console and counts)", /MATCH \(n\)/.test(r.query) && /connected/.test(r.status || ""), JSON.stringify(r));
+    check("...and the canvas area says the graph needs WebGL 2", /WebGL 2/.test(r.msg || ""), JSON.stringify(r.msg));
+    await browser.close();
+  },
 };
 
 const wanted = process.argv.slice(2).length ? process.argv.slice(2) : Object.keys(checks);

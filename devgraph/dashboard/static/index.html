@@ -492,6 +492,7 @@ table.dstable input[type="text"] { width: 100%; }
   </div>
   <div id="cy"></div>
   <div id="neo4jDownState" class="neo4j-down" role="alert" hidden></div>
+  <div id="graphUnavailable" class="neo4j-down" style="top:64px" role="alert" hidden></div>
   <div id="repoEmptyState" class="repo-empty" hidden>No repositories registered yet. Register one with <code>devgraph register &lt;path&gt;</code>, or with <b>+ Register repo</b> above.</div>
   <div class="control-flyout" id="controlFlyout" data-od-id="graph-control-panel">
     <div class="control-panel-body">
@@ -1535,7 +1536,37 @@ vec4 layer_dgnode(vec4 fillColor, float fillAlpha, vec4 ringColor, float ringWid
   };
   return view;
 }
-const graphView = createGraphView(document.getElementById("cy"));
+/* A stand-in for a browser that can't draw the canvas (sigma needs WebGL 2):
+   the same calls, holding nothing, so the rest of the page -- repositories,
+   console, panels -- runs as usual and the canvas area says why it's empty. */
+function createNullGraphView() {
+  const none = () => {};
+  return {
+    hasNode: () => false, hasEdge: () => false, has: () => false,
+    nodeCount: () => 0, edgeCount: () => 0, elementCount: () => 0, nodeIds: () => [], elementIds: () => [],
+    addNode: none, addEdge: none, remove: none, data: () => undefined, setData: none, setFlags: none,
+    updateNodes: none, updateEdges: none, nodeData: () => ({}), forEachNode: none, forEachEdge: none,
+    element: id => ({ id: () => id, data: () => undefined }),
+    position: () => ({ x: 0, y: 0 }), setPosition: none, forEachPosition: none, setPositions: none,
+    animatePositions: (targets, duration, done) => done && done(),
+    size: () => ({ width: 0, height: 0 }), zoom: () => 1, pan: () => ({ x: 0, y: 0 }),
+    toScreen: () => ({ x: 0, y: 0 }), toModel: () => ({ x: 0, y: 0 }),
+    extent: () => ({ x1: 0, x2: 0, y1: 0, y2: 0, w: 0, h: 0 }),
+    setView: none, angle: () => 0, setAngle: none, on: none, onCamera: none, onNodeDragEnd: none,
+    restyle: none, resize: none,
+  };
+}
+const graphView = (() => {
+  try {
+    return createGraphView(document.getElementById("cy"));
+  } catch (e) {
+    console.error("graph canvas unavailable:", e);
+    const note = document.getElementById("graphUnavailable");
+    note.textContent = "The graph view needs WebGL 2, which this browser has turned off or doesn't support. Everything else on the dashboard works.";
+    note.hidden = false;
+    return createNullGraphView();
+  }
+})();
 /* Adds element literals ({data: {...}}; an edge has
    source/target) -- the demo graph's shape. Edges without an id get one. */
 function addElements(els) {
