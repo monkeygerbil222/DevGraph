@@ -86,20 +86,21 @@ def decode_wide(data: bytes) -> tuple[str, str] | None:
 
     A UTF-16 or UTF-32 byte-order mark names the codec (the mark itself is
     not part of the text). Without one, `data` is UTF-16 when, in its first
-    8 KiB, every other byte is NUL in at least 70% of places and none of the
-    rest is (ASCII-range source in UTF-16 LE or BE), and the text holds no
-    control character but whitespace. Either way it must decode strictly,
+    8 KiB, NUL bytes fall predominantly on one parity: at least 30% of that
+    parity's bytes, and the other parity holding at most an eighth as many
+    (ASCII-range code is NUL on one; a character such as U+4E00 puts a NUL
+    on the other), LE or BE by which parity; and the text holds no control
+    character but whitespace. Either way it must decode strictly,
     to text holding no NUL, or it is not taken for one.
     """
     codec = next((name for bom, name in _WIDE_BOMS if data.startswith(bom)), None)
     marked = codec is not None
     if codec is None and len(data) >= 2 and len(data) % 2 == 0:
         sample = data[:_WIDE_SNIFF_BYTES]
-        even, odd = sample[0::2], sample[1::2]
-        if b"\0" not in even and odd.count(0) * 10 >= len(odd) * 7:
-            codec = "utf-16-le"
-        elif b"\0" not in odd and even.count(0) * 10 >= len(even) * 7:
-            codec = "utf-16-be"
+        even, odd = sample[0::2].count(0), sample[1::2].count(0)
+        major, minor = max(even, odd), min(even, odd)
+        if major * 10 >= (len(sample) // 2) * 3 and minor * 8 <= major:
+            codec = "utf-16-le" if odd > even else "utf-16-be"
     if codec is None:
         return None
     try:

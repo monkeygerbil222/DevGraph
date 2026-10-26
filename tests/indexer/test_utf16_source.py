@@ -94,3 +94,11 @@ def test_a_utf16_csharp_file_is_indexed_and_get_source_returns_its_methods(tmp_p
         engine.delete_repository(repo_id)
         registry.close()
         engine.close()
+
+
+@pytest.mark.parametrize("codec", ["utf-16-le", "utf-16-be"])
+def test_unmarked_utf16_with_a_nul_low_byte_character_is_still_text(codec):
+    # U+4E00 is 00 4E in UTF-16 LE: a NUL on the parity ASCII text leaves NUL-free.
+    text = "".join(f"// 一{i} 中文 説明\nint f{i}() {{ return {i}; }}\n" for i in range(20))
+    assert decode_wide(text.encode(codec)) == (text, codec)
+
