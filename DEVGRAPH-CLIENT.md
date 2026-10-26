@@ -343,8 +343,9 @@ transitive. A direct dependent reached through a method names it in `via`
 (`["Cart.total"]`; at most five, with `via_count`, how many there are, past
 that). A call on a value nothing types links every member of
 its name, so a dependent reached only by such by-name (`name` confidence)
-calls is marked `name_only: true` and counted in `name_only_dependents`, and
-a class's `risk_level` counts only the others; a by-name call of a dunder
+calls is marked `name_only: true` and counted in `name_only_dependents`, for
+information: a class's `risk_level` counts every direct dependent, as a
+function's and `impact_analysis_for_diff`'s do; a by-name call of a dunder
 method (`super().__init__()`) or of a library-like name (`get`, `append`)
 is not counted at all. A function's impact counts every caller, as before. `find_callers` on a
 class lists the callers of its methods, each with its `via`, leaving out

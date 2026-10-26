@@ -3,7 +3,8 @@
 of its name, so a class's by-name callers are mostly noise. A by-name call
 of a dunder member (`super().__init__()`) is no edge into the class, a
 dependent reached only by by-name calls is `name_only`, counted in
-`name_only_dependents`, and `risk_level` counts the others. A function's
+`name_only_dependents` for information; `risk_level` counts every direct
+dependent, as a function's does (review round 2). A function's
 impact is unchanged. Fixture code is fictional."""
 
 import textwrap
@@ -85,8 +86,8 @@ def test_a_classs_by_name_callers_are_counted_apart(engine, repo):
     # Cache.__init__'s super().__init__() is no edge into Store.__init__.
     assert rows == {"typed": False, "loose_a": True, "loose_b": True, "loose_c": True, "loose_d": True}
     assert result["name_only_dependents"] == 4
-    # One firm dependent: low, though five are listed.
-    assert result["risk_level"] == "low"
+    # Five direct dependents, by-name ones included (the dunder call not): medium.
+    assert result["risk_level"] == "medium"
     callers = tools.find_callers(engine, repo, "Store")
     assert sorted(row["name"] for row in callers["results"]) == ["loose_a", "loose_b", "loose_c", "loose_d", "typed"]
 

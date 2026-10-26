@@ -229,7 +229,8 @@ def _impact_expansion(cross_repo: bool, with_ids: bool = False) -> str:
     call of a noisy member (`_noisy_member_call`) is no edge into it, and a
     direct dependent whose every edge into hop 0 is a by-name call of a
     member is `name_only`: `firm_count` counts the others (all of them for
-    a Function target, which has no members), and `has_members` says
+    a Function target, which has no members; `name_only_dependents` is
+    `direct_count` less it), and `has_members` says
     whether there were members.
 
     Expanding distinct nodes hop by hop does work proportional to the nodes
@@ -2291,8 +2292,9 @@ def impact_analysis(
     of its methods and its subclasses (EXTENDS) are direct dependents, each
     caller with `via`, the methods it calls. For a class, a dependent reached
     only by by-name calls is marked `name_only` and the dict adds
-    `name_only_dependents`, their count; risk_level counts the others (a
-    function's counts every dependent).
+    `name_only_dependents`, their count, for information: risk_level
+    counts every direct dependent, as for a function (a by-name call of a
+    dunder or `NOISY_MEMBER_NAMES` member is no dependency at all).
 
     Args:
         engine: GraphEngine instance
@@ -2381,7 +2383,7 @@ def impact_analysis(
             "direct_dependents": dependents_envelope([_dependent(d) for d in row["direct_dependents"]]),
             "transitive_dependents": dependents_envelope([_dependent(d) for d in row["transitive_dependents"]]),
             "endpoints": _endpoints_envelope(answer_row, max_results),
-            "risk_level": _risk_level(row["firm_count"]),
+            "risk_level": _risk_level(row["direct_count"]),
         }
         if row["has_members"]:
             answer["name_only_dependents"] = row["direct_count"] - row["firm_count"]
@@ -2415,7 +2417,7 @@ def impact_analysis(
     answer = {
         **{key: dependents_envelope(rows) for key, rows in lists.items()},
         "endpoints": _endpoints_envelope(answer_row, max_results, tagged=True),
-        "risk_level": _risk_level(max(row["firm_count"] for row in results)),
+        "risk_level": _risk_level(max(row["direct_count"] for row in results)),
         "ambiguous_targets": ambiguous,
     }
     if any(row["has_members"] for row in results):
@@ -2626,7 +2628,7 @@ def impact_analysis_for_diff(
         "direct_dependents": _envelope([_dependent(d) for d in row["direct_dependents"]], max_results),
         "transitive_dependents": _envelope([_dependent(d) for d in row["transitive_dependents"]], max_results),
         "endpoints": _endpoints_envelope(row, max_results),
-        "risk_level": _risk_level(row["firm_count"]),
+        "risk_level": _risk_level(row["direct_count"]),
         **({"name_only_dependents": row["direct_count"] - row["firm_count"]} if row["has_members"] else {}),
         "truncated": bool(reasons),
         "truncated_reasons": list(reasons),
