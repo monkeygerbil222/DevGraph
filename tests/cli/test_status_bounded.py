@@ -15,7 +15,12 @@ from typer.testing import CliRunner
 from devgraph.cli import main as cli_main
 from devgraph.config.settings import Settings
 from devgraph.graph import engine as engine_module
+from devgraph.graph.engine import GraphEngine
 from devgraph.mcp import server as mcp_server
+
+#: The real check: without a local Neo4j (the Windows CI job), tests/conftest.py
+#: stubs it to fail at once, which would pass these tests without running it.
+_REAL_VERIFY = GraphEngine.verify_connectivity
 
 
 @pytest.fixture
@@ -55,6 +60,7 @@ def _invoke_bounded(args, seconds=60.0):
 
 @pytest.mark.parametrize("command", ["status", "doctor"])
 def test_the_connection_check_gives_up_within_the_probe_timeout(command, silent_uri, tmp_path, monkeypatch):
+    monkeypatch.setattr(GraphEngine, "verify_connectivity", _REAL_VERIFY)
     monkeypatch.setenv("DEVGRAPH_REGISTRY_DB_PATH", str(tmp_path / "home" / "registry.sqlite3"))
     settings = Settings(
         registry_db_path=tmp_path / "home" / "registry.sqlite3",
@@ -67,6 +73,7 @@ def test_the_connection_check_gives_up_within_the_probe_timeout(command, silent_
         result = _invoke_bounded([command])
     elapsed = time.monotonic() - started
     assert elapsed < 10.0, f"{command} took {elapsed:.1f} s"
+    assert elapsed >= 0.9, "the real connection check did not run (it waits out the 1 s probe timeout)"
     assert result.exit_code == 1
     (line,) = [line for line in result.output.splitlines() if "Not reachable" in line]
     assert f"nothing answers at {silent_uri}" in line
