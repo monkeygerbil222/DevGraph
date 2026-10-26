@@ -19,6 +19,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 from devgraph.indexer import gitignore
+from devgraph.indexer.source_text import decode_wide
 from devgraph.paths import is_within
 
 logger = logging.getLogger(__name__)
@@ -120,6 +121,9 @@ def content_skip_reason(path: Path, max_bytes: int) -> str | None:
     `max_bytes`), `BINARY` (a NUL byte in the first 8 KiB) or `GENERATED`
     (a line over `MAX_LINE_BYTES`, or long lines on average) -- or None.
 
+    UTF-16 or UTF-32 text (`source_text.decode_wide`) is no binary: it is
+    judged by its lines as UTF-8, as the extractors read it.
+
     The size comes from a stat, so a too-large file is never read. Raises
     OSError when the file can't be read.
     """
@@ -128,7 +132,10 @@ def content_skip_reason(path: Path, max_bytes: int) -> str | None:
     with open(path, "rb") as f:
         data = f.read(max_bytes + 1)
     if b"\0" in data[:BINARY_SNIFF_BYTES]:
-        return BINARY
+        wide = decode_wide(data)
+        if wide is None:
+            return BINARY
+        data = wide[0].encode("utf-8")
     if path.suffix.lower() in _PROSE_SUFFIXES:
         return None
     lines = data.splitlines() or [b""]
