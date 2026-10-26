@@ -37,3 +37,17 @@ def stub(monkeypatch, target, name, replacement):
 
 def _call_text(args, kwargs) -> str:
     return ", ".join([*(type(a).__name__ for a in args), *(f"{k}=" for k in kwargs)])
+
+
+class BatchMarkers:
+    """The Repository node's `batch_open` markers (dispatch
+    `_marks_open_batch`) for a fake engine: kept in `batch_open`."""
+
+    def open_batch(self, repo_id, token):
+        self.__dict__.setdefault("batch_open", []).append(token)
+
+    def close_batch(self, repo_id, tokens):
+        self.batch_open = [t for t in self.__dict__.get("batch_open", []) if t not in tokens]
+
+    def open_batches(self, repo_id):
+        return list(self.__dict__.get("batch_open", []))

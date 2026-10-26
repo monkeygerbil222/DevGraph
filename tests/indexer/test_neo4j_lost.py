@@ -16,7 +16,7 @@ from devgraph.graph.engine import EngineClosed, GraphEngine, provision_repositor
 from devgraph.indexer import dispatch
 from devgraph.indexer.dispatch import Neo4jLost, catch_up, full_scan, index_outdated, index_paths
 from devgraph.registry.store import RepoRegistry
-from tests.helpers import stub
+from tests.helpers import BatchMarkers, stub
 from tests.watcher.live_helpers import (
     fresh_snapshot,
     graph_snapshot,
@@ -26,7 +26,7 @@ from tests.watcher.live_helpers import (
 )
 
 
-class _QuietEngine:
+class _QuietEngine(BatchMarkers):
     def route_mount_state(self, repo_id, names=None):
         return {}
 

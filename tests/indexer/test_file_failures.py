@@ -7,10 +7,10 @@ import pytest
 from devgraph.graph.engine import EngineClosed
 from devgraph.indexer import dispatch
 from devgraph.indexer.dispatch import index_paths
-from tests.helpers import stub
+from tests.helpers import BatchMarkers, stub
 
 
-class _QuietEngine:
+class _QuietEngine(BatchMarkers):
     def route_mount_state(self, repo_id, names=None):
         return {}
 

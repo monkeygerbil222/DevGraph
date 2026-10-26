@@ -16,6 +16,7 @@ repo's own `record.path`).
 from __future__ import annotations
 
 import gc
+import itertools
 import logging
 import os
 import pickle
@@ -57,7 +58,6 @@ from devgraph.graph.engine import (
     SERVICE_API_SUFFIXES,
     EngineClosed,
     GraphEngine,
-    IndexesNotReady,
     provision_repository_schema,
 )
 from devgraph.graph.schema import FILE_SCOPED_LABELS, HEIR_KEY, NODE_LABELS, RELATIONSHIP_TYPES, pin_kind, split_pin
@@ -149,30 +149,60 @@ CONNECTION_LOST = (ServiceUnavailable, SessionExpired)
 #: file's write or in any pass after the files.
 ABORTS_BATCH = (*ABORTS_BATCH, BatchAborted, *CONNECTION_LOST)
 
-#: Repositories an incremental batch lost Neo4j partway through, since this
-#: process's last full scan of them. Such a batch may have written its files'
-#: nodes and not yet relinked the edges other files hold to them; a retry
-#: diffs against those nodes, finds nothing added, and would leave the edges
-#: out. So the next `catch_up` rescans the repository in full instead.
-_lost_batches: set[str] = set()
+#: This process's batches running now, by their `batch_open` marker.
+_running_batches: set[str] = set()
+_batch_serial = itertools.count(1)
 
 
-def _rescans_if_lost(fn):
-    """Record the repository in `_lost_batches` when `fn` (a batch that
-    writes) loses its connection to Neo4j; a shutdown or an index still
-    building writes nothing that needs it."""
+def _marks_open_batch(fn):
+    """Run `fn`, a batch that writes, under a `batch_open` marker on the
+    repository's Repository node: added before the batch's first write and
+    removed once it has finished. A batch cut short (Neo4j lost after its
+    files' nodes were written but before other files' edges to them were
+    relinked, a shutdown, the process killed) leaves its marker, and the
+    next `catch_up` rescans the repository in full (`_unfinished_batches`):
+    a retry could only diff against nodes the cut-short batch had already
+    written, find nothing added, and leave those edges out. The marker is
+    in the graph, so it outlives the process."""
 
     @wraps(fn)
     def wrapper(engine, repo_id, *args, **kwargs):
+        token = f"{_SCAN_OWNER}#{next(_batch_serial)}"
+        engine.open_batch(repo_id, token)
+        _running_batches.add(token)
         try:
-            return fn(engine, repo_id, *args, **kwargs)
-        except (EngineClosed, IndexesNotReady):
+            result = fn(engine, repo_id, *args, **kwargs)
+        except RepoRootUnavailable:
+            engine.close_batch(repo_id, [token])  # refused before any change
             raise
-        except CONNECTION_LOST:
-            _lost_batches.add(repo_id)
-            raise
+        finally:
+            _running_batches.discard(token)
+        engine.close_batch(repo_id, [token])
+        return result
 
     return wrapper
+
+
+def _unfinished_batches(engine: GraphEngine, repo_id: str) -> list[str]:
+    """The repository's `batch_open` markers whose batch ended without
+    finishing: this process's not running now, or a process of this host
+    that has ended (a marker of the same pid but another process is an
+    earlier process's). Another host's are never taken for ended: nothing
+    here can tell whether that batch still runs."""
+    unfinished = []
+    for token in engine.open_batches(repo_id):
+        holder = token.rsplit("#", 1)[0]
+        if holder == _SCAN_OWNER:
+            ended = token not in _running_batches
+        else:
+            parts = _SCAN_OWNER_PARTS.match(holder)
+            same_pid = parts is not None and parts.group(2) == socket.gethostname() and \
+                int(parts.group(1)) == os.getpid()
+            ended = same_pid or _holder_gone(holder)
+        if ended:
+            unfinished.append(token)
+    return unfinished
+
 
 _CPP_SUFFIXES = {".cpp", ".cc", ".cxx", ".h", ".hpp"}
 
@@ -900,7 +930,7 @@ def _stale_mounts(state: dict, table: MountTable) -> set[str]:
     }
 
 
-@_rescans_if_lost
+@_marks_open_batch
 def index_paths(
     engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[Path], docs_path: str | None = None,
     mentions_enabled: bool = False, sync_provider: bool = True, relink_outside: bool = True,
@@ -2381,7 +2411,7 @@ def _folders_above(rel: str) -> list[str]:
     return ["/".join(parts[:i]) for i in range(1, len(parts))]
 
 
-@_rescans_if_lost
+@_marks_open_batch
 def remove_paths(
     engine: GraphEngine, repo_id: str, repo_root: Path, paths: set[Path], docs_path: str | None = None,
     mentions_enabled: bool = False,
@@ -2714,23 +2744,24 @@ def catch_up(
     see `_claim_full_scan`) ran meanwhile is not repeated. Last, a changed resolver configuration re-indexes its
     language's files (sync_resolver_config).
 
-    So does a repository an incremental batch of this process lost Neo4j
-    partway through (`_lost_batches`): its retry could not tell which edges
-    of other files that batch left unwritten.
+    So does a repository with a batch that began and never finished
+    (`_unfinished_batches`): Neo4j lost partway through, or its process
+    killed. A retry could not tell which edges of other files that batch
+    left unwritten.
 
     A missing, unreadable or apparently unmounted root is refused as
     `prune_stale_files` refuses it (`force` as there), before any change.
     """
     check_repo_root(repo_root)
-    if repo_id in _lost_batches or index_outdated(engine, repo_id):
+    if _unfinished_batches(engine, repo_id) or index_outdated(engine, repo_id):
         # The repository is registered (the agent checks): a graph that lost
         # its Repository node (wiped) gets it back, or full_scan would take
         # it for removed and scan nothing.
         engine.upsert_repository(repo_id, repo_id, str(repo_root))
         with full_scan_turn(repo_id, while_waiting, engine):
-            if repo_id in _lost_batches or index_outdated(engine, repo_id):
-                if repo_id in _lost_batches:
-                    logger.info("%s: an update lost Neo4j partway through; rescanning in full", repo_id)
+            if (unfinished := _unfinished_batches(engine, repo_id)) or index_outdated(engine, repo_id):
+                if unfinished:
+                    logger.info("%s: an update was cut short partway through; rescanning in full", repo_id)
                 indexed = full_scan(
                     engine, repo_id, repo_root, docs_path=docs_path, mentions_enabled=mentions_enabled, force=force
                 )
@@ -3160,8 +3191,10 @@ def full_scan(
         engine.write_resolver_config(repo_id, resolver)
         _check_full_scan_claim(repo_id)  # taken over meanwhile: that scan stamps it
         engine.set_scan_options(repo_id, docs_path or "", mentions_enabled)
+        unfinished = _unfinished_batches(engine, repo_id)  # its own batches are finished by now
         engine.set_index_format(repo_id, INDEX_FORMAT)
-        _lost_batches.discard(repo_id)
+        if unfinished:
+            engine.close_batch(repo_id, unfinished)
         return indexed
     finally:
         _release_full_scan_lock(repo_id, engine)

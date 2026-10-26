@@ -20,7 +20,7 @@ import pytest
 from devgraph.graph.engine import GraphEngine
 from devgraph.indexer import dispatch
 from devgraph.indexer.dispatch import index_paths, remove_paths
-from tests.helpers import stub
+from tests.helpers import BatchMarkers, stub
 
 # Unique per run, so sessions sharing the Neo4j never seed or delete each
 # other's repositories; tests/conftest.py sweeps any a teardown leaves.
@@ -899,7 +899,7 @@ _SCAN_AND_EXPORT = textwrap.dedent(
 )
 
 
-class _UnitEngine:
+class _UnitEngine(BatchMarkers):
     def route_mount_state(self, repo_id, names=None):
         return {}
 
@@ -978,7 +978,7 @@ class TestDeterministicIndexOrder:
         assert seen == ["a.py", "b.py"]
 
 
-class _RowsEngine:
+class _RowsEngine(BatchMarkers):
     def __init__(self, rows):
         self.rows = rows
 
@@ -1288,7 +1288,7 @@ _KEYED_ADR_SCHEMA = textwrap.dedent("""
 """)
 
 
-class _RecordingEngine:
+class _RecordingEngine(BatchMarkers):
     """Records every engine call by name and arguments; returns None."""
 
     def __init__(self):
@@ -1450,7 +1450,7 @@ def test_prune_skips_walked_paths_outside_the_repository(tmp_path, monkeypatch):
     removed = []
     stub(monkeypatch, dispatch, "remove_paths", lambda engine, repo_id, root, paths, *a: removed.append(paths) or len(paths))
 
-    class FakeEngine:
+    class FakeEngine(BatchMarkers):
         def list_indexed_files(self, repo_id):
             return {"a.py", "gone.py"}
 

@@ -2,12 +2,15 @@
 relinked other files' edges to them, still converges (audit 11 review,
 item 1): its retry could diff only against the nodes the lost batch had
 already written, find nothing added, and leave `user()`'s call to the new
-`helper()` out, so the retry catch-up rescans the repository in full.
+`helper()` out. The batch leaves a `batch_open` marker on the Repository
+node, so the next catch-up, even in another process after a restart or a
+kill, rescans the repository in full.
 
 The connection is lost for real: the agent's engine talks to Neo4j through a
 forwarder this test runs on a port of its own, and the forwarder drops every
 connection as the batch reaches `_relink_name_refs`."""
 
+import os
 import socket
 import subprocess
 import threading
@@ -118,7 +121,10 @@ def repo_id(engine):
     engine.delete_repository(repo)
 
 
-def test_a_batch_losing_neo4j_while_relinking_converges_on_its_retry(engine, repo_id, tmp_path, monkeypatch):
+@pytest.mark.parametrize("restart", [False, True], ids=["retry", "after-a-restart"])
+def test_a_batch_losing_neo4j_while_relinking_converges_on_its_retry(
+    engine, repo_id, tmp_path, monkeypatch, restart
+):
     root = tmp_path / "repo"
     root.mkdir()
     subprocess.run(["git", "init"], cwd=root, capture_output=True, check=True)
@@ -155,13 +161,71 @@ def test_a_batch_losing_neo4j_while_relinking_converges_on_its_retry(engine, rep
         assert forwarder.dropped and len(requested) == 1  # the batch failed and asked for its retry
         assert graph_snapshot(engine, repo_id) != fresh_snapshot(engine, repo_id, root)
 
+        assert engine.open_batches(repo_id)  # the cut-short batch's marker stays
+
         forwarder.resume()
-        assert sync.on_catch_up(repo_id, requested[0][1], "retry")
+        if restart:
+            # The agent killed before its retry: a new process (another
+            # owner, the same pid as a restarted container's) with a new
+            # RepoSync and no memory of the batch runs its start catch-up.
+            monkeypatch.setattr(dispatch, "_SCAN_OWNER", f"{dispatch._SCAN_OWNER.rsplit('/', 1)[0]}/0badc0de")
+            monkeypatch.setattr(dispatch, "_running_batches", set())
+            sync = RepoSync(engine, registry, lambda event: None, lambda *args: None)
+            assert sync.on_catch_up(repo_id, datetime.fromisoformat(registry.get(repo_id).last_indexed), "start")
+        else:
+            assert sync.on_catch_up(repo_id, requested[0][1], "retry")
         expected = fresh_snapshot(engine, repo_id, root)
         actual = graph_snapshot(engine, repo_id)
         assert actual == expected, snapshot_diff(expected, actual)
+        assert engine.open_batches(repo_id) == []
     finally:
         registry.close()
         proxied.close()
         forwarder.close()
-        dispatch._lost_batches.discard(repo_id)
+
+
+def test_a_finished_batch_leaves_no_marker(engine, repo_id, tmp_path):
+    root = tmp_path / "repo"
+    root.mkdir()
+    subprocess.run(["git", "init"], cwd=root, capture_output=True, check=True)
+    (root / "a.py").write_text("def other():\n    return 1\n")
+    registry = RepoRegistry(tmp_path / "registry.sqlite3")
+    try:
+        registry.add_repo(root, repo_id=repo_id)
+        provision_repository_schema(engine, root)
+        engine.upsert_repository(repo_id, repo_id, str(root))
+        full_scan(engine, repo_id, root)
+        sync = RepoSync(engine, registry, lambda event: None, lambda *args: None)
+        (root / "a.py").write_text("def other():\n    return 2\n")
+        (root / "b.py").write_text("def more():\n    return 3\n")
+        sync.on_changes(repo_id, {root / "a.py", root / "b.py"}, set())
+        (root / "b.py").unlink()
+        sync.on_changes(repo_id, set(), {root / "b.py"})
+        assert engine.open_batches(repo_id) == []
+    finally:
+        registry.close()
+
+
+class _Markers:
+    def __init__(self, tokens):
+        self.tokens = tokens
+
+    def open_batches(self, repo_id):
+        return list(self.tokens)
+
+
+def test_which_markers_count_as_unfinished(monkeypatch):
+    host, pid = socket.gethostname(), os.getpid()
+    own = f"{pid}@{host}/0123abcd"
+    monkeypatch.setattr(dispatch, "_SCAN_OWNER", own)
+    monkeypatch.setattr(dispatch, "_running_batches", {f"{own}#2"})
+    monkeypatch.setattr(dispatch, "_holder_gone", lambda holder: holder.startswith("999999@"))
+    tokens = [
+        f"{own}#1",  # this process's, finished without closing: unfinished
+        f"{own}#2",  # this process's, running now
+        f"{pid}@{host}/deadbeef#1",  # an earlier process of this pid: unfinished
+        f"999999@{host}/feedface#4",  # an ended process of this host: unfinished
+        f"4242@{host}/cafecafe#1",  # a running process of this host
+        f"{pid}@elsewhere.example/0badf00d#1",  # another host's: never taken for ended
+    ]
+    assert dispatch._unfinished_batches(_Markers(tokens), "r") == [tokens[0], tokens[2], tokens[3]]

@@ -1849,6 +1849,38 @@ class GraphEngine:
                 repo_id=repo_id, version=version,
             )
 
+    def open_batch(self, repo_id: str, token: str) -> None:
+        """Add `token` to the repository's `batch_open` markers before a batch
+        writes (see dispatch `_marks_open_batch`); a repository with no
+        Repository node gets none."""
+        with self._driver.session() as session:
+            _run(
+                session,
+                "MATCH (r:Repository {repo_id: $repo_id}) WHERE NOT $token IN coalesce(r.batch_open, []) "
+                "SET r.batch_open = coalesce(r.batch_open, []) + $token",
+                repo_id=repo_id, token=token,
+            )
+
+    def close_batch(self, repo_id: str, tokens: list[str]) -> None:
+        """Remove `tokens` from the repository's `batch_open` markers."""
+        with self._driver.session() as session:
+            _run(
+                session,
+                "MATCH (r:Repository {repo_id: $repo_id}) WHERE r.batch_open IS NOT NULL "
+                "SET r.batch_open = [t IN r.batch_open WHERE NOT t IN $tokens]",
+                repo_id=repo_id, tokens=tokens,
+            )
+
+    def open_batches(self, repo_id: str) -> list[str]:
+        """The repository's `batch_open` markers: batches begun and not finished."""
+        with self._driver.session() as session:
+            records = _run_records(
+                session,
+                "MATCH (r:Repository {repo_id: $repo_id}) RETURN coalesce(r.batch_open, []) AS open",
+                repo_id=repo_id,
+            )
+        return list(records[0]["open"]) if records else []
+
     def claim_full_scan(
         self, repo_id: str, owner: str, stale_s: float, replace: str | None = None
     ) -> tuple[bool, str | None]:
