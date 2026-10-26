@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[2]
 # file -> (sha256 of the vendored file, the heading its notice sits under)
 VENDORED = {
     "graphology-0.26.0.umd.min.js": (
-        "dc337efa23903f61e064c8e7e7f93a429e6855dccfc2458802b4ed30c621c087", "graphology 0.26.0"),
+        "e65803eba4826a52a84ec3fedebda3e2434ff25d86b3e2309bfe6575141ab2ff", "graphology 0.26.0"),
     "sigma-4.0.3.min.js": (
         "694694451bff0ebb4301768e14344c4601de2e52e180a655e4ceaf1644cf43b2", "sigma.js 4.0.3"),
 }
@@ -70,6 +70,11 @@ def test_the_vendored_licenses_are_noted():
     for name, (_, heading) in VENDORED.items():
         assert f"## {heading}" in notices
         assert f"devgraph/dashboard/static/vendor/{name}" in notices
+
+
+def test_no_vendored_file_names_a_source_map_that_is_not_shipped():
+    for path in (STATIC / "vendor").iterdir():
+        assert "sourceMappingURL" not in path.read_text(encoding="utf-8"), path.name
 
 
 def test_the_vendored_files_are_the_pinned_builds():

@@ -87,8 +87,8 @@ THE SOFTWARE.
 
 ## graphology 0.26.0
 
-- File: `devgraph/dashboard/static/vendor/graphology-0.26.0.umd.min.js`, unmodified `dist/graphology.umd.min.js` (global `graphology`) from the npm package `graphology@0.26.0`
-  - File hash: sha256 `dc337efa23903f61e064c8e7e7f93a429e6855dccfc2458802b4ed30c621c087`
+- File: `devgraph/dashboard/static/vendor/graphology-0.26.0.umd.min.js`, `dist/graphology.umd.min.js` (global `graphology`) from the npm package `graphology@0.26.0`, unmodified apart from its last line, a `//# sourceMappingURL=` comment naming a map file the package ships but DevGraph does not (a browser's developer tools would request it and get a 404)
+  - File hash: sha256 `e65803eba4826a52a84ec3fedebda3e2434ff25d86b3e2309bfe6575141ab2ff`
   - npm tarball integrity (hash of the `graphology-0.26.0.tgz` it was extracted from, not of the file): `sha512-8SSImzgUUYC89Z042s+0r/vMibY7GX/Emz4LDO5e7jYXhuoWfHISPFJYjpRLUSJGq6UQ6xlenvX1p/hJdfXuXg==`
 - Source: https://github.com/graphology/graphology
 - License: MIT
