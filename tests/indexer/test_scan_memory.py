@@ -39,7 +39,7 @@ class RecordingEngine:
         "run_cypher": [], "read_resolver_config": {}, "find_handler_stub_sources": set(), "find_name_refs": [],
         "find_mentioning_documents": set(), "list_indexed_files": set(), "list_claim_sources": set(),
         "list_extracted_paths": set(), "list_docs_note_files": set(), "read_skipped_files": {},
-        "claim_full_scan": (True, None), "beat_full_scan": True,
+        "claim_full_scan": (True, None), "beat_full_scan": True, "open_batches": [],
     }
 
     def __init__(self):
