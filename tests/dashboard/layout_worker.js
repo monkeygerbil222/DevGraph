@@ -15,7 +15,8 @@ const path = require("path");
 const vm = require("vm");
 
 const workerSrc = fs.readFileSync(
-  path.join(__dirname, "..", "..", "devgraph", "dashboard", "static", "graph-layout-worker.js"), "utf8");
+  path.join(__dirname, "..", "..", "devgraph", "dashboard", "static", "graph-layout-worker.js"), "utf8")
+  .replace(/\r\n/g, "\n"); // a Windows checkout has CRLF line endings; the extractors match on \n
 
 // --- the reference: the pre-worker main-thread settle -------------------
 const QUAD_THETA = 0.8;

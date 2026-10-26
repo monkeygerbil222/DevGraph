@@ -7,7 +7,8 @@ const fs = require("fs");
 const path = require("path");
 
 const html = fs.readFileSync(
-  path.join(__dirname, "..", "..", "devgraph", "dashboard", "static", "index.html"), "utf8");
+  path.join(__dirname, "..", "..", "devgraph", "dashboard", "static", "index.html"), "utf8")
+  .replace(/\r\n/g, "\n"); // a Windows checkout has CRLF line endings; the extractors match on \n
 
 // Pull out just the functions under test plus their module-level state.
 const grab = (startRe, endMarker) => {
