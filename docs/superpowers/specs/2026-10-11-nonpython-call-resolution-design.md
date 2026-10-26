@@ -500,9 +500,10 @@ Tiers, first match wins:
    (`~`: methods are named bare, so another type of the package can have one
    of the name). The call of a struct the file declares whose embedded
    types are all structs of the file (index format 23, audit 11 item 4 and
-   its review F2) names the struct as its owner: its methods are its own,
-   wherever in the package, and those promoted from those structs (heir
-   keys, below). Any other type keeps the owner-less pin: another file's
+   its review F2) names the struct and each of those structs (directly or
+   through them) as owners, one owned pin each: its methods are its own and
+   those promoted from them, wherever in the package (`Inner.Hello` in
+   hello.go for `Outer struct{ Inner }` in types.go). Any other type keeps the owner-less pin: another file's
    type may embed a type of a third file, whose promoted method an owner
    would lose, or be an interface, whose implementers' methods are any of
    the name; so does a struct embedding another file's or package's type,

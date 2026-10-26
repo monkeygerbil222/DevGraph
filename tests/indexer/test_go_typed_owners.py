@@ -61,8 +61,9 @@ def test_a_struct_of_the_file_with_known_embeds_links_only_its_own_method(tmp_pa
     def owners(caller, callee="Total"):
         return _owners(tmp_path, USE, "model/use.go", caller, callee)
 
-    assert owners("UseOrder") == {("Order", "package")}
-    assert owners("UseOrder", "ID") == {("Order", "package")}
+    # Order's own method, or one promoted from Base, wherever in the package.
+    assert owners("UseOrder") == {("Order", "package"), ("Base", "package")}
+    assert owners("UseOrder", "ID") == {("Order", "package"), ("Base", "package")}
     assert owners("UsePlain") == {("Plain", "package")}
     # Embedding another file's type, directly or through a struct of the
     # file, or one it can't name: any Total of the package.
@@ -154,4 +155,35 @@ def test_find_callers_and_promotion_across_files(engine, repo_id, tmp_path):
     plain.write_text(textwrap.dedent(PLAIN).replace("type Plain struct{}", "type Plain struct{ Other }"))
     index_paths(engine, repo_id, tmp_path, {plain})
     assert _callers(engine, repo_id, "Total", "Other") == [("UsePlain", "package")]
+    _equals_fresh(engine, repo_id, tmp_path)
+
+
+TYPES = """\
+    package model
+
+    type Inner struct{}
+    type Outer struct{ Inner }
+
+    func UseOuter() int { o := &Outer{}; return o.Hello() }
+    """
+
+
+def test_a_method_promoted_from_an_in_file_struct_declared_elsewhere(engine, repo_id, tmp_path):
+    """Inner and Outer struct{ Inner } in types.go, Inner's Hello in
+    hello.go (review round 2): `(&Outer{}).Hello()` reaches it through
+    Inner's owned pin, and Outer's own Hello once it has one."""
+    _write(tmp_path, "go.mod", GO_MOD)
+    _write(tmp_path, "model/types.go", TYPES)
+    _write(tmp_path, "model/hello.go", "package model\n\nfunc (Inner) Hello() int { return 3 }\n")
+    _write(tmp_path, "model/other.go", "package model\n\ntype Other struct{}\n\nfunc (Other) Hello() int { return 4 }\n")
+    provision_repository_schema(engine, tmp_path)
+    engine.upsert_repository(repo_id, repo_id, str(tmp_path))
+    full_scan(engine, repo_id, tmp_path)
+    assert _callers(engine, repo_id, "Hello", "Inner") == [("UseOuter", "package")]
+    assert _callers(engine, repo_id, "Hello", "Other") == []
+    _equals_fresh(engine, repo_id, tmp_path)
+
+    own = _write(tmp_path, "model/outer.go", "package model\n\nfunc (o *Outer) Hello() int { return 5 }\n")
+    index_paths(engine, repo_id, tmp_path, {own})
+    assert _callers(engine, repo_id, "Hello", "Outer") == [("UseOuter", "package")]
     _equals_fresh(engine, repo_id, tmp_path)

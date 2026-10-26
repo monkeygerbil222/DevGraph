@@ -39,7 +39,8 @@ adapted to Go's grammar. Extracts:
     this file when the type and `m` are declared here, else the type's
     package directory at package confidence (`~`), owned by the type when it
     is a struct of this file whose embedded types are all structs of this
-    file (its own method, or one promoted from them: heir keys), any method
+    file (an owned pin for it and each of them: its own method, or one
+    promoted from them, wherever in the package), any method
     of the name otherwise (an interface's implementers, or a method promoted
     from a type embedded from elsewhere); an untyped receiver ->
     a bare-name edge that never ends at the caller, nothing for a
@@ -385,15 +386,18 @@ class _GoResolver:
         """Where `method` of `go_type` can be declared; None when nowhere in
         the repository (a builtin or external type). A struct of this file
         whose embedded types are all structs of this file has only its own
-        methods and those promoted from them (`heir_decls`): its call is
-        owned by it (common.owned_pin), still at package confidence. Any
+        methods and those promoted from them, wherever in the package: its
+        call is owned by it and by each of them (common.owned_pin,
+        `embedded_closure`), still at package confidence. Any
         other type's may be an interface's (its implementers') or promoted
         from a type embedded from elsewhere: any method of the name."""
         if go_type[0] == "local":
             if method in self.methods.get(go_type[1], ()):
                 return [owned_pin(self.file_path, go_type[1])]  # the type's own method
             if go_type[1] in self.fields and go_type[1] not in self.foreign_embeds:
-                return [owned_pin(self._own_dir(loose=True), go_type[1])]
+                # Its own method, or one promoted from a struct it embeds,
+                # declared anywhere in the package: one owned pin each.
+                return [owned_pin(self._own_dir(loose=True), owner) for owner in self.embedded_closure(go_type[1])]
             pins = [self._own_dir(loose=True)]
             if go_type[1] not in self.types and (not go_type[1] or go_type[1][:1].isupper()):
                 # An exported type the file doesn't declare (or what an
@@ -403,6 +407,14 @@ class _GoResolver:
         if go_type[0] == "pkg":
             return [pin for folder in go_type[1] for pin in self._package_pins(folder, loose=True)]
         return None
+
+    def embedded_closure(self, name: str) -> list[str]:
+        """`name` and the structs of this file it embeds, directly or through
+        them, nearest first."""
+        found = [name]
+        for each in found:
+            found += [e for e in self.embeds.get(each, []) if e in self.fields and e not in found]
+        return found
 
     def heir_decls(self) -> list[tuple[str, str, list[str], set[str]]]:
         """The file's types as common.add_heir_keys takes them: each with
