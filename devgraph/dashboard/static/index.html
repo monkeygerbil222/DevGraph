@@ -1373,7 +1373,7 @@ vec4 layer_dgnode(vec4 fillColor, float fillAlpha, vec4 ringColor, float ringWid
         /* Every edge is tessellated with as many segments as the most
            detailed path in this list needs, so they stay few: at sigma's
            defaults (16 curved, 32 loop) django's default view panned at
-           about 40 frames per second on the test machine, at 8 at 60. */
+           about 40 frames per second on the test machine, with 8 at 60. */
         paths: [pathCurved({ curvature: 0.35, segments: 8 }), pathLine(), pathLoop({ segments: 8 })],
         extremities: [extremityArrow({ lengthRatio: 6, widthRatio: 5 })],
         variables: { gradientOn: { type: "boolean", default: true } },

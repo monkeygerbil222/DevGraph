@@ -3,7 +3,8 @@
 Issue: HaydenSchmidtDOC/DevGraph#54 ("Graph UI Render speed on larger repos").
 Scope of this document: deliverable A (the libraries researched and
 benchmarked) plus a recommendation and a rough implementation plan. The
-rework itself is not part of this change.
+rework that followed it is summarised, with before and after numbers, in
+"Outcome" at the end.
 
 ## Summary
 
@@ -489,7 +490,8 @@ without blocking the UI on the same low-end machine). Update `README.md`,
 
 ## Bugs found along the way
 
-These are independent of the renderer decision:
+These are independent of the renderer decision (all fixed since; see
+"Outcome"):
 
 - The node ceiling does not bound the canvas: the relationships' far ends are
   added as well (1500 → 8,204 nodes on django's default view).
@@ -522,3 +524,93 @@ browser's frame-rate limit; `CHROME=` overrides `/usr/bin/google-chrome`).
 isolated pages. `fromapi.mjs` turns a payload exported from a real dashboard
 (`POST /api/cypher` with `canvas: true`) into a dataset, which is how the
 django sets were made; those exports are not committed.
+
+## Outcome
+
+The recommendation was implemented: sigma.js 4.0.3 on graphology 0.26.0
+(their own UMD builds, vendored), with the page's force-directed settle in a
+Web Worker (`devgraph/dashboard/static/graph-layout-worker.js`, the same
+physics step for step, checked by `tests/dashboard/layout_worker.js`).
+Cytoscape is gone. Everything else in the page reaches the canvas through a
+small adapter, `graphView`, so the application logic (query building, the
+stable-id diff merge and layout cache, schema and community colours,
+isolate and dim, the glow-in, the #15 supersession check before the canvas
+is touched, the #2 hidden-tab handling) is unchanged.
+
+Renderer-independent fixes from step 0, each with a regression test:
+
+- `mergeGraphElements` finds a new node's neighbour through a map built once
+  (it read each relationship's endpoints 9 million times for 3,000 new nodes,
+  now 33,000).
+- The node ceiling bounds every node drawn: a capped query keeps a
+  relationship only when its far end is one of the capped nodes
+  (`WITH collect(n) AS capped UNWIND capped AS n ... WHERE m IN capped`). On a
+  synthetic 8,000-node repository the capped query also got faster (1.2 s to
+  0.2 s). The benchmark's django payloads were exported before this fix, so
+  the "django default view" below still measures 8,204 nodes, a size the
+  default view no longer reaches.
+- The glow-in's progress is clamped to [0, 1].
+- The `shadow-*` styles and the "Node/edge shadows" switch are gone; so is
+  the node-glow overlay canvas and its "Node glow" switch: it was drawn every
+  frame behind `#cy`, whose background is opaque, so its halos were never
+  visible. For the same reason the dot grid that followed the camera is no
+  longer moved every frame. The compact payload (item 5) was not done.
+
+Things found while porting:
+
+- sigma's curved edges are tessellated with as many segments as the most
+  detailed path in the program needs (16 curved, 32 for self-loops by
+  default), for every edge: django's default view panned at about 40 frames
+  per second with the defaults and at 60 with 8 segments each.
+- sigma's own node drag re-processes every node on each move (about 28 FPS
+  at 8k nodes); the adapter drags with a partial redraw of the dragged node
+  and its edges and refreshes once when it is let go (about 50 FPS).
+- The ambient rotation turns sigma's camera instead of rewriting node
+  positions; labels stay upright, and the layout cache never stores rotated
+  positions.
+- The Hierarchical, Radial and Grid layouts were Cytoscape's; the page now
+  computes them itself (`presetLayout`).
+- Look: colours, sizes, the repository's rounded hexagon (a custom sigma node
+  shape) and the service diamond, hollow dimmed excluded nodes, curved
+  source-to-target gradient edges with arrows, labels only on hover or
+  search, all kept. Differences: excluded edges are solid grey rather than
+  dashed, labels are a fixed 12 px rather than scaling with zoom, and the
+  layout is mirrored vertically on screen relative to Cytoscape's (sigma's y
+  axis points up; the stored coordinates are unchanged).
+
+The benchmark harness now drives the real page through `graphView` (it still
+drives the pre-rework page through `cy`), measures node drag on the real page,
+and drags along a circle that starts at the grab point (sigma only starts a
+drag after a few small moves, so jumping 120 px on the first move measured
+the grab offset rather than the drag).
+
+Before and after, the real page with the browser's normal frame-rate limit,
+same machine (Intel HD Graphics 5500, load average under 2), one fresh
+browser per run. "First frame" is from navigation; "settled" is from data
+arrival to the layout's stop; FPS figures are frames per second.
+
+| Dataset | Page | First frame (s) | Layout settled (s) | FPS while settling | Pan FPS (drag) | Zoom FPS | Node drag FPS | JS heap (MB) |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| Synthetic 2k (2,000 / 4,683) | before (Cytoscape) | 4.8 | 63 | 1.0 | 9.9 | 2.0 | — (off) | 34 |
+| Synthetic 2k (2,000 / 4,683) | after (sigma) | 4.9 | 4.3 | 48 | 60 | 59 | 57 | 12 |
+| django default view (8,204 / 27,975) | before | 20.6 | > 240 | 0.1 | 0.1 | 0.2 | — (off) | 175 |
+| django default view (8,204 / 27,975) | after | 5.9 | 21 | 48 | 54 | 58 | 51 | 49 |
+| Synthetic 10k (10,000 / 23,362) | before | 21.1 | > 240 | 0.1 | 0.1 | 0.2 | — (off) | 156 |
+| Synthetic 10k (10,000 / 23,362) | after | 5.5 | 24 | 49 | 47 | 32 | 49 | 46 |
+| Synthetic 50k (50,000 / 116,836) | before (first table above) | 180 | > 240 | 0.0 | 0.0 | — (tab died) | — | 761 |
+| Synthetic 50k (50,000 / 116,836) | after | 12.9 | 149 | 46 | 8.9 | 4.9 | 10 | 210 |
+
+With the frame-rate limit off (the first table's setting) the new page drew
+django's default view at 212 FPS panning through the API (62 with the mouse,
+whose events arrive at about that rate), 137 zooming and 64 dragging; the
+10k view at 230, 155 and 58; and the 50k view at 51, 34 and 59.
+
+Targets met at the sizes the canvas shows: at 8-10k nodes, pan, zoom and drag
+are at 32-58 FPS with the frame-rate limit on (at least 30), and the page
+stays at about 48 FPS while the layout settles, where it was at 0.1. At 50k
+nodes the GPU, not JavaScript, is the limit (single-digit FPS), as the
+research predicted; the node ceiling and the server's row cap keep the canvas
+far below that. The layout still takes 20-25 s to settle at 8-10k nodes and
+2.5 minutes at 50k: moving it off the main thread made it harmless, not
+faster (it is the same physics, about 0.4 s a step at 8k nodes).
+
