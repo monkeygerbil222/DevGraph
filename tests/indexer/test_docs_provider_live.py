@@ -214,8 +214,14 @@ def snapshot(engine):
         "RETURN labels(a)[0] AS a, a.name AS an, type(x) AS t, labels(b)[0] AS b, b.name AS bn",
         {"r": REPO},
     )
+    # A finished batch's `batch_open` marker goes with the engine's next write
+    # (dispatch `_marks_open_batch`), so which batch's is still on the
+    # Repository node depends on when the snapshot is taken: left out.
     return (
-        sorted(repr((sorted(n["labels"]), sorted((k, repr(v)) for k, v in n["p"].items()))) for n in nodes),
+        sorted(
+            repr((sorted(n["labels"]), sorted((k, repr(v)) for k, v in n["p"].items() if k != "batch_open")))
+            for n in nodes
+        ),
         sorted((r["a"], r["an"] or "", r["t"], r["b"], r["bn"] or "") for r in rels),
     )
 
