@@ -35,6 +35,8 @@ def test_binary_and_plain_text_are_not_taken_for_wide_text():
     assert decode_wide(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x01\x00") is None
     assert decode_wide(bytes(range(256)) * 4) is None
     assert decode_wide(b"x = 1\n") is None
+    assert decode_wide(b"\x00\x01") is None  # two bytes of binary, not U+0001
+    assert decode_wide(b"\x01\x00\x02\x00ab") is None
     assert decode_wide("a\0b".encode("utf-16")) is None  # text holding a NUL is no source
 
 

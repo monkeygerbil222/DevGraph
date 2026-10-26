@@ -30,6 +30,8 @@ _WIDE_BOMS = (
 )
 #: How much of a file without a mark is looked at to tell UTF-16 text.
 _WIDE_SNIFF_BYTES = 8192
+#: The control characters text without a mark may hold.
+_WHITESPACE = frozenset("\t\n\v\f\r")
 
 
 def decode_source(data: bytes, python: bool = False) -> str:
@@ -85,10 +87,12 @@ def decode_wide(data: bytes) -> tuple[str, str] | None:
     A UTF-16 or UTF-32 byte-order mark names the codec (the mark itself is
     not part of the text). Without one, `data` is UTF-16 when, in its first
     8 KiB, every other byte is NUL in at least 70% of places and none of the
-    rest is (ASCII-range source in UTF-16 LE or BE). Either way it must
-    decode strictly, to text holding no NUL, or it is not taken for one.
+    rest is (ASCII-range source in UTF-16 LE or BE), and the text holds no
+    control character but whitespace. Either way it must decode strictly,
+    to text holding no NUL, or it is not taken for one.
     """
     codec = next((name for bom, name in _WIDE_BOMS if data.startswith(bom)), None)
+    marked = codec is not None
     if codec is None and len(data) >= 2 and len(data) % 2 == 0:
         sample = data[:_WIDE_SNIFF_BYTES]
         even, odd = sample[0::2], sample[1::2]
@@ -102,4 +106,6 @@ def decode_wide(data: bytes) -> tuple[str, str] | None:
         text = data.decode(codec)
     except UnicodeDecodeError:
         return None
-    return None if "\0" in text else (text, codec)
+    if "\0" in text or (not marked and any(c < " " and c not in _WHITESPACE for c in text[:_WIDE_SNIFF_BYTES])):
+        return None
+    return text, codec
