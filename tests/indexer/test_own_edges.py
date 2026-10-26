@@ -106,10 +106,9 @@ def test_unowned_sources_stay_bare():
     cpp = extract_cpp_file("void baz() {}\n\nvoid Foo::bar() { baz(); }\n", "foo.cpp", REPO)
     (call,) = [r for r in cpp.relationships if r.rel_type == "CALLS"]
     assert (call.from_name, call.from_file) == ("bar", "foo.cpp")
-    (stub,) = [n for n in cpp.nodes if n.label == "Class" and n.name == "Foo"]
-    assert "file" not in stub.properties
-    # Known gap (design: out of scope): the stub's CONTAINS keeps the
-    # from_file the extractor already sets, which the stub doesn't have.
+    assert not [n for n in cpp.nodes if n.label == "Class"]  # no stub (audit 11 item 5)
+    # Known gap (design: out of scope): the CONTAINS from the class keeps the
+    # from_file the extractor already sets, which the header's Class doesn't have.
     (contains,) = [r for r in cpp.relationships if r.rel_type == "CONTAINS" and r.from_name == "Foo"]
     assert contains.from_file == "foo.cpp"
 

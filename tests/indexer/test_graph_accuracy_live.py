@@ -1617,10 +1617,10 @@ def _widget_nodes(engine, repo_id):
      ({"widget.cpp": "void Widget::draw() {}\n"}, False)],
 ], ids=["header-first", "cpp-first", "split", "cpp-removed", "only-cpp-removed", "cpp-restored",
         "header-restored", "cpp-edited"])
-def test_a_cpp_out_of_class_definition_keeps_its_own_class_stub(engine, repo_id, tmp_path, steps):
-    """`void Widget::draw() {}` claims a file-less Class stub, like a route's
-    handler stub: it never merges onto the header's Class, and it goes with
-    its last claimant, whatever the order and batching."""
+def test_a_cpp_out_of_class_definition_makes_no_class_stub(engine, repo_id, tmp_path, steps):
+    """`void Widget::draw() {}` makes no Class of its own (audit 11 item 5;
+    it claimed a file-less stub before): the header's Class is the only
+    one, whatever the order and batching."""
     write(tmp_path, "gadget.h", GADGET_H)
     scan(engine, repo_id, tmp_path)
     for files, split in steps:
@@ -1640,16 +1640,15 @@ def test_a_cpp_out_of_class_definition_keeps_its_own_class_stub(engine, repo_id,
             if changed:
                 index_paths(engine, repo_id, tmp_path, changed)
         incremental_equals_fresh(engine, repo_id, tmp_path)
-    expected = [("", ["widget.cpp"])] if (tmp_path / "widget.cpp").exists() else []
-    if (tmp_path / "widget.h").exists():
-        expected.append(("widget.h", []))
+    expected = [("widget.h", [])] if (tmp_path / "widget.h").exists() else []
     assert _widget_nodes(engine, repo_id) == expected
 
 
 def test_the_index_upgrade_drops_old_class_stubs(engine, repo_id, tmp_path):
     """A stub an index before format 9 wrote has no `source`, so nothing ever
     unclaimed it: the upgrade's full scan deletes this repository's Class
-    nodes with no `file` or `source`, and keeps the claimed stub."""
+    nodes with no `file` or `source`; a claimed stub (formats 9 to 22) goes
+    too, as its claimant no longer claims it."""
     write(tmp_path, "widget.h", WIDGET_H)
     write(tmp_path, "widget.cpp", WIDGET_CPP)
     write(tmp_path, "gadget.h", GADGET_H)
@@ -1664,5 +1663,5 @@ def test_the_index_upgrade_drops_old_class_stubs(engine, repo_id, tmp_path):
     assert engine.run_cypher(
         "MATCH (n:Class {name: 'Gone'}) WHERE n.repo_id IN $r RETURN n.repo_id AS r", {"r": [repo_id, other]}
     ) == [{"r": other}]
-    assert _widget_nodes(engine, repo_id) == [("", ["widget.cpp"]), ("widget.h", [])]
+    assert _widget_nodes(engine, repo_id) == [("widget.h", [])]
     incremental_equals_fresh(engine, repo_id, tmp_path)
