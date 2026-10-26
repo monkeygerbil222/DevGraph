@@ -532,10 +532,6 @@ table.dstable input[type="text"] { width: 100%; }
             <span class="lbl">Color by community<span class="qmark" data-tip="Colors nodes by their graph-insights community instead of entity type. Grey nodes have no community: no dependency or containment edges, or insights not computed yet.">?</span></span>
             <label class="switch"><input type="checkbox" id="ctlCommunityColors" /><span class="track"></span><span class="thumb"></span></label>
           </div>
-          <div class="toggle-row">
-            <span class="lbl">Node/edge shadows<span class="qmark" data-tip="Soft drop-shadow on nodes and relationship lines. Costs real canvas paint time (shadow blur isn't free), more so with a lot on screen -- turn off for a flatter look on a large graph.">?</span></span>
-            <label class="switch"><input type="checkbox" id="ctlShadowsEnabled" checked /><span class="track"></span><span class="thumb"></span></label>
-          </div>
           <div class="toggle-row" style="margin-bottom:0">
             <span class="lbl">Node glow<span class="qmark" data-tip="A constant, faded halo just outside every on-screen node's circle, brightened further on hover or a query match. Drawn on its own overlay canvas; auto-suppressed once on-screen nodes pass the render-quality threshold above, regardless of this setting.">?</span></span>
             <label class="switch"><input type="checkbox" id="ctlGlowEnabled" checked /><span class="track"></span><span class="thumb"></span></label>
@@ -1075,7 +1071,7 @@ function catColorBright(cat) {
    AND type(r)="X") instead of the old exclude-list (AND NOT ... IN [...]).
    Clicking the already-isolated one clears back to the whole graph. Entity
    and relationship isolation are independent of each other. */
-const state = { isolatedEntity: null, isolatedRel: null, nodeCeiling: 794, relCeiling: 2000, highlightMode: true, renderThreshold: 1600, rotationEnabled: false, shadowsEnabled: true, glowEnabled: true, settleOnChange: true, colorByCommunity: false };
+const state = { isolatedEntity: null, isolatedRel: null, nodeCeiling: 794, relCeiling: 2000, highlightMode: true, renderThreshold: 1600, rotationEnabled: false, glowEnabled: true, settleOnChange: true, colorByCommunity: false };
 document.getElementById("ctlRotationEnabled").addEventListener("change", e => {
   state.rotationEnabled = e.target.checked;
   if (state.rotationEnabled) armRotationLoop();
@@ -1084,10 +1080,6 @@ document.getElementById("ctlRotationEnabled").addEventListener("change", e => {
      finding it false, sets rotationLoopArmed = false and returns WITHOUT
      scheduling another requestAnimationFrame -- so the loop actually ends,
      it doesn't just idle. */
-});
-document.getElementById("ctlShadowsEnabled").addEventListener("change", e => {
-  state.shadowsEnabled = e.target.checked;
-  cy.style().update(); // shadow-* below are function-valued styles gated on state.shadowsEnabled -- force Cytoscape to re-evaluate them on every element now, not just on the next unrelated restyle
 });
 document.getElementById("ctlCommunityColors").addEventListener("change", e => {
   state.colorByCommunity = e.target.checked;
@@ -1323,23 +1315,12 @@ const cy = cytoscape({
         "text-outline-color": "#08090a", "text-outline-width": 1.5, "text-outline-opacity": 0.7,
         "width": ele => STRUCTURAL_CATS.has(ele.data("cat")) ? 15 : 9, "height": ele => STRUCTURAL_CATS.has(ele.data("cat")) ? 15 : 9,
         /* Glow (query match / hover bloom) is drawn separately on glowCanvas
-           via renderGlow() below -- it never used this node's own canvas
-           shadow. Cytoscape shadow-blur is real per-node paint cost (shadow
-           blur isn't free), which is why it's user-toggleable (default on)
-           rather than always-on -- shadow-blur is forced to 0 when off, not
-           just shadow-opacity, since blur is what actually triggers the
-           expensive convolution regardless of opacity. Toggling calls
-           cy.style().update() (see the ctlShadowsEnabled listener) to force
-           these function values to re-evaluate. */
-        "shadow-blur": ele => state.shadowsEnabled ? 4 + (ele.data("glow")||0) * 16 : 0,
-        "shadow-color": ele => catColor(ele.data("cat")),
-        "shadow-opacity": ele => state.shadowsEnabled ? (ele.data("glow")||0) * 0.9 : 0,
-        "shadow-offset-x": 0, "shadow-offset-y": 0,
+           via renderGlow() below. Cytoscape 3.x has no shadow-* style
+           properties, so there are none here. */
         /* A thin border in the exact canvas background color (#08090a,
            same constant as text-outline-color above) helps separate
-           adjacent same-color nodes in a tight cluster independently of
-           the shadow toggle above: it reads as a gap rather than a ring,
-           for the flat cost of a stroke() call -- no blur convolution. */
+           adjacent same-color nodes in a tight cluster: it reads as a gap
+           rather than a ring, for the flat cost of a stroke() call. */
         "border-width": 1, "border-color": "#08090a", "border-opacity": 0.1,
         } },
     { selector: "node.show-label", style: { "label": "data(label)" } },
@@ -1359,10 +1340,6 @@ const cy = cytoscape({
         "curve-style": "unbundled-bezier", "control-point-distances": [16], "control-point-weights": [0.5],
         "target-arrow-shape": "triangle", "target-arrow-color": ele => catColor(ele.target().data("cat")), "arrow-scale": 0.55,
         "opacity": ele => 0.35 + (ele.data("glow")||0) * 0.55,
-        "shadow-blur": ele => state.shadowsEnabled ? (ele.data("glow")||0) * 16 : 0,
-        "shadow-color": ele => catColor(ele.source().data("cat")),
-        "shadow-opacity": ele => state.shadowsEnabled ? (ele.data("glow")||0) * 0.85 : 0,
-        "shadow-offset-x": 0, "shadow-offset-y": 0,
     } },
     { selector: "edge.excluded", style: { "line-fill": "solid", "line-color": "var(--meta)", "line-style": "dashed", "opacity": 0.25, "target-arrow-color": "var(--meta)" } },
     /* heavy-mode: engaged only once the on-screen node count (post-culling)
@@ -1379,10 +1356,9 @@ const cy = cytoscape({
     { selector: "node.hover-hl", style: {
         "background-color": ele => catColorBright(ele.data("cat")),
         "color": "#ffffff", "text-opacity": 1, "text-outline-opacity": 0.9,
-        "shadow-blur": ele => state.shadowsEnabled ? 20 : 0, "shadow-color": ele => catColor(ele.data("cat")), "shadow-opacity": ele => state.shadowsEnabled ? 1 : 0,
         "z-index": 20,
     } },
-    { selector: "edge.hover-hl", style: { "width": 2.2, "opacity": 1, "shadow-blur": ele => state.shadowsEnabled ? 30 : 0, "shadow-opacity": ele => state.shadowsEnabled ? 1 : 0, "z-index": 15 } },
+    { selector: "edge.hover-hl", style: { "width": 2.2, "opacity": 1, "z-index": 15 } },
   ],
   layout: { name: "random" },
   minZoom: 0.2, maxZoom: 3,
@@ -2388,7 +2364,7 @@ function highlightRel(rel, on) { cy.edges(relSelector(rel)).toggleClass("hover-h
 
 /* ── smooth glow/deglow: animate each node/edge's "glow" data value toward a
    target (1 = matched by the active cypher query, 0 = not) over ~420ms, driving
-   both the shadow style mappers above and the additive bloom canvas. ── */
+   both the edge opacity mapper above and the additive bloom canvas. ── */
 let glowAnimId = null;
 function animateGlowTo(targetIds) {
   const targets = targetIds instanceof Set ? targetIds : new Set(targetIds);

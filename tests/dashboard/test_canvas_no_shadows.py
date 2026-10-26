@@ -1,0 +1,28 @@
+"""The canvas offers no shadow setting it cannot draw.
+
+Cytoscape.js 3.x has no `shadow-*` style properties: the canvas stylesheet's
+shadow mappers were ignored with one warning per element, and the "Node/edge
+shadows" switch changed nothing on screen. Neither may come back.
+"""
+
+import re
+from pathlib import Path
+
+from devgraph.dashboard import app as dashboard_app
+
+STATIC = Path(dashboard_app.__file__).resolve().parent / "static"
+
+
+def _html() -> str:
+    return (STATIC / "index.html").read_text(encoding="utf-8")
+
+
+def test_no_canvas_style_sets_a_shadow():
+    assert not re.search(r"[\"']shadow-[a-z-]+[\"']\s*:", _html())
+
+
+def test_there_is_no_shadow_switch():
+    html = _html()
+    assert "ctlShadowsEnabled" not in html
+    assert "shadowsEnabled" not in html
+    assert "Node/edge shadows" not in html
