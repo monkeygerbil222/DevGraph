@@ -137,3 +137,39 @@ def test_find_callers_tells_two_types_same_named_methods_apart(engine, repo_id, 
     index_paths(engine, repo_id, tmp_path, {model})
     assert _callers(engine, repo_id, "doubled", "Priced") == []
     _equals_fresh(engine, repo_id, tmp_path)
+
+
+# --- a call through a trait (review F4) ---------------------------------------------
+
+TRAITS = """\
+    pub struct Order { pub n: u32 }
+    pub struct Invoice { pub n: u32 }
+    pub trait Local { fn hi(&self) -> u32; fn deflt(&self) -> u32 { 5 } }
+    impl Local for Invoice { fn hi(&self) -> u32 { 1 } }
+    impl Local for Order { fn hi(&self) -> u32 { 2 } }
+    """
+
+
+def test_a_traits_implementations_carry_its_heir_key():
+    result = extract_rust_file(textwrap.dedent(TRAITS), "src/model.rs", "repo")
+    keys = {(n.properties["owner"], n.properties["start_line"]): n.properties.get("mkeys")
+            for n in result.nodes if n.label == "Function" and n.name == "hi"}
+    assert keys == {("Invoice", 4): ["<Local"], ("Order", 5): ["<Local"]}
+
+
+def test_a_call_through_a_trait_links_its_files_implementations(engine, repo_id, tmp_path):
+    _write(tmp_path, "Cargo.toml", '[package]\nname = "shop"\nversion = "0.1.0"\n')
+    _write(tmp_path, "src/lib.rs", "pub mod model;\npub mod svc;\n")
+    _write(tmp_path, "src/model.rs", TRAITS)
+    _write(tmp_path, "src/svc.rs", """\
+        use crate::model::{Local, Order};
+
+        pub fn ufcs(o: &Order) -> u32 { Local::hi(o) }
+        pub fn typed(o: &Order) -> u32 { o.hi() }
+        """)
+    provision_repository_schema(engine, tmp_path)
+    engine.upsert_repository(repo_id, repo_id, str(tmp_path))
+    full_scan(engine, repo_id, tmp_path)
+    assert _callers(engine, repo_id, "hi", "Invoice") == [("ufcs", "resolved")]
+    assert _callers(engine, repo_id, "hi", "Order") == [("typed", "resolved"), ("ufcs", "resolved")]
+    _equals_fresh(engine, repo_id, tmp_path)

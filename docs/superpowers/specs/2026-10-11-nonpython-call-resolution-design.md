@@ -683,6 +683,11 @@ name give no edge, and a `use` of an inline module of the file none.
    of the same file: its own method, or a default method of a trait of that
    file it implements (each type's heir declaration has the traits of its
    file it implements as bases, so `Priced::doubled` carries `<Order`). A
+   call through a trait (`Local::hi(o)`, owned by `Local`) links the
+   implementations of that trait's file: a type's method implementing a
+   method the trait declares carries the trait's heir key (`<Local` on
+   `Order::hi` for `impl Local for Order`), as the owner-less pin to that
+   file reached them before (audit 11 review F4). A
    trait of another file is no base (its default methods are in its own
    file), so no Rust type is open; a default method of another file's trait,
    or a method an `impl` in another file adds, is not reached, as before.

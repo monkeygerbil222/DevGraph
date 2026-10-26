@@ -72,7 +72,8 @@ package confidence.
   loop over a `Vec<T>` or slice) -> this file when the type and the method
   are declared here, else the type's module, owned by the type (its own
   method, or a default method of a trait of that file it implements: heir
-  keys), as `Type::f()` there is; a std type (calls.STOP_TYPES)
+  keys), as `Type::f()` there is (`Trait::f()` reaches the implementations
+  of its file: they carry the trait's heir key); a std type (calls.STOP_TYPES)
   or a path outside the repository links nothing, and neither does a bare
   `f()` nothing declares or imports; an untyped receiver keeps a bare-name
   edge that never ends at its caller, unless its method is stoplisted
@@ -100,6 +101,7 @@ from typing import NamedTuple
 import tree_sitter_rust as tsrust
 from tree_sitter import Language, Node, Parser
 
+from devgraph.graph.schema import HEIR_KEY
 from devgraph.indexer.calls import STOP_METHODS, STOP_TYPES, CallSites, import_rows
 from devgraph.indexer.common import (
     ExtractionResult,
@@ -862,6 +864,17 @@ class _RustResolver:
             for name in names
         ]
 
+    def implemented(self, method: str, owner: str | None) -> list[str]:
+        """The traits of this file whose method `method` of the type
+        `owner` implements (`impl Local for Order { fn hi }`): each is a
+        heir key of it (graph/schema.py `HEIR_KEY`), so a call through the
+        trait (`Local::hi(o)`, owned by `Local`) links the implementations
+        of its file, as an owner-less pin to the file did."""
+        return [
+            trait for trait in self.trait_impls.get(owner or "", [])
+            if trait in self.types and method in self.methods.get(trait, set())
+        ]
+
     # --- types ---------------------------------------------------------------------
 
     def type_of(self, node: Node | None, source: bytes | None = None) -> _Type | None:
@@ -1362,6 +1375,9 @@ def extract_rust_file(
     visit_block(root, None, "Module", resolver.module)
     result.relationships += sites.rows(file_path, repo_id)
     add_heir_keys(result, resolver.heir_decls())
+    for node in result.nodes:
+        if node.label == "Function" and (traits := resolver.implemented(node.name, node.properties.get("owner"))):
+            node.properties["mkeys"] = sorted({*node.properties.get("mkeys", ()), *(HEIR_KEY + t for t in traits)})
 
     return own_edges(result, file_path)
 
