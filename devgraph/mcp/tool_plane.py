@@ -183,11 +183,14 @@ def _failure(tool: CypherTool, exc: Exception, layer: str = "project", uri: str 
     to reach Neo4j at `uri` when it is down. `layer` is "project" or "global"."""
     from neo4j.exceptions import Neo4jError
 
+    from devgraph.graph.engine import QueryNotAnswered
     from devgraph.mcp.tools import neo4j_unavailable
 
     unavailable = neo4j_unavailable(exc, uri) if uri else None
     if unavailable is not None:
         return unavailable
+    if isinstance(exc, QueryNotAnswered):  # our own message, no query text or data
+        return ToolError(f"{layer} tool {tool.name!r}: {exc}")
     if isinstance(exc, Neo4jError):
         code = str(getattr(exc, "code", None) or "unknown")
         if "TransactionTimedOut" in code:

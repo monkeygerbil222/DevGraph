@@ -82,4 +82,11 @@ def test_the_mcp_connection_timeout_is_a_setting(monkeypatch):
     monkeypatch.setattr(engine_module.GraphDatabase, "driver", driver)
     mcp_server.mcp_engine(Settings(mcp_connection_timeout_s=3.5))
     assert seen["connection_timeout"] == seen["connection_acquisition_timeout"] == 3.5
-    assert seen["liveness_check_timeout"] == 0
+    # Only a connection idle this long is checked before use: one RESET per idle spell, not per query.
+    assert seen["liveness_check_timeout"] == 10.0
+
+
+def test_the_default_limits():
+    defaults = Settings()
+    assert defaults.mcp_connection_timeout_s == 5.0
+    assert defaults.neo4j_probe_timeout_s == 5.0

@@ -575,34 +575,84 @@ _BASE_DELAY_S = 0.5
 FAIL_FAST_RETRY_PAUSE_S = 0.5
 
 
-#: How much longer than its transaction timeout a fail-fast
-#: `GraphEngine.run_read_cypher` waits for its answer before giving up on it
-#: as `Neo4jNotAnswering`. The transaction timeout is enforced by the server,
-#: so a connection whose server is gone (a forwarder still accepting) would
-#: otherwise wait for the server's receive-timeout hint (120 s), or forever.
+#: How much longer than its transaction timeout one try of a fail-fast
+#: `GraphEngine.run_read_cypher` waits for its answer before giving up on it.
+#: The transaction timeout is enforced by the server, so a connection whose
+#: server is gone (a forwarder still accepting) would otherwise wait for the
+#: server's receive-timeout hint (120 s), or forever.
 READ_DEADLINE_MARGIN_S = 5.0
 
 
+class QueryNotAnswered(TimeoutError):
+    """Neo4j accepted a fail-fast read's transaction (it answered the BEGIN)
+    but sent no answer by the read's deadline. Neo4j is up, so this is no
+    `ServiceUnavailable`: it is not reported as Neo4j being down."""
+
+
+class _ReadProgress:
+    """What a fail-fast read's worker tells `_within`: when its current try
+    began (an index wait or the retry starts a new one), and whether Neo4j
+    accepted that try's transaction."""
+
+    def __init__(self) -> None:
+        self.started = time.monotonic()
+        self.accepted = False
+
+
+#: The `_ReadProgress` of the read running in this thread, if any.
+_read_progress = threading.local()
+
+
+def _new_try() -> None:
+    """Restart the current fail-fast read's deadline: a new try, or a wait for an index."""
+    progress = getattr(_read_progress, "current", None)
+    if progress is not None:
+        progress.started, progress.accepted = time.monotonic(), False
+
+
+def _try_accepted() -> None:
+    progress = getattr(_read_progress, "current", None)
+    if progress is not None:
+        progress.accepted = True
+
+
 def _within(deadline_s: float, fn: Callable[[], Any]) -> Any:
-    """`fn()`, run in a daemon thread, or `Neo4jNotAnswering` once it has taken
-    `deadline_s`. The abandoned thread ends when its socket does (its session
-    keeps `GraphEngine.close` waiting only up to its timeout)."""
+    """`fn()`, run in a daemon thread, given up once its current try (see
+    `_ReadProgress`) has taken `deadline_s`: `QueryNotAnswered` when Neo4j had
+    accepted that try's transaction, else `Neo4jNotAnswering`. The abandoned
+    thread ends when its socket does (its session keeps `GraphEngine.close`
+    waiting only up to its timeout)."""
     outcome: dict[str, Any] = {}
+    progress = _ReadProgress()
 
     def target() -> None:
+        _read_progress.current = progress
         try:
             outcome["value"] = fn()
         except BaseException as exc:  # re-raised in the caller's thread
             outcome["error"] = exc
+        finally:
+            _read_progress.current = None
 
     worker = threading.Thread(target=target, name="devgraph-read", daemon=True)
     worker.start()
-    worker.join(deadline_s)
-    if worker.is_alive():
-        raise Neo4jNotAnswering(f"Neo4j did not answer within {deadline_s:.0f} s")
+    while worker.is_alive():
+        remaining = progress.started + deadline_s - time.monotonic()
+        if remaining <= 0:
+            if progress.accepted:
+                raise QueryNotAnswered(f"Neo4j accepted the query but didn't answer within {deadline_s:g} s")
+            raise Neo4jNotAnswering(f"Neo4j did not answer within {deadline_s:g} s")
+        worker.join(remaining)
     if "error" in outcome:
         raise outcome["error"]
     return outcome["value"]
+
+
+#: A pooled connection idle at least this long is checked (a RESET) before use,
+#: on an engine given `connection_timeout_s`: one whose server is gone behind a
+#: forwarder that still accepts is replaced rather than used. One used again
+#: sooner is not checked; a fail-fast read on it is still bounded by its deadline.
+LIVENESS_CHECK_S = 10.0
 
 
 #: How long `GraphEngine.close` waits, by default, for open sessions to end.
@@ -656,6 +706,7 @@ def _wait_for_indexes(fn, *args, **kwargs):
     for up to INDEX_WAIT_S; then raise `IndexesNotReady`."""
     deadline = None
     while True:
+        _new_try()
         try:
             return fn(*args, **kwargs)
         except Neo4jError as exc:
@@ -667,6 +718,7 @@ def _wait_for_indexes(fn, *args, **kwargs):
                 logger.warning("a graph index is still being built; waiting up to %.0f s for it", INDEX_WAIT_S)
             if now >= deadline:
                 raise IndexesNotReady(f"a graph index was still being built after {INDEX_WAIT_S:.0f} s") from exc
+            _new_try()  # waiting for the index is no sign of Neo4j being down
             time.sleep(_INDEX_POLL_S)
 
 
@@ -1484,16 +1536,18 @@ class GraphEngine:
         retried for up to 30 s, and getting a connection may take 30-60 s.
 
         `connection_timeout_s` bounds getting a connection: opening it, the Bolt
-        handshake, or waiting for a pooled one; a pooled connection is also
-        checked (a RESET) before each use, within that time, so one whose
-        server is gone behind a forwarder that still accepts is replaced, not
-        used. Running out of it raises `Neo4jNotAnswering`. `fail_fast` turns
+        handshake, or waiting for a pooled one; a pooled connection idle for
+        `LIVENESS_CHECK_S` is also checked (a RESET) before use, within that
+        time, so one whose server is gone behind a forwarder that still
+        accepts is replaced, not used. Running out of it raises
+        `Neo4jNotAnswering`. `fail_fast` turns
         the driver's retries off, and `verify_connectivity`'s; `run_read_cypher`
         then retries a read once, `FAIL_FAST_RETRY_PAUSE_S` later, when it
         failed once connected (a transient error, an expired session, the
         connection lost mid-query), and never when no connection could be had
-        at all (refused, timed out), and gives up on a read with no answer
-        `READ_DEADLINE_MARGIN_S` past its timeout. The MCP server sets both,
+        at all (refused, timed out), and gives up on a try with no answer
+        `READ_DEADLINE_MARGIN_S` past its timeout (see `_within`; waiting for
+        an index being built is no try without an answer). The MCP server sets both,
         so a request fails within a few seconds when Neo4j is down, and so do
         `devgraph status` and `doctor` for their connection check."""
         self.uri = uri
@@ -1506,7 +1560,7 @@ class GraphEngine:
         if connection_timeout_s is not None:
             limits["connection_timeout"] = connection_timeout_s
             limits["connection_acquisition_timeout"] = connection_timeout_s
-            limits["liveness_check_timeout"] = 0
+            limits["liveness_check_timeout"] = LIVENESS_CHECK_S
         # (repo_id, owner) of the full-scan claims taken through this engine
         # and not yet released: `close` releases them.
         self._held_scan_claims: set[tuple[str, str]] = set()
@@ -2956,8 +3010,10 @@ class GraphEngine:
         timeout bounds the time; rows stop being pulled after `max_rows`, and
         the second value says whether more existed. Used by the MCP tool
         plane for `devgraph.tools.yaml` tools. On a fail-fast engine, the
-        client also gives up `READ_DEADLINE_MARGIN_S` past the timeout (see
-        `_within`), since the server enforcing it may be gone.
+        client also gives up on a try `READ_DEADLINE_MARGIN_S` past the timeout
+        (see `_within`), since the server enforcing it may be gone:
+        `Neo4jNotAnswering` when it never accepted the transaction,
+        `QueryNotAnswered` when it did.
         """
         if not self._fail_fast:
             return self._read_cypher(query, parameters, timeout_s=timeout_s, max_rows=max_rows)
@@ -2974,6 +3030,7 @@ class GraphEngine:
         @unit_of_work(timeout=timeout_s)
         def work(tx):
             connected.append(True)
+            _try_accepted()
             rows: list[dict] = []
             for record in tx.run(query, parameters):
                 if len(rows) == max_rows:
@@ -2985,6 +3042,7 @@ class GraphEngine:
             with self._driver.session(default_access_mode=READ_ACCESS) as session:
                 return session.execute_read(work)
         try:
+            _new_try()
             with self._driver.session(default_access_mode=READ_ACCESS) as session:
                 return session.execute_read(work)
         except ABORTS_BATCH:
@@ -2993,6 +3051,7 @@ class GraphEngine:
             timed_out = "TransactionTimedOut" in str(getattr(exc, "code", None) or "")
             if not connected or timed_out:  # Neo4j can't be reached, or the query ran out of time
                 raise
+        _new_try()  # the retry, its pause included
         time.sleep(FAIL_FAST_RETRY_PAUSE_S)
         with self._driver.session(default_access_mode=READ_ACCESS) as session:
             return session.execute_read(work)

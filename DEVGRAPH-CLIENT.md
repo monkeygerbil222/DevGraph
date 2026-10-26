@@ -448,7 +448,9 @@ argument below its minimum (`max_results`, `within_commits`,
 If Neo4j is down (or gone behind a forwarder that still accepts connections),
 every tool fails within a few seconds with `Neo4j isn't
 reachable at <uri>; start Neo4j ...`: tell the user to start Neo4j (or run
-`devgraph doctor`) rather than retrying the call in a loop.
+`devgraph doctor`) rather than retrying the call in a loop. A tool that says
+`Neo4j accepted the query but didn't answer within 35 s ...` means Neo4j is up
+but slow or stalled: retry once, or narrow the request.
 
 If a tool returns empty/sparse results, check whether the repo has actually
 been scanned (step 1/2) before concluding the graph has nothing to say — an

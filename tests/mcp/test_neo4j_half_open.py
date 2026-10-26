@@ -75,8 +75,11 @@ def test_a_call_on_a_pooled_connection_fails_fast_once_the_forwarder_stops_answe
     settings = Settings(registry_db_path=tmp_path / "r.sqlite3", neo4j_uri=bolt.uri)
     monkeypatch.setattr(mcp_server, "get_settings", lambda: settings)
     record = _Repo("zz-half-open", tmp_path)
+    # A pooled connection idle past the liveness threshold is checked before use.
+    monkeypatch.setattr(engine_module, "LIVENESS_CHECK_S", 0.3)
     engine = mcp_server.mcp_engine(settings)
     engine.probe_connectivity()  # the server's start-up check leaves a pooled connection
+    time.sleep(0.5)
     bolt.freeze()
     server = mcp_server.build_server(engine, _Registry([record]), session_repo=record, session_source="env")
 
@@ -99,12 +102,27 @@ def test_a_call_on_a_pooled_connection_fails_fast_once_the_forwarder_stops_answe
 def test_a_read_that_never_gets_an_answer_is_abandoned_after_its_timeout_and_a_margin(bolt, monkeypatch):
     # Logged in, then silence: the transaction timeout is the server's to
     # enforce, so only the client's own deadline ends the wait.
-    monkeypatch.setattr(engine_module, "READ_DEADLINE_MARGIN_S", 1.0)
+    # It never answered the transaction's BEGIN, so it is reported unreachable.
+    monkeypatch.setattr(engine_module, "READ_DEADLINE_MARGIN_S", 0.5)
     engine = GraphEngine(bolt.uri, "neo4j", "x", fail_fast=True, connection_timeout_s=2.0)
     started = time.monotonic()
     try:
-        with pytest.raises(ServiceUnavailable, match="did not answer within 2 s"):
+        with pytest.raises(ServiceUnavailable, match=r"did not answer within 1\.5 s"):
             _run_bounded(lambda: engine.run_read_cypher("RETURN 1", {}, timeout_s=1, max_rows=1))
     finally:
         engine.close(timeout=0.1)
-    assert time.monotonic() - started < 2.0 + 3.0
+    assert time.monotonic() - started < 1.5 + 3.0
+
+
+def test_a_pooled_connection_used_again_soon_after_the_freeze_is_given_up_at_the_deadline(bolt, monkeypatch):
+    # Within the liveness threshold the pooled connection is used unchecked;
+    # its BEGIN is never answered, so the deadline reports Neo4j unreachable.
+    monkeypatch.setattr(engine_module, "READ_DEADLINE_MARGIN_S", 0.5)
+    engine = GraphEngine(bolt.uri, "neo4j", "x", fail_fast=True, connection_timeout_s=2.0)
+    try:
+        engine.probe_connectivity()
+        bolt.freeze()
+        with pytest.raises(ServiceUnavailable, match=r"did not answer within 1\.5 s"):
+            _run_bounded(lambda: engine.run_read_cypher("RETURN 1", {}, timeout_s=1, max_rows=1))
+    finally:
+        engine.close(timeout=0.1)

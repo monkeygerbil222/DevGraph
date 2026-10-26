@@ -63,7 +63,7 @@ from devgraph.agent import lifecycle
 from devgraph.config.global_tools import GLOBAL_TOOLS_FILENAME, global_tools_fingerprint
 from devgraph.config.project_tools import TOOLS_FILENAME
 from devgraph.config.settings import get_settings
-from devgraph.graph.engine import GraphEngine
+from devgraph.graph.engine import GraphEngine, QueryNotAnswered
 from devgraph.mcp import tools as devgraph_tools
 from devgraph.mcp.catalog import TOOL_CATALOG as _TOOL_CATALOG
 from devgraph.mcp.catalog import builtin_tool_names  # noqa: F401  (re-exported)
@@ -321,6 +321,9 @@ def _with_neo4j_errors(fn: Callable[..., Any], uri: str) -> Callable[..., Any]:
     def wrapper(*args: Any, **kwargs: Any) -> Any:
         try:
             return fn(*args, **kwargs)
+        except QueryNotAnswered as exc:
+            # Neo4j is up: not the "start Neo4j" advice of an unreachable one.
+            raise ToolError(f"{exc} (at {uri}); it is running but slow or stalled: retry, or narrow the request") from exc
         except Exception as exc:
             error = devgraph_tools.neo4j_unavailable(exc, uri)
             if error is None:
