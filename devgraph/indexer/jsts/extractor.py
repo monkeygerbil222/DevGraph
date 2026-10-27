@@ -72,6 +72,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import posixpath
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -789,10 +790,6 @@ def _extract_imports(
 #: the pins of where that is defined, joined by these.
 _EXPORT_SEP = "\x1f"
 _EXPORT_PIN_SEP = "\x1e"
-#: How many files deep an export is followed (`a` re-exporting `b`
-#: re-exporting `c` is two); past it, nothing.
-_MAX_EXPORT_DEPTH = 8
-
 #: `_export_entries` by a digest of the text read: a file is parsed again
 #: only when its content changes, however many importers read it.
 _ENTRIES_SEEN: dict[bytes, tuple] = {}
@@ -888,49 +885,113 @@ def export_surface(rel: str, config: ResolverConfig | None) -> ExportSurface:
     where it is defined, the pins of where that is: the file itself, or a
     re-export's specifier's `_specifier_pins`). A re-export (`export {
     default as subtract } from './math'`, or `export * from`) of a file
-    that aliases the name is followed to the definition, up to
-    `_MAX_EXPORT_DEPTH` files deep; through a cycle, nothing. Cached in
-    `config` for the batch (only a result no cycle or depth limit cut, so
-    it is the same whichever file is read first). Empty without `config`."""
+    that aliases the name is followed to the definition, however deep.
+    Files that re-export each other (a cycle, a strongly connected set) are
+    resolved together (`_resolve_cycle`), so the result never depends on
+    which file is read first. Cached in `config` for the batch, each file
+    read once. Empty without `config`."""
     if config is None:
         return {}
-    return _surface(rel, config, ())[0]
+    cache = config.js_surfaces
+    if rel not in cache:
+        _resolve_reachable(rel, config)
+    return cache[rel]
 
 
-def _surface(rel: str, config: ResolverConfig, stack: tuple[str, ...]) -> tuple[ExportSurface, bool]:
-    """`export_surface` of `rel` read through the files in `stack`, and
-    whether no cycle or depth limit cut it."""
-    if rel in config.js_surfaces:
-        return config.js_surfaces[rel], True
-    if rel in stack or len(stack) >= _MAX_EXPORT_DEPTH:
-        return {}, False
-    entries = _read_export_entries(config, rel)
-    surface, closed = _resolve_exports(rel, entries or ((), ()), config, (*stack, rel))
-    if closed:
-        config.js_surfaces[rel] = surface
-    return surface, closed
+def _export_dependencies(rel: str, entries: _ExportEntries, config: ResolverConfig) -> list[str]:
+    """The candidate files of every specifier the file `rel` re-exports from."""
+    folder = posixpath.dirname(rel)
+    specifiers = [spec for _exported, _original, spec in entries[0] if spec is not None] + list(entries[1])
+    return list(dict.fromkeys(
+        file for spec in specifiers for file in _resolve_module_specifier(spec, folder, config, rel)
+    ))
+
+
+def _resolve_reachable(rel: str, config: ResolverConfig) -> None:
+    """Fill `config.js_surfaces` for `rel` and every file it re-exports
+    from, transitively: Tarjan's strongly connected components, iterative
+    (a chain of any depth), each component resolved once its dependencies
+    are, in the order the algorithm completes them."""
+    cache = config.js_surfaces
+    entries: dict[str, _ExportEntries] = {}
+    index: dict[str, int] = {}
+    low: dict[str, int] = {}
+    stack: list[str] = []
+    on_stack: set[str] = set()
+
+    def visit(file: str):
+        entries[file] = _read_export_entries(config, file) or ((), ())
+        index[file] = low[file] = len(index)
+        stack.append(file)
+        on_stack.add(file)
+        return iter(_export_dependencies(file, entries[file], config))
+
+    work = [(rel, visit(rel))]
+    while work:
+        file, pending = work[-1]
+        for dep in pending:
+            if dep in cache:
+                continue
+            if dep not in index:
+                work.append((dep, visit(dep)))
+                break
+            if dep in on_stack:
+                low[file] = min(low[file], index[dep])
+        else:
+            work.pop()
+            if work:
+                low[work[-1][0]] = min(low[work[-1][0]], low[file])
+            if low[file] == index[file]:
+                members = []
+                while True:
+                    member = stack.pop()
+                    on_stack.discard(member)
+                    members.append(member)
+                    if member == file:
+                        break
+                _resolve_cycle(sorted(members), entries, config)
+
+
+def _resolve_cycle(members: list[str], entries: dict[str, _ExportEntries], config: ResolverConfig) -> None:
+    """Cache the surfaces of one strongly connected set of files, whose
+    other dependencies are cached: each is resolved from the others'
+    current surfaces, all of them in path order, from empty, until none
+    changes (at most once per member and once more), a result that depends
+    on the set alone."""
+    cache = config.js_surfaces
+    current: dict[str, ExportSurface] = {member: {} for member in members}
+
+    def lookup(file: str) -> ExportSurface:
+        return current[file] if file in current else cache.get(file, {})
+
+    for _round in range(len(members) + 1 if len(members) > 1 else 1):
+        changed = False
+        for member in members:
+            found = _resolve_exports(member, entries[member], config, lookup)
+            changed = changed or found != current[member]
+            current[member] = found
+        if not changed:
+            break
+    cache.update(current)
 
 
 def _resolve_exports(
-    rel: str, entries: _ExportEntries, config: ResolverConfig | None, stack: tuple[str, ...]
-) -> tuple[ExportSurface, bool]:
+    rel: str, entries: _ExportEntries, config: ResolverConfig | None,
+    lookup: Callable[[str], ExportSurface] | None = None,
+) -> ExportSurface:
     """The `export_surface` of the file `rel` whose `_export_entries` are
-    `entries`, read through `stack` (the files being resolved, `rel` last),
-    and whether no cycle or depth limit cut it. A name's first definition
-    wins: an entry, then each `export *` in order, each specifier's
-    candidate files in `_resolve_module_specifier` order."""
+    `entries`, reading the files it re-exports from through `lookup` (none
+    without one). A name's first definition wins: an entry, then each
+    `export *` in order, each specifier's candidate files in
+    `_resolve_module_specifier` order."""
     surface: ExportSurface = {}
-    closed = True
     folder = posixpath.dirname(rel)
 
     def surfaces(specifier: str):
-        nonlocal closed
-        if config is None:
+        if lookup is None:
             return
         for file in _resolve_module_specifier(specifier, folder, config, rel):
-            found, whole = _surface(file, config, stack)
-            closed = closed and whole
-            yield found
+            yield lookup(file)
 
     own, stars = entries
     for exported, original, specifier in own:
@@ -949,7 +1010,7 @@ def _resolve_exports(
             for name, value in each.items():
                 if name != "default":
                     surface.setdefault(name, value)
-    return surface, closed
+    return surface
 
 
 def _surface_entries(surface: ExportSurface) -> list[str]:
@@ -2069,7 +2130,9 @@ def extract_js_file(
     result.nodes.append(module_node)
     # What its importers' calls resolve through (`export_surface`), compared
     # by a batch to re-index them when it changes (dispatch `_export_importers`).
-    exports = _resolve_exports(file_path, _export_entries(root, source_bytes), config, (file_path,))[0]
+    exports = export_surface(file_path, config) if config is not None else _resolve_exports(
+        file_path, _export_entries(root, source_bytes), None,
+    )
     if exports:
         module_node.properties["js_exports"] = _surface_entries(exports)
 
