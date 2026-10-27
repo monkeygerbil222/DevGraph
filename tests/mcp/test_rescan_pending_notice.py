@@ -33,10 +33,10 @@ class _Engine:
 
 
 def test_a_pending_notice_follows_an_existing_one():
-    result = tools._with_notice({"count": 0, "notice": "results truncated"}, "rescan pending")
-    assert result["notice"] == "results truncated; rescan pending"
-    assert tools._with_notice({"count": 0}, "rescan pending")["notice"] == "rescan pending"
-    assert tools._with_notice({"count": 0, "notice": "x"}, None) == {"count": 0, "notice": "x"}
+    result = tools._with_notice({"count": 0, "notices": ["results truncated"]}, "rescan pending")
+    assert result["notices"] == ["results truncated", "rescan pending"]
+    assert tools._with_notice({"count": 0}, "rescan pending")["notices"] == ["rescan pending"]
+    assert tools._with_notice({"count": 0, "notices": ["x"]}, None) == {"count": 0, "notices": ["x"]}
 
 
 def test_the_agent_is_named_only_for_a_watched_repository():

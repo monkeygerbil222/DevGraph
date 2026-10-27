@@ -6,6 +6,7 @@ single note, identified by YAML front-matter:
     ---
     type: requirement | design_decision | architecture_note
     id: unique-slug
+    title: A human title                # optional; else the first `#` heading, else the id
     links: [path/to/module.py, ServiceName, ...]   # optional, what this note documents
     supersedes: other-note-id           # optional, design_decision only
     ---
@@ -105,9 +106,10 @@ class DocsExtractor:
         note_id = str(meta.get("id") or Path(filename).stem)
         body = match.group(2).strip()
 
+        title = meta.get("title")
         properties = {
             "source_file": filename,
-            "title": _first_heading(body) or note_id,
+            "title": (str(title).strip() if title is not None else "") or _first_heading(body) or note_id,
             "body": body,
         }
 

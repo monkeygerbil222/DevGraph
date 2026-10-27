@@ -190,7 +190,8 @@ def test_a_file_that_is_not_utf8_is_decoded_not_raised(two_helpers):
     (root / "b.py").write_bytes(b"def helper():\n    return 'caf\xe9'\n")  # Latin-1, as on disk
     result = get_source(engine, registry, repo_id, "helper", file="b.py")
     assert result["source"] == "def helper():\n    return 'café'"  # as the indexer decodes it
-    assert "UTF-8" in result["notice"] and "cp1252" in result["notice"]
+    (notice,) = result["notices"]
+    assert "UTF-8" in notice and "cp1252" in notice
 
 
 def test_get_source_honours_a_pep_263_declaration(two_helpers):
@@ -199,7 +200,7 @@ def test_get_source_honours_a_pep_263_declaration(two_helpers):
     index_paths(engine, repo_id, root, {root / "b.py"})  # the def moved down a line
     result = get_source(engine, registry, repo_id, "helper", file="b.py")
     assert result["source"] == "def helper():\n    return 'café'"
-    assert "notice" not in result  # declared, so read as intended
+    assert "notices" not in result  # declared, so read as intended
 
 
 def test_find_callers_keeps_same_named_callers_in_different_files_apart(two_helpers):
@@ -217,4 +218,5 @@ def test_get_source_notes_when_a_declared_codec_did_not_decode_the_file(two_help
     index_paths(engine, repo_id, root, {root / "b.py"})
     result = get_source(engine, registry, repo_id, "helper", file="b.py")
     assert result["source"] == "def helper():\n    return 'café'"
-    assert "ascii" in result["notice"] and "utf-8" in result["notice"]
+    (notice,) = result["notices"]
+    assert "ascii" in notice and "utf-8" in notice

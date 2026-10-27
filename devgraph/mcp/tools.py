@@ -91,8 +91,20 @@ def _source_off_notice(max_results: int, what: str, command: str, repo_id: str) 
     falls back to the network (no `gh`, no API call)."""
     return {
         **_envelope([], max_results),
-        "notice": f"{what} ingestion is off for {repo_id}; enable it with `devgraph {command} {repo_id} enable`",
+        "notices": [f"{what} ingestion is off for {repo_id}; enable it with `devgraph {command} {repo_id} enable`"],
     }
+
+
+def _docs_off_notice(registry: RepoRegistry | None, repo_id: str) -> str | None:
+    """A notice when `repo_id` is registered with no docs path: none of its
+    docs notes (requirements, design decisions, architecture notes) is indexed."""
+    repo = registry.get(repo_id) if registry is not None else None
+    if repo is None or repo.docs_path:
+        return None
+    return (
+        f"no docs path is set for {repo_id}, so no requirements, design decisions or architecture notes "
+        f"are indexed; set one with `devgraph annotate {repo_id} --docs-path <folder>`"
+    )
 
 
 def _rescan_pending_notice(engine: GraphEngine, registry: RepoRegistry | None, repo_id: str) -> str | None:
@@ -122,10 +134,10 @@ def _rescan_pending_notice(engine: GraphEngine, registry: RepoRegistry | None, r
 
 
 def _with_notice(result: dict[str, Any], notice: str | None) -> dict[str, Any]:
-    """`result` with `notice` added, after any notice it already has (a truncation)."""
+    """`result` with `notice` added to its `notices`, after any it already has (a truncation)."""
     if not notice:
         return result
-    return {**result, "notice": f"{result['notice']}; {notice}" if result.get("notice") else notice}
+    return {**result, "notices": [*result.get("notices", []), notice]}
 
 
 #: How long a built-in tool's query may run before it is cancelled.
@@ -404,9 +416,9 @@ def _capped_envelope(rows: list[Any], more: bool, max_results: int) -> dict[str,
     envelope = _envelope(rows, max_results)
     if more:
         envelope["truncated"] = True
-        envelope["notice"] = (
+        envelope["notices"] = [
             f"more than {LIST_ROW_LIMIT} matches; count covers the first {LIST_ROW_LIMIT}. Narrow the request"
-        )
+        ]
     return envelope
 
 
@@ -447,11 +459,14 @@ def _resolve_recency_cutoff(engine: GraphEngine, repo_id: str, modified_within_c
     return results[0]["d"]
 
 
+#: The docs notes' labels (indexer/docs/extractor.py `DOC_NOTE_LABELS`).
+_NOTE_LABELS = ("Requirement", "DesignDecision", "ArchitectureNote")
+
 # Labels search_component always covers: code, routes, datastores (Cache
-# included) and compose containers. A repository's schema-declared labels
-# are appended per call (see declared_node_labels).
+# included), compose containers and docs notes (by id, title or body). A
+# repository's schema-declared labels are appended per call (see declared_node_labels).
 _SEARCH_LABELS: tuple[str, ...] = (
-    "Service", "Module", "Class", "Function", "Endpoint", *schema.DATASTORE_LABELS, "Container",
+    "Service", "Module", "Class", "Function", "Endpoint", *schema.DATASTORE_LABELS, "Container", *_NOTE_LABELS,
 )
 
 
@@ -465,7 +480,9 @@ def search_component(
     extra_labels: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     """Search for components (services, modules, classes, functions, endpoints,
-    datastores of every type, Cache included, and containers) by name or description.
+    datastores of every type, Cache included, containers, and docs notes) by
+    name or description (a docs note's title or body; its title is the result's
+    description).
 
     Args:
         engine: GraphEngine instance
@@ -541,10 +558,31 @@ _SEARCH_TIER = (
     "WHEN any(t IN $terms WHERE toLower(n.name) CONTAINS t) THEN 6 ELSE 7 END"
 )
 _SEARCH_FILE = "CASE WHEN coalesce(n.file, '') <> '' THEN n.file ELSE coalesce(n.path, n.source_file, n.source) END"
+# Whether a matching node ranks with the test code (devgraph/test_paths.py), when
+# `$tests_last`: within each band of name matches (the whole query, tiers 0-3; one
+# of its terms, tiers 4-6) production code comes before test code, so a test
+# helper named exactly `make_repo` still beats `remove_repo`. Needs `file` bound.
+_SEARCH_IN_TESTS = "($tests_last AND coalesce(file, '') =~ $test_path)"
 _SEARCH_ROW = (
-    "{id: elementId(n), name: n.name, labels: labels(n), repo_id: n.repo_id, description: n.description, "
+    "{id: elementId(n), name: n.name, labels: labels(n), repo_id: n.repo_id, "
+    "description: coalesce(n.description, n.title), "
     f"file: {_SEARCH_FILE}, owner: CASE WHEN n.file IS NOT NULL THEN coalesce(n.owner, '') END}}"
 )
+
+
+#: Words a query names test code with (`test_search`, `conftest`, `fake engine`):
+#: such a query ranks test code as any other.
+_TEST_WORDS = frozenset({
+    "test", "tests", "testing", "conftest", "fixture", "fixtures", "spec", "specs",
+    "mock", "mocks", "fake", "fakes", "stub", "stubs",
+})
+
+
+def _targets_tests(query: str) -> bool:
+    """Whether `query` asks for test code: one of its words, split at `_` and at
+    case changes (`TestSearch`, `FakeEngine`, `mockRegistry`), is a test word."""
+    parts = re.findall(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|[0-9]+", query)
+    return not _TEST_WORDS.isdisjoint(part.lower() for part in parts)
 
 
 def _name_variants(query: str, terms: list[str]) -> list[str]:
@@ -649,25 +687,33 @@ def ranked_search(
     """Nodes of `labels` whose name or description contains a (lower-case) term,
     best first (`_SEARCH_TIER`): `query` itself as the name, then ignoring case,
     then a name starting with or containing `query`, then a name equal to,
-    starting with or containing a term, description only.
+    starting with or containing a term, description only. Within the band of
+    whole-query matches (tiers 0-3) and within that of term matches (4-6),
+    matches in test code (devgraph/test_paths.py) come after those in
+    production code, unless `query` asks for test code (`_targets_tests`): a
+    fixture named `engine` never hides `GraphEngine`, and a test helper named
+    exactly `make_repo` still comes before `remove_repo`.
 
     Names that start with one of `names` are found first through the
-    `(repo_id, name)` indexes. Only when they don't fill `limit` does a substring
-    scan fill the rest and count every match. Returns (rows, count,
-    count_is_lower_bound): the count is a lower bound when the scan never ran.
-    `repo_id` None searches every repository. Labels must be validated identifiers.
+    `(repo_id, name)` indexes. Only when their first `limit` rows aren't all
+    production code does a substring scan fill the rest and count every match. Returns
+    (rows, count, count_is_lower_bound): the count is a lower bound when the
+    scan never ran. `repo_id` None searches every repository. Labels must be
+    validated identifiers.
     """
     scope = "n.repo_id = $repo_id" if repo_id is not None else _cross_scope("n")
     if cutoff is not None:
         scope += " AND n.last_modified_at >= $cutoff"
     exact = query.strip()
+    tests_last = not _targets_tests(query)
     params: dict[str, Any] = {  # an empty query (None) matches no whole-query tier
         "repo_id": repo_id, "terms": terms, "names": names, "cutoff": cutoff,
         "exact": exact or None, "whole": exact.lower() or None,
+        "tests_last": tests_last, "test_path": TEST_PATH_CYPHER,
     }
     order = (
         f"WITH n, {_SEARCH_TIER} AS tier, {_SEARCH_FILE} AS file "
-        "ORDER BY tier, n.name, file IS NULL, file, elementId(n)\n"
+        f"ORDER BY tier = 7, tier >= 4, {_SEARCH_IN_TESTS}, tier, n.name, file IS NULL, file, elementId(n)\n"
     )
     indexed = _query(
         engine,
@@ -676,18 +722,26 @@ def ranked_search(
         params,
     )
     found = [r["row"] for r in indexed]
-    if len(found) > limit:
-        return found[:limit], len(found), True
-    substring = "any(t IN $terms WHERE toLower(n.name) CONTAINS t OR toLower(n.description) CONTAINS t)"
+    # Test-code rows of the index stage may rank below production matches only
+    # the substring scan finds (`GraphEngine` for `engine`), so they wait for it.
+    production = [r for r in found[:limit] if not (tests_last and is_test_path(r["file"]))]
+    if len(found) > limit and len(production) == limit:
+        return production, len(found), True
+    # A docs note's `title` and `body` are its description.
+    substring = (
+        "any(t IN $terms WHERE toLower(n.name) CONTAINS t OR toLower(n.description) CONTAINS t "
+        "OR toLower(n.title) CONTAINS t OR toLower(n.body) CONTAINS t)"
+    )
     rows = _query(
         engine,
         _search_branches(labels, f"{scope} AND {substring}") + order
         + "WITH collect(n) AS ns "
         f"RETURN size(ns) AS total, [n IN [n IN ns WHERE NOT elementId(n) IN $seen][..$fill] | {_SEARCH_ROW}] AS rest",
-        {**params, "seen": [r["id"] for r in found], "fill": limit - len(found)},
+        {**params, "seen": [r["id"] for r in production], "fill": limit - len(production)},
     )
     row = rows[0] if rows else {"total": 0, "rest": []}
-    return _rank_search_results(found + row["rest"], terms, exact), max(row["total"], len(found)), False
+    ranked = _rank_search_results(production + row["rest"], terms, exact, tests_last)
+    return ranked, max(row["total"], len(found)), False
 
 
 def declared_node_labels(registry: RepoRegistry | None, repo_id: str) -> tuple[str, ...]:
@@ -706,12 +760,15 @@ def declared_node_labels(registry: RepoRegistry | None, repo_id: str) -> tuple[s
     return tuple(node_type.label for node_type in effective.node_types)
 
 
-def _rank_search_results(results: list[dict], tokens: list[str], query: str = "") -> list[dict]:
+def _rank_search_results(
+    results: list[dict], tokens: list[str], query: str = "", tests_last: bool = False
+) -> list[dict]:
     """Sort search rows in `_SEARCH_TIER`'s order: `query` as the exact name,
     then ignoring case, then a name starting with or containing `query`, then a
     name equal to, starting with or containing a token, then description-only
     matches last; by name and file within a tier (no file last), as
-    `ranked_search`'s queries order them."""
+    `ranked_search`'s queries order them. With `tests_last`, name matches in
+    test code come after the production ones of their band (`_SEARCH_IN_TESTS`)."""
     exact = query.strip()
     whole = exact.lower()
 
@@ -733,10 +790,12 @@ def _rank_search_results(results: list[dict], tokens: list[str], query: str = ""
         if any(t in name for t in tokens):
             return 6
         return 7
-    return sorted(
-        results,
-        key=lambda row: (tier(row), row.get("name") or "", row.get("file") is None, row.get("file") or ""),
-    )
+    def key(row: dict) -> tuple:
+        rank = tier(row)
+        in_tests = tests_last and is_test_path(row.get("file"))
+        return (rank == 7, rank >= 4, in_tests, rank, row.get("name") or "", row.get("file") is None,
+                row.get("file") or "")
+    return sorted(results, key=key)
 
 
 # --- describe_node -------------------------------------------------------------
@@ -1185,6 +1244,33 @@ def _without_constructors(
     return [row for row in rows if all(row is not each for each in constructors)], constructors
 
 
+def _single_production(rows: list[dict[str, Any]]) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    """Name lookup candidates (all of them: at most `_DESCRIBE_MAX_CANDIDATES`)
+    as (the one outside test code, the ones in it) when exactly one has a file
+    outside test code (devgraph/test_paths.py) and the rest are in test code:
+    a monkeypatch stub or test helper named after a function is no rival of
+    its definition. (None, []) otherwise; a file-less stub counts as production."""
+    if len(rows) < 2 or len(rows) > _DESCRIBE_MAX_CANDIDATES:
+        return None, []
+    tests = [row for row in rows if is_test_path(row.get("file"))]
+    production = [row for row in rows if not is_test_path(row.get("file"))]
+    if len(production) != 1 or production[0].get("file") is None:
+        return None, []
+    return production[0], tests
+
+
+def _test_definitions(name: str, refs: list[dict[str, Any]]) -> dict[str, Any]:
+    """The keys an answer adds when it chose the production definition over
+    same-named ones in test code (`_single_production`): those, and a notice."""
+    return {
+        "also_defined_in_tests": [_sanitize_row(ref) for ref in refs],
+        "notices": [
+            f"{_echo(name)} is also defined in test code ({len(refs)} more, in also_defined_in_tests); "
+            "answered with the production definition. Pass file (and owner) to pick one of those"
+        ],
+    }
+
+
 def _unresolved_marked(ref: dict[str, Any]) -> dict[str, Any]:
     """A candidate ref, with `unresolved_handler: true` when it is a route's
     handler stub left visible because it folds into no single real Function
@@ -1321,6 +1407,9 @@ def describe_node(
         raise ToolError(f"{message} {_DESCRIBE_HINT}.")
 
     rows, constructors = _without_constructors(rows)
+    chosen, in_tests = _single_production(rows)
+    if chosen is not None:
+        rows = [chosen]
     if len(rows) > 1:
         candidates = sorted(
             (_unresolved_marked(_node_ref(row)) for row in rows),
@@ -1364,6 +1453,10 @@ def describe_node(
         found["constructors"] = sorted(
             (_node_ref(row) for row in constructors), key=lambda r: (r.get("file") or "", r.get("owner") or "")
         )
+    if in_tests:
+        found.update(_test_definitions(name, sorted(
+            (_node_ref(row) for row in in_tests), key=lambda r: (r.get("file") or "", r.get("owner") or "")
+        )))
     return found
 
 
@@ -1397,7 +1490,9 @@ def god_nodes(
 
     Returns:
         Dict with count (nodes ranked), results, and truncated flag. Each result
-        has name, labels, repo_id, and degree (number of direct relationships,
+        has name, labels, repo_id, file (a file-less node's null), owner (the
+        declarations a code symbol is in, "" at the top level; left out for a
+        node without a file), and degree (number of direct relationships,
         git-history and mentions edges left out). `Repository`, git-history
         (`Commit`, `PullRequest`, `Issue`) and mentions `Document` nodes are
         not ranked, so a sweep commit or a file edited often never outranks
@@ -1419,14 +1514,15 @@ def god_nodes(
     }}
     WITH n, COUNT {{ (n)-[r]-() WHERE NOT type(r) IN $skipped }} AS degree
     ORDER BY degree DESC, n.name
-    WITH collect({{name: n.name, labels: labels(n), repo_id: n.repo_id, degree: degree}}) AS ranked
+    WITH collect({{name: n.name, labels: labels(n), repo_id: n.repo_id, degree: degree,
+                  file: coalesce(n.file, n.path), owner: {_OWNER_OF.format(v="n")}}}) AS ranked
     RETURN size(ranked) AS total, ranked[0..$limit] AS top
     """
     params: dict[str, Any] = {"limit": limit, "skipped": list(_GOD_NODES_SKIPPED_RELATIONSHIPS)}
     if not cross_repo:
         params["repo_id"] = repo_id
     (row,) = _query(engine, cypher, params)
-    envelope = _envelope(row["top"], limit)
+    envelope = _envelope([_located(each) for each in row["top"]], limit)
     envelope["count"] = row["total"]
     envelope["truncated"] = row["total"] > len(envelope["results"])
     return envelope
@@ -2728,7 +2824,11 @@ def list_services(
         max_results: Maximum number of results to return in the envelope
 
     Returns:
-        Dict with count, results, and truncated flag containing services with their properties
+        Dict with count, results, and truncated flag containing services: name,
+        repo_id, description, file (the compose file or Containerfile declaring
+        it: one service declared in two compose files is two rows), and what
+        it runs, `image` (its Container's), or builds, `build_context` ("" for
+        the repository root), when it has one
     """
     _at_least(1, max_results=max_results)
     repo_filter = _cross_scope("s", "WHERE") if cross_repo else "WHERE s.repo_id = $repo_id"
@@ -2741,13 +2841,17 @@ def list_services(
     cypher = f"""
     MATCH (s:Service)
     {repo_filter}
-    RETURN s.name as name, s.repo_id as repo_id, s.description as description
-    ORDER BY (s.repo_id = $repo_id) DESC, s.repo_id, s.name
+    RETURN s.name as name, s.repo_id as repo_id, s.description as description,
+           coalesce(s.file, s.source) as file, s.build_context as build_context,
+           head([(s)-[:RUNS]->(c:Container) WHERE c.image IS NOT NULL | c.image]) as image
+    ORDER BY (s.repo_id = $repo_id) DESC, s.repo_id, s.name, file
     """
     params = {"repo_id": repo_id}
 
     results = _query(engine, cypher, params)
-    return _envelope(results, max_results)
+    # What a service runs or builds is listed only when it has one.
+    rows = [{k: v for k, v in row.items() if v is not None or k not in ("image", "build_context")} for row in results]
+    return _envelope(rows, max_results)
 
 
 #: The `framework` an Endpoint carries, by the extractors that write them
@@ -2871,6 +2975,7 @@ def explain_decision(
     repo_id: str,
     decision_name: str,
     cross_repo: bool = False,
+    registry: RepoRegistry | None = None,
 ) -> dict[str, Any]:
     """Explain a design decision: its rationale, what it documents, and history.
 
@@ -2879,10 +2984,16 @@ def explain_decision(
         repo_id: Repository ID
         decision_name: Name (id) of the DesignDecision note
         cross_repo: If True, search across repos
+        registry: RepoRegistry; a `notices` entry says when the repository has no docs path
 
     Returns:
         Dict with the decision's properties, what it documents, what it
         supersedes, and any ArchitectureNote it's backed by.
+
+    Raises:
+        ToolError: no decision has that id; it suggests decisions whose id or
+            title contains the name or one of its words, and says when the
+            repository has no docs path.
     """
     repo_filter = _cross_scope("d", "WHERE") if cross_repo else "WHERE d.repo_id = $repo_id"
     cypher = f"""
@@ -2902,8 +3013,44 @@ def explain_decision(
 
     results = _query(engine, cypher, params)
     if not results:
-        raise _not_found(engine, repo_id, "design decision", decision_name, ("DesignDecision",), cross_repo)
-    return results[0]
+        raise _decision_not_found(engine, registry, repo_id, decision_name, cross_repo)
+    return _with_notice(results[0], _docs_off_notice(registry, repo_id))
+
+
+#: Cypher: up to five of the repository's DesignDecisions whose id or title
+#: contains `$name` or one of `$words`, those matching more words first.
+_DECISION_SUGGESTIONS = f"""
+MATCH (d:DesignDecision) WHERE d.repo_id = $repo_id
+WITH d, size([w IN $words WHERE toLower(d.name) CONTAINS w OR toLower(coalesce(d.title, '')) CONTAINS w]) AS hits,
+     toLower(d.name) CONTAINS $whole OR toLower(coalesce(d.title, '')) CONTAINS $whole AS whole
+WHERE whole OR hits > 0
+RETURN d.name AS name, d.title AS title
+ORDER BY whole DESC, hits DESC, name
+LIMIT {_DESCRIBE_MAX_SUGGESTIONS}
+"""
+
+
+def _decision_not_found(
+    engine: GraphEngine, registry: RepoRegistry | None, repo_id: str, name: str, cross_repo: bool
+) -> ToolError:
+    """explain_decision's ToolError: no decision has the id `name`; the
+    repository's decisions whose id or title is like it, and, when the
+    repository has no docs path, that none is indexed."""
+    rows = _query(engine, _DECISION_SUGGESTIONS, {
+        "repo_id": repo_id, "whole": name.strip().lower(), "words": _search_tokens(name),
+    })
+    where = "any repository" if cross_repo else f"repository {_echo(repo_id)}"
+    lead = f"Similar decisions in repository {_echo(repo_id)}" if cross_repo else "Did you mean"
+    shown = "; ".join(f"name={_echo(row['name'])}, title={_echo(row['title'])}" for row in rows)
+    message = f"no design decision named {_echo(name)} in {where}."
+    if shown:
+        message += f" {lead}: {shown}? Pass a decision's name (its id)."
+    off = _docs_off_notice(registry, repo_id)
+    if off:
+        message += f" Note: {off}."
+    else:
+        message += " search_component finds decisions by id, title or body."
+    return ToolError(message)
 
 
 def find_requirements_for(
@@ -2924,7 +3071,8 @@ def find_requirements_for(
         cross_repo: If True, search across repos
         max_results: Maximum number of results to return in the envelope
         extra_labels: The repository's declared labels, looked up besides the built-in ones
-        registry: RepoRegistry; a `notice` says when a changed docs path awaits its rescan
+        registry: RepoRegistry; a `notices` entry says when the repository has no
+            docs path, or a changed one awaits its rescan
 
     Returns:
         Dict with count, results, and truncated flag containing the Requirement
@@ -2949,7 +3097,8 @@ def find_requirements_for(
         params["repo_id"] = repo_id
 
     results, more = _list_query(engine, cypher, params)
-    return _with_notice(_capped_envelope(results, more, max_results), _rescan_pending_notice(engine, registry, repo_id))
+    envelope = _with_notice(_capped_envelope(results, more, max_results), _docs_off_notice(registry, repo_id))
+    return _with_notice(envelope, _rescan_pending_notice(engine, registry, repo_id))
 
 
 def trace_design_rationale(
@@ -2968,7 +3117,8 @@ def trace_design_rationale(
         component_name: Name of the component (Module/Service/Class/etc.)
         cross_repo: If True, search across repos
         extra_labels: The repository's declared labels, looked up besides the built-in ones
-        registry: RepoRegistry; a `notice` says when a changed docs path awaits its rescan
+        registry: RepoRegistry; a `notices` entry says when the repository has no
+            docs path, or a changed one awaits its rescan
 
     Returns:
         Dict grouping every Requirement/DesignDecision/ArchitectureNote linked
@@ -2994,7 +3144,8 @@ def trace_design_rationale(
         params["repo_id"] = repo_id
 
     results = _query(engine, cypher, params)
-    return _with_notice(_sanitize_row(results[0]), _rescan_pending_notice(engine, registry, repo_id))
+    answer = _with_notice(_sanitize_row(results[0]), _docs_off_notice(registry, repo_id))
+    return _with_notice(answer, _rescan_pending_notice(engine, registry, repo_id))
 
 
 def blame_component(
@@ -3069,7 +3220,7 @@ def find_related_prs(
     """Find pull requests related to a component via commits that resolved issues touching it.
 
     Reads the graph's PullRequest nodes. When the repository's PR ingestion is
-    off (pr_source_enabled=False) the envelope is empty, with a `notice` saying
+    off (pr_source_enabled=False) the envelope is empty, with a `notices` entry saying
     how to enable it; nothing reaches the network.
 
     Args:
@@ -3126,7 +3277,7 @@ def issue_history_for(
     """Find issues referenced by commits that touched a component.
 
     Reads the graph's Issue nodes. When the repository's issue ingestion is off
-    (issue_source_enabled=False) the envelope is empty, with a `notice` saying
+    (issue_source_enabled=False) the envelope is empty, with a `notices` entry saying
     how to enable it; nothing reaches the network.
 
     Args:
@@ -3221,7 +3372,7 @@ def get_source(
         UTF-16 or UTF-32 by its byte-order mark or NUL pattern, else a
         Python coding line, else UTF-8, else cp1252 or Latin-1; when an
         undeclared file is not valid UTF-8, or a file isn't valid in its
-        declared codec, the dict adds a `notice` saying how it was decoded.
+        declared codec, the dict's `notices` say how it was decoded.
 
     Raises:
         ToolError: no Function or Class has that name (of `owner`, in `file`),
@@ -3279,6 +3430,9 @@ def get_source(
         return next((label for label in row["labels"] if label in ("Function", "Class")), row["labels"][0])
 
     results, constructors = _without_constructors(results, label_of)
+    chosen, in_tests = _single_production(results)
+    if chosen is not None:
+        results = [chosen]
     if len(results) > 1:
         candidates = [
             {
@@ -3352,9 +3506,13 @@ def get_source(
             {"name": c["name"], "file": c["file"], "owner": c["owner"], **({"repo_id": c["repo_id"]} if cross_repo else {})}
             for c in constructors
         ]
-    if notice is not None:
-        result["notice"] = notice
-    return result
+    if in_tests:
+        result.update(_test_definitions(component_name, [
+            {"label": label_of(r), "name": r["name"], "file": r["file"], "owner": r["owner"],
+             **({"repo_id": r["repo_id"]} if cross_repo else {})}
+            for r in in_tests
+        ]))
+    return _with_notice(result, notice)
 
 
 def find_mentions(
@@ -3370,8 +3528,8 @@ def find_mentions(
     """Find Document nodes that mention an entity, or what a Document mentions.
 
     When the repository's mentions indexing is off (mentions_enabled=False) the
-    envelope is empty, with a `notice` saying how to enable it; just turned
-    on or off, a `notice` says its rescan is still to come.
+    envelope is empty, with a `notices` entry saying how to enable it; just turned
+    on or off, a `notices` entry says its rescan is still to come.
 
     Args:
         engine: GraphEngine instance

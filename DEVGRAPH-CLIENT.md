@@ -311,6 +311,14 @@ owner} in `describe_node`, {name, file, owner} in `get_source`); pass
 `owner="Order"` or name it `Order.Order` to reach one. Two classes of one
 name are still `ambiguous`, their constructors left out of the candidates.
 
+**A test stub is no rival of its definition**: when a name has exactly one
+definition outside test code (the `find_callers` rule) and the others are in
+test code (a monkeypatch stub or test helper named after the function),
+`describe_node` and `get_source` answer with that one (status `found`) and add
+`also_defined_in_tests` (the refs of the test-code ones) and a `notices` entry
+saying so; pass one's `file` and `owner` to reach it. Two production
+definitions are still `ambiguous`, with every candidate listed.
+
 **Where an answer is, and one class's method**: every `find_callers` row
 names the caller's `file`, `owner` (the classes or functions it is declared
 in, `""` at the top level; a C++ class's namespaces too, so a method of
@@ -372,10 +380,17 @@ than the default. `search_component` ranks the whole query as the exact name
 first (then the same name in other case), then names starting with or
 containing the whole query, then names equal to, starting with or containing
 one of its words (so `run_cypher` comes before the many functions named `run`),
-then description-only matches; each
+then description-only matches. Name matches in test code (the rule
+`find_callers` uses to put test callers last) come after the production ones
+of their band (names matching the whole query; names matching one of its
+words), so `engine` finds `GraphEngine` before the test fixtures named
+`engine`, while a test helper named exactly `make_repo` still comes before
+`remove_repo`; they are still listed, and a query that names test code
+(`test_...`, `conftest`, `fixture`, `mock`, `fake`, `stub`, also in CamelCase:
+`FakeEngine`) ranks them as any other. Each
 result carries its `file`, and a route's handler stub is dropped when it
 folds into a real function (see Route handlers). Its `count` is the true number of
-matches, except when exact and prefix matches alone fill `max_results`: then
+matches, except when exact and prefix matches in production code alone fill `max_results`: then
 the response adds `count_is_lower_bound: true`. `max_results` is capped at
 200. The whole query and each of its words (`user_service`, underscores kept)
 are matched as well as its tokens. An exact name in unusual case (`gEt` for
@@ -424,7 +439,7 @@ Prefer these over re-reading files when the question is structural:
 
 | Question shape | Tool |
 |---|---|
-| "What is X / where is it?" | `search_component` (code, routes, datastores including caches, and compose containers: `redis` finds the Redis cache and the `redis` container) |
+| "What is X / where is it?" | `search_component` (code, routes, datastores including caches, compose containers, and docs notes by id, title or body: `redis` finds the Redis cache, the `redis` container and a decision titled "Use Redis for sessions") |
 | "What is X connected to? / follow X's links" | `describe_node` (a name, or a path or id for file, folder and docs nodes) |
 | "What is X, but only recently modified?" | `search_component` with `modified_within_commits=N` (only matches entities touched in the last N commits) |
 | "What calls X?" | `find_callers` (name, not path; callers in test code come after production ones, `test_count` says how many there are, and `include_tests=False` leaves them out) |
@@ -439,11 +454,11 @@ Prefer these over re-reading files when the question is structural:
 | "What's the overall architecture?" | `explain_architecture` (each service's datastores: databases, vector stores, queues and caches), `summarise_repository` (node counts, `cache_count` included) |
 | "Which routes does this service expose?" | `list_endpoints` (filters: `method`, `path_prefix` by whole segments, `framework`, `service`; each route with its handlers and owning service; a route whose mount its file doesn't show has `mounted: false` and a name like `GET ?/:id (routes/users.js)`) |
 | "What changed between my branch and main?" | `compare_branches(branch_a="main", branch_b="<branch>")`: files, per-file symbols added, removed and changed, and the graph callers of what changed |
-| "Why was X built this way?" | `explain_decision`, `trace_design_rationale` |
+| "Why was X built this way?" | `explain_decision` (a decision's id; `search_component` finds decisions and requirements by id, title or body), `trace_design_rationale` (with no docs path set for the repository, a `notices` entry says so and names the `devgraph annotate` command) |
 | "What requirements does X satisfy?" | `find_requirements_for` |
-| "Which docs mention X?" | `find_mentions` (only useful if Markdown mentions indexing was enabled; otherwise an empty result whose `notice` names the enable command; just after the setting or the docs path changed, a `notice` says the rescan applying it is still to come) |
+| "Which docs mention X?" | `find_mentions` (only useful if Markdown mentions indexing was enabled; otherwise an empty result whose `notices` name the enable command; just after the setting or the docs path changed, a `notices` entry says the rescan applying it is still to come) |
 | "Who changed X and when?" | `blame_component` (file path, not name) |
-| "What PRs/issues touched X?" | `find_related_prs`, `issue_history_for` (only useful if PR/issue ingestion was enabled in step 2; otherwise they return an empty result whose `notice` names the enable command, and never contact GitHub) |
+| "What PRs/issues touched X?" | `find_related_prs`, `issue_history_for` (only useful if PR/issue ingestion was enabled in step 2; otherwise they return an empty result whose `notices` name the enable command, and never contact GitHub) |
 | "Show me X's actual code" | `get_source` (name, not path — returns source text + full docstring; reads live from disk using the last-indexed line range, so rescan first if the file may have changed; a name defined in several files returns `status: "ambiguous"` with `candidates`, so pass `file` to pick one; each candidate carries `owner`, which `get_source` also takes, to pick one of several same-named functions in one file; a method can be named `A.save` or `A::save`, and a Kotlin companion's member `Repo.create`) |
 
 `compare_branches` and `impact_analysis_for_diff` both take two local refs

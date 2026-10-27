@@ -49,7 +49,8 @@ def test_a_source_that_is_off_returns_a_notice_and_runs_nothing(tmp_path, no_sub
     graph = _Graph()
     result = tool(graph, "widget", "widget/core.py", registry=registry)
     assert result["count"] == 0 and result["results"] == [] and result["truncated"] is False
-    assert command in result["notice"]
+    (notice,) = result["notices"]
+    assert command in notice
     assert len(graph.queries) == 1 and graph.queries[0].endswith("RETURN 1 LIMIT 1")  # only: does the file exist
 
 
@@ -67,7 +68,7 @@ def test_a_source_that_is_on_reads_the_graph(tmp_path, no_subprocess, tool, flag
     registry = _Registry(RepoRecord("widget", tmp_path, True, True, None, **{flag: True}))
     graph = _Graph()
     result = tool(graph, "widget", "widget/core.py", registry=registry)
-    assert "notice" not in result
+    assert "notices" not in result
     assert len(graph.queries) == 2  # the read, then (it being empty) whether the file exists
     assert "MODIFIES" in graph.queries[0]
 
@@ -89,7 +90,8 @@ class _Down:
 def test_with_the_source_off_and_neo4j_down_the_notice_comes_first(tmp_path, no_subprocess, tool, command):
     registry = _Registry(RepoRecord("widget", tmp_path, True, True, None))
     result = tool(_Down(), "widget", ".\\widget\\core.py", registry=registry)
-    assert f"devgraph {command} widget enable" in result["notice"]
+    (notice,) = result["notices"]
+    assert f"devgraph {command} widget enable" in notice
 
 
 def test_a_path_is_normalised(tmp_path, no_subprocess):

@@ -366,7 +366,8 @@ def _provider_specs(repo_root: Path) -> tuple[bool, filesystem.FilesystemSpec | 
 #: or default re-export, a default-exported function imported under another
 #: name and a destructured dynamic import linked to the function, and a
 #: JS/TS Module's `js_exports` (jsts `export_surface`), whose change
-#: re-indexes its importers (`_export_importers`).
+#: re-indexes its importers (`_export_importers`); and a docs note's title
+#: read from its `title:` front matter before its first `#` heading.
 #: An index stamped lower, or not at all, is rescanned automatically.
 INDEX_FORMAT = 25
 

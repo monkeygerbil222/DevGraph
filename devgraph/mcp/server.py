@@ -641,14 +641,18 @@ def build_server(
         modified_within_commits: int | None = None,
     ) -> dict[str, Any]:
         """Search for components (services, modules, classes, functions, endpoints,
-        databases, vector stores, queues, caches and compose containers) by
+        databases, vector stores, queues, caches, compose containers, and requirements,
+        design decisions and architecture notes by id, title or body) by
         name/description; returns {count, results, truncated},
         each result with name, labels, repo_id, description and file. Ranked: the whole
         query as the exact name, then the same ignoring case, then names starting with
         or containing the whole query, then names equal to, starting with or containing
-        one of its words (run_cypher before run), then description only. count is the true
+        one of its words (run_cypher before run), then description only. Name matches in
+        test code (tests/ folders, test_*.py, *.spec.ts and the like) come after the
+        production ones of their band (whole-query matches; word matches), unless the
+        query names test code (test_..., fake, mock, fixture, FakeEngine). count is the true
         number of matches, unless count_is_lower_bound is true (exact and prefix matches
-        alone filled max_results). max_results is capped at 200. A snake_case query such as
+        in production code alone filled max_results). max_results is capped at 200. A snake_case query such as
         user_service also matches as a whole word. An exact name in unusual case (gEt for
         get) is found by the substring scan, so it can be missed when exact and prefix
         matches alone fill max_results. A route's handler stub is left out when it folds
@@ -671,7 +675,9 @@ def build_server(
     ) -> dict[str, Any]:
         """Return the most-connected nodes in the graph — the core abstractions
         a new agent should look at first to orient itself in an unfamiliar repo.
-        Returns {count, results, truncated} with degree (number of direct relationships).
+        Returns {count, results, truncated}; each result has name, labels, file, owner
+        (for a code symbol: the classes or functions it is in, "" at the top level) and
+        degree (number of direct relationships).
         Git history (commits, PRs, issues) and mentions documents are left out."""
         return devgraph_tools.god_nodes(
             engine, repo_id, cross_repo, max_results,
@@ -708,7 +714,10 @@ def build_server(
     ) -> dict[str, Any]:
         """Return the repository's subsystems: Louvain communities over dependency and
         containment edges, largest first, as {count, results, truncated} of
-        {community, label, size, top_members}. top_members (highest PageRank first) is
+        {community, label, size, top_members}. A label is the most common folder of the
+        community's members outside test code (of all of them when every one is test
+        code); two communities of one label each add their top member's name,
+        "devgraph/graph (run_cypher)", and their number if still alike ("... #4"). top_members (highest PageRank first) is
         filled for the communities within max_results. Errors if graph insights have
         never been computed for the repository (the agent computes them after indexing)."""
         return devgraph_tools.find_communities(engine, registry, repo_id, max_results, members_per_community)
@@ -916,7 +925,9 @@ def build_server(
 
     @server.tool(annotations=_READ_ONLY)
     def list_services(repo_id: str, cross_repo: bool = False, max_results: int = 15) -> dict[str, Any]:
-        """List all services; returns {count, results, truncated}."""
+        """List all services; returns {count, results, truncated}. Each row names the file
+        declaring the service (one service in two compose files is two rows), and its
+        image or build_context ("" for the repository root) when it has one."""
         return devgraph_tools.list_services(engine, repo_id, cross_repo, max_results)
 
     @server.tool(annotations=_READ_ONLY)
@@ -946,8 +957,10 @@ def build_server(
     @server.tool(annotations=_READ_ONLY)
     def explain_decision(repo_id: str, decision_name: str, cross_repo: bool = False) -> dict[str, Any]:
         """Explain a design decision: its rationale, what it documents, and what it supersedes.
-        An unknown decision name is an error with similar names."""
-        return devgraph_tools.explain_decision(engine, repo_id, decision_name, cross_repo)
+        decision_name is the decision's id (search_component finds decisions by id, title
+        or body). An unknown id is an error suggesting decisions whose id or title is like
+        it; with no docs path set for the repository it says so."""
+        return devgraph_tools.explain_decision(engine, repo_id, decision_name, cross_repo, registry)
 
     @server.tool(annotations=_READ_ONLY)
     def find_requirements_for(
@@ -955,7 +968,8 @@ def build_server(
     ) -> dict[str, Any]:
         """Find requirements a component (module/service/etc.) satisfies; returns
         {count, results, truncated}. An unknown component is an error with similar names.
-        A `notice` says when a changed docs path is not indexed yet."""
+        A `notices` entry says when the repository has no docs path, or a changed docs
+        path is not indexed yet."""
         return devgraph_tools.find_requirements_for(
             engine, repo_id, component_name, cross_repo, max_results, declared(repo_id, cross_repo), registry
         )
@@ -963,8 +977,8 @@ def build_server(
     @server.tool(annotations=_READ_ONLY)
     def trace_design_rationale(repo_id: str, component_name: str, cross_repo: bool = False) -> dict[str, Any]:
         """Trace the design rationale (requirements, decisions, notes) behind a component.
-        An unknown component is an error with similar names. A `notice` says when a changed
-        docs path is not indexed yet."""
+        An unknown component is an error with similar names. A `notices` entry says when
+        the repository has no docs path, or a changed docs path is not indexed yet."""
         return devgraph_tools.trace_design_rationale(
             engine, repo_id, component_name, cross_repo, declared(repo_id, cross_repo), registry
         )
@@ -981,8 +995,8 @@ def build_server(
         """Find Documents mentioning an entity or what a Document mentions; returns {count, results, truncated}.
         direction="mentioned_by" (default): find Documents mentioning the entity named name.
         direction="mentions": find what the Document at repo-relative path name mentions.
-        With the repository's mentions indexing off, the envelope is empty and a `notice`
-        says how to enable it; a `notice` also says when a change to it awaits its rescan."""
+        With the repository's mentions indexing off, the envelope is empty and a `notices`
+        entry says how to enable it; one also says when a change to it awaits its rescan."""
         return devgraph_tools.find_mentions(
             engine, repo_id, name, label, direction, cross_repo, max_results, registry
         )
@@ -998,14 +1012,14 @@ def build_server(
     @server.tool(annotations=_READ_ONLY)
     def find_related_prs(repo_id: str, component_name: str, cross_repo: bool = False, max_results: int = 15) -> dict[str, Any]:
         """Find related PRs; returns {count, results, truncated}. With the repository's PR
-        ingestion off, the envelope is empty and a `notice` says how to enable it (never
+        ingestion off, the envelope is empty and a `notices` entry says how to enable it (never
         contacts the network). An unknown file is an error with similar names."""
         return devgraph_tools.find_related_prs(engine, repo_id, component_name, cross_repo, max_results, registry)
 
     @server.tool(annotations=_READ_ONLY)
     def issue_history_for(repo_id: str, component_name: str, cross_repo: bool = False, max_results: int = 15) -> dict[str, Any]:
         """Find issue history; returns {count, results, truncated}. With the repository's
-        issue ingestion off, the envelope is empty and a `notice` says how to enable it
+        issue ingestion off, the envelope is empty and a `notices` entry says how to enable it
         (never contacts the network). An unknown file is an error with similar names."""
         return devgraph_tools.issue_history_for(engine, repo_id, component_name, cross_repo, max_results, registry)
 
@@ -1023,7 +1037,9 @@ def build_server(
         be named with its class, "A.save" or "A::save". A class's name means the class,
         never its constructor (a function named like it and owned by it, as in Java, C#
         or C++): the answer names its constructors, which owner (the class's name)
-        reaches. A route's handler stub never makes
+        reaches. When exactly one candidate is outside test code and the others are in
+        it (a monkeypatch stub named after the function), the answer is that one, with
+        the others in also_defined_in_tests and a notice. A route's handler stub never makes
         the one function it stands for ambiguous; a stub standing for none is a
         candidate marked unresolved_handler. A file that is not valid UTF-8 is
         decoded with replacement characters, and a notice says so. An unknown name (or
@@ -1047,7 +1063,8 @@ def build_server(
         direction, with each neighbour's identity. A file, folder or docs node is named by
         its repo-relative path or id; a method may be named with its class, "A.save" or
         "A::save". An ambiguous name returns candidates; call again with label, file and
-        owner. A class's name means the class, never its constructor (a function named
+        owner. When exactly one candidate is outside test code and the others are in it,
+        the answer is that one, with the others in also_defined_in_tests and a notice. A class's name means the class, never its constructor (a function named
         like it and owned by it): the answer lists its constructors, reached with
         "Order.Order" or owner. A route handler answers as its real function, with its stub's
         relationships folded in when the stub provably stands for it; a stub routes
