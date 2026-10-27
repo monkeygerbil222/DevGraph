@@ -8,7 +8,7 @@ instead of each redeclaring the same three classes.
 from __future__ import annotations
 
 import posixpath
-from collections.abc import Iterable
+from collections.abc import Collection, Iterable
 from dataclasses import dataclass, field
 
 from devgraph.graph.schema import (
@@ -181,7 +181,10 @@ def member_owner(parent_label: str, parent_name: str | None, parent_owner: str |
     method of a nested class, `A.save` for a function nested in method
     `A.save`, `save` for one nested in a top-level `save`); "" at a Module's
     (or a namespace's) top level. A namespace, package or module is never
-    part of it. Two same-named declarations of one file with different
+    part of it, except that a C++ class at a namespace's top level is owned
+    by that namespace (`shop` for `shop::Ledger`, whose members are owned by
+    `shop.Ledger`, as an out-of-class definition names them; the C++
+    extractor's `class_owner`). Two same-named declarations of one file with different
     owners are two nodes (graph/engine.py `_upsert_nodes_tx`)."""
     if parent_label in ("Class", "Function") and parent_name:
         return f"{parent_owner}.{parent_name}" if parent_owner else parent_name
@@ -308,13 +311,14 @@ def _linearization(
 
 
 def _heirs(
-    classes: Iterable[ClassDecl], c3: bool = False,
+    classes: Iterable[ClassDecl], c3: bool = False, namespaces: Collection[str] = (),
 ) -> tuple[dict[tuple[str, str], set[str]], dict[str, set[str]]]:
     """`heir_keys`' keys as sets, and each *open* class's owner with the
-    member names its file says it has: a top-level class or alias with a
-    base, its own or an in-file ancestor's, that no class of the file is
-    named and is not `_CLOSED_BASES` (another file's, a library's,
-    `UNKNOWN_BASE`), whose other members the file can't name."""
+    member names its file says it has: a top-level class or alias (one in
+    one of `namespaces`, C++'s, included) with a base, its own or an in-file
+    ancestor's, that no class of the file is named and is not
+    `_CLOSED_BASES` (another file's, a library's, `UNKNOWN_BASE`), whose
+    other members the file can't name."""
     by_name: dict[str, list[tuple[str | None, list[str], set[str]]]] = {}
     for name, owner, bases, members in classes:
         by_name.setdefault(name, []).append((owner, list(bases), set(members)))
@@ -334,7 +338,8 @@ def _heirs(
                 resolved.update(member for _owner, _bases, each in by_name[base] for member in each)
             written = list(bases) + [b for base in chain for _o, bs, _m in by_name[base] for b in bs]
             # Only a top-level class or alias (its members' owner its name) can be imported.
-            if owner == name and any(b not in by_name and b not in _CLOSED_BASES for b in written):
+            top_level = owner == name or any(owner == f"{namespace}.{name}" for namespace in namespaces)
+            if top_level and any(b not in by_name and b not in _CLOSED_BASES for b in written):
                 open_owners.setdefault(owner, set()).update(resolved)
     return found, open_owners
 
@@ -356,7 +361,9 @@ def heir_keys(classes: Iterable[ClassDecl], c3: bool = False) -> dict[tuple[str,
     return {key: sorted(heirs) for key, heirs in _heirs(classes, c3)[0].items()}
 
 
-def add_heir_keys(result: ExtractionResult, classes: Iterable[ClassDecl], c3: bool = False) -> None:
+def add_heir_keys(
+    result: ExtractionResult, classes: Iterable[ClassDecl], c3: bool = False, namespaces: Collection[str] = (),
+) -> None:
     """Give each of `result`'s Functions the heir keys (`heir_keys`) of
     `classes`, the file's class declarations, as its `mkeys` (a member no
     class of the file inherits gets none), and its Module the file's open
@@ -364,8 +371,10 @@ def add_heir_keys(result: ExtractionResult, classes: Iterable[ClassDecl], c3: bo
     have any member its file doesn't name for it, so an owned end to it
     also links a Function of its name when no Function of that name there
     is its own or inherited member (`owner_matches`), what an owner-less
-    end linked before owners narrowed it."""
-    found, open_owners = _heirs(classes, c3)
+    end linked before owners narrowed it. A C++ class's owner names the
+    namespace it is declared in, one of `namespaces` (`shop.Ledger`), and
+    such a class counts as top-level."""
+    found, open_owners = _heirs(classes, c3, namespaces)
     for node in result.nodes:
         if node.label == "Module":
             node.properties["heir_open"] = sorted(open_owners)

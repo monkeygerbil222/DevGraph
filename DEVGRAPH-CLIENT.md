@@ -313,7 +313,8 @@ name are still `ambiguous`, their constructors left out of the candidates.
 
 **Where an answer is, and one class's method**: every `find_callers` row
 names the caller's `file`, `owner` (the classes or functions it is declared
-in, `""` at the top level) and `start_line`, so `A.run` and `B.run` of one
+in, `""` at the top level; a C++ class's namespaces too, so a method of
+`shop::Ledger` is owned by `shop.Ledger` and `shop::Ledger::sum` names it) and `start_line`, so `A.run` and `B.run` of one
 file are two rows told apart; a Module caller has no owner or line. Every
 `impact_analysis` dependent is `{name, type, file, owner}` (owner left out
 and file null when it has none). `find_callers`, `impact_analysis` and

@@ -70,8 +70,15 @@ class FakeSession:
     def execute_write(self, fn, *_args, **_kwargs):
         self._driver.work("write")
 
-    def execute_read(self, fn, *_args, **_kwargs):
+    def execute_read(self, fn, *args, **kwargs):
         self._driver.work("read")
+        return fn(FakeTx(), *args, **kwargs)
+
+
+class FakeTx:
+    """A read transaction on an empty graph."""
+
+    def run(self, *_args, **_kwargs):
         return []
 
 

@@ -36,6 +36,9 @@ class _IndexedEngine:
     def index_format(self, repo_id):
         return self.formats.get(repo_id)
 
+    def open_batches(self, repo_id):
+        return []
+
     def graph_repo_ids(self):
         return {repo_id for repo_id, fmt in self.formats.items() if fmt is not None} | self.unstamped
 

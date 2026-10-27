@@ -135,7 +135,7 @@ class FullScanCancelled(BatchAborted):
 class Neo4jLost(BatchAborted, ServiceUnavailable):
     """Neo4j stopped answering while a file was written (`ServiceUnavailable`,
     the engine's `Neo4jNotAnswering` among them, or `SessionExpired`, after
-    the engine's and the driver's retries; never the engine's own aborts,
+    the engine's retries; never the engine's own aborts,
     `EngineClosed` and `IndexesNotReady`, which are raised as they are). Not
     that file's failure: every file after it would fail the same way, one
     retry budget each, and a batch carrying on would be stamped with files
@@ -345,9 +345,15 @@ def _provider_specs(repo_root: Path) -> tuple[bool, filesystem.FilesystemSpec | 
 #: binary (an older index holds no nodes, and a skip mark, for such a file);
 #: C++ without a file-less Class per out-of-class method, with typed-receiver
 #: calls owned by the receiver's type (heir keys on a file's inherited
-#: methods), and an overload set kept at its first definition.
+#: methods), and an overload set kept at its first definition; 24: a C++
+#: class declared in a namespace owned by it (`shop`), so its members, in
+#: the class or out of it, are all owned by `shop.Ledger` (an in-class
+#: method was owned by `Ledger`, an out-of-class one by `shop.Ledger` or
+#: `Ledger` as the definition was spelt; one outside every namespace block
+#: under the file's one `using namespace` read in it), and one class name
+#: in two namespaces of a file two nodes.
 #: An index stamped lower, or not at all, is rescanned automatically.
-INDEX_FORMAT = 23
+INDEX_FORMAT = 24
 
 
 def index_outdated(engine: GraphEngine, repo_id: str) -> bool:

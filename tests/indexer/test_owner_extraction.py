@@ -238,10 +238,11 @@ def test_cpp_specialisation_qualifier_and_nested_class_owners():
         void lib::Widget::paint() {}
         """), "src/ui.cpp", "repo")
     owners = {(n.label, n.name): n.properties.get("owner") for n in result.nodes if n.properties.get("file")}
-    assert owners[("Class", "Inner")] == "Outer"
-    assert owners[("Function", "run")] == owners[("Function", "stop")] == "Outer.Inner"
+    # A C++ class is owned by its namespace, in-class and out-of-class members alike.
+    assert owners[("Class", "Inner")] == "ui.Outer"
+    assert owners[("Function", "run")] == owners[("Function", "stop")] == "ui.Outer.Inner"
     assert owners[("Class", "Stack")] == "" and owners[("Function", "push")] == owners[("Function", "pop")] == "Stack"
-    assert owners[("Function", "paint")] == "lib.Widget"  # `lib` is no namespace of this file
+    assert owners[("Function", "paint")] == "lib.Widget"  # a namespace named in the qualifier stays
 
 
 def test_a_cross_file_call_names_the_owner_its_resolver_knows():

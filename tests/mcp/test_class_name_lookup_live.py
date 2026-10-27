@@ -104,7 +104,7 @@ def repo(engine, tmp_path_factory):
     ("Order", "java/shop/Order.java", ""),
     ("Line", "java/shop/Order.java", "Order"),
     ("Svc", "cs/Svc.cs", ""),
-    ("Circle", "cpp/shapes.hpp", ""),
+    ("Circle", "cpp/shapes.hpp", "geo"),  # a C++ class is owned by its namespace
 ])
 def test_describe_node_and_get_source_answer_a_class_name_with_the_class(engine, repo, name, file, owner):
     repo_id, registry = repo

@@ -1103,7 +1103,10 @@ unchanged by it (M1 to M5 equal; `name_refs` 3 to 8 % larger).
 
 A C++ explicit specialisation is its template's class, a class nested in
 a class body is extracted, and an out-of-class member is owned by its
-qualifier's classes (less the file's namespaces).
+qualifier under the namespaces the definition is in (index format 24:
+`shop.Ledger`, as an in-class member of `namespace shop { class Ledger }`
+is; before, the file's namespaces were left out of the qualifier and every
+namespace out of an in-class member's owner).
 
 ## Routes beyond Python (index format 13)
 
