@@ -351,7 +351,9 @@ def _provider_specs(repo_root: Path) -> tuple[bool, filesystem.FilesystemSpec | 
 #: method was owned by `Ledger`, an out-of-class one by `shop.Ledger` or
 #: `Ledger` as the definition was spelt; one outside every namespace block
 #: under the file's one `using namespace` read in it), and one class name
-#: in two namespaces of a file two nodes.
+#: in two namespaces of a file two nodes; 25 (the number set when the audit 12
+#: branches are integrated): a docs note's title read from its `title:` front
+#: matter before its first `#` heading.
 #: An index stamped lower, or not at all, is rescanned automatically.
 INDEX_FORMAT = 24
 
