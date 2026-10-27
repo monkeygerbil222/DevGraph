@@ -6,6 +6,7 @@ import textwrap
 
 import pytest
 
+from devgraph.graph.schema import LOCAL_KEY
 from devgraph.indexer.java.extractor import extract_java_file
 from devgraph.indexer.python.extractor import extract_python_file
 
@@ -212,8 +213,9 @@ def test_a_function_local_class_is_not_the_module_level_class_of_its_name():
     assert ("go", "Admin", "save", "app/mod.py", "User") in calls
     assert ("top", "", "save", "app/mod.py", "User") in calls
     keys = {(n.properties["owner"], tuple(n.properties.get("mkeys", ()))) for n in result.nodes if n.name == "save"}
-    # Only the module-level User's save is inherited by Admin.
-    assert keys == {("User", ("<Admin",)), ("factory.User", ())}
+    # Only the module-level User's save is inherited by Admin; the local
+    # class's is local to `factory` (LOCAL_KEY, audit 12).
+    assert keys == {("User", ("<Admin",)), ("factory.User", (LOCAL_KEY,))}
     (extends,) = [r for r in result.relationships if r.rel_type == "EXTENDS"]
     assert (extends.to_name, extends.to_file, extends.to_owner) == ("User", "app/mod.py", "")
 
