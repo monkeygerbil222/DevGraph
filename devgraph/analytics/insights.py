@@ -48,6 +48,8 @@ _PAGERANK_TOLERANCE = 1e-10
 _BETWEENNESS_SAMPLE = 256
 _ROOT_LABEL = "(root)"
 _LABEL_MAX_CHARS = 80
+# A disambiguating member name is cut to this, leaving room for the folder.
+_SUFFIX_NAME_MAX_CHARS = 40
 
 
 @dataclass
@@ -110,14 +112,26 @@ def _community_label(members: list[dict[str, Any]], ranks: dict[str, float]) -> 
     return label[:_LABEL_MAX_CHARS]
 
 
+def _with_suffix(label: str, suffix: str) -> str:
+    """`label` plus `suffix`, within `_LABEL_MAX_CHARS`: the label is cut, never the suffix."""
+    return label[: _LABEL_MAX_CHARS - len(suffix)] + suffix
+
+
 def _told_apart(communities: list[dict[str, Any]], tops: list[dict[str, Any]]) -> None:
     """Communities sharing a label each add their top member's name to it
-    (`devgraph/graph (run_cypher)`), in place."""
+    (`devgraph/graph (run_cypher)`), and those still sharing one their
+    number (`devgraph/graph (run) #4`), in place."""
     shared = Counter(c["label"] for c in communities)
-    for community, top in zip(communities, tops):
-        if shared[community["label"]] > 1:
-            name = top.get("name") or top["id"]
-            community["label"] = f"{community['label']} ({name})"[:_LABEL_MAX_CHARS]
+    suffixes = [
+        f" ({str(top.get('name') or top['id'])[:_SUFFIX_NAME_MAX_CHARS]})" if shared[c["label"]] > 1 else ""
+        for c, top in zip(communities, tops)
+    ]
+    named = Counter(c["label"] + suffix for c, suffix in zip(communities, suffixes))
+    for community, suffix in zip(communities, suffixes):
+        if named[community["label"] + suffix] > 1:
+            suffix += f" #{community['community']}"
+        if suffix:
+            community["label"] = _with_suffix(community["label"], suffix)
 
 
 def compute_insights(nodes: list[dict[str, Any]], edges: list[dict[str, Any]]) -> InsightResult:

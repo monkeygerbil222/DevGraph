@@ -37,3 +37,25 @@ def test_duplicate_community_labels_disambiguated():
              edge("b1", "hub_b"), edge("b2", "hub_b"), edge("b1", "b2")]
     labels = sorted(c["label"] for c in compute_insights(nodes, edges).communities)
     assert labels == ["shop (hub_a)", "shop (hub_b)"]
+
+
+def _twin_triangles(folder, hub_a, hub_b):
+    """Two unconnected triangles in `folder`, each with a hub named as given."""
+    nodes = [node(n, f"{folder}/{n}.py") for n in ("a1", "a2", "b1", "b2")]
+    nodes += [{"id": "ha", "name": hub_a, "labels": ["Function"], "file": f"{folder}/ha.py"},
+              {"id": "hb", "name": hub_b, "labels": ["Function"], "file": f"{folder}/hb.py"}]
+    edges = [edge("a1", "ha"), edge("a2", "ha"), edge("a1", "a2"), edge("b1", "hb"), edge("b2", "hb"), edge("b1", "b2")]
+    return compute_insights(nodes, edges).communities
+
+
+def test_labels_still_shared_after_the_top_member_add_the_community_number():
+    labels = sorted(c["label"] for c in _twin_triangles("shop", "run", "run"))
+    assert labels == ["shop (run) #0", "shop (run) #1"]
+
+
+def test_a_long_label_keeps_its_distinguishing_suffix():
+    communities = _twin_triangles("x" * 100, "run", "run")
+    assert sorted(c["label"] for c in communities) == [
+        "x" * (80 - len(" (run) #0")) + " (run) #0", "x" * (80 - len(" (run) #1")) + " (run) #1",
+    ]
+    assert all(len(c["label"]) == 80 for c in communities)

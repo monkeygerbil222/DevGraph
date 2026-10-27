@@ -717,7 +717,7 @@ def build_server(
         {community, label, size, top_members}. A label is the most common folder of the
         community's members outside test code (of all of them when every one is test
         code); two communities of one label each add their top member's name,
-        "devgraph/graph (run_cypher)". top_members (highest PageRank first) is
+        "devgraph/graph (run_cypher)", and their number if still alike ("... #4"). top_members (highest PageRank first) is
         filled for the communities within max_results. Errors if graph insights have
         never been computed for the repository (the agent computes them after indexing)."""
         return devgraph_tools.find_communities(engine, registry, repo_id, max_results, members_per_community)
