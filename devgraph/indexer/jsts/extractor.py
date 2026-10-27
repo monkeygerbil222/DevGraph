@@ -63,8 +63,9 @@ Known limitations (v1 scope cuts, documented per Implementation Plan #8):
   - A name imported through an alias (a renamed or default re-export, a
     default-exported function) is resolved by reading the imported file's
     exports (`export_surface`), so its call links the function as it is
-    named where defined; a namespace member (`M.shout()`) or a `require`
-    is not followed through one.
+    named where defined; a namespace member (`M.shout()`), a `require` or a
+    destructured dynamic import (which records no IMPORTS edge to relink
+    it by) is not followed through one.
 """
 
 from __future__ import annotations
@@ -2130,11 +2131,11 @@ def extract_js_file(
     result.nodes.append(module_node)
     # What its importers' calls resolve through (`export_surface`), compared
     # by a batch to re-index them when it changes (dispatch `_export_importers`).
+    # Always written, empty too: a Module's write merges its properties.
     exports = export_surface(file_path, config) if config is not None else _resolve_exports(
         file_path, _export_entries(root, source_bytes), None,
     )
-    if exports:
-        module_node.properties["js_exports"] = _surface_entries(exports)
+    module_node.properties["js_exports"] = _surface_entries(exports)
 
     current_dir = file_path.rsplit("/", 1)[0] if "/" in file_path else ""
     for target, names in _extract_imports(root, source_bytes, current_dir, config, file_path):

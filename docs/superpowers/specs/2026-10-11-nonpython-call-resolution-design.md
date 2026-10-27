@@ -321,12 +321,16 @@ reading the imported file (`export_surface`, cached per batch in
 (`export default function sub`, `export default sub;`, `{ sub as default }`),
 a renamed export of one, and `export { a as b } from` / `export { default
 as b } from` / `export * from`, followed through the files they re-export
-from (up to eight deep; through a cycle, nothing, and only a result no cycle
-cut is cached, so it doesn't depend on which file is read first). An ES named
+from, however deep (every file reached is read once per batch; files that
+re-export each other, a strongly connected set, are resolved together to a
+fixpoint in path order, so the result never depends on which file is read
+first). An ES named
 or default import whose first candidate file exporting the name aliases it
 calls the function by its own name, owned `""` where it is defined. A
-namespace member (`M.shout()`) and a `require` are not followed through an
-alias. Each JS/TS Module records the aliases it exports (`js_exports`); a
+namespace member (`M.shout()`), a `require` and a destructured dynamic import
+(which records no `IMPORTS` entry to relink it by) are not followed through an
+alias. Each JS/TS Module records the aliases it exports (`js_exports`, empty
+included, as a Module write merges properties); a
 batch compares them with the graph's, and a file whose aliases changed has
 every importer (an `IMPORTS` entry in its `name_refs`, which a file records
 whether the import's target existed or not) indexed again in the same batch,

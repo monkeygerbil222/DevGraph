@@ -128,4 +128,5 @@ def test_module_records_its_export_aliases(tmp_path):
     assert module.properties["js_exports"] == sorted(module.properties["js_exports"])
     assert len(module.properties["js_exports"]) == 2  # shout and subtract
     plain = extract_js_file(STRINGS, "src/lib/strings.ts", "repo", ResolverConfig(tmp_path))
-    assert "js_exports" not in next(n for n in plain.nodes if n.label == "Module").properties
+    # Written empty too, so an edit dropping the last alias clears it.
+    assert next(n for n in plain.nodes if n.label == "Module").properties["js_exports"] == []
