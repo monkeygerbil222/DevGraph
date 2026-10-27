@@ -1013,7 +1013,12 @@ def _pending_rescans(engine: GraphEngine, repos: list[Any]) -> list[Any]:
     """The active, indexed `repos` whose graph index predates the current
     format (or is gone: a wiped graph), or whose update was cut short (an
     unfinished `batch_open` marker, by catch-up's own rule), and so await a
-    rescan. A never-indexed repo's first scan (add/rescan) stamps the format."""
+    rescan. A never-indexed repo's first scan (add/rescan) stamps the format.
+
+    Catch-up's rule counts a marker of a process still running only when that
+    process says its batch failed, which nothing outside it can know: a
+    failed batch of a running agent is not counted here until the agent's
+    own retry catch-up has run (and rescanned it), or the agent has ended."""
     from devgraph.indexer.dispatch import _unfinished_batches, index_outdated
 
     return [
