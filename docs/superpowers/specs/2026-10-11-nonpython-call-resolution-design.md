@@ -322,7 +322,8 @@ reading the imported file (`export_surface`, cached per batch in
 a renamed export of one, and `export { a as b } from` / `export { default
 as b } from` / `export * from`, followed through the files they re-export
 from, however deep (every file reached is read once per batch; files that
-re-export each other, a strongly connected set, are resolved together to a
+re-export each other (a strongly connected set, or one file re-exporting
+from itself) are resolved together to a
 fixpoint in path order, so the result never depends on which file is read
 first). An ES named
 or default import whose first candidate file exporting the name aliases it

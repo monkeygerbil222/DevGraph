@@ -42,3 +42,10 @@ def test_deep_chain_is_followed_whatever_is_cached(tmp_path):
     for i in reversed(range(depth + 1)):
         export_surface(f"src/chain/c{i}.ts", config)
     assert export_surface("src/chain/c0.ts", config)["x0"] == expected
+
+
+def test_a_file_re_exporting_from_itself_resolves_to_the_definition(tmp_path):
+    write(tmp_path, "src/s.ts", "function f() {}\nexport { f as g };\nexport { g as h } from './s';\n"
+          "export { h as i } from './s';\n")
+    surface = export_surface("src/s.ts", ResolverConfig(tmp_path))
+    assert surface["g"] == surface["h"] == surface["i"] == ("f", ("src/s.ts",))

@@ -919,6 +919,7 @@ def _resolve_reachable(rel: str, config: ResolverConfig) -> None:
     low: dict[str, int] = {}
     stack: list[str] = []
     on_stack: set[str] = set()
+    own_dependency: set[str] = set()  # files re-exporting from themselves
 
     def visit(file: str):
         entries[file] = _read_export_entries(config, file) or ((), ())
@@ -936,6 +937,8 @@ def _resolve_reachable(rel: str, config: ResolverConfig) -> None:
             if dep not in index:
                 work.append((dep, visit(dep)))
                 break
+            if dep == file:
+                own_dependency.add(file)
             if dep in on_stack:
                 low[file] = min(low[file], index[dep])
         else:
@@ -950,22 +953,27 @@ def _resolve_reachable(rel: str, config: ResolverConfig) -> None:
                     members.append(member)
                     if member == file:
                         break
-                _resolve_cycle(sorted(members), entries, config)
+                _resolve_cycle(sorted(members), entries, config, len(members) > 1 or file in own_dependency)
 
 
-def _resolve_cycle(members: list[str], entries: dict[str, _ExportEntries], config: ResolverConfig) -> None:
+def _resolve_cycle(
+    members: list[str], entries: dict[str, _ExportEntries], config: ResolverConfig, cyclic: bool,
+) -> None:
     """Cache the surfaces of one strongly connected set of files, whose
-    other dependencies are cached: each is resolved from the others'
-    current surfaces, all of them in path order, from empty, until none
-    changes (at most once per member and once more), a result that depends
-    on the set alone."""
+    other dependencies are cached. One that is `cyclic` (several files, or
+    one re-exporting from itself) is resolved from its members' current
+    surfaces, all of them in path order, from empty, until none changes (at
+    most once per entry of theirs and twice more: each round settles at
+    least one more of their aliases), a result that depends on the set
+    alone; any other is resolved once."""
     cache = config.js_surfaces
     current: dict[str, ExportSurface] = {member: {} for member in members}
 
     def lookup(file: str) -> ExportSurface:
         return current[file] if file in current else cache.get(file, {})
 
-    for _round in range(len(members) + 1 if len(members) > 1 else 1):
+    rounds = sum(len(entries[m][0]) + len(entries[m][1]) for m in members) + 2 if cyclic else 1
+    for _round in range(rounds):
         changed = False
         for member in members:
             found = _resolve_exports(member, entries[member], config, lookup)
