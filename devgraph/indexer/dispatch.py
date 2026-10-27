@@ -356,7 +356,10 @@ def _provider_specs(repo_root: Path) -> tuple[bool, filesystem.FilesystemSpec | 
 #: no other file's CALLS reaches, a production file's name-only CALLS never
 #: ending in a test file (devgraph/test_paths.py), and a Python `super()`
 #: call on a base outside the repository, or a dunder or capitalised method
-#: on an untyped receiver, linking no function by name.
+#: on an untyped receiver, linking no function by name; a Python decorator
+#: called by the scope its decorated definition is in, and a call of a name
+#: an `__init__.py` re-exports under an alias linked to the original
+#: (resolver configuration `python_aliases`).
 #: An index stamped lower, or not at all, is rescanned automatically.
 INDEX_FORMAT = 25
 

@@ -41,7 +41,7 @@ from devgraph.indexer.common import (
     owned_pin,
     split_owned_pin,
 )
-from devgraph.indexer.python.resolve import Bindings, absolute_module, relative_module
+from devgraph.indexer.python.resolve import Bindings, ModuleRef, absolute_module, relative_module
 from devgraph.indexer.resolver_config import ResolverConfig
 
 logger = logging.getLogger(__name__)
@@ -582,11 +582,33 @@ class _CallResolver:
     docstring): each target is (callee name, pin), the pin a file, a package
     directory ending in "/", or None for a bare name match."""
 
-    def __init__(self, file_path: str, bindings: Bindings, classes: dict[str, _ClassInfo], source: bytes):
+    def __init__(
+        self, file_path: str, bindings: Bindings, classes: dict[str, _ClassInfo], source: bytes,
+        config: ResolverConfig | None = None,
+    ):
         self.file_path = file_path
         self.bindings = bindings
         self.classes = classes
         self.source = source
+        self.config = config
+        self.aliases = config.python_aliases() if config is not None else {}
+
+    def _aliased(self, module: ModuleRef, name: str) -> list[tuple[str, str | None]]:
+        """The names `name` read off `module` stands for through an
+        `__init__.py` of its that re-exports another name under it
+        (`from .util import other as renamed`, resolver_config
+        `python_aliases`): that name, at the top level of its module."""
+        found: list[tuple[str, str | None]] = []
+        for init in module.files():
+            for alias, original, written in self.aliases.get(init, ()):
+                if alias != name:
+                    continue
+                folder = init.rsplit("/", 1)[0] if "/" in init else ""
+                ref = relative_module(written, folder) if written.startswith(".") else absolute_module(
+                    written, init, self.config.python_roots(init),
+                )
+                found += [(original, owned_pin(pin, "")) for pin in ref.files() + ref.dirs()]
+        return found
 
     def _module_pins(self, receiver: str) -> list[str] | None:
         """Where a name read off an imported module or a from-imported name
@@ -683,7 +705,9 @@ class _CallResolver:
             symbol = self.bindings.symbols.get(name)
             # A from-imported (or star-imported) name is a module's top-level one.
             if symbol is not None:
-                return [(symbol.name, owned_pin(pin, "")) for pin in symbol.module.files() + symbol.module.dirs()]
+                return [
+                    (symbol.name, owned_pin(pin, "")) for pin in symbol.module.files() + symbol.module.dirs()
+                ] + self._aliased(symbol.module, symbol.name)
             if name in self.bindings.modules or name in _BUILTIN_NAMES:
                 return []
             return [(name, owned_pin(pin, "")) for star in self.bindings.stars for pin in star.files() + star.dirs()]
@@ -712,7 +736,9 @@ class _CallResolver:
         elif (receiver := _pure_dotted(obj, source)) is not None:
             pins = self._receiver_pins(receiver, attr, scope)
             if pins is not None:
-                return [(attr, pin) for pin in pins]
+                module = self.bindings.modules.get(receiver)
+                read_off = module is not None and pins == self._module_pins(receiver)  # not a typed value's
+                return [(attr, pin) for pin in pins] + (self._aliased(module, attr) if read_off else [])
         elif (constructor := _constructed(obj, source)) is not None:
             pins = self._class_pins(constructor, attr, scope.fn)  # `Fake().run()`
             if pins is not None:
@@ -857,6 +883,32 @@ def _extract_imports(root: Node, source: bytes, file_path: str, roots: tuple[str
     return bindings
 
 
+def aliases(text: str) -> list[list[str]]:
+    """A package's `__init__.py` renames, its `from M import name as alias`
+    statements outside every def and class (under `try:`/`if` too), as
+    sorted [alias, name, M as written] lists: Python resolver configuration
+    (resolver_config `python_aliases`), since a call of the alias in another
+    file reaches `name` in M only through this file's text."""
+    root = _make_parser().parse(text.encode("utf-8")).root_node
+    source = text.encode("utf-8")
+    found: set[tuple[str, str, str]] = set()
+
+    def walk(node: Node) -> None:
+        if node.type in ("function_definition", "class_definition"):
+            return
+        module = node.child_by_field_name("module_name") if node.type == "import_from_statement" else None
+        for child in node.named_children if module is not None else []:
+            name, alias = child.child_by_field_name("name"), child.child_by_field_name("alias")
+            if child.type == "aliased_import" and name is not None and alias is not None:
+                if _text(alias, source) != _text(name, source):
+                    found.add((_text(alias, source), _text(name, source), _text(module, source)))
+        for child in node.named_children:
+            walk(child)
+
+    walk(root)
+    return [list(each) for each in sorted(found)]
+
+
 def extract_python_file(
     source_code: str, file_path: str, repo_id: str, config: ResolverConfig | None = None,
 ) -> ExtractionResult:
@@ -928,23 +980,34 @@ def extract_python_file(
         )
 
     class_table = _class_table(root, source_bytes)
-    resolver = _CallResolver(file_path, bindings, class_table, source_bytes)
+    resolver = _CallResolver(file_path, bindings, class_table, source_bytes, config)
     fixtures = _fixture_types(root, source_bytes)
     # (caller label, caller name, caller owner) -> callee name -> [pins, bare?, caller classes]
     calls: dict[tuple[str, str, str | None], dict[str, list]] = {}
 
     def record_calls(
         caller_label: str, caller_name: str, body: Node, scope: _Scope, caller_class: str | None,
-        caller_owner: str | None,
+        caller_owner: str | None, decorators: list[Node] | None = None,
     ) -> None:
         # caller_class records the enclosing class of a method-body call (None
         # for module-level/free-function calls) so find_callers can optionally
         # narrow results via scope_to_class — an opt-in query-time filter
         # (Implementation Plan #3, Item 2). caller_owner tells same-named
-        # callers of the file apart (None for the Module).
+        # callers of the file apart (None for the Module). With `decorators`
+        # (`body` unused) their callees are recorded instead: each is called
+        # where its definition is, and only where it resolves, never by bare
+        # name (an untyped `@app.get(...)` is no call of every `get`).
         by_name = calls.setdefault((caller_label, caller_name, caller_owner), {})
-        for func in _call_functions(body):
+        functions = _call_functions(body) if decorators is None else [
+            target.child_by_field_name("function") if target.type == "call" else target
+            for deco in decorators if (target := next(iter(deco.named_children), None)) is not None
+        ]
+        for func in functions:
+            if func is None or (decorators is not None and func.type not in ("identifier", "attribute")):
+                continue
             for name, pin in resolver.resolve(func, scope):
+                if pin is None and decorators is not None:
+                    continue
                 entry = by_name.setdefault(name, [set(), False, set()])
                 if pin is None:
                     entry[1] = True
@@ -989,6 +1052,11 @@ def extract_python_file(
             # decorated_definition wraps decorator(s) + the actual definition.
             decorators = [c for c in node.named_children if c.type == "decorator"]
             node = node.child_by_field_name("definition")
+            # The block's scope calls each decorator, as Python evaluates it there.
+            record_calls(
+                parent_label, parent_name or file_path, node, scope, parent_name if parent_label == "Class" else None,
+                parent_owner if parent_label != "Module" else None, decorators=decorators,
+            )
         if node is not None and node.type == "class_definition":
             _visit_class(node, parent_name, parent_label, scope, parent_owner, extra_decorators=decorators)
         elif node is not None and node.type == "function_definition":
