@@ -32,6 +32,7 @@ const src = [
   "let logRows = [];",
   grab(/^function renderLog\(/m, "\n"),
   grab(/^function insightRowsHtml\(/m, "\n}"),
+  grab(/^function godNodeRows\(/m, "\n}"),
   grab(/^function renderAC\(/m, "\n}"),
   grab(/^function escapeHtml\(/m, "}"),
   grab(/^function highlightCypher\(/m, "\n}"),
@@ -66,7 +67,8 @@ const globals = {
 };
 const api = new Function(...Object.keys(globals), src + `
 return {
-  escapeHtmlVal, highlightCypher, renderGitList, renderGitTree, showGitCard, renderLog, insightRowsHtml, renderAC,
+  escapeHtmlVal, highlightCypher, renderGitList, renderGitTree, showGitCard, renderLog, insightRowsHtml, godNodeRows,
+  renderAC,
   setGit: (commits, uncommitted) => {
     COMMITS = commits; UNCOMMITTED = uncommitted;
     COMMITS_BY_HASH = Object.fromEntries(commits.map(c => [c.hash, c]));
@@ -144,12 +146,15 @@ const collect = () => { const out = written.join("\n"); written.length = 0; retu
   check("renderAC escapes candidate text and kind", safe(out), out);
 }
 
-// 8. The degree leaderboard lives inside a large async loader; pin its row
-//    template so the count column cannot regress to a raw interpolation.
+// 8. The degree leaderboard lives inside a large async loader; pin that it
+//    renders only through godNodeRows and insightRowsHtml, and drive those
+//    with a hostile value in every column (name, label, degree, file, owner).
 {
-  const line = html.split("\n").find(l => l.includes("godEl.innerHTML = godJson.results[0].data.map"));
-  check("degree leaderboard escapes every column",
-    !!line && !/\$\{d\.row\[\d\]\}/.test(line), line);
+  const line = html.split("\n").find(l => l.includes("godEl.innerHTML = ") && l.includes("godJson"));
+  check("degree leaderboard renders through godNodeRows and insightRowsHtml",
+    !!line && line.trim() === "godEl.innerHTML = insightRowsHtml(godNodeRows(godJson.results[0].data));", line);
+  const out = api.insightRowsHtml(api.godNodeRows([{ row: [EVIL, EVIL, EVIL, "src/" + EVIL, EVIL] }]));
+  check("degree leaderboard escapes every column", safe(out), out);
 }
 
 // 9. The Cypher highlighter: quotes escaped, and the markup it builds shows
