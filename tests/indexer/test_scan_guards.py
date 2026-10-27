@@ -86,6 +86,9 @@ class _Engine(BatchMarkers):
     def list_file_nodes(self, repo_id, files):
         return set()
 
+    def file_js_exports(self, repo_id, files):
+        return {}
+
     def read_applied_schema(self, repo_id):
         return None
 
