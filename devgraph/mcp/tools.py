@@ -91,8 +91,20 @@ def _source_off_notice(max_results: int, what: str, command: str, repo_id: str) 
     falls back to the network (no `gh`, no API call)."""
     return {
         **_envelope([], max_results),
-        "notice": f"{what} ingestion is off for {repo_id}; enable it with `devgraph {command} {repo_id} enable`",
+        "notices": [f"{what} ingestion is off for {repo_id}; enable it with `devgraph {command} {repo_id} enable`"],
     }
+
+
+def _docs_off_notice(registry: RepoRegistry | None, repo_id: str) -> str | None:
+    """A notice when `repo_id` is registered with no docs path: none of its
+    docs notes (requirements, design decisions, architecture notes) is indexed."""
+    repo = registry.get(repo_id) if registry is not None else None
+    if repo is None or repo.docs_path:
+        return None
+    return (
+        f"no docs path is set for {repo_id}, so no requirements, design decisions or architecture notes "
+        f"are indexed; set one with `devgraph annotate {repo_id} --docs-path <folder>`"
+    )
 
 
 def _rescan_pending_notice(engine: GraphEngine, registry: RepoRegistry | None, repo_id: str) -> str | None:
@@ -122,10 +134,10 @@ def _rescan_pending_notice(engine: GraphEngine, registry: RepoRegistry | None, r
 
 
 def _with_notice(result: dict[str, Any], notice: str | None) -> dict[str, Any]:
-    """`result` with `notice` added, after any notice it already has (a truncation)."""
+    """`result` with `notice` added to its `notices`, after any it already has (a truncation)."""
     if not notice:
         return result
-    return {**result, "notice": f"{result['notice']}; {notice}" if result.get("notice") else notice}
+    return {**result, "notices": [*result.get("notices", []), notice]}
 
 
 #: How long a built-in tool's query may run before it is cancelled.
@@ -404,9 +416,9 @@ def _capped_envelope(rows: list[Any], more: bool, max_results: int) -> dict[str,
     envelope = _envelope(rows, max_results)
     if more:
         envelope["truncated"] = True
-        envelope["notice"] = (
+        envelope["notices"] = [
             f"more than {LIST_ROW_LIMIT} matches; count covers the first {LIST_ROW_LIMIT}. Narrow the request"
-        )
+        ]
     return envelope
 
 
@@ -447,11 +459,14 @@ def _resolve_recency_cutoff(engine: GraphEngine, repo_id: str, modified_within_c
     return results[0]["d"]
 
 
+#: The docs notes' labels (indexer/docs/extractor.py `DOC_NOTE_LABELS`).
+_NOTE_LABELS = ("Requirement", "DesignDecision", "ArchitectureNote")
+
 # Labels search_component always covers: code, routes, datastores (Cache
-# included) and compose containers. A repository's schema-declared labels
-# are appended per call (see declared_node_labels).
+# included), compose containers and docs notes (by id, title or body). A
+# repository's schema-declared labels are appended per call (see declared_node_labels).
 _SEARCH_LABELS: tuple[str, ...] = (
-    "Service", "Module", "Class", "Function", "Endpoint", *schema.DATASTORE_LABELS, "Container",
+    "Service", "Module", "Class", "Function", "Endpoint", *schema.DATASTORE_LABELS, "Container", *_NOTE_LABELS,
 )
 
 
@@ -465,7 +480,9 @@ def search_component(
     extra_labels: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     """Search for components (services, modules, classes, functions, endpoints,
-    datastores of every type, Cache included, and containers) by name or description.
+    datastores of every type, Cache included, containers, and docs notes) by
+    name or description (a docs note's title or body; its title is the result's
+    description).
 
     Args:
         engine: GraphEngine instance
@@ -546,7 +563,8 @@ _SEARCH_FILE = "CASE WHEN coalesce(n.file, '') <> '' THEN n.file ELSE coalesce(n
 # and both before description-only matches. Needs `file` bound (`_SEARCH_FILE`).
 _SEARCH_IN_TESTS = "($tests_last AND coalesce(file, '') =~ $test_path)"
 _SEARCH_ROW = (
-    "{id: elementId(n), name: n.name, labels: labels(n), repo_id: n.repo_id, description: n.description, "
+    "{id: elementId(n), name: n.name, labels: labels(n), repo_id: n.repo_id, "
+    "description: coalesce(n.description, n.title), "
     f"file: {_SEARCH_FILE}, owner: CASE WHEN n.file IS NOT NULL THEN coalesce(n.owner, '') END}}"
 )
 
@@ -706,7 +724,11 @@ def ranked_search(
     production = [r for r in found if not (tests_last and is_test_path(r["file"]))]
     if len(production) > limit:
         return production[:limit], len(found), True
-    substring = "any(t IN $terms WHERE toLower(n.name) CONTAINS t OR toLower(n.description) CONTAINS t)"
+    # A docs note's `title` and `body` are its description.
+    substring = (
+        "any(t IN $terms WHERE toLower(n.name) CONTAINS t OR toLower(n.description) CONTAINS t "
+        "OR toLower(n.title) CONTAINS t OR toLower(n.body) CONTAINS t)"
+    )
     rows = _query(
         engine,
         _search_branches(labels, f"{scope} AND {substring}") + order
@@ -2936,6 +2958,7 @@ def explain_decision(
     repo_id: str,
     decision_name: str,
     cross_repo: bool = False,
+    registry: RepoRegistry | None = None,
 ) -> dict[str, Any]:
     """Explain a design decision: its rationale, what it documents, and history.
 
@@ -2944,10 +2967,16 @@ def explain_decision(
         repo_id: Repository ID
         decision_name: Name (id) of the DesignDecision note
         cross_repo: If True, search across repos
+        registry: RepoRegistry; a `notices` entry says when the repository has no docs path
 
     Returns:
         Dict with the decision's properties, what it documents, what it
         supersedes, and any ArchitectureNote it's backed by.
+
+    Raises:
+        ToolError: no decision has that id; it suggests decisions whose id or
+            title contains the name or one of its words, and says when the
+            repository has no docs path.
     """
     repo_filter = _cross_scope("d", "WHERE") if cross_repo else "WHERE d.repo_id = $repo_id"
     cypher = f"""
@@ -2967,8 +2996,44 @@ def explain_decision(
 
     results = _query(engine, cypher, params)
     if not results:
-        raise _not_found(engine, repo_id, "design decision", decision_name, ("DesignDecision",), cross_repo)
-    return results[0]
+        raise _decision_not_found(engine, registry, repo_id, decision_name, cross_repo)
+    return _with_notice(results[0], _docs_off_notice(registry, repo_id))
+
+
+#: Cypher: up to five of the repository's DesignDecisions whose id or title
+#: contains `$name` or one of `$words`, those matching more words first.
+_DECISION_SUGGESTIONS = f"""
+MATCH (d:DesignDecision) WHERE d.repo_id = $repo_id
+WITH d, size([w IN $words WHERE toLower(d.name) CONTAINS w OR toLower(coalesce(d.title, '')) CONTAINS w]) AS hits,
+     toLower(d.name) CONTAINS $whole OR toLower(coalesce(d.title, '')) CONTAINS $whole AS whole
+WHERE whole OR hits > 0
+RETURN d.name AS name, d.title AS title
+ORDER BY whole DESC, hits DESC, name
+LIMIT {_DESCRIBE_MAX_SUGGESTIONS}
+"""
+
+
+def _decision_not_found(
+    engine: GraphEngine, registry: RepoRegistry | None, repo_id: str, name: str, cross_repo: bool
+) -> ToolError:
+    """explain_decision's ToolError: no decision has the id `name`; the
+    repository's decisions whose id or title is like it, and, when the
+    repository has no docs path, that none is indexed."""
+    rows = _query(engine, _DECISION_SUGGESTIONS, {
+        "repo_id": repo_id, "whole": name.strip().lower(), "words": _search_tokens(name),
+    })
+    where = "any repository" if cross_repo else f"repository {_echo(repo_id)}"
+    lead = f"Similar decisions in repository {_echo(repo_id)}" if cross_repo else "Did you mean"
+    shown = "; ".join(f"name={_echo(row['name'])}, title={_echo(row['title'])}" for row in rows)
+    message = f"no design decision named {_echo(name)} in {where}."
+    if shown:
+        message += f" {lead}: {shown}? Pass a decision's name (its id)."
+    off = _docs_off_notice(registry, repo_id)
+    if off:
+        message += f" Note: {off}."
+    else:
+        message += " search_component finds decisions by id, title or body."
+    return ToolError(message)
 
 
 def find_requirements_for(
@@ -2989,7 +3054,8 @@ def find_requirements_for(
         cross_repo: If True, search across repos
         max_results: Maximum number of results to return in the envelope
         extra_labels: The repository's declared labels, looked up besides the built-in ones
-        registry: RepoRegistry; a `notice` says when a changed docs path awaits its rescan
+        registry: RepoRegistry; a `notices` entry says when the repository has no
+            docs path, or a changed one awaits its rescan
 
     Returns:
         Dict with count, results, and truncated flag containing the Requirement
@@ -3014,7 +3080,8 @@ def find_requirements_for(
         params["repo_id"] = repo_id
 
     results, more = _list_query(engine, cypher, params)
-    return _with_notice(_capped_envelope(results, more, max_results), _rescan_pending_notice(engine, registry, repo_id))
+    envelope = _with_notice(_capped_envelope(results, more, max_results), _docs_off_notice(registry, repo_id))
+    return _with_notice(envelope, _rescan_pending_notice(engine, registry, repo_id))
 
 
 def trace_design_rationale(
@@ -3033,7 +3100,8 @@ def trace_design_rationale(
         component_name: Name of the component (Module/Service/Class/etc.)
         cross_repo: If True, search across repos
         extra_labels: The repository's declared labels, looked up besides the built-in ones
-        registry: RepoRegistry; a `notice` says when a changed docs path awaits its rescan
+        registry: RepoRegistry; a `notices` entry says when the repository has no
+            docs path, or a changed one awaits its rescan
 
     Returns:
         Dict grouping every Requirement/DesignDecision/ArchitectureNote linked
@@ -3059,7 +3127,8 @@ def trace_design_rationale(
         params["repo_id"] = repo_id
 
     results = _query(engine, cypher, params)
-    return _with_notice(_sanitize_row(results[0]), _rescan_pending_notice(engine, registry, repo_id))
+    answer = _with_notice(_sanitize_row(results[0]), _docs_off_notice(registry, repo_id))
+    return _with_notice(answer, _rescan_pending_notice(engine, registry, repo_id))
 
 
 def blame_component(
@@ -3134,7 +3203,7 @@ def find_related_prs(
     """Find pull requests related to a component via commits that resolved issues touching it.
 
     Reads the graph's PullRequest nodes. When the repository's PR ingestion is
-    off (pr_source_enabled=False) the envelope is empty, with a `notice` saying
+    off (pr_source_enabled=False) the envelope is empty, with a `notices` entry saying
     how to enable it; nothing reaches the network.
 
     Args:
@@ -3191,7 +3260,7 @@ def issue_history_for(
     """Find issues referenced by commits that touched a component.
 
     Reads the graph's Issue nodes. When the repository's issue ingestion is off
-    (issue_source_enabled=False) the envelope is empty, with a `notice` saying
+    (issue_source_enabled=False) the envelope is empty, with a `notices` entry saying
     how to enable it; nothing reaches the network.
 
     Args:
@@ -3286,7 +3355,7 @@ def get_source(
         UTF-16 or UTF-32 by its byte-order mark or NUL pattern, else a
         Python coding line, else UTF-8, else cp1252 or Latin-1; when an
         undeclared file is not valid UTF-8, or a file isn't valid in its
-        declared codec, the dict adds a `notice` saying how it was decoded.
+        declared codec, the dict's `notices` say how it was decoded.
 
     Raises:
         ToolError: no Function or Class has that name (of `owner`, in `file`),
@@ -3426,9 +3495,7 @@ def get_source(
              **({"repo_id": r["repo_id"]} if cross_repo else {})}
             for r in in_tests
         ]))
-    if notice is not None:
-        result["notice"] = notice
-    return result
+    return _with_notice(result, notice)
 
 
 def find_mentions(
@@ -3444,8 +3511,8 @@ def find_mentions(
     """Find Document nodes that mention an entity, or what a Document mentions.
 
     When the repository's mentions indexing is off (mentions_enabled=False) the
-    envelope is empty, with a `notice` saying how to enable it; just turned
-    on or off, a `notice` says its rescan is still to come.
+    envelope is empty, with a `notices` entry saying how to enable it; just turned
+    on or off, a `notices` entry says its rescan is still to come.
 
     Args:
         engine: GraphEngine instance

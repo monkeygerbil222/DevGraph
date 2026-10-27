@@ -38,7 +38,7 @@ def test_a_list_tool_over_the_cap_returns_a_truncated_envelope(name):
     assert result["truncated"] is True
     assert result["count"] == tools.LIST_ROW_LIMIT
     assert len(result["results"]) == 15
-    assert f"more than {tools.LIST_ROW_LIMIT}" in result["notice"]
+    assert f"more than {tools.LIST_ROW_LIMIT}" in result["notices"][0]
     query, max_rows = engine.queries[-1]
     assert max_rows == tools.LIST_ROW_LIMIT and f"LIMIT {tools.LIST_ROW_LIMIT + 1}" in query
 
@@ -47,5 +47,5 @@ def test_blame_component_returns_a_truncated_envelope():
     engine = _Overflowing()
     result = tools.blame_component(engine, "demo", "a.py")
     assert result["count"] == tools.LIST_ROW_LIMIT and len(result["results"]) == 15 and result["truncated"] is True
-    assert f"more than {tools.LIST_ROW_LIMIT}" in result["notice"]
+    assert f"more than {tools.LIST_ROW_LIMIT}" in result["notices"][0]
     assert f"LIMIT {tools.LIST_ROW_LIMIT + 1}" in engine.queries[-1][0]

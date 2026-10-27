@@ -27,6 +27,7 @@ class _Repo:
     mentions_enabled: bool = False
     pr_source_enabled: bool = False
     issue_source_enabled: bool = False
+    docs_path: str | None = "docs"
 
 
 class _Registry:
@@ -162,7 +163,7 @@ def test_out_of_range_numbers_are_errors(client, tool, arguments, message):
 def test_find_mentions_says_when_mentions_are_off(client):
     body = _answer(client, "find_mentions", {"name": "validate_token"})
     assert body["results"] == []
-    assert body["notice"] == f"Mentions ingestion is off for {REPO}; enable it with `devgraph mentions {REPO} enable`"
+    assert body["notices"][0] == f"Mentions ingestion is off for {REPO}; enable it with `devgraph mentions {REPO} enable`"
 
 
 def test_trace_request_flow_takes_a_bare_path_for_any_method(client):

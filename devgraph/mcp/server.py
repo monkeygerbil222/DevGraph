@@ -641,7 +641,8 @@ def build_server(
         modified_within_commits: int | None = None,
     ) -> dict[str, Any]:
         """Search for components (services, modules, classes, functions, endpoints,
-        databases, vector stores, queues, caches and compose containers) by
+        databases, vector stores, queues, caches, compose containers, and requirements,
+        design decisions and architecture notes by id, title or body) by
         name/description; returns {count, results, truncated},
         each result with name, labels, repo_id, description and file. Ranked: the whole
         query as the exact name, then the same ignoring case, then names starting with
@@ -951,8 +952,10 @@ def build_server(
     @server.tool(annotations=_READ_ONLY)
     def explain_decision(repo_id: str, decision_name: str, cross_repo: bool = False) -> dict[str, Any]:
         """Explain a design decision: its rationale, what it documents, and what it supersedes.
-        An unknown decision name is an error with similar names."""
-        return devgraph_tools.explain_decision(engine, repo_id, decision_name, cross_repo)
+        decision_name is the decision's id (search_component finds decisions by id, title
+        or body). An unknown id is an error suggesting decisions whose id or title is like
+        it; with no docs path set for the repository it says so."""
+        return devgraph_tools.explain_decision(engine, repo_id, decision_name, cross_repo, registry)
 
     @server.tool(annotations=_READ_ONLY)
     def find_requirements_for(
@@ -960,7 +963,8 @@ def build_server(
     ) -> dict[str, Any]:
         """Find requirements a component (module/service/etc.) satisfies; returns
         {count, results, truncated}. An unknown component is an error with similar names.
-        A `notice` says when a changed docs path is not indexed yet."""
+        A `notices` entry says when the repository has no docs path, or a changed docs
+        path is not indexed yet."""
         return devgraph_tools.find_requirements_for(
             engine, repo_id, component_name, cross_repo, max_results, declared(repo_id, cross_repo), registry
         )
@@ -968,8 +972,8 @@ def build_server(
     @server.tool(annotations=_READ_ONLY)
     def trace_design_rationale(repo_id: str, component_name: str, cross_repo: bool = False) -> dict[str, Any]:
         """Trace the design rationale (requirements, decisions, notes) behind a component.
-        An unknown component is an error with similar names. A `notice` says when a changed
-        docs path is not indexed yet."""
+        An unknown component is an error with similar names. A `notices` entry says when
+        the repository has no docs path, or a changed docs path is not indexed yet."""
         return devgraph_tools.trace_design_rationale(
             engine, repo_id, component_name, cross_repo, declared(repo_id, cross_repo), registry
         )
@@ -986,8 +990,8 @@ def build_server(
         """Find Documents mentioning an entity or what a Document mentions; returns {count, results, truncated}.
         direction="mentioned_by" (default): find Documents mentioning the entity named name.
         direction="mentions": find what the Document at repo-relative path name mentions.
-        With the repository's mentions indexing off, the envelope is empty and a `notice`
-        says how to enable it; a `notice` also says when a change to it awaits its rescan."""
+        With the repository's mentions indexing off, the envelope is empty and a `notices`
+        entry says how to enable it; one also says when a change to it awaits its rescan."""
         return devgraph_tools.find_mentions(
             engine, repo_id, name, label, direction, cross_repo, max_results, registry
         )
@@ -1003,14 +1007,14 @@ def build_server(
     @server.tool(annotations=_READ_ONLY)
     def find_related_prs(repo_id: str, component_name: str, cross_repo: bool = False, max_results: int = 15) -> dict[str, Any]:
         """Find related PRs; returns {count, results, truncated}. With the repository's PR
-        ingestion off, the envelope is empty and a `notice` says how to enable it (never
+        ingestion off, the envelope is empty and a `notices` entry says how to enable it (never
         contacts the network). An unknown file is an error with similar names."""
         return devgraph_tools.find_related_prs(engine, repo_id, component_name, cross_repo, max_results, registry)
 
     @server.tool(annotations=_READ_ONLY)
     def issue_history_for(repo_id: str, component_name: str, cross_repo: bool = False, max_results: int = 15) -> dict[str, Any]:
         """Find issue history; returns {count, results, truncated}. With the repository's
-        issue ingestion off, the envelope is empty and a `notice` says how to enable it
+        issue ingestion off, the envelope is empty and a `notices` entry says how to enable it
         (never contacts the network). An unknown file is an error with similar names."""
         return devgraph_tools.issue_history_for(engine, repo_id, component_name, cross_repo, max_results, registry)
 

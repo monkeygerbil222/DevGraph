@@ -44,6 +44,7 @@ class Repo:
     repo_id: str
     path: Path
     active: bool = True
+    docs_path: str | None = None
 
 
 class Registry:

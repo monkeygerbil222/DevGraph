@@ -11,7 +11,7 @@ from __future__ import annotations
 from typing import Any
 
 TOOL_CATALOG: list[dict[str, Any]] = [
-    {"name": "search_component", "identifier_kind": "name/description substring (code, endpoints, datastores including caches, containers)", "envelope": True, "phase": 1, "note": "the whole query as exact name first (then ignoring case), then names starting with or containing it, then names equal to, starting with or containing one of its words, name matches in test code after production ones (unless the query names test code); each result has its file; count_is_lower_bound marks a count the substring scan never finished"},
+    {"name": "search_component", "identifier_kind": "name/description substring (code, endpoints, datastores including caches, containers, docs notes by id, title or body)", "envelope": True, "phase": 1, "note": "the whole query as exact name first (then ignoring case), then names starting with or containing it, then names equal to, starting with or containing one of its words, name matches in test code after production ones (unless the query names test code); each result has its file; count_is_lower_bound marks a count the substring scan never finished"},
     {"name": "list_recent_changes", "identifier_kind": "commit-count window (within_commits), optional entity_type label", "envelope": True, "phase": 3},
     {"name": "trace_request_flow", "identifier_kind": "endpoint name (\"GET /users/<id>\") or bare path (\"/users/<id>\", every method)", "envelope": False, "phase": 1, "note": "a route's handler node is listed as the one real function it stands for (the traced route's own when routes share a handler name), or as itself; each component has its file and owner; edges are {type, from, to}"},
     {"name": "get_service_dependencies", "identifier_kind": "service name", "envelope": False, "phase": 1},
@@ -24,7 +24,7 @@ TOOL_CATALOG: list[dict[str, Any]] = [
     {"name": "explain_architecture", "identifier_kind": None, "envelope": False, "phase": 1, "note": "the response is not an envelope; services_and_datastores and endpoints inside it are {count, results, truncated}; a service uses Database, VectorStore, Queue and Cache nodes; each endpoint's path has a leading / (a Django pattern's added, as in list_endpoints)"},
     {"name": "list_services", "identifier_kind": None, "envelope": True, "phase": 1},
     {"name": "list_endpoints", "identifier_kind": "optional filters: method, path_prefix (whole segments), framework, service name", "envelope": True, "phase": 1, "note": "a route under a mount prefix its file doesn't show is listed with mounted false and its own path"},
-    {"name": "explain_decision", "identifier_kind": "DesignDecision name/id", "envelope": False, "phase": 2},
+    {"name": "explain_decision", "identifier_kind": "DesignDecision name/id", "envelope": False, "phase": 2, "note": "search_component finds decisions by id, title or body; an unknown id suggests decisions by id or title"},
     {"name": "find_requirements_for", "identifier_kind": "component name", "envelope": True, "phase": 2},
     {"name": "trace_design_rationale", "identifier_kind": "component name", "envelope": False, "phase": 2},
     {"name": "find_mentions", "identifier_kind": "entity name (mentioned_by) or Document repo-relative path (mentions)", "envelope": True, "phase": 2, "note": "requires mentions indexing opt-in; when off, an empty envelope with a notice naming the enable command"},

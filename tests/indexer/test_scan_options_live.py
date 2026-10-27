@@ -118,11 +118,11 @@ def test_the_agent_applies_mentions_enabled(repo):
 
     registry.set_mentions_enabled(repo_id, True)
     assert scan_options_pending(engine, repo_id, None, True)
-    notice = tools.find_mentions(engine, repo_id, "place_order", registry=registry)["notice"]
+    (notice,) = tools.find_mentions(engine, repo_id, "place_order", registry=registry)["notices"]
     assert "devgraph rescan" in notice
     assert _scheduler(engine, registry).run_once() == [repo_id]
     assert not scan_options_pending(engine, repo_id, None, True)
-    assert "notice" not in tools.find_mentions(engine, repo_id, "place_order", registry=registry)
+    assert "notices" not in tools.find_mentions(engine, repo_id, "place_order", registry=registry)
     _assert_fresh(engine, repo_id, root, mentions_enabled=True)
 
     registry.set_mentions_enabled(repo_id, False)
@@ -140,8 +140,9 @@ def test_the_agent_applies_a_docs_path_change(repo):
 
     registry.set_docs_path(repo_id, "notes")
     result = tools.find_requirements_for(engine, repo_id, "orders.py", registry=registry)
-    assert "devgraph rescan" in result["notice"]
+    (notice,) = result["notices"]
+    assert "devgraph rescan" in notice
     assert _scheduler(engine, registry).run_once() == [repo_id]
     assert engine.list_docs_note_files(repo_id) == {"notes/r2.md"}
-    assert "notice" not in tools.trace_design_rationale(engine, repo_id, "orders.py", registry=registry)
+    assert "notices" not in tools.trace_design_rationale(engine, repo_id, "orders.py", registry=registry)
     _assert_fresh(engine, repo_id, root, docs_path="notes")
