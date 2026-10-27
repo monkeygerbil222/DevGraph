@@ -757,7 +757,10 @@ TRANSACTION_RETRY_S = 30.0
 #: How long it is retried after losing its connection to Neo4j (refused,
 #: dropped): every later try would most likely fail the same way, and an
 #: indexing batch then aborts with `Neo4jLost` within about this long, where
-#: the driver's retry made it wait about 31 s.
+#: the driver's retry made it wait about 31 s. Only a direct (`bolt://`)
+#: connection's loss is a `ServiceUnavailable`: through a `neo4j://` routing
+#: URI the driver reports a lost connection as `SessionExpired`, which gets
+#: `TRANSACTION_RETRY_S`, as a cluster's leader switch must.
 CONNECTION_RETRY_S = 5.0
 
 #: The first pause before a retry, doubled after each one, as the driver's.
