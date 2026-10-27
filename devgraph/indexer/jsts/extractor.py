@@ -60,11 +60,18 @@ Known limitations (v1 scope cuts, documented per Implementation Plan #8):
     root package.json's `workspaces` or pnpm-workspace.yaml's `packages`)
     under that package's entry point or subpath; any other bare specifier
     (`import x from 'lodash'`) is an external package, with no IMPORTS edge.
+  - A name imported through an alias (a renamed or default re-export, a
+    default-exported function) is resolved by reading the imported file's
+    exports (`export_surface`), so its call links the function as it is
+    named where defined; a namespace member (`M.shout()`) or a `require`
+    is not followed through one.
 """
 
 from __future__ import annotations
 
+import hashlib
 import logging
+import posixpath
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -420,12 +427,25 @@ def _bound_names(func: Node) -> set[bytes]:
     return _pattern_names(func.child_by_field_name("parameters") or func.child_by_field_name("parameter"))
 
 
+def _dynamic_import(declarator: Node) -> Node | None:
+    """The `import(...)` call a destructuring declarator binds, awaited
+    (`const { f } = await import('./x')`), else None."""
+    name, value = declarator.child_by_field_name("name"), declarator.child_by_field_name("value")
+    if name is None or name.type != "object_pattern" or value is None or value.type != "await_expression":
+        return None
+    call = value.named_children[0] if value.named_children else None
+    func = call.child_by_field_name("function") if call is not None and call.type == "call_expression" else None
+    return call if func is not None and func.type == "import" else None
+
+
 def _declared_names(declaration: Node) -> set[bytes]:
     """The names a `const`/`let`/`var` declaration binds to anything but a
-    function (`const Widget = pick()`, `const { Row } = parts`)."""
+    function or a dynamic import (`_dynamic_import`, an import binding of
+    `_bindings`): `const Widget = pick()`, `const { Row } = parts`."""
     return {
         name for declarator in declaration.named_children if declarator.type == "variable_declarator"
         and _function_value(declarator.child_by_field_name("value")) is None
+        and _dynamic_import(declarator) is None
         for name in _pattern_names(declarator.child_by_field_name("name"))
     }
 
@@ -674,8 +694,10 @@ def _specifier_pins(
     files (`_resolve_module_specifier`) and the recursive prefix of each path
     it names, so a barrel's re-export reaches the defining file (as
     "package"; never the repository root), and of a workspace package's
-    directory, whose entry point re-exports from anywhere in it. None for
-    an external package."""
+    directory, whose entry point re-exports from anywhere in it. A path
+    naming a barrel's index file (`./lib/index`, `./lib/index.js`, a
+    tsconfig alias to `src/lib/index.ts`) has its folder's prefix, as
+    `./lib` has. None for an external package."""
     specifier = specifier.split("?", 1)[0].split("#", 1)[0]
     packages: list[str] = []
     if specifier.startswith("."):
@@ -689,6 +711,8 @@ def _specifier_pins(
         pins += _base_candidates(base)
         stem, dot, ext = base.rpartition(".")
         folder = stem if dot and "/" not in ext and f".{ext}" in _EXPLICIT_EXTENSIONS and stem else base
+        if posixpath.basename(folder) == "index":
+            folder = posixpath.dirname(folder)
         if folder and "!" not in folder:  # graph/schema.py split_pin: no "!" in a path pin
             pins.append(folder + "/")
     pins += [folder + "/" for folder in packages if "!" not in folder]
@@ -759,6 +783,180 @@ def _extract_imports(
 
     walk(root)
     return imports
+
+
+#: A Module's `js_exports` entry is its export name, the original name and
+#: the pins of where that is defined, joined by these.
+_EXPORT_SEP = "\x1f"
+_EXPORT_PIN_SEP = "\x1e"
+#: How many files deep an export is followed (`a` re-exporting `b`
+#: re-exporting `c` is two); past it, nothing.
+_MAX_EXPORT_DEPTH = 8
+
+#: `_export_entries` by a digest of the text read: a file is parsed again
+#: only when its content changes, however many importers read it.
+_ENTRIES_SEEN: dict[bytes, tuple] = {}
+_ENTRIES_SEEN_MAX = 100_000
+
+#: (export name, original name, specifier or None for the file itself), and
+#: the specifiers of its `export * from`.
+_ExportEntries = tuple[tuple[tuple[str, str, str | None], ...], tuple[str, ...]]
+#: Export name -> (the function's name where defined, the pins of where that is).
+ExportSurface = dict[str, tuple[str, tuple[str, ...]]]
+
+
+def _export_entries(root: Node, source: bytes) -> _ExportEntries:
+    """The file's exports that name a function otherwise than its own
+    export name says, as written: its default-exported top-level function
+    (`export default function bar`, `export default bar;`, `export { bar as
+    default }`), a renamed export of one (`export { upper as shout }`),
+    every `export { a, b as c } from '...'` (`default` too), and every
+    `export * from '...'`. A class is left out: a default import reaches a
+    default-exported class's members already (DEFAULT_EXPORT)."""
+    entries: list[tuple[str, str, str | None]] = []
+    stars: list[str] = []
+    top_level = _top_level_functions(root)
+    for node in root.named_children:
+        if node.type != "export_statement":
+            continue
+        source_node = node.child_by_field_name("source")
+        specifier = _string_value(source_node, source) if source_node is not None else None
+        if any(child.type == "default" for child in node.children):
+            value = node.child_by_field_name("declaration") or node.child_by_field_name("value")
+            if value is not None and value.type in ("function_declaration", "generator_function_declaration"):
+                value = value.child_by_field_name("name")
+            if value is not None and value.type == "identifier" and _text(value, source) in top_level:
+                entries.append(("default", _text(value, source), None))
+            continue
+        clause = next((c for c in node.named_children if c.type == "export_clause"), None)
+        if clause is None:
+            if specifier is not None and not _is_type_star_export(node) and not any(
+                c.type == "namespace_export" for c in node.named_children
+            ):
+                stars.append(specifier)
+            continue
+        for spec in (c for c in clause.named_children if c.type == "export_specifier"):
+            name, alias = spec.child_by_field_name("name"), spec.child_by_field_name("alias")
+            if name is None:
+                continue
+            original, exported = _text(name, source), _text(alias or name, source)
+            if specifier is not None:
+                entries.append((exported, original, specifier))
+            elif original != exported and original in top_level:
+                entries.append((exported, original, None))
+    return tuple(entries), tuple(stars)
+
+
+def _read_export_entries(config: ResolverConfig, rel: str) -> _ExportEntries | None:
+    """`_export_entries` of the repository file `rel`, or None when it is no
+    JS/TS file a scan extracts: missing, under an ignored or gitignored
+    path, or too large, binary or generated (walk.content_skip_reason)."""
+    from devgraph.config import get_settings
+    from devgraph.indexer.gitignore import is_gitignored
+    from devgraph.indexer.resolver_config import LANGUAGE_SUFFIXES
+    from devgraph.indexer.source_text import read_source
+    from devgraph.indexer.walk import content_skip_reason, is_ignored_path
+
+    if not rel.endswith(LANGUAGE_SUFFIXES["ts"]):
+        return None
+    path = config.root / rel
+    try:
+        if (
+            not path.is_file() or is_ignored_path(Path(rel), config.root) or is_gitignored(config.root, rel)
+            or content_skip_reason(path, get_settings().max_file_bytes) is not None
+        ):
+            return None
+        data = path.read_bytes()
+        key = hashlib.blake2b(data + rel.rsplit(".", 1)[-1].encode(), digest_size=16).digest()
+        found = _ENTRIES_SEEN.get(key)
+        if found is None:
+            if b"export" not in data:
+                return (), ()
+            text = read_source(path).encode("utf-8")
+            root = _make_parser(_language_for_extension(Path(rel).suffix)).parse(text).root_node
+            if len(_ENTRIES_SEEN) >= _ENTRIES_SEEN_MAX:
+                _ENTRIES_SEEN.clear()
+            found = _ENTRIES_SEEN[key] = _export_entries(root, text)
+        return found
+    except OSError:
+        return None
+
+
+def export_surface(rel: str, config: ResolverConfig | None) -> ExportSurface:
+    """What the JS/TS file `rel` exports under a name its function doesn't
+    have, read from the disk: each export name -> (the function's name
+    where it is defined, the pins of where that is: the file itself, or a
+    re-export's specifier's `_specifier_pins`). A re-export (`export {
+    default as subtract } from './math'`, or `export * from`) of a file
+    that aliases the name is followed to the definition, up to
+    `_MAX_EXPORT_DEPTH` files deep; through a cycle, nothing. Cached in
+    `config` for the batch (only a result no cycle or depth limit cut, so
+    it is the same whichever file is read first). Empty without `config`."""
+    if config is None:
+        return {}
+    return _surface(rel, config, ())[0]
+
+
+def _surface(rel: str, config: ResolverConfig, stack: tuple[str, ...]) -> tuple[ExportSurface, bool]:
+    """`export_surface` of `rel` read through the files in `stack`, and
+    whether no cycle or depth limit cut it."""
+    if rel in config.js_surfaces:
+        return config.js_surfaces[rel], True
+    if rel in stack or len(stack) >= _MAX_EXPORT_DEPTH:
+        return {}, False
+    entries = _read_export_entries(config, rel)
+    surface, closed = _resolve_exports(rel, entries or ((), ()), config, (*stack, rel))
+    if closed:
+        config.js_surfaces[rel] = surface
+    return surface, closed
+
+
+def _resolve_exports(
+    rel: str, entries: _ExportEntries, config: ResolverConfig | None, stack: tuple[str, ...]
+) -> tuple[ExportSurface, bool]:
+    """The `export_surface` of the file `rel` whose `_export_entries` are
+    `entries`, read through `stack` (the files being resolved, `rel` last),
+    and whether no cycle or depth limit cut it. A name's first definition
+    wins: an entry, then each `export *` in order, each specifier's
+    candidate files in `_resolve_module_specifier` order."""
+    surface: ExportSurface = {}
+    closed = True
+    folder = posixpath.dirname(rel)
+
+    def surfaces(specifier: str):
+        nonlocal closed
+        if config is None:
+            return
+        for file in _resolve_module_specifier(specifier, folder, config, rel):
+            found, whole = _surface(file, config, stack)
+            closed = closed and whole
+            yield found
+
+    own, stars = entries
+    for exported, original, specifier in own:
+        if specifier is None:
+            surface.setdefault(exported, (original, (rel,)))
+            continue
+        found = next((each[original] for each in surfaces(specifier) if original in each), None)
+        if found is not None:
+            surface.setdefault(exported, found)
+        elif original not in (exported, "default"):
+            pins = _specifier_pins(specifier, folder, config, rel)
+            if pins:
+                surface.setdefault(exported, (original, tuple(pins)))
+    for specifier in stars:
+        for each in surfaces(specifier):
+            for name, value in each.items():
+                if name != "default":
+                    surface.setdefault(name, value)
+    return surface, closed
+
+
+def _surface_entries(surface: ExportSurface) -> list[str]:
+    """A file's `export_surface` as its Module's `js_exports`, sorted."""
+    return sorted(
+        _EXPORT_SEP.join((name, original, _EXPORT_PIN_SEP.join(pins))) for name, (original, pins) in surface.items()
+    )
 
 
 @dataclass(frozen=True)
@@ -1121,7 +1319,8 @@ def _bindings(
     root: Node, source: bytes, current_dir: str, config: ResolverConfig | None, file_path: str
 ) -> tuple[dict[str, _Binding], bool]:
     """The names the file's imports bind (`import` statements, and
-    `const x = require(...)` / `const {a, b: c} = require(...)`), and
+    `const x = require(...)` / `const {a, b: c} = require(...)`, and a
+    destructured dynamic import, `const {a} = await import(...)`), and
     whether it is a module at all: a classic script has no `import`,
     `export` or `require`."""
     bindings: dict[str, _Binding] = {}
@@ -1158,13 +1357,14 @@ def _bindings(
             if func is not None and func.type == "identifier" and func.text == b"require":
                 module = True
         elif node.type == "variable_declarator":
-            value = node.child_by_field_name("value")
+            # `const { f } = await import('./x')` binds as a destructured require does.
+            name, dynamic = node.child_by_field_name("name"), _dynamic_import(node)
+            value = dynamic or node.child_by_field_name("value")
             func = value.child_by_field_name("function") if value is not None and value.type == "call_expression" \
                 else None
-            if func is not None and func.type == "identifier" and func.text == b"require":
+            if func is not None and (func.type == "identifier" and func.text == b"require" or dynamic is not None):
                 args = value.child_by_field_name("arguments")
                 where = pins(args.named_children[0]) if args is not None and args.named_children else None
-                name = node.child_by_field_name("name")
                 if name is not None and name.type == "identifier":
                     bindings[_text(name, source)] = _Binding(_text(name, source), where, True)
                 elif name is not None and name.type == "object_pattern":
@@ -1191,6 +1391,7 @@ class _CallResolver:
     def __init__(
         self, file_path: str, bindings: dict[str, _Binding], classes: dict[str, _ClassInfo],
         defined: set[str], script: bool, source: bytes, objects: dict[str, dict[str, str]] | None = None,
+        config: ResolverConfig | None = None,
     ):
         self.file_path = file_path
         self.bindings = bindings
@@ -1199,6 +1400,21 @@ class _CallResolver:
         self.script = script
         self.source = source
         self.objects = objects or {}
+        self.config = config
+
+    def _aliased(self, binding: _Binding) -> list[tuple[str, str | None, bool]] | None:
+        """An ES named or default import's targets when a file it names
+        exports the name as an alias (`export_surface`): the function under
+        its own name, a top-level one where it is defined; the first
+        candidate file exporting it decides. None otherwise."""
+        if binding.pins is None or binding.namespace or not (binding.top_level or binding.default):
+            return None
+        key = DEFAULT_EXPORT if binding.default else binding.name
+        for pin in binding.pins:
+            if not pin.endswith("/") and key in (surface := export_surface(pin, self.config)):
+                original, pins = surface[key]
+                return [(original, owned_pin(each, ""), False) for each in pins]
+        return None
 
     def _binding_pins(self, name: str) -> list[str] | None:
         binding = self.bindings.get(name)
@@ -1327,6 +1543,8 @@ class _CallResolver:
             if name in self.defined:
                 return [(name, self.file_path, False)]
             binding = self.bindings.get(name)
+            if binding is not None and (aliased := self._aliased(binding)) is not None:
+                return aliased
             if binding is not None:  # an ES named import's top-level function; else any of the name
                 owner = "" if binding.top_level else None
                 return [(binding.name, owned_pin(pin, owner), False) for pin in binding.pins or ()]
@@ -1849,6 +2067,11 @@ def extract_js_file(
         properties={"type": "module", "source_file": file_path},
     )
     result.nodes.append(module_node)
+    # What its importers' calls resolve through (`export_surface`), compared
+    # by a batch to re-index them when it changes (dispatch `_export_importers`).
+    exports = _resolve_exports(file_path, _export_entries(root, source_bytes), config, (file_path,))[0]
+    if exports:
+        module_node.properties["js_exports"] = _surface_entries(exports)
 
     current_dir = file_path.rsplit("/", 1)[0] if "/" in file_path else ""
     for target, names in _extract_imports(root, source_bytes, current_dir, config, file_path):
@@ -1868,7 +2091,7 @@ def extract_js_file(
     class_table = _class_table(root, source_bytes)
     resolver = _CallResolver(
         file_path, bindings, class_table, _defined_functions(root, source_bytes), not module, source_bytes,
-        _module_objects(root),
+        _module_objects(root), config,
     )
     top_level = _top_level_functions(root)
     # (caller label, caller name, caller owner)

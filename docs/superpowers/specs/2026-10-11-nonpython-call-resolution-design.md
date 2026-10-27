@@ -313,6 +313,27 @@ Any other bare specifier (`react`, `lodash`) is external: no
 `IMPORTS` edge (the old `node_modules/<name>` guess never matched, the walk
 skipping `node_modules`), and a call through its binding links nothing.
 
+A specifier naming a barrel's index file (`./lib/index`, `./lib/index.js`,
+a tsconfig alias to `src/lib/index.ts`) takes its folder's prefix, as `./lib`
+does (index format 25). A name imported through an alias is resolved by
+reading the imported file (`export_surface`, cached per batch in
+`ResolverConfig.js_surfaces`): its default-exported top-level function
+(`export default function sub`, `export default sub;`, `{ sub as default }`),
+a renamed export of one, and `export { a as b } from` / `export { default
+as b } from` / `export * from`, followed through the files they re-export
+from (up to eight deep; through a cycle, nothing, and only a result no cycle
+cut is cached, so it doesn't depend on which file is read first). An ES named
+or default import whose first candidate file exporting the name aliases it
+calls the function by its own name, owned `""` where it is defined. A
+namespace member (`M.shout()`) and a `require` are not followed through an
+alias. Each JS/TS Module records the aliases it exports (`js_exports`); a
+batch compares them with the graph's, and a file whose aliases changed has
+every importer (an `IMPORTS` entry in its `name_refs`, which a file records
+whether the import's target existed or not) indexed again in the same batch,
+repeated while an importer's own aliases change; `remove_paths` does the same
+for a deleted file that had aliases. A destructured dynamic import (`const {
+f } = await import('./x')`) binds as a destructured `require` does.
+
 Tiers, first match wins:
 
 1. A function, class or `const` arrow defined in the file (nested included):
