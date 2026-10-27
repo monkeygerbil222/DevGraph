@@ -311,6 +311,14 @@ owner} in `describe_node`, {name, file, owner} in `get_source`); pass
 `owner="Order"` or name it `Order.Order` to reach one. Two classes of one
 name are still `ambiguous`, their constructors left out of the candidates.
 
+**A test stub is no rival of its definition**: when a name has exactly one
+definition outside test code (the `find_callers` rule) and the others are in
+test code (a monkeypatch stub or test helper named after the function),
+`describe_node` and `get_source` answer with that one (status `found`) and add
+`also_defined_in_tests` (the refs of the test-code ones) and a `notices` entry
+saying so; pass one's `file` and `owner` to reach it. Two production
+definitions are still `ambiguous`, with every candidate listed.
+
 **Where an answer is, and one class's method**: every `find_callers` row
 names the caller's `file`, `owner` (the classes or functions it is declared
 in, `""` at the top level; a C++ class's namespaces too, so a method of

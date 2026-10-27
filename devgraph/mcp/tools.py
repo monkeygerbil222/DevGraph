@@ -1218,6 +1218,33 @@ def _without_constructors(
     return [row for row in rows if all(row is not each for each in constructors)], constructors
 
 
+def _single_production(rows: list[dict[str, Any]]) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    """Name lookup candidates (all of them: at most `_DESCRIBE_MAX_CANDIDATES`)
+    as (the one outside test code, the ones in it) when exactly one has a file
+    outside test code (devgraph/test_paths.py) and the rest are in test code:
+    a monkeypatch stub or test helper named after a function is no rival of
+    its definition. (None, []) otherwise; a file-less stub counts as production."""
+    if len(rows) < 2 or len(rows) > _DESCRIBE_MAX_CANDIDATES:
+        return None, []
+    tests = [row for row in rows if is_test_path(row.get("file"))]
+    production = [row for row in rows if not is_test_path(row.get("file"))]
+    if len(production) != 1 or production[0].get("file") is None:
+        return None, []
+    return production[0], tests
+
+
+def _test_definitions(name: str, refs: list[dict[str, Any]]) -> dict[str, Any]:
+    """The keys an answer adds when it chose the production definition over
+    same-named ones in test code (`_single_production`): those, and a notice."""
+    return {
+        "also_defined_in_tests": [_sanitize_row(ref) for ref in refs],
+        "notices": [
+            f"{_echo(name)} is also defined in test code ({len(refs)} more, in also_defined_in_tests); "
+            "answered with the production definition. Pass file (and owner) to pick one of those"
+        ],
+    }
+
+
 def _unresolved_marked(ref: dict[str, Any]) -> dict[str, Any]:
     """A candidate ref, with `unresolved_handler: true` when it is a route's
     handler stub left visible because it folds into no single real Function
@@ -1354,6 +1381,9 @@ def describe_node(
         raise ToolError(f"{message} {_DESCRIBE_HINT}.")
 
     rows, constructors = _without_constructors(rows)
+    chosen, in_tests = _single_production(rows)
+    if chosen is not None:
+        rows = [chosen]
     if len(rows) > 1:
         candidates = sorted(
             (_unresolved_marked(_node_ref(row)) for row in rows),
@@ -1397,6 +1427,10 @@ def describe_node(
         found["constructors"] = sorted(
             (_node_ref(row) for row in constructors), key=lambda r: (r.get("file") or "", r.get("owner") or "")
         )
+    if in_tests:
+        found.update(_test_definitions(name, sorted(
+            (_node_ref(row) for row in in_tests), key=lambda r: (r.get("file") or "", r.get("owner") or "")
+        )))
     return found
 
 
@@ -1430,7 +1464,9 @@ def god_nodes(
 
     Returns:
         Dict with count (nodes ranked), results, and truncated flag. Each result
-        has name, labels, repo_id, and degree (number of direct relationships,
+        has name, labels, repo_id, file (a file-less node's null), owner (the
+        declarations a code symbol is in, "" at the top level; left out for a
+        node without a file), and degree (number of direct relationships,
         git-history and mentions edges left out). `Repository`, git-history
         (`Commit`, `PullRequest`, `Issue`) and mentions `Document` nodes are
         not ranked, so a sweep commit or a file edited often never outranks
@@ -1452,14 +1488,15 @@ def god_nodes(
     }}
     WITH n, COUNT {{ (n)-[r]-() WHERE NOT type(r) IN $skipped }} AS degree
     ORDER BY degree DESC, n.name
-    WITH collect({{name: n.name, labels: labels(n), repo_id: n.repo_id, degree: degree}}) AS ranked
+    WITH collect({{name: n.name, labels: labels(n), repo_id: n.repo_id, degree: degree,
+                  file: coalesce(n.file, n.path), owner: {_OWNER_OF.format(v="n")}}}) AS ranked
     RETURN size(ranked) AS total, ranked[0..$limit] AS top
     """
     params: dict[str, Any] = {"limit": limit, "skipped": list(_GOD_NODES_SKIPPED_RELATIONSHIPS)}
     if not cross_repo:
         params["repo_id"] = repo_id
     (row,) = _query(engine, cypher, params)
-    envelope = _envelope(row["top"], limit)
+    envelope = _envelope([_located(each) for each in row["top"]], limit)
     envelope["count"] = row["total"]
     envelope["truncated"] = row["total"] > len(envelope["results"])
     return envelope
@@ -3307,6 +3344,9 @@ def get_source(
         return next((label for label in row["labels"] if label in ("Function", "Class")), row["labels"][0])
 
     results, constructors = _without_constructors(results, label_of)
+    chosen, in_tests = _single_production(results)
+    if chosen is not None:
+        results = [chosen]
     if len(results) > 1:
         candidates = [
             {
@@ -3380,6 +3420,12 @@ def get_source(
             {"name": c["name"], "file": c["file"], "owner": c["owner"], **({"repo_id": c["repo_id"]} if cross_repo else {})}
             for c in constructors
         ]
+    if in_tests:
+        result.update(_test_definitions(component_name, [
+            {"label": label_of(r), "name": r["name"], "file": r["file"], "owner": r["owner"],
+             **({"repo_id": r["repo_id"]} if cross_repo else {})}
+            for r in in_tests
+        ]))
     if notice is not None:
         result["notice"] = notice
     return result
