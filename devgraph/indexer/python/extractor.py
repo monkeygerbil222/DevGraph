@@ -26,6 +26,7 @@ from pathlib import Path
 import tree_sitter_python as tspython
 from tree_sitter import Language, Node, Parser
 
+from devgraph.graph.schema import LOCAL_KEY
 from devgraph.indexer.calls import STOP_METHODS, call_rows
 from devgraph.indexer.common import (
     ExtractionResult,
@@ -309,6 +310,14 @@ def _class_like(name: str) -> bool:
     """Whether a from-imported name reads as a class (CapWords), not an
     instance (`config`, `DEFAULTS`)."""
     return name[:1].isupper() and not name.isupper()
+
+
+def _no_bare_match(attr: str) -> bool:
+    """Whether a method name called on a receiver nothing types links
+    nothing rather than every function of the name: a dunder (`__init__`,
+    `__enter__`, which every class may define) or a capitalised name, read
+    as a constructor (`mod.Engine()`), as `_constructed` reads one."""
+    return (attr.startswith("__") and attr.endswith("__")) or attr[:1].isupper()
 
 
 #: Compound statements, and their clauses and blocks, whose body runs in
@@ -696,6 +705,10 @@ class _CallResolver:
             pins = self._method_pins(scope.cls, attr, own=own_receiver)
             if pins is not None:
                 return [(attr, pin) for pin in pins]
+            if super_call:
+                return []  # no base of the repository has it: an outside base's (`Exception.__init__`)
+        elif super_call:
+            return []
         elif (receiver := _pure_dotted(obj, source)) is not None:
             pins = self._receiver_pins(receiver, attr, scope)
             if pins is not None:
@@ -704,7 +717,7 @@ class _CallResolver:
             pins = self._class_pins(constructor, attr, scope.fn)  # `Fake().run()`
             if pins is not None:
                 return [(attr, pin) for pin in pins]
-        if obj.type in _LITERAL_RECEIVERS or attr in STOP_METHODS["python"]:
+        if obj.type in _LITERAL_RECEIVERS or attr in STOP_METHODS["python"] or _no_bare_match(attr):
             return []
         return [(attr, None)]
 
@@ -1092,6 +1105,11 @@ def extract_python_file(
             "start_line": node.start_point[0] + 1,
             "end_line": node.end_point[0] + 1,
         }
+        if enclosing.fn is not None:
+            # Defined in a function (directly, or as a method of a class
+            # defined in one): local to it, so no other file's call reaches
+            # it (graph/schema.py LOCAL_KEY).
+            func_properties["nested"] = True
         body_node = node.child_by_field_name("body")
         if body_node is not None:
             docstring = _extract_docstring(body_node, source_bytes)
@@ -1154,6 +1172,9 @@ def extract_python_file(
 
     merge_same_nodes(result)
     add_heir_keys(result, _class_declarations(root, source_bytes), c3=True)
+    for node in result.nodes:
+        if node.properties.get("nested"):
+            node.properties["mkeys"] = sorted({*node.properties.get("mkeys", ()), LOCAL_KEY})
     return own_edges(result, file_path)
 
 

@@ -351,9 +351,14 @@ def _provider_specs(repo_root: Path) -> tuple[bool, filesystem.FilesystemSpec | 
 #: method was owned by `Ledger`, an out-of-class one by `shop.Ledger` or
 #: `Ledger` as the definition was spelt; one outside every namespace block
 #: under the file's one `using namespace` read in it), and one class name
-#: in two namespaces of a file two nodes.
+#: in two namespaces of a file two nodes; 25: a Python function defined in
+#: another function `nested` (match key graph/schema.py LOCAL_KEY), which
+#: no other file's CALLS reaches, a production file's name-only CALLS never
+#: ending in a test file (devgraph/test_paths.py), and a Python `super()`
+#: call on a base outside the repository, or a dunder or capitalised method
+#: on an untyped receiver, linking no function by name.
 #: An index stamped lower, or not at all, is rescanned automatically.
-INDEX_FORMAT = 24
+INDEX_FORMAT = 25
 
 
 def index_outdated(engine: GraphEngine, repo_id: str) -> bool:
