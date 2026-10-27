@@ -648,9 +648,9 @@ def build_server(
         query as the exact name, then the same ignoring case, then names starting with
         or containing the whole query, then names equal to, starting with or containing
         one of its words (run_cypher before run), then description only. Name matches in
-        test code (tests/ folders, test_*.py, *.spec.ts and the like) come after every
-        name match in production code, unless the query names test code (test_..., fake,
-        mock, fixture). count is the true
+        test code (tests/ folders, test_*.py, *.spec.ts and the like) come after the
+        production ones of their band (whole-query matches; word matches), unless the
+        query names test code (test_..., fake, mock, fixture, FakeEngine). count is the true
         number of matches, unless count_is_lower_bound is true (exact and prefix matches
         in production code alone filled max_results). max_results is capped at 200. A snake_case query such as
         user_service also matches as a whole word. An exact name in unusual case (gEt for

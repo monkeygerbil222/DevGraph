@@ -381,10 +381,13 @@ first (then the same name in other case), then names starting with or
 containing the whole query, then names equal to, starting with or containing
 one of its words (so `run_cypher` comes before the many functions named `run`),
 then description-only matches. Name matches in test code (the rule
-`find_callers` uses to put test callers last) come after every name match in
-production code, so `engine` finds `GraphEngine` before the test fixtures named
-`engine`; they are still listed, and a query that names test code (`test_...`,
-`conftest`, `fixture`, `mock`, `fake`, `stub`) ranks them as any other. Each
+`find_callers` uses to put test callers last) come after the production ones
+of their band (names matching the whole query; names matching one of its
+words), so `engine` finds `GraphEngine` before the test fixtures named
+`engine`, while a test helper named exactly `make_repo` still comes before
+`remove_repo`; they are still listed, and a query that names test code
+(`test_...`, `conftest`, `fixture`, `mock`, `fake`, `stub`, also in CamelCase:
+`FakeEngine`) ranks them as any other. Each
 result carries its `file`, and a route's handler stub is dropped when it
 folds into a real function (see Route handlers). Its `count` is the true number of
 matches, except when exact and prefix matches in production code alone fill `max_results`: then

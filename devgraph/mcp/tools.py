@@ -559,8 +559,9 @@ _SEARCH_TIER = (
 )
 _SEARCH_FILE = "CASE WHEN coalesce(n.file, '') <> '' THEN n.file ELSE coalesce(n.path, n.source_file, n.source) END"
 # Whether a matching node ranks with the test code (devgraph/test_paths.py), when
-# `$tests_last`: name matches in production code come before those in test code,
-# and both before description-only matches. Needs `file` bound (`_SEARCH_FILE`).
+# `$tests_last`: within each band of name matches (the whole query, tiers 0-3; one
+# of its terms, tiers 4-6) production code comes before test code, so a test
+# helper named exactly `make_repo` still beats `remove_repo`. Needs `file` bound.
 _SEARCH_IN_TESTS = "($tests_last AND coalesce(file, '') =~ $test_path)"
 _SEARCH_ROW = (
     "{id: elementId(n), name: n.name, labels: labels(n), repo_id: n.repo_id, "
@@ -578,10 +579,10 @@ _TEST_WORDS = frozenset({
 
 
 def _targets_tests(query: str) -> bool:
-    """Whether `query` asks for test code: a word (or a word's `_` part) is a
-    test word, or starts with `test` (`TestSearch`, `testCase`)."""
-    words = re.findall(r"[A-Za-z0-9_]+", query.lower())
-    return any(w.startswith("test") or not _TEST_WORDS.isdisjoint(w.split("_")) for w in words)
+    """Whether `query` asks for test code: one of its words, split at `_` and at
+    case changes (`TestSearch`, `FakeEngine`, `mockRegistry`), is a test word."""
+    parts = re.findall(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|[0-9]+", query)
+    return not _TEST_WORDS.isdisjoint(part.lower() for part in parts)
 
 
 def _name_variants(query: str, terms: list[str]) -> list[str]:
@@ -686,14 +687,16 @@ def ranked_search(
     """Nodes of `labels` whose name or description contains a (lower-case) term,
     best first (`_SEARCH_TIER`): `query` itself as the name, then ignoring case,
     then a name starting with or containing `query`, then a name equal to,
-    starting with or containing a term, description only. Name matches in test
-    code (devgraph/test_paths.py) come after every name match in production
-    code, and before description-only matches, unless `query` asks for test
-    code (`_targets_tests`): a fixture named `engine` never hides `GraphEngine`.
+    starting with or containing a term, description only. Within the band of
+    whole-query matches (tiers 0-3) and within that of term matches (4-6),
+    matches in test code (devgraph/test_paths.py) come after those in
+    production code, unless `query` asks for test code (`_targets_tests`): a
+    fixture named `engine` never hides `GraphEngine`, and a test helper named
+    exactly `make_repo` still comes before `remove_repo`.
 
     Names that start with one of `names` are found first through the
-    `(repo_id, name)` indexes. Only when they don't fill `limit` with production
-    code does a substring scan fill the rest and count every match. Returns
+    `(repo_id, name)` indexes. Only when their first `limit` rows aren't all
+    production code does a substring scan fill the rest and count every match. Returns
     (rows, count, count_is_lower_bound): the count is a lower bound when the
     scan never ran. `repo_id` None searches every repository. Labels must be
     validated identifiers.
@@ -710,7 +713,7 @@ def ranked_search(
     }
     order = (
         f"WITH n, {_SEARCH_TIER} AS tier, {_SEARCH_FILE} AS file "
-        f"ORDER BY tier = 7, {_SEARCH_IN_TESTS}, tier, n.name, file IS NULL, file, elementId(n)\n"
+        f"ORDER BY tier = 7, tier >= 4, {_SEARCH_IN_TESTS}, tier, n.name, file IS NULL, file, elementId(n)\n"
     )
     indexed = _query(
         engine,
@@ -721,9 +724,9 @@ def ranked_search(
     found = [r["row"] for r in indexed]
     # Test-code rows of the index stage may rank below production matches only
     # the substring scan finds (`GraphEngine` for `engine`), so they wait for it.
-    production = [r for r in found if not (tests_last and is_test_path(r["file"]))]
-    if len(production) > limit:
-        return production[:limit], len(found), True
+    production = [r for r in found[:limit] if not (tests_last and is_test_path(r["file"]))]
+    if len(found) > limit and len(production) == limit:
+        return production, len(found), True
     # A docs note's `title` and `body` are its description.
     substring = (
         "any(t IN $terms WHERE toLower(n.name) CONTAINS t OR toLower(n.description) CONTAINS t "
@@ -765,7 +768,7 @@ def _rank_search_results(
     name equal to, starting with or containing a token, then description-only
     matches last; by name and file within a tier (no file last), as
     `ranked_search`'s queries order them. With `tests_last`, name matches in
-    test code come after the other name matches (`_SEARCH_IN_TESTS`)."""
+    test code come after the production ones of their band (`_SEARCH_IN_TESTS`)."""
     exact = query.strip()
     whole = exact.lower()
 
@@ -790,7 +793,8 @@ def _rank_search_results(
     def key(row: dict) -> tuple:
         rank = tier(row)
         in_tests = tests_last and is_test_path(row.get("file"))
-        return (rank == 7, in_tests, rank, row.get("name") or "", row.get("file") is None, row.get("file") or "")
+        return (rank == 7, rank >= 4, in_tests, rank, row.get("name") or "", row.get("file") is None,
+                row.get("file") or "")
     return sorted(results, key=key)
 
 
