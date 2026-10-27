@@ -26,6 +26,8 @@ from typing import Any
 
 import networkx as nx
 
+from devgraph.test_paths import is_test_path
+
 logger = logging.getLogger(__name__)
 
 # Edges that mean "A depends on B", directed as stored: A CALLS B gives B
@@ -83,16 +85,39 @@ def pagerank(node_ids: list[str], edges: list[tuple[str, str]]) -> dict[str, flo
     return {nid: rank[index[nid]] for nid in node_ids}
 
 
+def _production(members: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """`members` outside test code (devgraph/test_paths.py), or all of them
+    when every member with a file is in test code."""
+    production = [m for m in members if m.get("file") and not is_test_path(m["file"])]
+    return production or members
+
+
+def _top_member(members: list[dict[str, Any]], ranks: dict[str, float]) -> dict[str, Any]:
+    """The highest-PageRank member outside test code (`_production`), ties by name."""
+    return min(_production(members), key=lambda m: (-ranks.get(m["id"], -1.0), m.get("name") or "", m["id"]))
+
+
 def _community_label(members: list[dict[str, Any]], ranks: dict[str, float]) -> str:
-    """Most common member directory, else the highest-PageRank member's name."""
-    dirs = Counter(posixpath.dirname(m["file"]) or _ROOT_LABEL for m in members if m.get("file"))
+    """Most common directory of the members outside test code (of all of them
+    when every one is in test code), else the highest-PageRank member's name."""
+    dirs = Counter(posixpath.dirname(m["file"]) or _ROOT_LABEL for m in _production(members) if m.get("file"))
     if dirs:
         top = max(dirs.values())
         label = min(d for d, count in dirs.items() if count == top)
     else:
-        best = min(members, key=lambda m: (-ranks.get(m["id"], -1.0), m.get("name") or "", m["id"]))
+        best = _top_member(members, ranks)
         label = best.get("name") or best["id"]
     return label[:_LABEL_MAX_CHARS]
+
+
+def _told_apart(communities: list[dict[str, Any]], tops: list[dict[str, Any]]) -> None:
+    """Communities sharing a label each add their top member's name to it
+    (`devgraph/graph (run_cypher)`), in place."""
+    shared = Counter(c["label"] for c in communities)
+    for community, top in zip(communities, tops):
+        if shared[community["label"]] > 1:
+            name = top.get("name") or top["id"]
+            community["label"] = f"{community['label']} ({name})"[:_LABEL_MAX_CHARS]
 
 
 def compute_insights(nodes: list[dict[str, Any]], edges: list[dict[str, Any]]) -> InsightResult:
@@ -134,12 +159,14 @@ def compute_insights(nodes: list[dict[str, Any]], edges: list[dict[str, Any]]) -
 
     community_of: dict[str, int] = {}
     communities: list[dict[str, Any]] = []
+    tops: list[dict[str, Any]] = []
     for number, members in enumerate(ordered):
         for member in members:
             community_of[member] = number
-        communities.append(
-            {"community": number, "label": _community_label([by_id[m] for m in members], ranks), "size": len(members)}
-        )
+        nodes_of = [by_id[m] for m in members]
+        communities.append({"community": number, "label": _community_label(nodes_of, ranks), "size": len(members)})
+        tops.append(_top_member(nodes_of, ranks))
+    _told_apart(communities, tops)
 
     scored = sorted(set(community_of) | set(ranks))
     node_rows = [

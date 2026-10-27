@@ -2815,7 +2815,11 @@ def list_services(
         max_results: Maximum number of results to return in the envelope
 
     Returns:
-        Dict with count, results, and truncated flag containing services with their properties
+        Dict with count, results, and truncated flag containing services: name,
+        repo_id, description, file (the compose file or Containerfile declaring
+        it: one service declared in two compose files is two rows), and what
+        it runs, `image` (its Container's), or builds, `build_context` ("" for
+        the repository root), when it has one
     """
     _at_least(1, max_results=max_results)
     repo_filter = _cross_scope("s", "WHERE") if cross_repo else "WHERE s.repo_id = $repo_id"
@@ -2828,13 +2832,17 @@ def list_services(
     cypher = f"""
     MATCH (s:Service)
     {repo_filter}
-    RETURN s.name as name, s.repo_id as repo_id, s.description as description
-    ORDER BY (s.repo_id = $repo_id) DESC, s.repo_id, s.name
+    RETURN s.name as name, s.repo_id as repo_id, s.description as description,
+           coalesce(s.file, s.source) as file, s.build_context as build_context,
+           head([(s)-[:RUNS]->(c:Container) WHERE c.image IS NOT NULL | c.image]) as image
+    ORDER BY (s.repo_id = $repo_id) DESC, s.repo_id, s.name, file
     """
     params = {"repo_id": repo_id}
 
     results = _query(engine, cypher, params)
-    return _envelope(results, max_results)
+    # What a service runs or builds is listed only when it has one.
+    rows = [{k: v for k, v in row.items() if v is not None or k not in ("image", "build_context")} for row in results]
+    return _envelope(rows, max_results)
 
 
 #: The `framework` an Endpoint carries, by the extractors that write them

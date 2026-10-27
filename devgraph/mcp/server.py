@@ -714,7 +714,10 @@ def build_server(
     ) -> dict[str, Any]:
         """Return the repository's subsystems: Louvain communities over dependency and
         containment edges, largest first, as {count, results, truncated} of
-        {community, label, size, top_members}. top_members (highest PageRank first) is
+        {community, label, size, top_members}. A label is the most common folder of the
+        community's members outside test code (of all of them when every one is test
+        code); two communities of one label each add their top member's name,
+        "devgraph/graph (run_cypher)". top_members (highest PageRank first) is
         filled for the communities within max_results. Errors if graph insights have
         never been computed for the repository (the agent computes them after indexing)."""
         return devgraph_tools.find_communities(engine, registry, repo_id, max_results, members_per_community)
@@ -922,7 +925,9 @@ def build_server(
 
     @server.tool(annotations=_READ_ONLY)
     def list_services(repo_id: str, cross_repo: bool = False, max_results: int = 15) -> dict[str, Any]:
-        """List all services; returns {count, results, truncated}."""
+        """List all services; returns {count, results, truncated}. Each row names the file
+        declaring the service (one service in two compose files is two rows), and its
+        image or build_context ("" for the repository root) when it has one."""
         return devgraph_tools.list_services(engine, repo_id, cross_repo, max_results)
 
     @server.tool(annotations=_READ_ONLY)
