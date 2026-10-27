@@ -939,7 +939,8 @@ def _lookup_cypher(labels: tuple[str, ...], declared: frozenset[str]) -> str:
     return (
         f"CALL () {{\n{body}\n}}\n"
         "RETURN elementId(n) AS id, labels(n)[0] AS label, n.name AS name, "
-        f"coalesce(n.file, n.path) AS file, {_OWNER_OF.format(v='n')} AS owner, properties(n) AS properties\n"
+        f"coalesce(n.file, n.path) AS file, {_OWNER_OF.format(v='n')} AS owner, n.nested AS nested, "
+        "properties(n) AS properties\n"
         f"LIMIT {_DESCRIBE_MAX_CANDIDATES + 1}"
     )
 
@@ -957,7 +958,7 @@ def _owned_lookup_cypher(labels: tuple[str, ...], companion: bool = False) -> st
     return (
         f"CALL () {{\n{body}\n}}\n"
         "RETURN elementId(n) AS id, labels(n)[0] AS label, n.name AS name, "
-        f"n.file AS file, n.owner AS owner, properties(n) AS properties\n"
+        f"n.file AS file, n.owner AS owner, n.nested AS nested, properties(n) AS properties\n"
         f"LIMIT {_DESCRIBE_MAX_CANDIDATES + 1}"
     )
 
@@ -1246,29 +1247,40 @@ def _without_constructors(
 
 def _single_production(rows: list[dict[str, Any]]) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
     """Name lookup candidates (all of them: at most `_DESCRIBE_MAX_CANDIDATES`)
-    as (the one outside test code, the ones in it) when exactly one has a file
-    outside test code (devgraph/test_paths.py) and the rest are in test code:
-    a monkeypatch stub or test helper named after a function is no rival of
-    its definition. (None, []) otherwise; a file-less stub counts as production."""
+    as (the one outside test code, the others) when exactly one has a file
+    outside test code (devgraph/test_paths.py) and is not `nested` in a
+    function, and the rest are in test code or nested in a function of
+    another file: a monkeypatch stub, a test helper or another function's
+    local helper named after a function is no rival of its definition (no
+    other file's call reaches a nested one, graph/engine.py `_CALL_REACHES`).
+    (None, []) otherwise; a file-less stub counts as production."""
     if len(rows) < 2 or len(rows) > _DESCRIBE_MAX_CANDIDATES:
         return None, []
-    tests = [row for row in rows if is_test_path(row.get("file"))]
     production = [row for row in rows if not is_test_path(row.get("file"))]
-    if len(production) != 1 or production[0].get("file") is None:
+    top = [row for row in production if not row.get("nested")]
+    if len(top) != 1 or top[0].get("file") is None:
         return None, []
-    return production[0], tests
+    if any(row is not top[0] and row.get("file") == top[0]["file"] for row in production):
+        return None, []
+    return top[0], [row for row in rows if row is not top[0]]
 
 
 def _test_definitions(name: str, refs: list[dict[str, Any]]) -> dict[str, Any]:
     """The keys an answer adds when it chose the production definition over
-    same-named ones in test code (`_single_production`): those, and a notice."""
-    return {
-        "also_defined_in_tests": [_sanitize_row(ref) for ref in refs],
-        "notices": [
-            f"{_echo(name)} is also defined in test code ({len(refs)} more, in also_defined_in_tests); "
-            "answered with the production definition. Pass file (and owner) to pick one of those"
-        ],
-    }
+    same-named ones in test code or nested in another file's functions
+    (`_single_production`): those, each kind under its own key, and a notice."""
+    tests = [_sanitize_row(ref) for ref in refs if is_test_path(ref.get("file"))]
+    nested = [_sanitize_row(ref) for ref in refs if not is_test_path(ref.get("file"))]
+    keys: dict[str, Any] = {"notices": []}
+    for key, rows, where in (("also_defined_in_tests", tests, "in test code"),
+                             ("also_nested_in_functions", nested, "nested in another file's functions")):
+        if rows:
+            keys[key] = rows
+            keys["notices"].append(
+                f"{_echo(name)} is also defined {where} ({len(rows)} more, in {key}); "
+                "answered with the production definition. Pass file (and owner) to pick one of those"
+            )
+    return keys
 
 
 def _unresolved_marked(ref: dict[str, Any]) -> dict[str, Any]:
@@ -1407,7 +1419,7 @@ def describe_node(
         raise ToolError(f"{message} {_DESCRIBE_HINT}.")
 
     rows, constructors = _without_constructors(rows)
-    chosen, in_tests = _single_production(rows)
+    chosen, passed_over = _single_production(rows)
     if chosen is not None:
         rows = [chosen]
     if len(rows) > 1:
@@ -1453,9 +1465,9 @@ def describe_node(
         found["constructors"] = sorted(
             (_node_ref(row) for row in constructors), key=lambda r: (r.get("file") or "", r.get("owner") or "")
         )
-    if in_tests:
+    if passed_over:
         found.update(_test_definitions(name, sorted(
-            (_node_ref(row) for row in in_tests), key=lambda r: (r.get("file") or "", r.get("owner") or "")
+            (_node_ref(row) for row in passed_over), key=lambda r: (r.get("file") or "", r.get("owner") or "")
         )))
     return found
 
@@ -3391,7 +3403,7 @@ def get_source(
     {_fold_target("n")}WITH n, folded WHERE folded IS NULL AND NOT {_shadowed_stub("n")}
     RETURN n.name as name, labels(n) as labels, n.repo_id as repo_id,
            n.file as file, {_OWNER_OF.format(v="n")} as owner, n.start_line as start_line, n.end_line as end_line,
-           n.docstring_full as docstring_full
+           n.docstring_full as docstring_full, n.nested as nested
     ORDER BY n.repo_id, n.file, n.start_line
     LIMIT {_DESCRIBE_MAX_CANDIDATES + 1}
     """, params)
@@ -3430,7 +3442,7 @@ def get_source(
         return next((label for label in row["labels"] if label in ("Function", "Class")), row["labels"][0])
 
     results, constructors = _without_constructors(results, label_of)
-    chosen, in_tests = _single_production(results)
+    chosen, passed_over = _single_production(results)
     if chosen is not None:
         results = [chosen]
     if len(results) > 1:
@@ -3506,11 +3518,11 @@ def get_source(
             {"name": c["name"], "file": c["file"], "owner": c["owner"], **({"repo_id": c["repo_id"]} if cross_repo else {})}
             for c in constructors
         ]
-    if in_tests:
+    if passed_over:
         result.update(_test_definitions(component_name, [
             {"label": label_of(r), "name": r["name"], "file": r["file"], "owner": r["owner"],
              **({"repo_id": r["repo_id"]} if cross_repo else {})}
-            for r in in_tests
+            for r in passed_over
         ]))
     return _with_notice(result, notice)
 

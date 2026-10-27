@@ -1038,8 +1038,9 @@ def build_server(
         never its constructor (a function named like it and owned by it, as in Java, C#
         or C++): the answer names its constructors, which owner (the class's name)
         reaches. When exactly one candidate is outside test code and the others are in
-        it (a monkeypatch stub named after the function), the answer is that one, with
-        the others in also_defined_in_tests and a notice. A route's handler stub never makes
+        it (a monkeypatch stub named after the function) or nested in a function of
+        another file, the answer is that one, with the others in also_defined_in_tests
+        (or also_nested_in_functions) and a notice. A route's handler stub never makes
         the one function it stands for ambiguous; a stub standing for none is a
         candidate marked unresolved_handler. A file that is not valid UTF-8 is
         decoded with replacement characters, and a notice says so. An unknown name (or
@@ -1063,8 +1064,9 @@ def build_server(
         direction, with each neighbour's identity. A file, folder or docs node is named by
         its repo-relative path or id; a method may be named with its class, "A.save" or
         "A::save". An ambiguous name returns candidates; call again with label, file and
-        owner. When exactly one candidate is outside test code and the others are in it,
-        the answer is that one, with the others in also_defined_in_tests and a notice. A class's name means the class, never its constructor (a function named
+        owner. When exactly one candidate is outside test code and the others are in it
+        or nested in a function of another file, the answer is that one, with the others
+        in also_defined_in_tests (or also_nested_in_functions) and a notice. A class's name means the class, never its constructor (a function named
         like it and owned by it): the answer lists its constructors, reached with
         "Order.Order" or owner. A route handler answers as its real function, with its stub's
         relationships folded in when the stub provably stands for it; a stub routes

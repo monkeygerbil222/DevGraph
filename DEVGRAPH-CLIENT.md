@@ -313,10 +313,12 @@ name are still `ambiguous`, their constructors left out of the candidates.
 
 **A test stub is no rival of its definition**: when a name has exactly one
 definition outside test code (the `find_callers` rule) and the others are in
-test code (a monkeypatch stub or test helper named after the function),
-`describe_node` and `get_source` answer with that one (status `found`) and add
-`also_defined_in_tests` (the refs of the test-code ones) and a `notices` entry
-saying so; pass one's `file` and `owner` to reach it. Two production
+test code (a monkeypatch stub or test helper named after the function) or are
+a Python function nested in a function of another file (a local helper no
+other file's call reaches), `describe_node` and `get_source` answer with that
+one (status `found`) and add `also_defined_in_tests` (the refs of the
+test-code ones), `also_nested_in_functions` (the refs of the nested ones) and
+a `notices` entry for each; pass one's `file` and `owner` to reach it. Two production
 definitions are still `ambiguous`, with every candidate listed.
 
 **Where an answer is, and one class's method**: every `find_callers` row
