@@ -196,3 +196,17 @@ def test_an_mcp_insight_tool_on_a_slow_neo4j_does_not_say_to_start_it(tmp_path, 
     (content,) = result.content
     assert "accepted the query but didn't answer" in content.text
     assert "isn't reachable" not in content.text
+
+
+class _RecordingDriver(_StreamingDriver):
+    def execute_read(self, work, *args, **kwargs):
+        self.timeout = getattr(work, "timeout", None)
+        return super().execute_read(work, *args, **kwargs)
+
+
+def test_the_load_has_a_generous_server_limit():
+    """An abandoned load (its client gave up) must not stream on the server forever."""
+    engine = GraphEngine("bolt://127.0.0.1:9", "neo4j", "x", fail_fast=True, connection_timeout_s=2.0)
+    engine._driver = _RecordingDriver(gap_s=0.0)
+    engine.load_insight_graph("r", COMMUNITY_RELATIONSHIPS)
+    assert engine._driver.timeout == engine_module.INSIGHT_LOAD_TIMEOUT_S >= 600

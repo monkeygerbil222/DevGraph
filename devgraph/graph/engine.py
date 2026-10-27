@@ -665,9 +665,14 @@ INSIGHT_SUMMARY_TIMEOUT_S = 30.0
 
 #: How long one try of `GraphEngine.load_insight_graph` may go without an
 #: answer (the transaction accepted, or a row) before it is given up. The load
-#: has no limit of its own: it is legitimately long on a large graph, and runs
-#: as long as rows keep coming.
+#: is legitimately long on a large graph, and runs as long as rows keep
+#: coming, up to Neo4j's own limit, `INSIGHT_LOAD_TIMEOUT_S`.
 INSIGHT_LOAD_QUIET_S = 60.0
+
+#: Neo4j's limit on one insight load: generous, so only a load whose client
+#: gave up on it (`INSIGHT_LOAD_QUIET_S`) or a runaway one is cut, and an
+#: abandoned load never streams on the server forever.
+INSIGHT_LOAD_TIMEOUT_S = 600.0
 
 
 #: A pooled connection idle at least this long is checked (a RESET) before use,
@@ -3188,7 +3193,8 @@ class GraphEngine:
         between is simply not matched.
 
         Each try is given up after `INSIGHT_LOAD_QUIET_S` without an answer
-        (see `_bounded_read`), however long the rows keep coming.
+        (see `_bounded_read`), however long the rows keep coming, up to
+        Neo4j's limit `INSIGHT_LOAD_TIMEOUT_S` (10 minutes) for the whole load.
         """
 
         def work(tx):
@@ -3203,7 +3209,7 @@ class GraphEngine:
                 nodes.append(record.data())
             return nodes, edges
 
-        return self._bounded_read(work, INSIGHT_LOAD_QUIET_S)
+        return self._bounded_read(work, INSIGHT_LOAD_QUIET_S, timeout_s=INSIGHT_LOAD_TIMEOUT_S)
 
     def write_insights(self, repo_id: str, rows: list[dict[str, Any]], summary: dict[str, Any]) -> None:
         """Replace a repository's insight properties (see `_write_insights_tx`)."""
