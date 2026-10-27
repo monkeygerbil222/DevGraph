@@ -1,6 +1,6 @@
-"""A Python decorator is called by the scope its decorated definition is in
-(audit 12 item 5): the Module, class or function, as Python evaluates it,
-resolved like a call there but never by bare name (an untyped
+"""A Python decorator is called by the definition it decorates (audit 12
+item 5 and its review), `via: "decorator"`, resolved like a call in the
+scope Python evaluates it in but never by bare name (an untyped
 `@app.get(...)` links no `get`). A name an `__init__.py` re-exports under
 an alias (`from .util import other as renamed`) reaches the original, the
 `__init__.py` being Python resolver configuration."""
@@ -11,13 +11,16 @@ from devgraph.indexer.python.extractor import extract_python_file
 from devgraph.indexer.resolver_config import ResolverConfig, fingerprints, touches_config
 
 
+def rows(source: str, file_path: str = "app/main.py", config=None):
+    result = extract_python_file(textwrap.dedent(source), file_path, "repo", config)
+    return [r for r in result.relationships if r.rel_type == "CALLS"]
+
+
 def calls(source: str, file_path: str = "app/main.py", config=None) -> set[tuple]:
     """(caller label, caller, callee, to_file, confidence) per CALLS row."""
-    result = extract_python_file(textwrap.dedent(source), file_path, "repo", config)
     return {
         (r.from_label, r.from_name, r.to_name, r.to_file, r.properties["confidence"])
-        for r in result.relationships
-        if r.rel_type == "CALLS"
+        for r in rows(source, file_path, config)
     }
 
 
@@ -58,12 +61,39 @@ def test_decorator_usage_is_a_caller():
                 pass
         """
     found = calls(source)
-    assert ("Module", "app/main.py", "plain", "app/main.py", "resolved") in found
-    assert ("Module", "app/main.py", "plain", "app/deco.py", "resolved") in found
-    assert ("Module", "app/main.py", "retry", "app/__init__.py", "resolved") in found
-    assert ("Module", "app/main.py", "retry", "app/", "package") in found
-    assert ("Class", "Job", "plain", "app/main.py", "resolved") in found
-    assert ("Function", "outer", "plain", "app/main.py", "resolved") in found
+    assert ("Function", "a", "plain", "app/main.py", "resolved") in found
+    assert ("Function", "b", "plain", "app/deco.py", "resolved") in found
+    assert ("Function", "c", "retry", "app/__init__.py", "resolved") in found
+    assert ("Function", "c", "retry", "app/", "package") in found
+    assert ("Function", "run", "plain", "app/main.py", "resolved") in found
+    assert ("Function", "inner", "plain", "app/main.py", "resolved") in found
+    # No scope calls them: the definitions do.
+    assert not [row for row in found if row[0] in ("Module", "Class") or row[1] == "outer"]
+    decorated = [r for r in rows(source) if r.to_name in ("plain", "retry")]
+    assert all(r.properties["via"] == "decorator" for r in decorated)
+    (run,) = {(r.from_owner, r.properties.get("caller_class")) for r in decorated if r.from_name == "run"}
+    assert run == ("Job", "Job")
+
+
+def test_a_decorated_class_calls_its_decorator():
+    found = rows("def register(cls):\n    return cls\n\n\n@register\nclass Plugin:\n    pass\n")
+    assert [(r.from_label, r.from_name, r.to_name, r.properties["via"]) for r in found] == [
+        ("Class", "Plugin", "register", "decorator"),
+    ]
+
+
+def test_a_decorator_the_definition_also_calls_is_one_plain_call():
+    source = """\
+        def plain(fn):
+            return fn
+
+
+        @plain
+        def a():
+            plain(None)
+        """
+    (row,) = [r for r in rows(source) if r.to_name == "plain"]
+    assert row.from_name == "a" and "via" not in row.properties
 
 
 def test_an_unresolved_or_builtin_decorator_links_nothing():
@@ -125,8 +155,7 @@ def test_aliased_package_reexport_links_original(tmp_path):
             app.renamed()
         """
     found = calls(source, "main.py", config)
-    for caller in (("Module", "main.py"), ("Function", "f")):
-        assert (*caller, "other", "app/util.py", "resolved") in found
+    assert ("Function", "f", "other", "app/util.py", "resolved") in found
     assert ("Function", "f", "make", "app/core.py", "resolved") in found
     # Without the configuration, only the alias's own name.
     assert not [row for row in calls(source, "main.py") if row[2] in ("other", "make")]

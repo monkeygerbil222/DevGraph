@@ -984,6 +984,8 @@ def extract_python_file(
     fixtures = _fixture_types(root, source_bytes)
     # (caller label, caller name, caller owner) -> callee name -> [pins, bare?, caller classes]
     calls: dict[tuple[str, str, str | None], dict[str, list]] = {}
+    # The same for the decorators each definition is decorated with (`via`).
+    decorated: dict[tuple[str, str, str | None], dict[str, list]] = {}
 
     def record_calls(
         caller_label: str, caller_name: str, body: Node, scope: _Scope, caller_class: str | None,
@@ -994,10 +996,13 @@ def extract_python_file(
         # narrow results via scope_to_class — an opt-in query-time filter
         # (Implementation Plan #3, Item 2). caller_owner tells same-named
         # callers of the file apart (None for the Module). With `decorators`
-        # (`body` unused) their callees are recorded instead: each is called
-        # where its definition is, and only where it resolves, never by bare
-        # name (an untyped `@app.get(...)` is no call of every `get`).
-        by_name = calls.setdefault((caller_label, caller_name, caller_owner), {})
+        # (`body` unused) their callees are recorded instead, in `decorated`:
+        # the decorated definition calls each, and only where it resolves,
+        # never by bare name (an untyped `@app.get(...)` is no call of every
+        # `get`).
+        by_name = (calls if decorators is None else decorated).setdefault(
+            (caller_label, caller_name, caller_owner), {},
+        )
         functions = _call_functions(body) if decorators is None else [
             target.child_by_field_name("function") if target.type == "call" else target
             for deco in decorators if (target := next(iter(deco.named_children), None)) is not None
@@ -1052,11 +1057,15 @@ def extract_python_file(
             # decorated_definition wraps decorator(s) + the actual definition.
             decorators = [c for c in node.named_children if c.type == "decorator"]
             node = node.child_by_field_name("definition")
-            # The block's scope calls each decorator, as Python evaluates it there.
-            record_calls(
-                parent_label, parent_name or file_path, node, scope, parent_name if parent_label == "Class" else None,
-                parent_owner if parent_label != "Module" else None, decorators=decorators,
-            )
+            name_node = node.child_by_field_name("name") if node is not None else None
+            if name_node is not None and node.type in ("class_definition", "function_definition"):
+                # The decorated definition calls each decorator, resolved in the
+                # block's scope, where Python evaluates it.
+                record_calls(
+                    "Class" if node.type == "class_definition" else "Function", _text(name_node, source_bytes),
+                    node, scope, parent_name if parent_label == "Class" else None,
+                    member_owner(parent_label, parent_name, parent_owner), decorators=decorators,
+                )
         if node is not None and node.type == "class_definition":
             _visit_class(node, parent_name, parent_label, scope, parent_owner, extra_decorators=decorators)
         elif node is not None and node.type == "function_definition":
@@ -1226,6 +1235,18 @@ def extract_python_file(
                 visit_definition(child, func_name, "Function", scope, scope, cls, owner)
 
     visit_block(root, None, "Module", _Scope(_direct_defs(root, source_bytes), {}, None), "")
+    # A decorator its definition also calls in its body is one call of it
+    # (one edge, one set of properties), not `via` the decorator.
+    via: set[tuple[tuple[str, str, str | None], str]] = set()
+    for key, by_name in decorated.items():
+        for name, (pins, _bare, classes) in by_name.items():
+            if not pins:
+                continue
+            if name not in calls.get(key, {}):
+                via.add((key, name))
+            entry = calls.setdefault(key, {}).setdefault(name, [set(), False, set()])
+            entry[0].update(pins)
+            entry[2].update(classes)
     for (caller_label, caller_name, caller_owner), by_name in sorted(
         calls.items(), key=lambda item: (item[0][0], item[0][1], item[0][2] or "")
     ):
@@ -1235,6 +1256,7 @@ def extract_python_file(
                     caller_label, caller_name, name, pins, bare, min(classes, default=None), file_path, repo_id,
                     no_self=True,  # every bare Python call site is `x.m()` on an untyped receiver
                     caller_owner=caller_owner,
+                    via="decorator" if ((caller_label, caller_name, caller_owner), name) in via else None,
                 )
             )
 

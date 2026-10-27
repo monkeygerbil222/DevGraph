@@ -64,6 +64,7 @@ from devgraph.graph.schema import FILE_SCOPED_LABELS, HEIR_KEY, NODE_LABELS, REL
 from devgraph.indexer.apis.extractor import APIExtractor
 from devgraph.indexer.apis.routes import MountTable, mount_routes
 from devgraph.indexer.common import (
+    VIA_DECORATOR,
     best_pin,
     name_ref_properties,
     owner_matches,
@@ -2060,9 +2061,12 @@ def _relink_name_refs(
     rerun: list[tuple[dict, list[dict]]] = []
 
     def relink(origin, fields, from_file, to_file, confidence, exclude=(), to_name=None, from_owner=None,
-               to_owner=None, visible=None):
+               to_owner=None, visible=None, via=None):
         rel_type, from_label, from_name, _from_file, to_label, field_to_name, caller_class, _owner = fields
-        properties = {key: value for key, value in (("caller_class", caller_class), ("confidence", confidence)) if value}
+        properties = {
+            key: value
+            for key, value in (("caller_class", caller_class), ("confidence", confidence), ("via", via)) if value
+        }
         rels.append({
             "from_label": from_label, "from_name": from_name, "rel_type": rel_type,
             "to_label": to_label, "to_name": to_name or field_to_name, "repo_id": repo_id,
@@ -2136,7 +2140,7 @@ def _relink_name_refs(
                     if pin is not None and owner_matches(owners[pin], to_owner, keys, opened, siblings.get(to_name, ())):
                         relink(
                             origin, fields, from_file, to_file, pin_confidence(pin, confidence), from_owner=owner,
-                            to_owner=to_owner,
+                            to_owner=to_owner, via="decorator" if confidence == VIA_DECORATOR else None,
                         )
             if not from_file and from_label != "Module":
                 excludes = pin_excludes(owners, origin) if pins is not None else {None: ()}

@@ -56,6 +56,14 @@ def _assert_fresh(engine, repo_id, root):
         pytest.fail("graph does not equal a fresh full_scan:\n" + snapshot_diff(expected, actual))
 
 
+def _vias(engine, repo_id, name):
+    rows = engine.run_cypher(
+        "MATCH (a {repo_id: $r})-[x:CALLS]->(b:Function {repo_id: $r, name: $n}) RETURN a.name AS a, x.via AS v",
+        {"r": repo_id, "n": name},
+    )
+    return [row["v"] for row in sorted(rows, key=lambda row: row["a"])]
+
+
 def _callers(engine, repo_id, name):
     rows = engine.run_cypher(
         "MATCH (a {repo_id: $r})-[:CALLS]->(b:Function {repo_id: $r, name: $n}) RETURN a.name AS a",
@@ -92,9 +100,11 @@ def test_impact_of_decorator_lists_decorated_functions(engine, repo_id, tmp_path
     _write(tmp_path, "app/jobs.py", JOBS)
     _scan(engine, repo_id, tmp_path)
     callers = tools.find_callers(engine, repo_id, "retry")
-    assert sorted(row["name"] for row in callers["results"]) == ["Worker", "app/jobs.py"]
+    assert sorted((row["name"], row.get("owner"), row.get("via_decorator")) for row in callers["results"]) == [
+        ("fetch", "", True), ("run", "Worker", True),
+    ]
     impact = tools.impact_analysis(engine, repo_id, "retry")
-    assert sorted(row["name"] for row in impact["direct_dependents"]["results"]) == ["Worker", "app/jobs.py"]
+    assert sorted(row["name"] for row in impact["direct_dependents"]["results"]) == ["fetch", "run"]
 
 
 def test_a_decorator_added_or_removed_live_equals_fresh(engine, repo_id, tmp_path):
@@ -105,7 +115,13 @@ def test_a_decorator_added_or_removed_live_equals_fresh(engine, repo_id, tmp_pat
     assert _callers(engine, repo_id, "retry") == []
     jobs.write_text(textwrap.dedent(JOBS))
     index_paths(engine, repo_id, tmp_path, {jobs})
-    assert _callers(engine, repo_id, "retry") == ["Worker", "app/jobs.py"]
+    assert _callers(engine, repo_id, "retry") == ["fetch", "run"]
+    assert _vias(engine, repo_id, "retry") == ["decorator", "decorator"]
+    _assert_fresh(engine, repo_id, tmp_path)
+    # Calling it in the body too: one plain call, no longer `via` the decorator.
+    jobs.write_text(textwrap.dedent(JOBS).replace("return 1", "return retry(1)"))
+    index_paths(engine, repo_id, tmp_path, {jobs})
+    assert _vias(engine, repo_id, "retry") == [None, "decorator"]
     _assert_fresh(engine, repo_id, tmp_path)
     jobs.write_text("def fetch():\n    return 1\n")
     index_paths(engine, repo_id, tmp_path, {jobs})
@@ -125,4 +141,15 @@ def test_an_aliased_reexport_changed_live_equals_fresh(engine, repo_id, tmp_path
     assert sync_resolver_config(engine, repo_id, tmp_path, {init}) > 0
     assert _callers(engine, repo_id, "other") == []
     assert _callers(engine, repo_id, "helper") == ["main"]
+    _assert_fresh(engine, repo_id, tmp_path)
+
+
+def test_a_decorator_defined_after_its_users_is_relinked_via_it(engine, repo_id, tmp_path):
+    _write(tmp_path, "app/__init__.py", "")
+    _write(tmp_path, "app/jobs.py", JOBS)
+    _scan(engine, repo_id, tmp_path)
+    assert _callers(engine, repo_id, "retry") == []
+    util = _write(tmp_path, "app/util.py", RETRY)
+    index_paths(engine, repo_id, tmp_path, {util})
+    assert _vias(engine, repo_id, "retry") == ["decorator", "decorator"]
     _assert_fresh(engine, repo_id, tmp_path)

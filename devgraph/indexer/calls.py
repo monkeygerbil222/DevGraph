@@ -175,6 +175,7 @@ def call_rows(
     rel_type: str = "CALLS",
     to_label: str = "Function",
     caller_owner: str | None = None,
+    via: str | None = None,
 ) -> list[GraphRelationship]:
     """One caller's CALLS rows to one callee name, every call site to it
     collapsed together, so no two rows can meet in one edge with different
@@ -190,13 +191,17 @@ def call_rows(
     pin (common.owned_pin) narrows its pin to the callee's members of that
     owner: a pin some call site reached with no owner links every member of
     the name, and one reached under several owners a row per owner.
-    Precedence and exclusions are the pins', whatever their owners."""
+    Precedence and exclusions are the pins', whatever their owners. `via`
+    ("decorator": a Python definition's call of its decorator) is set on
+    every row as the `via` property (common.name_ref_properties records it)."""
 
     def row(pin: str | None, confidence: str, exclude: list[str] | None = None,
             to_owner: str | None = None) -> GraphRelationship:
         properties = {"confidence": confidence}
         if caller_class:
             properties["caller_class"] = caller_class
+        if via:
+            properties["via"] = via
         return GraphRelationship(
             from_label=caller_label, from_name=caller_name, rel_type=rel_type, to_label=to_label, to_name=name,
             repo_id=repo_id, properties=properties, to_file=pin, exclude=exclude,
