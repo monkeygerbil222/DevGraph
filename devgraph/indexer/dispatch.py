@@ -358,9 +358,15 @@ def _provider_specs(repo_root: Path) -> tuple[bool, filesystem.FilesystemSpec | 
 #: ending in a test file (devgraph/test_paths.py), and a Python `super()`
 #: call on a base outside the repository, or a dunder or capitalised method
 #: on an untyped receiver, linking no function by name; a Python decorator
-#: called by the scope its decorated definition is in, and a call of a name
-#: an `__init__.py` re-exports under an alias linked to the original
-#: (resolver configuration `python_aliases`).
+#: called by the definition it decorates (`via: "decorator"`), and a call of
+#: a name an `__init__.py` re-exports under an alias linked to the original
+#: (resolver configuration `python_aliases`); JS/TS imports through an
+#: alias: a barrel imported by its index file (`./lib/index`, `./lib/index.js`,
+#: a tsconfig alias to `index.ts`) pinned to its folder's prefix, a renamed
+#: or default re-export, a default-exported function imported under another
+#: name and a destructured dynamic import linked to the function, and a
+#: JS/TS Module's `js_exports` (jsts `export_surface`), whose change
+#: re-indexes its importers (`_export_importers`).
 #: An index stamped lower, or not at all, is rescanned automatically.
 INDEX_FORMAT = 25
 
@@ -1165,6 +1171,7 @@ def _index_paths(
     previous_projects: dict = {}
     stale: set = set()
     claims_before: dict = {}
+    previous_exports: dict = {}  # JS/TS file -> its Module's `js_exports` (see _export_importers)
 
     def snapshot(keys: list[str]) -> None:
         previous = engine.list_file_nodes(repo_id, keys)
@@ -1173,6 +1180,8 @@ def _index_paths(
         previous_keys.update({node[:4]: node[4] for node in previous})
         previous_projects.update({node[:4]: node[6] for node in previous})
         stale.update(node[:4] for node in previous if node[5])
+        if js := [key for key in keys if key.endswith(LANGUAGE_SUFFIXES["ts"])]:
+            previous_exports.update(engine.file_js_exports(repo_id, js))
         # The claims on the shared nodes the batch's files claim (see
         # _written_back_shared).
         if any(not n[2] for n in nodes):
@@ -1230,6 +1239,24 @@ def _index_paths(
             batch_keys = sorted(by_rel_path)
         for rel_path in sorted(settle):
             index_one(rel_path, by_rel_path[rel_path])
+    # A JS/TS file importing a name through another file's export aliases
+    # resolved its calls by that file's `js_exports`: every importer of a
+    # file whose aliases changed is indexed again, joining the batch, and
+    # so on while an importer's own aliases change (a barrel re-exporting
+    # the file). A full scan has no file outside the batch.
+    changed = set(by_rel_path)
+    while relink_outside and changed:
+        changed = {
+            rel for rel in changed if previous_exports.get(rel, ()) != extractions.js_exports.get(rel, ())
+        }
+        outside = sorted(_export_importers(engine, repo_id, changed, set(by_rel_path)))
+        if outside:
+            snapshot(outside)
+            by_rel_path.update({rel: root_resolved / rel for rel in outside})
+            batch_keys = sorted(by_rel_path)
+            for rel_path in outside:
+                index_one(rel_path, by_rel_path[rel_path])
+        changed = set(outside)
 
     # Files outside the batch that refer by name to a node the batch just
     # added were indexed before that node existed, so their edge to it was
@@ -1654,6 +1681,8 @@ def _index_single_path(
         nodes = [n.to_dict() for n in result.nodes] + _datastore_nodes(repo_id, rel_path, content, "js")
         rels = [r.to_dict() for r in result.relationships]
         nodes, rels = _mounted(nodes, rels, rel_path, mounts)
+        module = next(node for node in nodes if node["label"] == "Module" and node["name"] == rel_path)
+        extractions.js_exports[rel_path] = tuple(module["properties"].get("js_exports") or ())
         # Same replace-then-reupsert rationale as the .py branch above:
         # prune this file's previously-indexed nodes/edges and write the
         # freshly-extracted ones in one transaction. Its routes' Endpoint
@@ -1798,6 +1827,8 @@ class _Extractions:
         self.files: dict[str, dict[str, _Extracted]] = {lang: {} for lang in self.LANGUAGES}
         self.late = False  # set once the batch's match keys are written
         self._spill = None
+        # Each JS/TS file's Module's `js_exports` as extracted (see _export_importers).
+        self.js_exports: dict[str, tuple[str, ...]] = {}
 
     def __enter__(self) -> _Extractions:
         return self
@@ -2202,6 +2233,19 @@ def _module_pin_keys(module: str) -> tuple[str, str, str]:
     return folder, posixpath.basename(folder), posixpath.basename(module)
 
 
+def _export_importers(engine: GraphEngine, repo_id: str, modules: set[str], skip: set[str]) -> set[str]:
+    """The JS/TS files outside `skip` importing one of `modules`: an
+    IMPORTS by-name edge to it in their `name_refs`, which a file records
+    whether the imported file existed then or not. One graph read, only
+    when there are modules."""
+    if not modules:
+        return set()
+    return {
+        origin for origin, _refs, _visible in engine.find_name_refs(repo_id, sorted(modules), sorted(skip))
+        if origin.endswith(LANGUAGE_SUFFIXES["ts"])
+    }
+
+
 def _find_referrers(
     engine: GraphEngine,
     repo_id: str,
@@ -2463,7 +2507,9 @@ def remove_paths(
     another file's Express router re-indexes that router file
     (`_stale_mounts`), with `docs_path` and `mentions_enabled` as
     index_paths takes them; a compose file's deletion re-owns the files
-    under it (`_relink_owning_services`).
+    under it (`_relink_owning_services`); a JS/TS file's that had export
+    aliases (`js_exports`) re-indexes the files importing it
+    (`_export_importers`).
 
     Args:
         engine: A GraphEngine instance.
@@ -2502,6 +2548,9 @@ def remove_paths(
     )
     # Router mounts the deleted files held (apis/routes.py).
     mounted = engine.route_mount_state(repo_id, sorted(removed)) if removed else {}
+    # Export aliases the deleted JS/TS files' importers resolved calls through.
+    gone_js = sorted(rel for rel in removed if rel.endswith(LANGUAGE_SUFFIXES["ts"]))
+    exported = engine.file_js_exports(repo_id, gone_js) if gone_js else {}
     # Must match the repo-relative key index_paths() writes for every
     # extractor (Module/Class/Function/Document nodes, and shared nodes'
     # `sources`).
@@ -2521,6 +2570,11 @@ def remove_paths(
                 engine, repo_id, repo_root, {repo_root / rel for rel in settle}, docs_path=docs_path,
                 mentions_enabled=mentions_enabled, sync_provider=False,
             )
+    if importers := _export_importers(engine, repo_id, set(exported), removed):
+        index_paths(
+            engine, repo_id, repo_root, {repo_root / rel for rel in importers}, docs_path=docs_path,
+            mentions_enabled=mentions_enabled, sync_provider=False,
+        )
 
     ok, fs_spec, docs_spec = specs
     if removed:

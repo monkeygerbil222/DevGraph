@@ -548,7 +548,12 @@ class ResolverConfig:
     the `src` directories holding Python files (`python_roots`) and the
     aliasing `__init__.py` files (`python_aliases`), and
     `ts_files` for the TS inputs, whose workspace package.json files name
-    the workspace packages (`js_workspaces`), so no batch globs for them."""
+    the workspace packages (`js_workspaces`), so no batch globs for them.
+
+    `js_surfaces` caches, for the batch, the JS/TS files' export aliases
+    an import reads (jsts.extractor.export_surface). They are source files,
+    no configuration: a change to one re-indexes its importers
+    (dispatch `_export_importers`), not every JS/TS file."""
 
     def __init__(
         self, repo_root: Path, go_files: Callable[[], list[str] | None] | None = None,
@@ -578,6 +583,8 @@ class ResolverConfig:
         self._dirs: dict[str, list[str]] = {}
         self._ts_files = ts_files
         self._js_workspaces: dict[str, list[str]] | None = None
+        # Each JS/TS file's export aliases, as read (jsts.extractor.export_surface).
+        self.js_surfaces: dict[str, dict[str, tuple[str, tuple[str, ...]]]] = {}
 
     # --- files ---------------------------------------------------------------
 

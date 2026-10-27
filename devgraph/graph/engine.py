@@ -2876,6 +2876,19 @@ class GraphEngine:
             )
             return {row["f"]: tuple(sorted(row["o"])) for row in rows or []}
 
+    def file_js_exports(self, repo_id: str, files: list[str]) -> dict[str, tuple[str, ...]]:
+        """Each of `files`' Module's `js_exports` (its file's export aliases,
+        indexer/jsts/extractor.py `export_surface`), sorted; a Module
+        without one is left out."""
+        with self._driver.session() as session:
+            rows = _run_records(
+                session,
+                "UNWIND $files AS f MATCH (m:Module {repo_id: $repo_id, name: f}) WHERE m.js_exports IS NOT NULL "
+                "RETURN m.name AS f, m.js_exports AS e",
+                repo_id=repo_id, files=files,
+            )
+            return {row["f"]: tuple(sorted(row["e"])) for row in rows or []}
+
     def write_heir_open(self, repo_id: str, opens: dict[str, list[str]]) -> None:
         """Write these files' Modules' `heir_open`, which a batch's pass-1
         node writes leave as they were (see write_match_keys)."""
