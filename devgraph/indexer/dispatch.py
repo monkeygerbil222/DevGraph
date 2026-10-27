@@ -349,8 +349,9 @@ def _provider_specs(repo_root: Path) -> tuple[bool, filesystem.FilesystemSpec | 
 #: class declared in a namespace owned by it (`shop`), so its members, in
 #: the class or out of it, are all owned by `shop.Ledger` (an in-class
 #: method was owned by `Ledger`, an out-of-class one by `shop.Ledger` or
-#: `Ledger` as the definition was spelt), and one class name in two
-#: namespaces of a file two nodes.
+#: `Ledger` as the definition was spelt; one outside every namespace block
+#: under the file's one `using namespace` read in it), and one class name
+#: in two namespaces of a file two nodes.
 #: An index stamped lower, or not at all, is rescanned automatically.
 INDEX_FORMAT = 24
 

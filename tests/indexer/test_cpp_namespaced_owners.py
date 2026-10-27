@@ -220,3 +220,111 @@ def test_live_an_edit_equals_a_fresh_scan(engine, repo):
     assert actual == expected, snapshot_diff(expected, actual)
     callers = tools.find_callers(engine, repo_id, "avg", owner="shop.Ledger")
     assert sorted(row["name"] for row in callers["results"]) == ["report"]
+
+
+# ── `using namespace` before an out-of-class definition (review follow-up) ──
+
+
+def test_an_out_of_class_definition_under_using_namespace_is_owned_in_that_namespace():
+    assert _owners("""\
+        #include "hdr.h"
+        using namespace std;
+        using namespace shop;
+        int Ledger::total() const { return 0; }
+        Ledger::Ledger() {}
+        void Ledger::Entry::f2() {}
+        int shop::Ledger::avg() const { return 1; }
+        """, "ledger.cpp") == [
+        ("Function", "Ledger", "shop.Ledger"),
+        ("Function", "avg", "shop.Ledger"),
+        ("Function", "f2", "shop.Ledger.Entry"),
+        ("Function", "total", "shop.Ledger"),
+    ]
+
+
+def test_a_class_of_the_file_or_two_used_namespaces_keep_the_qualifier_as_written():
+    # A global class of the file is that class; two candidate namespaces are
+    # left to the lookup's C++ owner-suffix rule.
+    assert _owners(
+        "using namespace shop;\nclass Local { int m(); };\nint Local::m() { return 0; }\n", "local.cpp"
+    ) == [("Class", "Local", ""), ("Function", "m", "Local")]
+    assert _owners(
+        '#include "hdr.h"\nusing namespace shop;\nusing namespace books;\nint Ledger::total() { return 0; }\n',
+        "two.cpp",
+    ) == [("Function", "total", "Ledger")]
+
+
+USING_HDR = """\
+    namespace shop {
+    class Ledger {
+    public:
+        Ledger();
+        int sum() const { return 1; }
+        int total() const;
+    };
+    }
+    """
+
+USING_CPP = """\
+    #include "hdr.h"
+    using namespace shop;
+    Ledger::Ledger() {}
+    int Ledger::total() const { return sum(); }
+    """
+
+USING_APP = """\
+    #include "hdr.h"
+    int report() { shop::Ledger l; return l.total(); }
+    """
+
+
+@pytest.fixture
+def using_repo(engine, tmp_path):
+    root = tmp_path / "repo"
+    root.mkdir()
+    for rel, text in {"hdr.h": USING_HDR, "ledger.cpp": USING_CPP, "app.cpp": USING_APP}.items():
+        (root / rel).write_text(textwrap.dedent(text))
+    repo_id = f"zz-cppusing-{uuid.uuid4().hex[:8]}"
+    provision_repository_schema(engine, root)
+    engine.upsert_repository(repo_id, repo_id, str(root))
+    full_scan(engine, repo_id, root)
+    yield repo_id, root
+    engine.delete_repository(repo_id)
+
+
+def _finds_total(engine, repo_id):
+    described = tools.describe_node(engine, repo_id, "Ledger")
+    assert described["status"] == "found", described
+    assert [c["file"] for c in described["constructors"]] == ["ledger.cpp"]
+    assert tools.describe_node(engine, repo_id, "shop::Ledger::total")["status"] == "found"
+    callers = tools.find_callers(engine, repo_id, "total", owner="shop.Ledger")
+    assert sorted(row["name"] for row in callers["results"]) == ["report"]
+    # Class impact reaches the class's members through CONTAINS, which an
+    # out-of-class definition in another file lacks (the known gap): `total`
+    # is listed as the class's own member calling `sum`, not via itself.
+    impact = tools.impact_analysis(engine, repo_id, "Ledger", file="hdr.h")
+    direct = {(row["name"], row.get("owner")): row.get("via") for row in impact["direct_dependents"]["results"]}
+    assert direct == {("total", "shop.Ledger"): ["shop.Ledger.sum"]}, impact
+
+
+def test_live_a_definition_under_using_namespace_is_the_class_s_member(engine, using_repo):
+    repo_id, root = using_repo
+    _finds_total(engine, repo_id)
+    (root / "ledger.cpp").write_text(textwrap.dedent(USING_CPP).replace("return sum();", "return sum() + 1;"))
+    (root / "app.cpp").write_text(textwrap.dedent(USING_APP).replace("int report()", "int report2() { return 0; }\nint report()"))
+    index_paths(engine, repo_id, root, {root / "ledger.cpp", root / "app.cpp"})
+    expected = fresh_snapshot(engine, repo_id, root)
+    actual = graph_snapshot(engine, repo_id)
+    assert actual == expected, snapshot_diff(expected, actual)
+    _finds_total(engine, repo_id)
+
+
+def test_live_two_used_namespaces_still_answer_the_class_name_with_the_class(engine, using_repo):
+    repo_id, root = using_repo
+    (root / "ledger.cpp").write_text(textwrap.dedent(USING_CPP).replace(
+        "using namespace shop;", "using namespace shop;\nusing namespace books;"
+    ))
+    index_paths(engine, repo_id, root, {root / "ledger.cpp"})
+    described = tools.describe_node(engine, repo_id, "Ledger")
+    assert described["status"] == "found", described
+    assert [(c["file"], c["owner"]) for c in described["constructors"]] == [("ledger.cpp", "Ledger")]

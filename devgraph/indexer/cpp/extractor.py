@@ -76,7 +76,11 @@ final name, not the leftmost one, since the leftmost segment is more likely
 to be an enclosing namespace than the class itself. Its owner is the
 qualifier under the namespaces the definition is in (`_qualified_owner`):
 `int shop::Ledger::sum()` and `namespace shop { int Ledger::sum() }` are
-both owned by `shop.Ledger`. This is a textual
+both owned by `shop.Ledger`, and so is `int Ledger::sum()` outside every
+namespace block after `using namespace shop;`, when that is the file's one
+used namespace (`std` aside) and no class of the file is named `Ledger`;
+with several, the owner stays `Ledger` (`_CppResolver.used_namespace`).
+This is a textual
 heuristic, not a semantic one: it does not require (or verify) that a class
 named 'Inner' was actually declared in this same file. When it wasn't (the
 class lives in a header), no Class node is made for it here: the header's
@@ -468,6 +472,7 @@ class _CppResolver:
         self.fields: dict[str, dict[str, _CppType | None]] = {}
         self.owners: dict[str, set[str]] = {}
         self.scopes: set[tuple[str, ...]] = set()
+        self.used: set[tuple[str, ...]] = set()  # `using namespace a::b;`, as written
         # `using geo::Circle;`: Circle -> ("geo",); `namespace g = geo;`: g -> ("geo",).
         self.using_types: dict[str, tuple[str, ...]] = {}
         self.aliases: dict[str, tuple[str, ...]] = {}
@@ -485,6 +490,7 @@ class _CppResolver:
                 target = next(iter(node.named_children), None)
                 if target is not None and any(c.type == "namespace" for c in node.children):
                     self.scopes.add(_scope_parts(_text(target, source)))  # `using namespace a::b;`
+                    self.used.add(_scope_parts(_text(target, source)))
                 elif target is not None and target.type == "qualified_identifier":
                     parts = _scope_parts(_text(target, source))
                     if len(parts) > 1:
@@ -566,6 +572,22 @@ class _CppResolver:
         found |= self.owners.get(typed.name, set())
         return sorted(found)
 
+    def used_namespace(self, qualifier: list[str]) -> tuple[str, ...]:
+        """The namespace an out-of-class definition's `qualifier`, written
+        outside any namespace block, is in: a class of this file's own
+        namespace, else the one namespace (alias spelt out, `std` left out)
+        the file uses with `using namespace` that the qualifier doesn't
+        already name; () when that is no single one (a lookup then matches
+        a C++ owner by its tail, `tools._without_constructors`)."""
+        first = qualifier[0]
+        declared = {owner.rsplit(".", 1)[0] if "." in owner else "" for owner in self.owners.get(first, ())}
+        if declared:
+            return tuple(declared.pop().split(".")) if len(declared) == 1 and "" not in declared else ()
+        used = {self.aliases.get(ns[0], ns[:1]) + ns[1:] for ns in self.used if ns and ns != ("std",)}
+        if any(first in ns for ns in used) or len(used) != 1:
+            return ()
+        return used.pop()
+
     def type_pins(self, typed: _CppType, method: str) -> list[str] | None:
         """Where a method of `typed` is: this file for a class declared
         here (and its same-stem sources, for a header), else the include
@@ -606,10 +628,14 @@ def _nested_class(declaration: Node) -> Node | None:
     return None
 
 
-def _qualified_owner(enclosing: tuple[str, ...], qualifier: list[str]) -> list[str]:
+def _qualified_owner(enclosing: tuple[str, ...], qualifier: list[str], used: tuple[str, ...] = ()) -> list[str]:
     """An out-of-class definition's owner: its `qualifier` under the
     namespaces `enclosing` it, read from the one its first segment names
-    (inside `namespace a { namespace b {` a `b::C::f` is `a.b.C`)."""
+    (inside `namespace a { namespace b {` a `b::C::f` is `a.b.C`); outside
+    every namespace block, under `used` (`_CppResolver.used_namespace`:
+    `using namespace shop; int Ledger::f()` is `shop.Ledger`)."""
+    if not enclosing:
+        return [*used, *qualifier]
     if qualifier and qualifier[0] in enclosing:
         return [*enclosing[:enclosing.index(qualifier[0])], *qualifier]
     return [*enclosing, *qualifier]
@@ -992,7 +1018,9 @@ def extract_cpp_file(source_code: str, file_path: str, repo_id: str) -> Extracti
                 # definition is in (`namespace shop { int Ledger::sum() }`
                 # and `int shop::Ledger::sum()` are both `shop.Ledger`), as
                 # for a member defined in its class (`class_owner`).
-                qualifier = _qualified_owner(_enclosing(node, source_bytes)[0], parts[:-1])
+                enclosing = _enclosing(node, source_bytes)[0]
+                used = resolver.used_namespace(parts[:-1]) if not enclosing else ()
+                qualifier = _qualified_owner(enclosing, parts[:-1], used)
         elif inner.type in ("identifier", "field_identifier", "destructor_name", "operator_name"):
             func_name = _text(inner, source_bytes)
             class_name = parent_name if parent_label == "Class" else None
