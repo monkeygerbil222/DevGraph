@@ -98,5 +98,7 @@ def test_a_functions_impact_counts_every_caller(engine, repo):
     assert all("name_only" not in row for row in result["direct_dependents"]["results"])
     assert "name_only_dependents" not in result
     assert result["risk_level"] == "medium"
+    # Cache's super().__init__() reaches no base of the repository (its base
+    # is `object`), so it links no `__init__` at all (audit 12).
     init = tools.find_callers(engine, repo, "__init__", owner="Store")
-    assert [row["name"] for row in init["results"]] == ["__init__"]
+    assert init["results"] == []

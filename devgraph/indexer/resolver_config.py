@@ -25,6 +25,10 @@ the nearest Directory.Build.props and Directory.Build.targets above it (their
 that decide the SDK's implicit usings), and every `.cs` file whose head
 (`cs_global_usings`) holds a `global using`.
 
+Python's configuration also holds every `__init__.py` that re-exports a
+name under an alias (`from .util import other as renamed`,
+`python_aliases`): a call of `renamed` reaches `other` only through it.
+
 JS/TS's configuration also holds the repository's workspace packages
 (`js_workspaces`): the root package.json's `workspaces` and
 pnpm-workspace.yaml's `packages` globs, and the package.json of each
@@ -118,7 +122,8 @@ def touches_config(rel: str, inputs: list[str], repo_root: Path) -> bool:
     head now holds a `global using` (one whose head held one is an input; a
     file of no project counts for nothing until a `.csproj` above it, itself
     a change, makes it one), a .rs file that now re-exports (one that
-    did is an input), a Python file created beside a Python project's `src`
+    did is an input), an `__init__.py` that now re-exports under an alias
+    (likewise), a Python file created beside a Python project's `src`
     directory that is no source root yet or deleted under one, or a
     deleted directory under an input (a `src` root's `src/pkg`).
 
@@ -134,6 +139,8 @@ def touches_config(rel: str, inputs: list[str], repo_root: Path) -> bool:
         return True  # a Python file or a folder deleted under a source root: it may hold the last
     if rel.endswith(".rs"):
         return bool(_rust_file_reexports(Path(repo_root) / rel))
+    if posixpath.basename(rel) == "__init__.py" and _python_file_aliases(Path(repo_root) / rel):
+        return True  # it now re-exports under an alias (one that did is an input)
     if rel.endswith(".py"):
         # Under a project's `src` directory not yet a root, a new file can
         # make it one.
@@ -537,8 +544,9 @@ class ResolverConfig:
     the Cargo.toml files and the re-exporting .rs files (`rust_crates`,
     `rust_reexports`), `cs_files` for the C#
     project files and the .cs files holding a `global using`
-    (`cs_projects`), `python_files` for the pyproject.toml files and
-    the `src` directories holding Python files (`python_roots`), and
+    (`cs_projects`), `python_files` for the pyproject.toml files,
+    the `src` directories holding Python files (`python_roots`) and the
+    aliasing `__init__.py` files (`python_aliases`), and
     `ts_files` for the TS inputs, whose workspace package.json files name
     the workspace packages (`js_workspaces`), so no batch globs for them."""
 
@@ -566,6 +574,7 @@ class ResolverConfig:
         self._python_files = python_files
         self._python_roots: dict[str, list[str]] | None = None
         self._python_src: list[str] = []
+        self._python_aliases: dict[str, list[list[str]]] | None = None
         self._dirs: dict[str, list[str]] = {}
         self._ts_files = ts_files
         self._js_workspaces: dict[str, list[str]] | None = None
@@ -1096,7 +1105,24 @@ class ResolverConfig:
         return sorted(roots)
 
     def _python_digest(self, rel: str) -> object:
+        if posixpath.basename(rel) == "__init__.py":
+            return _python_file_aliases(self.root / rel)
         return self._pyproject_roots(rel) if posixpath.basename(rel) == "pyproject.toml" else []
+
+    def _python_config_files(self) -> list[str]:
+        files = self._python_files() if self._python_files is not None else None
+        return _python_inputs(self.root) if files is None else files
+
+    def python_aliases(self) -> dict[str, list[list[str]]]:
+        """Every `__init__.py` re-exporting a name under an alias, by its
+        repo-relative path: its [alias, name, module as written] lists
+        (python.extractor `aliases`)."""
+        if self._python_aliases is None:
+            self._python_aliases = {
+                rel: found for rel in self._python_config_files()
+                if posixpath.basename(rel) == "__init__.py" and (found := _python_file_aliases(self.root / rel))
+            }
+        return self._python_aliases
 
     def python_roots(self, file_path: str) -> tuple[str, ...]:
         """The source roots of the Python file `file_path` (repo-relative),
@@ -1104,9 +1130,7 @@ class ResolverConfig:
         project file (`_python_inputs`) whose parent is at or above it, and
         the roots the pyproject.toml files at or above it declare."""
         if self._python_roots is None:
-            files = self._python_files() if self._python_files is not None else None
-            if files is None:
-                files = _python_inputs(self.root)
+            files = self._python_config_files()
             self._python_roots = {
                 rel: self._pyproject_roots(rel) for rel in files if posixpath.basename(rel) == "pyproject.toml"
             }
@@ -1261,7 +1285,8 @@ def _python_inputs(root: Path, walked: list[str] | None = None) -> list[str]:
     paths, or `walked`): every pyproject.toml, setup.py and setup.cfg, and
     every directory named `src` holding a Python file (at any depth) whose
     parent holds one of them, so a JavaScript app's stray `src/utils.py`
-    makes no root; sorted."""
+    makes no root, and every `__init__.py` re-exporting under an alias
+    (`python_aliases`); sorted."""
     if walked is None:
         walked = []
         for path in indexable_paths(root):
@@ -1274,6 +1299,9 @@ def _python_inputs(root: Path, walked: list[str] | None = None) -> list[str]:
     found.update(
         each for rel in walked if rel.endswith(".py") for each in _src_dirs(rel)
         if posixpath.dirname(each) in projects
+    )
+    found.update(
+        rel for rel in walked if posixpath.basename(rel) == "__init__.py" and _python_file_aliases(root / rel)
     )
     return sorted(found)
 
@@ -1301,6 +1329,30 @@ def _rust_file_reexports(path: Path) -> list[list]:
         if len(_REEXPORTS_SEEN) >= _REEXPORTS_SEEN_MAX:
             _REEXPORTS_SEEN.clear()
         found = _REEXPORTS_SEEN[key] = reexports(data.decode("utf-8", errors="replace"))
+    return found
+
+
+#: `aliases` by a digest of the text it read, as `_REEXPORTS_SEEN`.
+_ALIASES_SEEN: dict[bytes, list[list[str]]] = {}
+
+
+def _python_file_aliases(path: Path) -> list[list[str]]:
+    """The aliased re-exports of the `__init__.py` at `path` (none when it
+    is missing, unreadable or larger than a configuration file may be)."""
+    from devgraph.indexer.python.extractor import aliases  # the extractor imports this module
+
+    try:
+        if not path.is_file() or path.stat().st_size > _MAX_CONFIG_BYTES:
+            return []
+        data = path.read_bytes()
+    except OSError:
+        return []
+    key = hashlib.blake2b(data, digest_size=16).digest()
+    found = _ALIASES_SEEN.get(key)
+    if found is None:
+        if len(_ALIASES_SEEN) >= _REEXPORTS_SEEN_MAX:
+            _ALIASES_SEEN.clear()
+        found = _ALIASES_SEEN[key] = aliases(data.decode("utf-8", errors="replace"))
     return found
 
 
@@ -1343,8 +1395,9 @@ def fingerprints(repo_root: Path) -> dict[str, dict]:
     pnpm-workspace.yaml's workspace globs and each workspace package's
     package.json `name` and entry points (`js_workspaces`, `_js_digest`);
     for Python each pyproject.toml's source roots
-    (`_pyproject_roots`), and every Python project file and `src`
-    directory holding Python files beside one (`_python_inputs`). A compiler flag, a `require` bump or a dependency or
+    (`_pyproject_roots`) and each aliasing `__init__.py`'s aliases, and
+    every Python project file, `src` directory holding Python files beside
+    one and aliasing `__init__.py` (`_python_inputs`). A compiler flag, a `require` bump or a dependency or
     version change counts for nothing."""
     root = Path(repo_root)
     config = ResolverConfig(root)

@@ -33,6 +33,7 @@ __all__ = [
     "NAME_REF_SEP",
     "PIN_BY_KIND",
     "UNKNOWN_BASE",
+    "VIA_DECORATOR",
     "ExtractionResult",
     "GraphNode",
     "GraphRelationship",
@@ -612,8 +613,8 @@ def name_ref_properties(rels: list[dict]) -> dict:
     NAME_REF_OWNED marks the layout; an older entry has none (see
     `parse_name_ref`). An unpinned entry's `confidence` is its edges' `confidence`
     property. A pinned entry's is "pin" when its edges carry one, each pin's
-    being its kind's (graph/schema.py `PIN_CONFIDENCE`), and empty when they
-    carry none. `name_ref_targets` is their sorted
+    being its kind's (graph/schema.py `PIN_CONFIDENCE`), VIA_DECORATOR when
+    they are also `via` a decorator, and empty when they carry none. `name_ref_targets` is their sorted
     distinct `to_name`s and `name_ref_sources` the sorted distinct
     `from_name`s of their unpinned non-Module sources. `name_ref_visible`
     is the sorted `visible` of the file's edges (one C# project's, the
@@ -659,7 +660,7 @@ def name_ref_properties(rels: list[dict]) -> dict:
         if to_file is not None:
             pins.add(to_file)
             if properties.get("confidence"):
-                confidences.add(PIN_BY_KIND)
+                confidences.add(VIA_DECORATOR if properties.get("via") == "decorator" else PIN_BY_KIND)
         targets.add(rel["to_name"])
         if unpinned_source:
             sources.add(rel["from_name"])
@@ -680,6 +681,9 @@ def name_ref_properties(rels: list[dict]) -> dict:
 #: A pinned `name_refs` entry's confidence when its edges carry one: each
 #: pin's is its kind's.
 PIN_BY_KIND = "pin"
+#: PIN_BY_KIND for the edges of a Python definition to its decorator, which
+#: also carry `via: "decorator"` (calls.call_rows), so a relink writes it.
+VIA_DECORATOR = "decorator"
 
 
 def pin_confidence(pin: str, entry_confidence: str) -> str:

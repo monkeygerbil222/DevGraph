@@ -64,6 +64,7 @@ from devgraph.graph.schema import FILE_SCOPED_LABELS, HEIR_KEY, NODE_LABELS, REL
 from devgraph.indexer.apis.extractor import APIExtractor
 from devgraph.indexer.apis.routes import MountTable, mount_routes
 from devgraph.indexer.common import (
+    VIA_DECORATOR,
     best_pin,
     name_ref_properties,
     owner_matches,
@@ -351,9 +352,17 @@ def _provider_specs(repo_root: Path) -> tuple[bool, filesystem.FilesystemSpec | 
 #: method was owned by `Ledger`, an out-of-class one by `shop.Ledger` or
 #: `Ledger` as the definition was spelt; one outside every namespace block
 #: under the file's one `using namespace` read in it), and one class name
-#: in two namespaces of a file two nodes.
+#: in two namespaces of a file two nodes; 25: a Python function defined in
+#: another function `nested` (match key graph/schema.py LOCAL_KEY), which
+#: no other file's CALLS reaches, a production file's name-only CALLS never
+#: ending in a test file (devgraph/test_paths.py), and a Python `super()`
+#: call on a base outside the repository, or a dunder or capitalised method
+#: on an untyped receiver, linking no function by name; a Python decorator
+#: called by the scope its decorated definition is in, and a call of a name
+#: an `__init__.py` re-exports under an alias linked to the original
+#: (resolver configuration `python_aliases`).
 #: An index stamped lower, or not at all, is rescanned automatically.
-INDEX_FORMAT = 24
+INDEX_FORMAT = 25
 
 
 def index_outdated(engine: GraphEngine, repo_id: str) -> bool:
@@ -2052,9 +2061,12 @@ def _relink_name_refs(
     rerun: list[tuple[dict, list[dict]]] = []
 
     def relink(origin, fields, from_file, to_file, confidence, exclude=(), to_name=None, from_owner=None,
-               to_owner=None, visible=None):
+               to_owner=None, visible=None, via=None):
         rel_type, from_label, from_name, _from_file, to_label, field_to_name, caller_class, _owner = fields
-        properties = {key: value for key, value in (("caller_class", caller_class), ("confidence", confidence)) if value}
+        properties = {
+            key: value
+            for key, value in (("caller_class", caller_class), ("confidence", confidence), ("via", via)) if value
+        }
         rels.append({
             "from_label": from_label, "from_name": from_name, "rel_type": rel_type,
             "to_label": to_label, "to_name": to_name or field_to_name, "repo_id": repo_id,
@@ -2128,7 +2140,7 @@ def _relink_name_refs(
                     if pin is not None and owner_matches(owners[pin], to_owner, keys, opened, siblings.get(to_name, ())):
                         relink(
                             origin, fields, from_file, to_file, pin_confidence(pin, confidence), from_owner=owner,
-                            to_owner=to_owner,
+                            to_owner=to_owner, via="decorator" if confidence == VIA_DECORATOR else None,
                         )
             if not from_file and from_label != "Module":
                 excludes = pin_excludes(owners, origin) if pins is not None else {None: ()}

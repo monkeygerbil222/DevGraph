@@ -253,6 +253,13 @@ NAME_REF_OWNED = "\x1b"
 #: owned by `User` (an owned pin) links it too (graph/engine.py
 #: `_owner_test`). No C# match key starts with it.
 HEIR_KEY = "<"
+#: The match key of a function local to another function (a Python def
+#: nested in a def, or a method of a class defined in one; its node is
+#: `nested` too): no other file's call reaches it (graph/engine.py
+#: `_upsert_relationships_tx`). Kept among `mkeys` so a node that stops or
+#: starts being local in place (`def outer` becoming `class outer`) is
+#: rekeyed and its edges written again. No other match key is it.
+LOCAL_KEY = ">"
 
 
 # Path pins: a relationship row's `to_file` (see devgraph/indexer/common.py

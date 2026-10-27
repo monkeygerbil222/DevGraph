@@ -45,6 +45,7 @@ from devgraph.graph.schema import (
     split_pin,
 )
 from devgraph.indexer.docs.extractor import DOC_NOTE_LABELS
+from devgraph.test_paths import TEST_PATH_CYPHER, is_test_path
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     # Imported for annotations only: `devgraph.config.project_schema` imports
@@ -1252,7 +1253,8 @@ def _group_rels_by_triple(
     its group's Cypher tests the shadow (see `_end_match`). Only the keys
     its group's Cypher reads are sent. A row also carries its edges'
     `visible` (C# project visibility) as `vis`, once, which a path-pinned
-    target tests (`_visible`). The source is
+    target tests (`_visible`), and `no_test`, whether it is a production
+    file's name-only CALLS (`_CALL_REACHES`). The source is
     then matched once for all of them: a resolved call names several
     candidate files per callee.
     """
@@ -1283,6 +1285,10 @@ def _group_rels_by_triple(
             "properties": properties,
             "origin": origin,
             "vis": visible,
+            # A production file's name-only call: no test file's node can be
+            # what it calls (`_upsert_relationships_tx`).
+            "no_test": rel["rel_type"] == "CALLS" and properties.get("confidence") == "name"
+            and origin is not None and not is_test_path(origin),
             "targets": [],
         })
         target = {"to_name": rel["to_name"], "to_file": to_file}
@@ -1533,19 +1539,34 @@ def _end_match(
     return match + hint + ("WHERE " + " AND ".join(conditions) + " " if conditions else "")
 
 
+#: What a CALLS row's target Function must meet besides its pin: a function
+#: local to another (`nested`, graph/schema.py LOCAL_KEY) is called from its
+#: own file only, and a production file's name-only call (`no_test`, see
+#: `_group_rels_by_triple`) never ends in a test file (devgraph/test_paths.py).
+#: A relink writes a name-only edge pinned to its target's file, with its
+#: confidence, so both hold for it too.
+_CALL_REACHES = (
+    "(NOT coalesce(b.nested, false) OR row.origin IS NULL OR b.file = row.origin) "
+    "AND (NOT row.no_test OR NOT coalesce(b.file, '') =~ $test_path)"
+)
+
+
 def _upsert_relationships_tx(tx, rels: list[dict[str, Any]]) -> None:
     for (from_label, rel_type, to_label, from_pin, to_pin), rows in _group_rels_by_triple(rels).items():
+        also = ["(NOT t.no_self OR a <> b)"] if to_pin == "name" else []
+        if rel_type == "CALLS" and to_label == "Function":
+            also.append(_CALL_REACHES)
         tx.run(
             "UNWIND $rows AS row "
             + _end_match("a", from_label, "from", from_pin)
             + "UNWIND row.targets AS t "
             + _end_match(
-                "b", to_label, "to", to_pin, "t", also="(NOT t.no_self OR a <> b)" if to_pin == "name" else None,
-                inherit=rel_type != "CONTAINS",
+                "b", to_label, "to", to_pin, "t", also=" AND ".join(also) or None, inherit=rel_type != "CONTAINS",
             )
             + f"MERGE (a)-[r:{rel_type}]->(b) "
             "SET r += row.properties " + _ADD_ORIGIN,
             rows=rows,
+            test_path=TEST_PATH_CYPHER,
         )
 
 
@@ -1581,10 +1602,10 @@ def _write_insights_tx(tx, repo_id: str, rows: list[dict[str, Any]], summary: di
 
 #: Properties an extractor writes on a file's Module, Class or Function only
 #: when the code has them (a docstring's summary and text, a Kotlin
-#: companion's `kind`): `_replace_file_nodes_tx` clears them on a kept node
+#: companion's `kind`, a Python function's `nested`): `_replace_file_nodes_tx` clears them on a kept node
 #: whose new extraction has none. Match keys and `proj` are written apart
 #: (`write_match_keys`).
-_OPTIONAL_CODE_PROPERTIES = ("description", "docstring_full", "kind")
+_OPTIONAL_CODE_PROPERTIES = ("description", "docstring_full", "kind", "nested")
 
 
 def _replace_file_nodes_tx(

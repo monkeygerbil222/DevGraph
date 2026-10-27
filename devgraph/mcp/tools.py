@@ -1918,7 +1918,8 @@ def find_callers(
         Dict with count, results, truncated flag and test_count (the callers in
         test code, listed or not) containing callers with their
         types, repo_id, file, owner and start_line (when the caller has them: a
-        Module has neither) and confidence (same-named callers are separate
+        Module has neither), `via_decorator` (only when true: a Python
+        definition decorated with the target, its edge's `via: "decorator"`) and confidence (same-named callers are separate
         rows, told apart by file and owner); count 0 for a known target nothing calls. When targets
         of that name lie in several files and `file` is not given, each row adds
         `target_files`, the files of the targets it calls (at most 10, with
@@ -1967,14 +1968,14 @@ def find_callers(
     WITH caller, min(CASE rel.confidence WHEN 'resolved' THEN 0 WHEN 'package' THEN 1 WHEN 'name' THEN 3
                      ELSE 2 END) AS rank,
          collect(DISTINCT CASE WHEN callee <> target THEN coalesce(callee.owner, '') + '.' + callee.name END)
-         AS via{target_files}
+         AS via, max(CASE WHEN rel.via = 'decorator' THEN 1 ELSE 0 END) AS by_decorator{target_files}
     WITH *, {is_test} AS is_test
     WHERE $include_tests OR NOT is_test
     RETURN caller.name as name, labels(caller) as type, caller.repo_id as repo_id,
            coalesce(caller.file, caller.source_file) as file,
            {_OWNER_OF.format(v="caller")} as owner, caller.start_line as start_line,
            CASE rank WHEN 0 THEN 'resolved' WHEN 1 THEN 'package' WHEN 3 THEN 'name' END as confidence,
-           via{target_files and ", target_files"}
+           via, by_decorator = 1 AS via_decorator{target_files and ", target_files"}
     ORDER BY is_test, rank, name, file
     LIMIT {LIST_ROW_LIMIT + 1}
     """
@@ -2006,7 +2007,11 @@ def find_callers(
     """
     routed_by = next(iter(_query(engine, routes, {**params, "max_results": max_results})), None)
     results, more = _list_query(engine, cypher, params)
-    results = [_dependent(row) for row in results]
+    # `via_decorator` kept only when true: the caller is decorated with the target.
+    results = [
+        {**_dependent(row), **({"via_decorator": True} if decorator else {})}
+        for row in results for decorator in [row.pop("via_decorator", False)]
+    ]
     if ambiguous:
         results = [_with_target_files(row, row["target_files"]) for row in results]
     envelope = _capped_envelope(results, more, max_results)
