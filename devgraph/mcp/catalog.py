@@ -11,7 +11,7 @@ from __future__ import annotations
 from typing import Any
 
 TOOL_CATALOG: list[dict[str, Any]] = [
-    {"name": "search_component", "identifier_kind": "name/description substring (code, endpoints, datastores including caches, containers)", "envelope": True, "phase": 1, "note": "the whole query as exact name first (then ignoring case), then names starting with or containing it, then names equal to, starting with or containing one of its words; each result has its file; count_is_lower_bound marks a count the substring scan never finished"},
+    {"name": "search_component", "identifier_kind": "name/description substring (code, endpoints, datastores including caches, containers)", "envelope": True, "phase": 1, "note": "the whole query as exact name first (then ignoring case), then names starting with or containing it, then names equal to, starting with or containing one of its words, name matches in test code after production ones (unless the query names test code); each result has its file; count_is_lower_bound marks a count the substring scan never finished"},
     {"name": "list_recent_changes", "identifier_kind": "commit-count window (within_commits), optional entity_type label", "envelope": True, "phase": 3},
     {"name": "trace_request_flow", "identifier_kind": "endpoint name (\"GET /users/<id>\") or bare path (\"/users/<id>\", every method)", "envelope": False, "phase": 1, "note": "a route's handler node is listed as the one real function it stands for (the traced route's own when routes share a handler name), or as itself; each component has its file and owner; edges are {type, from, to}"},
     {"name": "get_service_dependencies", "identifier_kind": "service name", "envelope": False, "phase": 1},

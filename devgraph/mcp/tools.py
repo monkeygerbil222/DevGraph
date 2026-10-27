@@ -541,10 +541,29 @@ _SEARCH_TIER = (
     "WHEN any(t IN $terms WHERE toLower(n.name) CONTAINS t) THEN 6 ELSE 7 END"
 )
 _SEARCH_FILE = "CASE WHEN coalesce(n.file, '') <> '' THEN n.file ELSE coalesce(n.path, n.source_file, n.source) END"
+# Whether a matching node ranks with the test code (devgraph/test_paths.py), when
+# `$tests_last`: name matches in production code come before those in test code,
+# and both before description-only matches. Needs `file` bound (`_SEARCH_FILE`).
+_SEARCH_IN_TESTS = "($tests_last AND coalesce(file, '') =~ $test_path)"
 _SEARCH_ROW = (
     "{id: elementId(n), name: n.name, labels: labels(n), repo_id: n.repo_id, description: n.description, "
     f"file: {_SEARCH_FILE}, owner: CASE WHEN n.file IS NOT NULL THEN coalesce(n.owner, '') END}}"
 )
+
+
+#: Words a query names test code with (`test_search`, `conftest`, `fake engine`):
+#: such a query ranks test code as any other.
+_TEST_WORDS = frozenset({
+    "test", "tests", "testing", "conftest", "fixture", "fixtures", "spec", "specs",
+    "mock", "mocks", "fake", "fakes", "stub", "stubs",
+})
+
+
+def _targets_tests(query: str) -> bool:
+    """Whether `query` asks for test code: a word (or a word's `_` part) is a
+    test word, or starts with `test` (`TestSearch`, `testCase`)."""
+    words = re.findall(r"[A-Za-z0-9_]+", query.lower())
+    return any(w.startswith("test") or not _TEST_WORDS.isdisjoint(w.split("_")) for w in words)
 
 
 def _name_variants(query: str, terms: list[str]) -> list[str]:
@@ -649,25 +668,31 @@ def ranked_search(
     """Nodes of `labels` whose name or description contains a (lower-case) term,
     best first (`_SEARCH_TIER`): `query` itself as the name, then ignoring case,
     then a name starting with or containing `query`, then a name equal to,
-    starting with or containing a term, description only.
+    starting with or containing a term, description only. Name matches in test
+    code (devgraph/test_paths.py) come after every name match in production
+    code, and before description-only matches, unless `query` asks for test
+    code (`_targets_tests`): a fixture named `engine` never hides `GraphEngine`.
 
     Names that start with one of `names` are found first through the
-    `(repo_id, name)` indexes. Only when they don't fill `limit` does a substring
-    scan fill the rest and count every match. Returns (rows, count,
-    count_is_lower_bound): the count is a lower bound when the scan never ran.
-    `repo_id` None searches every repository. Labels must be validated identifiers.
+    `(repo_id, name)` indexes. Only when they don't fill `limit` with production
+    code does a substring scan fill the rest and count every match. Returns
+    (rows, count, count_is_lower_bound): the count is a lower bound when the
+    scan never ran. `repo_id` None searches every repository. Labels must be
+    validated identifiers.
     """
     scope = "n.repo_id = $repo_id" if repo_id is not None else _cross_scope("n")
     if cutoff is not None:
         scope += " AND n.last_modified_at >= $cutoff"
     exact = query.strip()
+    tests_last = not _targets_tests(query)
     params: dict[str, Any] = {  # an empty query (None) matches no whole-query tier
         "repo_id": repo_id, "terms": terms, "names": names, "cutoff": cutoff,
         "exact": exact or None, "whole": exact.lower() or None,
+        "tests_last": tests_last, "test_path": TEST_PATH_CYPHER,
     }
     order = (
         f"WITH n, {_SEARCH_TIER} AS tier, {_SEARCH_FILE} AS file "
-        "ORDER BY tier, n.name, file IS NULL, file, elementId(n)\n"
+        f"ORDER BY tier = 7, {_SEARCH_IN_TESTS}, tier, n.name, file IS NULL, file, elementId(n)\n"
     )
     indexed = _query(
         engine,
@@ -676,18 +701,22 @@ def ranked_search(
         params,
     )
     found = [r["row"] for r in indexed]
-    if len(found) > limit:
-        return found[:limit], len(found), True
+    # Test-code rows of the index stage may rank below production matches only
+    # the substring scan finds (`GraphEngine` for `engine`), so they wait for it.
+    production = [r for r in found if not (tests_last and is_test_path(r["file"]))]
+    if len(production) > limit:
+        return production[:limit], len(found), True
     substring = "any(t IN $terms WHERE toLower(n.name) CONTAINS t OR toLower(n.description) CONTAINS t)"
     rows = _query(
         engine,
         _search_branches(labels, f"{scope} AND {substring}") + order
         + "WITH collect(n) AS ns "
         f"RETURN size(ns) AS total, [n IN [n IN ns WHERE NOT elementId(n) IN $seen][..$fill] | {_SEARCH_ROW}] AS rest",
-        {**params, "seen": [r["id"] for r in found], "fill": limit - len(found)},
+        {**params, "seen": [r["id"] for r in production], "fill": limit - len(production)},
     )
     row = rows[0] if rows else {"total": 0, "rest": []}
-    return _rank_search_results(found + row["rest"], terms, exact), max(row["total"], len(found)), False
+    ranked = _rank_search_results(production + row["rest"], terms, exact, tests_last)
+    return ranked, max(row["total"], len(found)), False
 
 
 def declared_node_labels(registry: RepoRegistry | None, repo_id: str) -> tuple[str, ...]:
@@ -706,12 +735,15 @@ def declared_node_labels(registry: RepoRegistry | None, repo_id: str) -> tuple[s
     return tuple(node_type.label for node_type in effective.node_types)
 
 
-def _rank_search_results(results: list[dict], tokens: list[str], query: str = "") -> list[dict]:
+def _rank_search_results(
+    results: list[dict], tokens: list[str], query: str = "", tests_last: bool = False
+) -> list[dict]:
     """Sort search rows in `_SEARCH_TIER`'s order: `query` as the exact name,
     then ignoring case, then a name starting with or containing `query`, then a
     name equal to, starting with or containing a token, then description-only
     matches last; by name and file within a tier (no file last), as
-    `ranked_search`'s queries order them."""
+    `ranked_search`'s queries order them. With `tests_last`, name matches in
+    test code come after the other name matches (`_SEARCH_IN_TESTS`)."""
     exact = query.strip()
     whole = exact.lower()
 
@@ -733,10 +765,11 @@ def _rank_search_results(results: list[dict], tokens: list[str], query: str = ""
         if any(t in name for t in tokens):
             return 6
         return 7
-    return sorted(
-        results,
-        key=lambda row: (tier(row), row.get("name") or "", row.get("file") is None, row.get("file") or ""),
-    )
+    def key(row: dict) -> tuple:
+        rank = tier(row)
+        in_tests = tests_last and is_test_path(row.get("file"))
+        return (rank == 7, in_tests, rank, row.get("name") or "", row.get("file") is None, row.get("file") or "")
+    return sorted(results, key=key)
 
 
 # --- describe_node -------------------------------------------------------------

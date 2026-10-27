@@ -372,10 +372,14 @@ than the default. `search_component` ranks the whole query as the exact name
 first (then the same name in other case), then names starting with or
 containing the whole query, then names equal to, starting with or containing
 one of its words (so `run_cypher` comes before the many functions named `run`),
-then description-only matches; each
+then description-only matches. Name matches in test code (the rule
+`find_callers` uses to put test callers last) come after every name match in
+production code, so `engine` finds `GraphEngine` before the test fixtures named
+`engine`; they are still listed, and a query that names test code (`test_...`,
+`conftest`, `fixture`, `mock`, `fake`, `stub`) ranks them as any other. Each
 result carries its `file`, and a route's handler stub is dropped when it
 folds into a real function (see Route handlers). Its `count` is the true number of
-matches, except when exact and prefix matches alone fill `max_results`: then
+matches, except when exact and prefix matches in production code alone fill `max_results`: then
 the response adds `count_is_lower_bound: true`. `max_results` is capped at
 200. The whole query and each of its words (`user_service`, underscores kept)
 are matched as well as its tokens. An exact name in unusual case (`gEt` for
